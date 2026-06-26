@@ -68,11 +68,49 @@ def default_known_hosts_file() -> Path:
 def winfsp_paths() -> list[Path]:
     if not is_windows():
         return []
+    paths: list[Path] = []
+    try:
+        import winreg
+
+        uninstall_keys = [
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+            r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        ]
+        for uninstall_key in uninstall_keys:
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, uninstall_key) as key:
+                    count = winreg.QueryInfoKey(key)[0]
+                    for index in range(count):
+                        try:
+                            subkey_name = winreg.EnumKey(key, index)
+                            with winreg.OpenKey(key, subkey_name) as subkey:
+                                display_name = winreg.QueryValueEx(subkey, "DisplayName")[0]
+                                if "WinFsp" not in str(display_name):
+                                    continue
+                                install_location = winreg.QueryValueEx(subkey, "InstallLocation")[0]
+                                if install_location:
+                                    paths.append(Path(winreg.ExpandEnvironmentStrings(str(install_location))))
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+    except ImportError:
+        pass
+
     roots = [
         os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
         os.environ.get("ProgramFiles", "C:\\Program Files"),
     ]
-    return [Path(root) / "WinFsp" for root in roots]
+    paths.extend(Path(root) / "WinFsp" for root in roots)
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path).casefold()
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    return unique
 
 
 def find_winfsp() -> Path | None:
