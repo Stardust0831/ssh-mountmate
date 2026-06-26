@@ -186,7 +186,7 @@ rsshmount.cmd mount gpu01 /home/ubuntu
 ## Windows 安装到用户目录
 
 ```powershell
-.\install.ps1
+.\app\install.ps1
 %LOCALAPPDATA%\rsshmount\rsshmount.cmd doctor
 ```
 

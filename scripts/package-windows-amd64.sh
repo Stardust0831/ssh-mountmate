@@ -15,11 +15,11 @@ mkdir -p "$DIST/app" "$ROOT/dist"
 
 cp "$ROOT/启动 SSH MountMate.cmd" "$DIST/启动 SSH MountMate.cmd"
 cp "$ROOT/README.md" "$DIST/README.md"
-cp "$ROOT/rsshmount.py" "$DIST/app/rsshmount.py"
-cp "$ROOT/rsshmount_gui.pyw" "$DIST/app/rsshmount_gui.pyw"
-cp "$ROOT/rsshmount.cmd" "$DIST/app/rsshmount.cmd"
-cp "$ROOT/rsshmount-gui.cmd" "$DIST/app/rsshmount-gui.cmd"
-cp "$ROOT/install.ps1" "$DIST/app/install.ps1"
+cp "$ROOT/app/rsshmount.py" "$DIST/app/rsshmount.py"
+cp "$ROOT/app/rsshmount_gui.pyw" "$DIST/app/rsshmount_gui.pyw"
+cp "$ROOT/app/rsshmount.cmd" "$DIST/app/rsshmount.cmd"
+cp "$ROOT/app/rsshmount-gui.cmd" "$DIST/app/rsshmount-gui.cmd"
+cp "$ROOT/app/install.ps1" "$DIST/app/install.ps1"
 
 python3 - "$ROOT/dist/$NAME.zip" "$DIST" "$NAME" <<'PY'
 import os

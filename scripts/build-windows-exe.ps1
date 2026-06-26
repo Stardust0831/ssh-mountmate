@@ -12,8 +12,8 @@ pyinstaller `
   --distpath $Dist `
   --workpath (Join-Path $Root "build\pyinstaller") `
   --specpath (Join-Path $Root "build") `
-  --add-data "$Root\rsshmount.py;." `
+  --add-data "$Root\app\rsshmount.py;." `
   --hidden-import pystray._win32 `
-  "$Root\rsshmount_gui.pyw"
+  "$Root\app\rsshmount_gui.pyw"
 
 Write-Host "built: $(Join-Path $Dist 'SSHMountMate.exe')"

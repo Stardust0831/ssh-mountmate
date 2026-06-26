@@ -13,7 +13,7 @@ trap cleanup EXIT
 
 mkdir -p "$DIST/bin" "$ROOT/dist"
 
-cp "$ROOT/rsshmount.py" "$DIST/rsshmount"
+cp "$ROOT/app/rsshmount.py" "$DIST/rsshmount"
 cp "$ROOT/README.md" "$DIST/README.md"
 cp "$ROOT/install.sh" "$DIST/install.sh"
 chmod +x "$DIST/rsshmount" "$DIST/install.sh"
