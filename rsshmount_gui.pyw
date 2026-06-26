@@ -173,7 +173,7 @@ def running_pid_set() -> set[int]:
     if os.name != "nt":
         return set()
     result = subprocess.run(
-        ["tasklist", "/FO", "CSV", "/NH"],
+        ["tasklist", "/FI", "IMAGENAME eq rclone.exe", "/FO", "CSV", "/NH"],
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
@@ -338,7 +338,11 @@ def run_visible_winget_install(title: str, package_id: str) -> None:
         ),
         encoding="utf-8",
     )
-    subprocess.run(["cmd.exe", "/c", f'start "" /wait "{script}"'], check=True)
+    subprocess.run(
+        ["cmd.exe", "/c", f'call "{script}"'],
+        creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+        check=True,
+    )
 
 
 def install_rclone() -> None:
@@ -566,10 +570,9 @@ class App:
         self.prompted_deps = False
 
         self.build()
-        self.setup_tray()
         self.root.protocol("WM_DELETE_WINDOW", self.exit_app)
         self.refresh_list()
-        self.check_dependencies_async()
+        self.root.after(700, self.check_dependencies_async)
 
     def build(self) -> None:
         top = Frame(self.root, padx=10, pady=8)
