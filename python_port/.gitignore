@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+*.egg-info/
 build/pyinstaller-work/
 build/*.spec
 dist/
