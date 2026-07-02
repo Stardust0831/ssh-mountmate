@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import configparser
+import ctypes
 import json
 import os
 import shlex
@@ -317,11 +318,25 @@ def remote_spec(host: str, remote_path: str) -> str:
     return f"{host}:{remote_path}"
 
 
+def windows_drive_in_use(value: str) -> bool:
+    if not is_windows() or not is_windows_drive(value):
+        return False
+    try:
+        mask = ctypes.windll.kernel32.GetLogicalDrives()
+    except Exception:
+        mask = 0
+    letter = value[0].upper()
+    bit = 1 << (ord(letter) - ord("A"))
+    if mask:
+        return bool(mask & bit)
+    return Path(f"{letter}:\\").exists()
+
+
 def default_mountpoint(host: str) -> Path:
     if is_windows():
         for letter in "ZYXWVUTSRQPONMLKJIHGFED":
             drive = f"{letter}:"
-            if not Path(drive + "\\").exists():
+            if not windows_drive_in_use(drive):
                 return Path(drive)
         die("no free drive letter found; pass a mountpoint such as X:")
     return Path.home() / "mnt" / host
@@ -334,7 +349,11 @@ def is_windows_drive(value: str) -> bool:
 def prepare_mountpoint(mountpoint: Path) -> None:
     value = str(mountpoint)
     if is_windows():
-        if value == "*" or is_windows_drive(value):
+        if value == "*":
+            return
+        if is_windows_drive(value):
+            if windows_drive_in_use(value):
+                die(f"Windows drive is already in use: {value}")
             return
         parent = mountpoint.parent
         if not parent.exists():

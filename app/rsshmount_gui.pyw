@@ -634,7 +634,7 @@ def verified_mount_status(server: dict) -> str:
 def mountpoint_ready(mountpoint: str) -> bool:
     try:
         if os.name == "nt" and len(mountpoint) in (2, 3) and mountpoint[1] == ":":
-            return Path(mountpoint[:2] + "\\").exists()
+            return rsshmount.windows_drive_in_use(mountpoint)
         return Path(mountpoint).exists()
     except OSError:
         return False
@@ -783,7 +783,7 @@ def mountpoint_choices() -> list[str]:
     choices = ["Auto"]
     for letter in "ZYXWVUTSRQPONMLKJIHGFED":
         drive = f"{letter}:"
-        if not Path(drive + "\\").exists():
+        if not rsshmount.windows_drive_in_use(drive):
             choices.append(drive)
     return choices
 
@@ -1362,7 +1362,7 @@ class App:
             ("🗑", self.t("delete_config"), lambda s=server: self.delete_server(s), not mounted),
         ]
         for index, (text, tooltip, command, enabled) in enumerate(buttons):
-            self.icon_button(actions, text, tooltip, command, enabled=enabled).grid(row=index // 2, column=index % 2, padx=2, pady=2)
+            self.icon_button(actions, text, tooltip, command, enabled=enabled).grid(row=0, column=index, padx=2, pady=2)
 
     def icon_button(self, parent, text: str, tooltip: str, command, *, enabled: bool = True):
         button = Button(parent, text=text, width=3, height=1, command=command, font=("Segoe UI Emoji", 14))
