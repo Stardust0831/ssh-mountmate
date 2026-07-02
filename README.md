@@ -90,6 +90,12 @@ After import, the connection is saved as an editable rclone SFTP configuration. 
 
 Batch import uses the selected config file and resolves each host with OpenSSH's `ssh -F <config> -G <host>` behavior. This keeps OpenSSH include/default handling while still saving normal editable SSH MountMate connections.
 
+During batch import, duplicate entries are marked in the preview and skipped:
+
+- `SAME`: same SSH `Host` alias and same HostName/User/Port.
+- `SAME HOST`: same SSH `Host` alias but different resolved target.
+- `SAME TARGET`: different alias but same HostName/User/Port.
+
 ## Connection Method
 
 Each saved connection can use one of two methods:
@@ -273,6 +279,12 @@ SSH MountMate 会读取 OpenSSH config 中具体的 `Host` 条目。选择后会
 导入后，连接会作为可编辑的 rclone SFTP 配置保存。实际挂载行为由 GUI 中看到的字段决定，而不是隐藏地实时调用某条 SSH 命令。
 
 批量导入会使用用户选择的 config 文件，并通过 OpenSSH 的 `ssh -F <config> -G <host>` 行为解析每个 Host。这样可以复用 OpenSSH 的 Include 和默认值处理，同时仍然保存为普通可编辑的 SSH MountMate 连接。
+
+批量导入时，重复项会在预览中标记并跳过：
+
+- `SAME`：SSH `Host` 名和 HostName/User/Port 都相同。
+- `SAME HOST`：SSH `Host` 名相同，但解析后的目标不同。
+- `SAME TARGET`：SSH `Host` 名不同，但 HostName/User/Port 相同。
 
 ## 连接方式
 

@@ -118,6 +118,8 @@ TEXT = {
         "import_configs": "Import configs",
         "no_importable_hosts": "No concrete Host entries found in this SSH config.",
         "imported_configs": "Imported {count} configs.",
+        "batch_skipped": "Skipped {count} duplicate or invalid configs.",
+        "batch_import_notice": "Importing {new_count} new configs. {skip_count} duplicate or invalid configs will be skipped.",
         "manual": "Manual",
         "ssh_host": "SSH Host",
         "name": "Name",
@@ -226,6 +228,8 @@ TEXT = {
         "import_configs": "导入配置",
         "no_importable_hosts": "这个 SSH config 中没有找到具体 Host。",
         "imported_configs": "已导入 {count} 个配置。",
+        "batch_skipped": "已跳过 {count} 个重复或无效配置。",
+        "batch_import_notice": "将导入 {new_count} 个新配置，并跳过 {skip_count} 个重复或无效配置。",
         "manual": "手动",
         "ssh_host": "SSH Host",
         "name": "名称",
@@ -501,6 +505,16 @@ def load_servers() -> list[dict]:
 
 
 def list_ssh_config_hosts(config_path: str | Path | None = None, seen: set[Path] | None = None) -> list[str]:
+    entries = list_ssh_config_host_entries(config_path, seen)
+    unique: list[str] = []
+    for entry in entries:
+        host = entry["host"]
+        if host not in unique:
+            unique.append(host)
+    return unique
+
+
+def list_ssh_config_host_entries(config_path: str | Path | None = None, seen: set[Path] | None = None) -> list[dict]:
     config = Path(config_path).expanduser() if config_path else (Path.home() / ".ssh" / "config")
     seen = seen or set()
     try:
@@ -511,8 +525,8 @@ def list_ssh_config_hosts(config_path: str | Path | None = None, seen: set[Path]
         return []
     seen.add(resolved)
 
-    hosts: list[str] = []
-    for raw_line in config.read_text(encoding="utf-8", errors="ignore").splitlines():
+    entries: list[dict] = []
+    for line_no, raw_line in enumerate(config.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
@@ -526,17 +540,12 @@ def list_ssh_config_hosts(config_path: str | Path | None = None, seen: set[Path]
                 if not os.path.isabs(expanded):
                     expanded = str(config.parent / expanded)
                 for included in glob.glob(expanded):
-                    hosts.extend(list_ssh_config_hosts(Path(included), seen))
+                    entries.extend(list_ssh_config_host_entries(Path(included), seen))
         elif keyword == "host":
             for host in words[1:]:
                 if "*" not in host and "?" not in host and "!" not in host:
-                    hosts.append(host)
-
-    unique: list[str] = []
-    for host in hosts:
-        if host not in unique:
-            unique.append(host)
-    return unique
+                    entries.append({"host": host, "path": config, "line": line_no, "raw": raw_line})
+    return entries
 
 
 def save_servers(servers: list[dict]) -> None:
@@ -980,22 +989,134 @@ def server_from_ssh_config_host(host_alias: str, config_path: str | Path | None 
     }
 
 
-def ssh_config_batch_servers(config_path: str | Path) -> tuple[list[dict], list[str]]:
+def normalized_port(value) -> str:
+    text = str(value or "22").strip()
+    return str(int(text)) if text.isdigit() else text
+
+
+def normalized_host_alias(server: dict) -> str:
+    return str(server.get("host_alias") or "").strip().casefold()
+
+
+def target_fingerprint(server: dict) -> tuple[str, str, str]:
+    return (
+        str(server.get("host") or "").strip().casefold(),
+        str(server.get("user") or "").strip(),
+        normalized_port(server.get("port")),
+    )
+
+
+def full_batch_fingerprint(server: dict) -> tuple:
+    return (
+        normalized_host_alias(server),
+        *target_fingerprint(server),
+    )
+
+
+def batch_duplicate_reason(server: dict, known: list[dict]) -> str:
+    server_full = full_batch_fingerprint(server)
+    server_alias = normalized_host_alias(server)
+    server_target = target_fingerprint(server)
+    for existing in known:
+        if server_full == full_batch_fingerprint(existing):
+            return "SAME"
+    if server_alias:
+        for existing in known:
+            if server_alias == normalized_host_alias(existing):
+                return "SAME HOST"
+    for existing in known:
+        if server_target == target_fingerprint(existing):
+            return "SAME TARGET"
+    return ""
+
+
+def ssh_config_batch_plan(config_path: str | Path, existing_servers: list[dict] | None = None) -> dict:
     path = Path(config_path).expanduser()
     hosts = list_ssh_config_hosts(path)
-    servers: list[dict] = []
-    errors: list[str] = []
+    existing = [dict(server) for server in (existing_servers or [])]
+    accepted: list[dict] = []
+    skipped: list[dict] = []
+    errors: list[dict] = []
+    statuses: dict[str, dict] = {}
     for host_alias in hosts:
         try:
             server = server_from_ssh_config_host(host_alias, path)
         except Exception as exc:
-            errors.append(f"{host_alias}: {exc}")
+            item = {"host": host_alias, "status": "INVALID", "reason": str(exc)}
+            errors.append(item)
+            statuses[host_alias] = item
             continue
         if not server.get("host") or not server.get("user"):
-            errors.append(f"{host_alias}: missing HostName or User")
+            item = {"host": host_alias, "status": "INVALID", "reason": "missing HostName or User"}
+            errors.append(item)
+            statuses[host_alias] = item
             continue
-        servers.append(server)
-    return servers, errors
+        reason = batch_duplicate_reason(server, [*existing, *accepted])
+        if reason:
+            item = {"host": host_alias, "status": reason, "reason": duplicate_reason_text(reason), "server": server}
+            skipped.append(item)
+            statuses[host_alias] = item
+            continue
+        accepted.append(server)
+        statuses[host_alias] = {"host": host_alias, "status": "NEW", "reason": "", "server": server}
+    return {"servers": accepted, "skipped": skipped, "errors": errors, "statuses": statuses, "hosts": hosts}
+
+
+def duplicate_reason_text(status: str) -> str:
+    return {
+        "SAME": "same config already exists",
+        "SAME HOST": "same SSH Host already exists",
+        "SAME TARGET": "same HostName/User/Port already exists",
+        "INVALID": "invalid config",
+    }.get(status, "")
+
+
+def ssh_config_batch_servers(config_path: str | Path, existing_servers: list[dict] | None = None) -> tuple[list[dict], list[str]]:
+    plan = ssh_config_batch_plan(config_path, existing_servers)
+    messages = [f"{item['host']}: {item['status']} {item['reason']}".strip() for item in [*plan["skipped"], *plan["errors"]]]
+    return plan["servers"], messages
+
+
+def annotated_ssh_config_preview(config_path: str | Path, existing_servers: list[dict] | None = None) -> str:
+    path = Path(config_path).expanduser()
+    plan = ssh_config_batch_plan(path, existing_servers)
+    statuses = plan["statuses"]
+    entries = [entry for entry in list_ssh_config_host_entries(path) if Path(entry["path"]).resolve() == path.resolve()]
+    line_annotations: dict[int, list[str]] = {}
+    for entry in entries:
+        item = statuses.get(entry["host"])
+        if not item:
+            continue
+        label = item["status"]
+        if label != "NEW":
+            label = f"SKIP {label}"
+        line_annotations.setdefault(int(entry["line"]), []).append(f"{entry['host']}: {label}")
+
+    lines = []
+    try:
+        raw_lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError as exc:
+        raw_lines = [str(exc)]
+    for line_no, raw_line in enumerate(raw_lines, 1):
+        annotations = line_annotations.get(line_no)
+        if annotations:
+            lines.append(f"{raw_line}    # SSH MountMate: {'; '.join(annotations)}")
+        else:
+            lines.append(raw_line)
+
+    summary = [
+        f"NEW: {len(plan['servers'])}",
+        f"SKIPPED: {len(plan['skipped'])}",
+        f"INVALID: {len(plan['errors'])}",
+        "",
+    ]
+    for item in plan["statuses"].values():
+        status = item["status"]
+        reason = item.get("reason") or ""
+        suffix = f" - {reason}" if reason else ""
+        summary.append(f"{status:<11} {item['host']}{suffix}")
+    summary.extend(["", "----- SSH config preview -----", ""])
+    return "\n".join([*summary, *lines])
 
 
 def winfsp_installed() -> bool:
@@ -2001,7 +2122,7 @@ class App:
             self.show_error("\n\n".join(errors))
 
     def add_config(self) -> None:
-        dialog = ServerDialog(self.root, rclone=self.current_rclone(), lang=self.lang)
+        dialog = ServerDialog(self.root, rclone=self.current_rclone(), lang=self.lang, existing_servers=self.servers)
         self.root.wait_window(dialog.window)
         if dialog.result:
             results = dialog.result if isinstance(dialog.result, list) else [dialog.result]
@@ -2100,11 +2221,12 @@ class App:
 
 
 class ServerDialog:
-    def __init__(self, root: Tk, *, rclone: str, lang: str, existing: dict | None = None):
+    def __init__(self, root: Tk, *, rclone: str, lang: str, existing: dict | None = None, existing_servers: list[dict] | None = None):
         self.result = None
         self.rclone = rclone
         self.lang = lang
         self.existing = existing or {}
+        self.existing_servers = [dict(server) for server in (existing_servers or [])]
         existing_source = self.existing.get("source")
         if not existing_source and self.existing.get("mode") == "ssh_config":
             existing_source = "ssh_config"
@@ -2291,17 +2413,12 @@ class ServerDialog:
     def load_batch_preview(self) -> None:
         path = Path(self.batch_config_path.get()).expanduser()
         try:
-            content = path.read_text(encoding="utf-8", errors="ignore")
-        except OSError as exc:
+            content = annotated_ssh_config_preview(path, self.existing_servers)
+        except Exception as exc:
             content = str(exc)
-        try:
-            hosts = list_ssh_config_hosts(path)
-            summary = f"{len(hosts)} Host entries\n\n"
-        except Exception:
-            summary = ""
         self.batch_preview.configure(state="normal")
         self.batch_preview.delete("1.0", END)
-        self.batch_preview.insert("1.0", summary + content)
+        self.batch_preview.insert("1.0", content)
         self.batch_preview.configure(state="disabled")
 
     def on_mousewheel(self, event) -> None:
@@ -2405,17 +2522,17 @@ class ServerDialog:
     def save(self) -> None:
         source = self.source.get()
         if source == "ssh_config_batch":
-            servers, errors = ssh_config_batch_servers(self.batch_config_path.get())
+            plan = ssh_config_batch_plan(self.batch_config_path.get(), self.existing_servers)
+            servers = plan["servers"]
+            skipped = [*plan["skipped"], *plan["errors"]]
             if not servers:
                 message = self.t("no_importable_hosts")
-                if errors:
-                    message += "\n\n" + "\n".join(errors)
+                if skipped:
+                    message += "\n\n" + "\n".join(f"{item['host']}: {item['status']} {item.get('reason', '')}".strip() for item in skipped)
                 messagebox.showerror(APP_TITLE, message)
                 return
-            if errors:
-                self.result = servers
-                self.window.destroy()
-                return
+            if skipped:
+                messagebox.showinfo(APP_TITLE, self.t("batch_import_notice", new_count=len(servers), skip_count=len(skipped)))
             self.result = servers
             self.window.destroy()
             return
