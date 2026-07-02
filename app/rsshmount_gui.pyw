@@ -564,6 +564,28 @@ def normalize_server_ids(servers: list[dict]) -> tuple[list[dict], bool]:
     return normalized, changed
 
 
+def server_source_value(server: dict) -> str:
+    if server.get("source"):
+        return str(server.get("source"))
+    return "ssh_config" if server.get("mode") == "ssh_config" else "manual"
+
+
+def same_password_target(existing: dict, result: dict) -> bool:
+    if server_source_value(existing) != server_source_value(result):
+        return False
+    return all(
+        str(existing.get(key) or "") == str(result.get(key) or "")
+        for key in ("host_alias", "host", "user", "port", "auth")
+    )
+
+
+def same_key_passphrase_target(existing: dict, result: dict) -> bool:
+    return (
+        str(existing.get("auth") or "") == str(result.get("auth") or "")
+        and str(existing.get("key_file") or "") == str(result.get("key_file") or "")
+    )
+
+
 def server_label(server: dict) -> str:
     name = server.get("name") or server.get("id")
     mode = server.get("source") or server.get("mode", "")
@@ -2118,7 +2140,7 @@ class ServerDialog:
 
         if self.auth.get() == "password":
             password = self.get("password")
-            if not password and self.existing.get("password_obscured"):
+            if not password and self.existing.get("password_obscured") and same_password_target(self.existing, result):
                 result["password_obscured"] = self.existing["password_obscured"]
             elif not password:
                 messagebox.showerror(APP_TITLE, self.t("password_required"))
@@ -2137,7 +2159,7 @@ class ServerDialog:
                 except Exception as exc:
                     messagebox.showerror(APP_TITLE, str(exc))
                     return
-            elif self.existing.get("key_pass_obscured"):
+            elif self.existing.get("key_pass_obscured") and same_key_passphrase_target(self.existing, result):
                 result["key_pass_obscured"] = self.existing["key_pass_obscured"]
         self.result = result
         self.window.destroy()
