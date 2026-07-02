@@ -519,7 +519,9 @@ def load_servers() -> list[dict]:
         return []
     if not isinstance(servers, list):
         return []
-    servers, changed = normalize_server_ids(servers)
+    servers, id_changed = normalize_server_ids(servers)
+    servers, name_changed = normalize_server_names(servers)
+    changed = id_changed or name_changed
     if changed:
         save_servers(servers)
     return servers
@@ -593,6 +595,49 @@ def make_unique_server_id(base: str, used: set[str]) -> str:
             return candidate
 
 
+def server_name_base(server: dict) -> str:
+    return str(server.get("name") or server.get("host_alias") or server.get("host") or server.get("id") or "Server").strip() or "Server"
+
+
+def server_name_key(name: str) -> str:
+    return str(name or "").strip().casefold()
+
+
+def mountpoint_folder_name_for_name(name: str) -> str:
+    return sanitize_server_id(name)
+
+
+def mountpoint_folder_key_for_name(name: str) -> str:
+    return mountpoint_folder_name_for_name(name).casefold()
+
+
+def make_unique_server_name(base: str, used_names: set[str], used_mount_folders: set[str]) -> str:
+    root = str(base or "").strip() or "Server"
+
+    def available(candidate: str) -> bool:
+        return server_name_key(candidate) not in used_names and mountpoint_folder_key_for_name(candidate) not in used_mount_folders
+
+    if available(root):
+        return root
+    for number in range(2, 1000):
+        candidate = f"{root} {number}"
+        if available(candidate):
+            return candidate
+    while True:
+        candidate = f"{root} {uuid.uuid4().hex[:8]}"
+        if available(candidate):
+            return candidate
+
+
+def add_used_server_name(name: str, used_names: set[str], used_mount_folders: set[str]) -> None:
+    used_names.add(server_name_key(name))
+    used_mount_folders.add(mountpoint_folder_key_for_name(name))
+
+
+def mountpoint_folder_name(server: dict) -> str:
+    return mountpoint_folder_name_for_name(server_name_base(server))
+
+
 def server_remote_name_for_state(server: dict) -> str:
     return server.get("host_alias", "") if server.get("mode") == "ssh_config" else server.get("id", "")
 
@@ -634,6 +679,21 @@ def normalize_server_ids(servers: list[dict]) -> tuple[list[dict], bool]:
             server["id"] = make_unique_server_id(base, used)
             used.add(server["id"])
             changed = True
+    return normalized, changed
+
+
+def normalize_server_names(servers: list[dict]) -> tuple[list[dict], bool]:
+    normalized = [dict(server) for server in servers]
+    used_names: set[str] = set()
+    used_mount_folders: set[str] = set()
+    changed = False
+    for server in normalized:
+        original = str(server.get("name") or "").strip()
+        unique = make_unique_server_name(server_name_base(server), used_names, used_mount_folders)
+        if original != unique:
+            server["name"] = unique
+            changed = True
+        add_used_server_name(unique, used_names, used_mount_folders)
     return normalized, changed
 
 
@@ -815,8 +875,10 @@ def mountpoint_ready(mountpoint: str) -> bool:
 def resolve_mountpoint(server: dict) -> str:
     configured_mountpoint = server.get("mountpoint") or ""
     if configured_mountpoint == HOME_MOUNTPOINT_VALUE:
-        return str(rsshmount.home_mountpoint(remote_name(server)))
+        return str(rsshmount.home_mountpoint(mountpoint_folder_name(server)))
     if not configured_mountpoint or configured_mountpoint.lower() == "auto":
+        if os.name != "nt":
+            return str(rsshmount.home_mountpoint(mountpoint_folder_name(server)))
         return str(rsshmount.default_mountpoint(remote_name(server)))
     return configured_mountpoint
 
@@ -906,9 +968,11 @@ def current_mountpoint(server: dict) -> str:
             pass
     configured = server.get("mountpoint") or ""
     if configured == HOME_MOUNTPOINT_VALUE:
-        return str(rsshmount.home_mountpoint(remote_name(server)))
+        return str(rsshmount.home_mountpoint(mountpoint_folder_name(server)))
     if configured and configured.lower() != "auto":
         return configured
+    if os.name != "nt":
+        return str(rsshmount.home_mountpoint(mountpoint_folder_name(server)))
     return str(rsshmount.default_mountpoint(remote_name(server)))
 
 
@@ -939,10 +1003,10 @@ def display_mountpoint_for_status(server: dict, status: str) -> str:
     if status == "mounted":
         return display_mountpoint(server)
     if configured == HOME_MOUNTPOINT_VALUE:
-        return str(rsshmount.home_mountpoint(remote_name(server)))
+        return str(rsshmount.home_mountpoint(mountpoint_folder_name(server)))
     if configured and configured.lower() != "auto":
         return configured
-    return "Auto"
+    return str(rsshmount.home_mountpoint(mountpoint_folder_name(server))) if os.name != "nt" else "Auto"
 
 
 def format_capacity_bytes(size: int) -> str:
@@ -2320,7 +2384,13 @@ class App:
         if dialog.result:
             results = dialog.result if isinstance(dialog.result, list) else [dialog.result]
             used_ids = {server.get("id", "") for server in self.servers}
+            used_names: set[str] = set()
+            used_mount_folders: set[str] = set()
+            for server in self.servers:
+                add_used_server_name(server_name_base(server), used_names, used_mount_folders)
             for result in results:
+                result["name"] = make_unique_server_name(server_name_base(result), used_names, used_mount_folders)
+                add_used_server_name(result["name"], used_names, used_mount_folders)
                 result["id"] = make_unique_server_id(result.get("id") or result.get("name", ""), used_ids)
                 used_ids.add(result["id"])
                 self.servers.append(result)
@@ -2347,7 +2417,14 @@ class App:
         dialog = ServerDialog(self.root, rclone=self.current_rclone(), existing=server, lang=self.lang)
         self.root.wait_window(dialog.window)
         if dialog.result:
-            self.servers[index] = dialog.result
+            result = dialog.result
+            used_names: set[str] = set()
+            used_mount_folders: set[str] = set()
+            for existing_index, existing_server in enumerate(self.servers):
+                if existing_index != index:
+                    add_used_server_name(server_name_base(existing_server), used_names, used_mount_folders)
+            result["name"] = make_unique_server_name(server_name_base(result), used_names, used_mount_folders)
+            self.servers[index] = result
             save_servers(self.servers)
             self.refresh_list()
             self.refresh_mount_status_async()
