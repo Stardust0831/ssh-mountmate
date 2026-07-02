@@ -6,12 +6,13 @@ import json
 import locale
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, X, Y, BooleanVar, Button, Canvas, Checkbutton, Entry, Frame, Label, Scrollbar, StringVar, Tk, Toplevel, filedialog, messagebox
+from tkinter import BOTH, END, LEFT, RIGHT, X, Y, BooleanVar, Button, Canvas, Checkbutton, Entry, Frame, Label, Scrollbar, StringVar, Text, Tk, Toplevel, filedialog, messagebox
 from tkinter import font as tkfont
 from tkinter import ttk
 
@@ -21,6 +22,10 @@ import rsshmount
 APP_TITLE = "SSH MountMate"
 CACHE_SIZE_CHOICES = ["default (off)", "1G", "5G", "10G", "20G", "50G", "100G", "500G"]
 CACHE_AGE_CHOICES = ["default (1h0m0s)", "5m", "15m", "30m", "1h", "6h", "24h", "168h"]
+MIN_FREE_CHOICES = ["default (off)", "1G", "5G", "10G", "20G", "50G", "100G"]
+WRITE_BACK_CHOICES = ["default (5s)", "0s", "5s", "10s", "30s", "1m", "5m"]
+DIR_CACHE_TIME_CHOICES = ["default (5m0s)", "30s", "1m", "5m", "15m", "1h"]
+BUFFER_SIZE_CHOICES = ["default (16Mi)", "0", "8Mi", "16Mi", "32Mi", "64Mi", "128Mi"]
 LANGUAGE_CHOICES = {"auto": "Auto", "en": "English", "zh": "中文"}
 FONT_FAMILY_EN = "Segoe UI"
 FONT_FAMILY_ZH = "Noto Sans CJK SC"
@@ -43,6 +48,10 @@ TEXT = {
         "vfs_cache_mode": "VFS cache mode",
         "max_cache_size": "Max cache size",
         "max_cache_age": "Max cache age",
+        "min_free_space": "Min free space",
+        "write_back": "Write-back delay",
+        "dir_cache_time": "Directory cache",
+        "buffer_size": "Buffer size",
         "startup_all": "Mount all configs on Windows login",
         "language": "Language",
         "save_settings": "Save settings",
@@ -54,7 +63,17 @@ TEXT = {
         "unmount": "Unmount",
         "open_folder": "Open mounted folder",
         "edit_mount": "Edit mount information",
+        "edit_mounted_disabled": "Unmount before editing this config",
         "delete_config": "Delete this config",
+        "refresh_remote": "Refresh remote directory cache",
+        "refresh_unavailable": "Remount this config to enable refresh",
+        "view_log": "View mount log",
+        "copy": "Copy",
+        "close": "Close",
+        "error_details": "Error details",
+        "mount_log": "Mount log",
+        "copied": "Copied.",
+        "remote_refreshed": "Remote directory cache refreshed.",
         "checking_capacity": "checking capacity",
         "unknown_capacity": "unknown capacity",
         "capacity_used": "{used} / {total} used ({percent}%)",
@@ -110,6 +129,10 @@ TEXT = {
         "vfs_cache_mode": "VFS 缓存模式",
         "max_cache_size": "最大缓存大小",
         "max_cache_age": "最大缓存寿命",
+        "min_free_space": "最小剩余空间",
+        "write_back": "写回延迟",
+        "dir_cache_time": "目录缓存",
+        "buffer_size": "读取缓冲",
         "startup_all": "Windows 登录时挂载全部配置",
         "language": "语言",
         "save_settings": "保存设置",
@@ -121,7 +144,17 @@ TEXT = {
         "unmount": "取消挂载",
         "open_folder": "打开挂载目录",
         "edit_mount": "编辑挂载信息",
+        "edit_mounted_disabled": "请先取消挂载，再编辑此配置",
         "delete_config": "删除此配置",
+        "refresh_remote": "刷新远程目录缓存",
+        "refresh_unavailable": "重新挂载后才能刷新缓存",
+        "view_log": "查看挂载日志",
+        "copy": "复制",
+        "close": "关闭",
+        "error_details": "错误详情",
+        "mount_log": "挂载日志",
+        "copied": "已复制。",
+        "remote_refreshed": "远程目录缓存已刷新。",
         "checking_capacity": "正在检查容量",
         "unknown_capacity": "容量未知",
         "capacity_used": "已用 {used} / {total}（{percent}%）",
@@ -178,6 +211,10 @@ def default_settings() -> dict:
         "vfs_cache_mode": "writes",
         "vfs_cache_max_size": "",
         "vfs_cache_max_age": "",
+        "vfs_cache_min_free_space": "",
+        "vfs_write_back": "",
+        "dir_cache_time": "",
+        "buffer_size": "",
         "startup_all": False,
         "language": "auto",
     }
@@ -369,6 +406,12 @@ def run(cmd: list[str], *, check=True, capture=False) -> subprocess.CompletedPro
     )
 
 
+def free_local_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
 def load_servers() -> list[dict]:
     path = servers_path()
     if not path.exists():
@@ -453,6 +496,37 @@ def running_pid_set() -> set[int]:
     return pids
 
 
+def running_rclone_processes() -> dict[int, str]:
+    if os.name != "nt":
+        return {}
+    command = (
+        "Get-CimInstance Win32_Process -Filter \"Name='rclone.exe'\" | "
+        "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
+    )
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-Command", command],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        creationflags=create_no_window(),
+    )
+    try:
+        data = json.loads(result.stdout.strip() or "[]")
+    except json.JSONDecodeError:
+        return {}
+    if isinstance(data, dict):
+        data = [data]
+    processes: dict[int, str] = {}
+    for item in data:
+        try:
+            pid = int(item.get("ProcessId", 0))
+        except (TypeError, ValueError):
+            continue
+        if pid:
+            processes[pid] = str(item.get("CommandLine") or "")
+    return processes
+
+
 def pid_is_running(pid: int, pid_set: set[int] | None = None) -> bool:
     if pid_set is not None:
         return pid in pid_set
@@ -496,6 +570,63 @@ def mount_status_with_pids(server: dict, pid_set: set[int]) -> str:
     return "mounted" if pid and pid_is_running(pid, pid_set) else "stale"
 
 
+def command_matches_state(command: str, state: dict) -> bool:
+    command = command.casefold()
+    expected = [state.get("remote", ""), state.get("mountpoint", ""), state.get("log", "")]
+    return all(str(value).casefold() in command for value in expected if value)
+
+
+def mount_status_with_processes(server: dict, processes: dict[int, str]) -> str:
+    state_file = server_state_file(server)
+    if not state_file.exists():
+        return "stopped"
+    try:
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        pid = int(state.get("pid", 0))
+    except Exception:
+        return "stale"
+    command = processes.get(pid)
+    if not pid or not command:
+        return "stale"
+    return "mounted" if command_matches_state(command, state) else "stale"
+
+
+def verified_mount_status(server: dict) -> str:
+    if os.name == "nt":
+        return mount_status_with_processes(server, running_rclone_processes())
+    return mount_status(server)
+
+
+def mountpoint_ready(mountpoint: str) -> bool:
+    try:
+        if os.name == "nt" and len(mountpoint) in (2, 3) and mountpoint[1] == ":":
+            return Path(mountpoint[:2] + "\\").exists()
+        return Path(mountpoint).exists()
+    except OSError:
+        return False
+
+
+def wait_for_mount_ready(proc: subprocess.Popen, mountpoint: str, log_path: Path, timeout: float = 20.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            break
+        if mountpoint_ready(mountpoint):
+            return
+        time.sleep(0.25)
+    if proc.poll() is None:
+        proc.terminate()
+        time.sleep(0.5)
+        if proc.poll() is None:
+            proc.kill()
+    tail = ""
+    try:
+        tail = "\n".join(log_path.read_text(encoding="utf-8", errors="ignore").splitlines()[-12:])
+    except OSError:
+        pass
+    raise RuntimeError(f"Mount did not become ready. See log: {log_path}\n{tail}")
+
+
 def current_mountpoint(server: dict) -> str:
     state_file = server_state_file(server)
     if state_file.exists():
@@ -509,6 +640,23 @@ def current_mountpoint(server: dict) -> str:
     if configured and configured.lower() != "auto":
         return configured
     return str(rsshmount.default_mountpoint(remote_name(server)))
+
+
+def current_state(server: dict) -> dict:
+    state_file = server_state_file(server)
+    if not state_file.exists():
+        return {}
+    try:
+        return json.loads(state_file.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def current_log_path(server: dict) -> Path:
+    state = current_state(server)
+    if state.get("log"):
+        return Path(state["log"])
+    return rsshmount.app_state_dir() / f"{remote_name(server)}.log"
 
 
 def display_mountpoint(server: dict) -> str:
@@ -525,7 +673,7 @@ def format_capacity_bytes(size: int) -> str:
 
 
 def capacity_info(server: dict, status: str | None = None) -> dict:
-    if (status or mount_status(server)) != "mounted":
+    if (status or verified_mount_status(server)) != "mounted":
         return {}
     mountpoint = current_mountpoint(server)
     try:
@@ -770,7 +918,7 @@ def remote_name(server: dict) -> str:
 
 
 def mount_server(server: dict, rclone: str) -> dict:
-    if mount_status(server) == "mounted":
+    if verified_mount_status(server) == "mounted":
         raise RuntimeError("This config is already mounted. Unmount it before mounting again.")
     ensure_remote(server, rclone)
     settings = load_settings()
@@ -788,11 +936,16 @@ def mount_server(server: dict, rclone: str) -> dict:
     )
     remote = rsshmount.remote_spec(remote_name(server), remote_path)
     log_path = state_dir / f"{remote_name(server)}.log"
+    rc_addr = f"127.0.0.1:{free_local_port()}"
 
     cmd = [
         rclone,
         "--config",
         str(rsshmount.rclone_config_path()),
+        "--rc",
+        "--rc-no-auth",
+        "--rc-addr",
+        rc_addr,
         "mount",
         remote,
         mountpoint,
@@ -803,8 +956,6 @@ def mount_server(server: dict, rclone: str) -> dict:
         str(cache_dir),
         "--log-file",
         str(log_path),
-        "--dir-cache-time",
-        "30s",
         "--volname",
         server.get("name") or remote_name(server),
     ]
@@ -812,6 +963,14 @@ def mount_server(server: dict, rclone: str) -> dict:
         cmd.extend(["--vfs-cache-max-size", settings["vfs_cache_max_size"]])
     if settings.get("vfs_cache_max_age"):
         cmd.extend(["--vfs-cache-max-age", settings["vfs_cache_max_age"]])
+    if settings.get("vfs_cache_min_free_space"):
+        cmd.extend(["--vfs-cache-min-free-space", settings["vfs_cache_min_free_space"]])
+    if settings.get("vfs_write_back"):
+        cmd.extend(["--vfs-write-back", settings["vfs_write_back"]])
+    if settings.get("dir_cache_time"):
+        cmd.extend(["--dir-cache-time", settings["dir_cache_time"]])
+    if settings.get("buffer_size"):
+        cmd.extend(["--buffer-size", settings["buffer_size"]])
     if server.get("network_mode"):
         cmd.append("--network-mode")
 
@@ -822,15 +981,8 @@ def mount_server(server: dict, rclone: str) -> dict:
         | getattr(subprocess, "CREATE_NO_WINDOW", 0)
     )
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, creationflags=flags)
-    time.sleep(2)
-    if proc.poll() is not None:
-        tail = ""
-        try:
-            tail = "\n".join(log_path.read_text(encoding="utf-8", errors="ignore").splitlines()[-8:])
-        except OSError:
-            pass
-        raise RuntimeError(f"Mount failed. See log: {log_path}\n{tail}")
-    state = {"pid": proc.pid, "server_id": server["id"], "remote": remote, "mountpoint": mountpoint, "log": str(log_path)}
+    wait_for_mount_ready(proc, mountpoint, log_path)
+    state = {"pid": proc.pid, "server_id": server["id"], "remote": remote, "mountpoint": mountpoint, "log": str(log_path), "rc_addr": rc_addr}
     (state_dir / f"{server['id']}.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
     return state
 
@@ -841,13 +993,29 @@ def unmount_server(server: dict) -> None:
         raise RuntimeError("This server is not recorded as mounted.")
     state = json.loads(state_file.read_text(encoding="utf-8"))
     pid = str(state["pid"])
-    if not pid_is_running(int(pid)):
+    if os.name == "nt":
+        command = running_rclone_processes().get(int(pid), "")
+        if not command:
+            state_file.unlink(missing_ok=True)
+            return
+        if not command_matches_state(command, state):
+            state_file.unlink(missing_ok=True)
+            raise RuntimeError("Recorded PID no longer belongs to this mount. Removed stale state; the current rclone process was not stopped.")
+    elif not pid_is_running(int(pid)):
         state_file.unlink(missing_ok=True)
         return
     result = subprocess.run(["taskkill", "/PID", pid, "/T"], text=True, creationflags=create_no_window())
     if result.returncode != 0:
         run(["taskkill", "/PID", pid, "/T", "/F"])
     state_file.unlink(missing_ok=True)
+
+
+def refresh_remote_cache(server: dict, rclone: str) -> None:
+    state = current_state(server)
+    rc_addr = state.get("rc_addr")
+    if not rc_addr:
+        raise RuntimeError("This mount was created without rclone RC. Remount it before refreshing the directory cache.")
+    run([rclone, "--rc-addr", rc_addr, "rc", "vfs/forget"], capture=True)
 
 
 def startup_command(server_id: str) -> str:
@@ -1036,14 +1204,14 @@ class App:
         servers = [dict(server) for server in self.servers]
 
         def worker() -> None:
-            pid_set = running_pid_set() if os.name == "nt" else None
+            processes = running_rclone_processes() if os.name == "nt" else None
             statuses: dict[str, str] = {}
             capacities: dict[str, dict] = {}
             for server in servers:
                 server_id = server.get("id", "")
                 if not server_id:
                     continue
-                status = mount_status_with_pids(server, pid_set) if pid_set is not None else mount_status(server)
+                status = mount_status_with_processes(server, processes) if processes is not None else mount_status(server)
                 statuses[server_id] = status
                 capacities[server_id] = capacity_info(server, status)
             self.root.after(0, lambda: self.apply_mount_statuses(statuses, capacities))
@@ -1110,8 +1278,10 @@ class App:
         actions = Frame(row, bg=row_bg)
         actions.pack(side=RIGHT)
         self.icon_button(actions, "■" if mounted else "▶", self.t("unmount") if mounted else self.t("mount"), lambda s=server: self.toggle_mount(s)).pack(side=LEFT, padx=4)
+        self.icon_button(actions, "↻", self.t("refresh_remote") if mounted and current_state(server).get("rc_addr") else self.t("refresh_unavailable"), lambda s=server: self.refresh_remote(s), enabled=mounted and bool(current_state(server).get("rc_addr"))).pack(side=LEFT, padx=4)
         self.icon_button(actions, "📂", self.t("open_folder"), lambda s=server: self.open_folder(s), enabled=mounted).pack(side=LEFT, padx=4)
-        self.icon_button(actions, "✎", self.t("edit_mount"), lambda s=server: self.edit_server(s)).pack(side=LEFT, padx=4)
+        self.icon_button(actions, "✎", self.t("edit_mounted_disabled") if mounted else self.t("edit_mount"), lambda s=server: self.edit_server(s), enabled=not mounted).pack(side=LEFT, padx=4)
+        self.icon_button(actions, "☰", self.t("view_log"), lambda s=server: self.open_log(s)).pack(side=LEFT, padx=4)
         self.icon_button(actions, "🗑", self.t("delete_config"), lambda s=server: self.delete_server(s), enabled=not mounted).pack(side=LEFT, padx=4)
 
     def icon_button(self, parent, text: str, tooltip: str, command, *, enabled: bool = True):
@@ -1186,7 +1356,7 @@ class App:
         settings = load_settings()
         window = Toplevel(self.root)
         window.title(self.t("settings"))
-        window.geometry("520x430")
+        window.geometry("560x640")
         frame = Frame(window, padx=14, pady=14)
         frame.pack(fill=BOTH, expand=True)
         Label(frame, textvariable=self.dep_status, anchor="w", justify=LEFT).pack(fill=X, pady=(0, 12))
@@ -1199,6 +1369,10 @@ class App:
         cache_mode = StringVar(value=settings.get("vfs_cache_mode", "writes"))
         cache_max_size = StringVar(value=setting_to_choice(settings.get("vfs_cache_max_size", ""), CACHE_SIZE_CHOICES[0]))
         cache_max_age = StringVar(value=setting_to_choice(settings.get("vfs_cache_max_age", ""), CACHE_AGE_CHOICES[0]))
+        min_free_space = StringVar(value=setting_to_choice(settings.get("vfs_cache_min_free_space", ""), MIN_FREE_CHOICES[0]))
+        write_back = StringVar(value=setting_to_choice(settings.get("vfs_write_back", ""), WRITE_BACK_CHOICES[0]))
+        dir_cache_time = StringVar(value=setting_to_choice(settings.get("dir_cache_time", ""), DIR_CACHE_TIME_CHOICES[0]))
+        buffer_size = StringVar(value=setting_to_choice(settings.get("buffer_size", ""), BUFFER_SIZE_CHOICES[0]))
         startup_all = BooleanVar(value=bool(settings.get("startup_all", False)))
         language = StringVar(value=language_choice_from_setting(settings.get("language", "auto")))
 
@@ -1228,6 +1402,26 @@ class App:
         Label(age_row, text=self.t("max_cache_age"), width=16, anchor="w").pack(side=LEFT)
         ttk.Combobox(age_row, values=CACHE_AGE_CHOICES, textvariable=cache_max_age, state="readonly").pack(side=LEFT, fill=X, expand=True)
 
+        min_free_row = Frame(frame)
+        min_free_row.pack(fill=X, pady=3)
+        Label(min_free_row, text=self.t("min_free_space"), width=16, anchor="w").pack(side=LEFT)
+        ttk.Combobox(min_free_row, values=MIN_FREE_CHOICES, textvariable=min_free_space, state="readonly").pack(side=LEFT, fill=X, expand=True)
+
+        write_back_row = Frame(frame)
+        write_back_row.pack(fill=X, pady=3)
+        Label(write_back_row, text=self.t("write_back"), width=16, anchor="w").pack(side=LEFT)
+        ttk.Combobox(write_back_row, values=WRITE_BACK_CHOICES, textvariable=write_back, state="readonly").pack(side=LEFT, fill=X, expand=True)
+
+        dir_cache_row = Frame(frame)
+        dir_cache_row.pack(fill=X, pady=3)
+        Label(dir_cache_row, text=self.t("dir_cache_time"), width=16, anchor="w").pack(side=LEFT)
+        ttk.Combobox(dir_cache_row, values=DIR_CACHE_TIME_CHOICES, textvariable=dir_cache_time, state="readonly").pack(side=LEFT, fill=X, expand=True)
+
+        buffer_row = Frame(frame)
+        buffer_row.pack(fill=X, pady=3)
+        Label(buffer_row, text=self.t("buffer_size"), width=16, anchor="w").pack(side=LEFT)
+        ttk.Combobox(buffer_row, values=BUFFER_SIZE_CHOICES, textvariable=buffer_size, state="readonly").pack(side=LEFT, fill=X, expand=True)
+
         Checkbutton(frame, text=self.t("startup_all"), variable=startup_all).pack(anchor="w", pady=8)
 
         def save() -> None:
@@ -1238,6 +1432,10 @@ class App:
                     "vfs_cache_mode": cache_mode.get() or "writes",
                     "vfs_cache_max_size": choice_to_setting(cache_max_size.get().strip()),
                     "vfs_cache_max_age": choice_to_setting(cache_max_age.get().strip()),
+                    "vfs_cache_min_free_space": choice_to_setting(min_free_space.get().strip()),
+                    "vfs_write_back": choice_to_setting(write_back.get().strip()),
+                    "dir_cache_time": choice_to_setting(dir_cache_time.get().strip()),
+                    "buffer_size": choice_to_setting(buffer_size.get().strip()),
                     "startup_all": bool(startup_all.get()),
                     "language": language_setting_from_choice(language.get()),
                 }
@@ -1297,7 +1495,50 @@ class App:
 
     def on_dependency_install_failed(self, message: str) -> None:
         self.status.set(self.t("deps_failed"))
-        messagebox.showerror(APP_TITLE, message)
+        self.show_error(message)
+
+    def show_text_window(self, title: str, content: str) -> None:
+        window = Toplevel(self.root)
+        window.title(title)
+        window.geometry("720x420")
+        frame = Frame(window, padx=10, pady=10)
+        frame.pack(fill=BOTH, expand=True)
+        scrollbar = Scrollbar(frame)
+        text = Text(frame, wrap="word", yscrollcommand=scrollbar.set)
+        scrollbar.configure(command=text.yview)
+        text.insert("1.0", content)
+        text.configure(state="disabled")
+        text.pack(side=LEFT, fill=BOTH, expand=True)
+        scrollbar.pack(side=RIGHT, fill=Y)
+        buttons = Frame(window, padx=10, pady=8)
+        buttons.pack(fill=X)
+
+        def copy_content() -> None:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(content)
+            self.status.set(self.t("copied"))
+
+        Button(buttons, text=self.t("copy"), command=copy_content).pack(side=RIGHT)
+        Button(buttons, text=self.t("close"), command=window.destroy).pack(side=RIGHT, padx=6)
+
+    def show_error(self, message: str) -> None:
+        self.show_text_window(self.t("error_details"), message)
+
+    def open_log(self, server: dict) -> None:
+        path = current_log_path(server)
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+            content = f"{path}\n\n" + "\n".join(lines[-300:])
+        except OSError as exc:
+            content = f"{path}\n\n{exc}"
+        self.show_text_window(self.t("mount_log"), content)
+
+    def refresh_remote(self, server: dict) -> None:
+        try:
+            refresh_remote_cache(server, self.current_rclone())
+            self.status.set(self.t("remote_refreshed"))
+        except Exception as exc:
+            self.show_error(str(exc))
 
     def add_config(self) -> None:
         dialog = ServerDialog(self.root, rclone=self.current_rclone(), lang=self.lang)
@@ -1327,23 +1568,23 @@ class App:
             self.refresh_mount_status_async()
 
     def toggle_mount(self, server: dict) -> None:
-        if mount_status(server) == "mounted":
+        if verified_mount_status(server) == "mounted":
             try:
                 unmount_server(server)
                 self.status.set(self.t("unmounted"))
             except Exception as exc:
-                messagebox.showerror(APP_TITLE, str(exc))
+                self.show_error(str(exc))
         else:
             try:
                 state = mount_server(server, self.current_rclone())
                 self.status.set(self.t("mounted_at", remote=state["remote"], mountpoint=state["mountpoint"]))
             except Exception as exc:
-                messagebox.showerror(APP_TITLE, str(exc))
+                self.show_error(str(exc))
         self.refresh_list()
         self.refresh_mount_status_async()
 
     def open_folder(self, server: dict) -> None:
-        if mount_status(server) != "mounted":
+        if verified_mount_status(server) != "mounted":
             messagebox.showinfo(APP_TITLE, self.t("mount_before_open"))
             return
         mountpoint = current_mountpoint(server)
@@ -1355,10 +1596,10 @@ class App:
             else:
                 subprocess.Popen(["xdg-open", mountpoint])
         except Exception as exc:
-            messagebox.showerror(APP_TITLE, str(exc))
+            self.show_error(str(exc))
 
     def delete_server(self, server: dict) -> None:
-        status = mount_status(server)
+        status = verified_mount_status(server)
         name = server.get("name") or server.get("id")
         if status == "mounted":
             if not messagebox.askyesno(APP_TITLE, self.t("delete_mounted_confirm", name=name)):
@@ -1366,15 +1607,19 @@ class App:
             try:
                 unmount_server(server)
             except Exception as exc:
-                messagebox.showerror(APP_TITLE, str(exc))
+                self.show_error(str(exc))
                 return
         else:
             if not messagebox.askyesno(APP_TITLE, self.t("delete_confirm", name=name)):
                 return
         state_file = server_state_file(server)
-        if state_file.exists() and mount_status(server) != "mounted":
+        if state_file.exists() and verified_mount_status(server) != "mounted":
             state_file.unlink(missing_ok=True)
         self.servers = [item for item in self.servers if item is not server and item.get("id") != server.get("id")]
+        try:
+            disable_startup(server)
+        except Exception:
+            pass
         save_servers(self.servers)
         self.status.set(self.t("deleted", name=name))
         self.refresh_list()
