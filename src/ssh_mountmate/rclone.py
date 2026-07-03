@@ -4,6 +4,10 @@ import shutil
 import subprocess
 import platform
 import os
+import stat
+import tempfile
+import urllib.request
+import zipfile
 from pathlib import Path
 
 from .paths import managed_bin_dir
@@ -21,6 +25,17 @@ def bundled_rclone_candidates(app_root: Path) -> list[Path]:
 
 def managed_rclone_path() -> Path:
     return managed_bin_dir() / current_platform().rclone_binary
+
+
+def rclone_download_arch(machine: str | None = None) -> str:
+    value = (machine or platform.machine()).lower()
+    if value in {"x86_64", "amd64"}:
+        return "amd64"
+    if value in {"arm64", "aarch64"}:
+        return "arm64"
+    if value in {"i386", "i686", "x86"}:
+        return "386"
+    return "amd64"
 
 
 def common_rclone_paths(system: str | None = None) -> list[Path]:
@@ -163,6 +178,31 @@ def rclone_download_url(version: str = "current", system: str | None = None, arc
     return f"https://downloads.rclone.org/{target}"
 
 
+def install_managed_rclone() -> Path:
+    platform_info = current_platform()
+    binary = platform_info.rclone_binary
+    arch = rclone_download_arch()
+    url = rclone_download_url(system=platform_info.system, arch=arch)
+    managed = managed_rclone_path()
+    managed.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="ssh-mountmate-rclone-") as temp_name:
+        temp = Path(temp_name)
+        archive = temp / "rclone.zip"
+        urllib.request.urlretrieve(url, archive)
+        with zipfile.ZipFile(archive) as zf:
+            members = [member for member in zf.namelist() if Path(member).name == binary and not member.endswith("/")]
+            if not members:
+                raise RuntimeError(f"Downloaded rclone archive did not contain {binary}: {url}")
+            extracted = Path(zf.extract(members[0], temp))
+            shutil.copy2(extracted, managed)
+
+    if platform_info.system != "Windows":
+        mode = managed.stat().st_mode
+        managed.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return managed
+
+
 def manual_install_commands() -> dict[str, list[str]]:
     return {
         "Windows": [
@@ -186,7 +226,7 @@ def manual_install_commands() -> dict[str, list[str]]:
 
 
 def manual_install_text() -> str:
-    lines = ["rclone manual install options", ""]
+    lines = ["manual dependency install options", ""]
     for system, commands in manual_install_commands().items():
         lines.append(f"{system}:")
         for command in commands:

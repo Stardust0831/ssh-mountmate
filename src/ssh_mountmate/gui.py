@@ -21,7 +21,7 @@ from tkinter import ttk
 
 from . import VERSION
 from . import core as rsshmount
-from .rclone import augment_process_path, manual_install_text
+from .rclone import augment_process_path, install_managed_rclone, managed_rclone_path, manual_install_text
 
 
 APP_TITLE = "SSH MountMate"
@@ -439,7 +439,7 @@ def refresh_windows_path_env() -> None:
 
 
 def known_rclone_paths() -> list[Path]:
-    candidates: list[Path] = []
+    candidates: list[Path] = [managed_rclone_path()]
     if os.name != "nt":
         home = Path.home()
         candidates.extend(
@@ -1372,8 +1372,15 @@ def run_visible_winget_install(title: str, package_id: str) -> tuple[int, Path]:
 def install_rclone() -> None:
     if resolve_rclone_path():
         return
+    try:
+        install_managed_rclone()
+    except Exception as exc:
+        if os.name != "nt":
+            raise RuntimeError(f"Automatic rclone download failed: {exc}\n\nInstall rclone manually and retry.\n\n" + manual_install_text()) from exc
+    if resolve_rclone_path():
+        return
     if os.name != "nt":
-        raise RuntimeError("rclone is missing. Install rclone manually and retry.\n\n" + manual_install_text())
+        raise RuntimeError("rclone is missing after automatic download.\n\nInstall rclone manually and retry.\n\n" + manual_install_text())
     code, log_path = run_visible_winget_install("rclone", "Rclone.Rclone")
     refresh_windows_path_env()
     if resolve_rclone_path():
@@ -2934,7 +2941,7 @@ class ServerDialog:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--version", action="version", version=f"{APP_TITLE} {VERSION}")
-    parser.add_argument("--install-help", action="store_true", help="Print manual rclone install commands and exit.")
+    parser.add_argument("--install-help", action="store_true", help="Print manual dependency install commands and exit.")
     parser.add_argument("--mount-id")
     args = parser.parse_args()
     if args.install_help:
