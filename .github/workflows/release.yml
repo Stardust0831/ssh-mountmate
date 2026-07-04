@@ -130,4 +130,6 @@ jobs:
               "${PRERELEASE_ARGS[@]}" \
               "${NOTES_ARGS[@]}"
           fi
+          RELEASE_ID="$(gh release view "$TAG" --repo "$GH_REPO" --json databaseId --jq .databaseId)"
+          gh api -X PATCH "repos/$GH_REPO/releases/$RELEASE_ID" -f draft=false >/dev/null
           gh release view "$TAG" --repo "$GH_REPO" >/dev/null
