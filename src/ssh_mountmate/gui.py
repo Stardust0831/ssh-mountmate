@@ -155,10 +155,14 @@ TEXT = {
         "imported_configs": "Imported {count} configs.",
         "batch_skipped": "Skipped {count} duplicate or invalid configs.",
         "batch_import_notice": "Importing {new_count} new configs. {skip_count} duplicate or invalid configs will be skipped.",
-        "batch_conflicts": "Duplicate configs",
+        "batch_conflicts": "Import plan",
+        "batch_import": "Import",
         "batch_ignore": "Ignore",
         "batch_overwrite": "Overwrite",
         "batch_overwrite_help": "Overwrite updates the saved SSH connection fields and keeps local mount settings such as remote path and mountpoint.",
+        "batch_details": "Details",
+        "batch_detail_title": "Batch import details",
+        "batch_detail_text": "Host: {host}\nStatus: {status}\nReason: {reason}\nAction: {action}\n\nImported config:\n{server}\n\nMatched saved config:\n{match}",
         "manual": "Manual",
         "ssh_host": "SSH Host",
         "name": "Name",
@@ -305,10 +309,14 @@ TEXT = {
         "imported_configs": "已导入 {count} 个配置。",
         "batch_skipped": "已跳过 {count} 个重复或无效配置。",
         "batch_import_notice": "将导入 {new_count} 个新配置，并跳过 {skip_count} 个重复或无效配置。",
-        "batch_conflicts": "重复配置",
+        "batch_conflicts": "导入计划",
+        "batch_import": "导入",
         "batch_ignore": "忽略",
         "batch_overwrite": "覆盖",
         "batch_overwrite_help": "覆盖只更新已保存配置里的 SSH 连接字段，并保留远程路径、挂载点等本地挂载设置。",
+        "batch_details": "详情",
+        "batch_detail_title": "批量导入详情",
+        "batch_detail_text": "Host：{host}\n状态：{status}\n原因：{reason}\n动作：{action}\n\n拟导入配置：\n{server}\n\n匹配到的已保存配置：\n{match}",
         "manual": "手动",
         "ssh_host": "SSH Host",
         "name": "名称",
@@ -1721,6 +1729,7 @@ def ssh_config_batch_plan(config_path: str | Path, existing_servers: list[dict] 
     accepted: list[dict] = []
     skipped: list[dict] = []
     errors: list[dict] = []
+    items: list[dict] = []
     statuses: dict[str, dict] = {}
     for host_alias in hosts:
         try:
@@ -1728,11 +1737,13 @@ def ssh_config_batch_plan(config_path: str | Path, existing_servers: list[dict] 
         except Exception as exc:
             item = {"host": host_alias, "status": "INVALID", "reason": str(exc)}
             errors.append(item)
+            items.append(item)
             statuses[host_alias] = item
             continue
         if not server.get("host") or not server.get("user"):
             item = {"host": host_alias, "status": "INVALID", "reason": "missing HostName or User"}
             errors.append(item)
+            items.append(item)
             statuses[host_alias] = item
             continue
         reason, matched = batch_duplicate_match(server, [*existing, *accepted])
@@ -1749,11 +1760,14 @@ def ssh_config_batch_plan(config_path: str | Path, existing_servers: list[dict] 
                 "can_overwrite": can_overwrite,
             }
             skipped.append(item)
+            items.append(item)
             statuses[host_alias] = item
             continue
         accepted.append(server)
-        statuses[host_alias] = {"host": host_alias, "status": "NEW", "reason": "", "server": server}
-    return {"servers": accepted, "skipped": skipped, "errors": errors, "statuses": statuses, "hosts": hosts}
+        item = {"host": host_alias, "status": "NEW", "reason": "", "server": server, "match": None, "can_overwrite": False}
+        items.append(item)
+        statuses[host_alias] = item
+    return {"servers": accepted, "skipped": skipped, "errors": errors, "statuses": statuses, "hosts": hosts, "items": items}
 
 
 def duplicate_reason_text(status: str) -> str:
@@ -2461,6 +2475,7 @@ class App:
         self.root = root
         self.root.title(APP_TITLE)
         self.root.geometry("760x460")
+        self.root.minsize(560, 360)
         self.settings = load_settings()
         self.lang = effective_language(self.settings)
         configure_default_fonts(self.root, self.lang)
@@ -2687,8 +2702,6 @@ class App:
 
     def action_button_columns_for_width(self, width: int | None = None) -> int:
         width = width or self.cards_canvas.winfo_width() or self.root.winfo_width()
-        if width < 430:
-            return 1
         if width < 600:
             return 2
         return 4
@@ -2730,6 +2743,10 @@ class App:
 
         actions = Frame(row, bg=row_bg)
         actions.pack(side=RIGHT, anchor="e")
+        actions.grid_columnconfigure(0, minsize=42)
+        actions.grid_columnconfigure(1, minsize=42)
+        actions.grid_columnconfigure(2, minsize=42)
+        actions.grid_columnconfigure(3, minsize=42)
 
         mid = Frame(row, bg=row_bg, padx=0)
         mid.pack(side=LEFT, fill=BOTH, expand=True, padx=(0, 18))
@@ -3701,35 +3718,110 @@ class ServerDialog:
         self.batch_preview.configure(state="disabled")
         self.update_batch_conflicts(plan)
 
+    def batch_action_label(self, action: str) -> str:
+        return {
+            "import": self.t("batch_import"),
+            "ignore": self.t("batch_ignore"),
+            "overwrite": self.t("batch_overwrite"),
+        }.get(action, action)
+
+    def batch_action_from_label(self, label: str) -> str:
+        if label == self.t("batch_import"):
+            return "import"
+        if label == self.t("batch_overwrite"):
+            return "overwrite"
+        return "ignore"
+
+    def batch_item_default_action(self, item: dict) -> str:
+        return "import" if item.get("status") == "NEW" else "ignore"
+
+    def batch_item_action_choices(self, item: dict) -> list[str]:
+        status = item.get("status")
+        actions = ["import"] if status == "NEW" else ["ignore"]
+        if item.get("can_overwrite"):
+            actions.append("overwrite")
+        return [self.batch_action_label(action) for action in actions]
+
+    def compact_dict_text(self, value: dict | None) -> str:
+        if not value:
+            return "-"
+        keys = ["name", "host_alias", "host", "user", "port", "auth", "key_file", "connection_method", "remote_path", "mountpoint"]
+        lines = []
+        for key in keys:
+            if key in value and value.get(key) not in (None, ""):
+                lines.append(f"{key}: {value.get(key)}")
+        return "\n".join(lines) if lines else "-"
+
+    def show_batch_item_details(self, item: dict, action_var: StringVar) -> None:
+        text = self.t(
+            "batch_detail_text",
+            host=item.get("host") or "",
+            status=item.get("status") or "",
+            reason=item.get("reason") or "",
+            action=self.batch_action_label(action_var.get()),
+            server=self.compact_dict_text(item.get("server")),
+            match=self.compact_dict_text(item.get("match")),
+        )
+        self.show_text_window(self.t("batch_detail_title"), text)
+
+    def show_text_window(self, title: str, content: str) -> None:
+        window = Toplevel(self.window)
+        window.title(title)
+        window.geometry("640x420")
+        frame = Frame(window, padx=10, pady=10)
+        frame.pack(fill=BOTH, expand=True)
+        scrollbar = Scrollbar(frame)
+        text = Text(frame, wrap="word", yscrollcommand=scrollbar.set)
+        scrollbar.configure(command=text.yview)
+        text.insert("1.0", content)
+        text.configure(state="disabled")
+        text.pack(side=LEFT, fill=BOTH, expand=True)
+        scrollbar.pack(side=RIGHT, fill=Y)
+        buttons = Frame(window, padx=10, pady=8)
+        buttons.pack(fill=X)
+
+        def copy_content() -> None:
+            self.window.clipboard_clear()
+            self.window.clipboard_append(content)
+
+        Button(buttons, text=self.t("copy"), command=copy_content).pack(side=RIGHT)
+        Button(buttons, text=self.t("close"), command=window.destroy).pack(side=RIGHT, padx=6)
+
     def update_batch_conflicts(self, plan: dict | None) -> None:
         if not hasattr(self, "batch_conflicts_body"):
             return
         for child in self.batch_conflicts_body.winfo_children():
             child.destroy()
         self.batch_conflict_actions = {}
-        conflicts = []
-        if plan:
-            conflicts = [item for item in plan.get("skipped", []) if item.get("can_overwrite")]
-        if not conflicts:
+        items = list(plan.get("items", [])) if plan else []
+        if not items:
             if hasattr(self, "batch_conflicts_frame"):
                 self.batch_conflicts_frame.pack_forget()
             return
         self.batch_conflicts_frame.pack(fill=X, padx=10, pady=(8, 0))
-        for item in conflicts:
+        for item in items:
             row = Frame(self.batch_conflicts_body)
-            row.pack(fill=X, pady=1)
+            row.pack(fill=X, pady=2)
             match = item.get("match") or {}
-            label = f"{item['host']} - {item['status']} ({match.get('name') or match.get('host_alias') or match.get('id') or ''})"
-            Label(row, text=label, anchor="w").pack(side=LEFT, fill=X, expand=True)
-            action = StringVar(value="ignore")
-            combo = ttk.Combobox(row, values=[self.t("batch_ignore"), self.t("batch_overwrite")], width=12, state="readonly")
-            combo.set(self.t("batch_ignore"))
+            match_label = match.get("name") or match.get("host_alias") or match.get("id") or ""
+            reason = item.get("reason") or ""
+            label = f"{item['host']} - {item['status']}"
+            if reason:
+                label += f" - {reason}"
+            if match_label:
+                label += f" ({match_label})"
+            Label(row, text=label, anchor="w", width=42).pack(side=LEFT, fill=X, expand=True)
+            action = StringVar(value=self.batch_item_default_action(item))
+            values = self.batch_item_action_choices(item)
+            combo = ttk.Combobox(row, values=values, width=12, state="readonly")
+            combo.set(self.batch_action_label(action.get()))
 
             def on_action_changed(_event=None, var=action, widget=combo):
-                var.set("overwrite" if widget.get() == self.t("batch_overwrite") else "ignore")
+                var.set(self.batch_action_from_label(widget.get()))
 
             combo.bind("<<ComboboxSelected>>", on_action_changed)
             combo.pack(side=RIGHT)
+            Button(row, text=self.t("batch_details"), command=lambda current=item, var=action: self.show_batch_item_details(current, var)).pack(side=RIGHT, padx=(4, 6))
             self.batch_conflict_actions[str(item["host"])] = (item, action)
         self.update_scrollregion()
 
@@ -3975,13 +4067,31 @@ class ServerDialog:
         source = self.source.get()
         if source == "ssh_config_batch":
             plan = ssh_config_batch_plan(self.batch_config_path.get(), self.existing_servers)
-            servers = list(plan["servers"])
+            action_items = self.batch_conflict_actions
+            if not action_items:
+                self.update_batch_conflicts(plan)
+                action_items = self.batch_conflict_actions
+            servers = []
             overwrite_count = 0
-            for item, action in self.batch_conflict_actions.values():
-                if action.get() != "overwrite":
+            ignored_count = 0
+            for item in plan.get("items", []):
+                action_entry = action_items.get(str(item.get("host") or ""))
+                action = action_entry[1].get() if action_entry else self.batch_item_default_action(item)
+                if action == "ignore":
+                    ignored_count += 1
+                    continue
+                if action == "import":
+                    if item.get("status") == "NEW" and item.get("server"):
+                        servers.append(dict(item["server"]))
+                    else:
+                        ignored_count += 1
+                    continue
+                if action != "overwrite":
+                    ignored_count += 1
                     continue
                 match = item.get("match") or {}
                 if not match.get("id"):
+                    ignored_count += 1
                     continue
                 server = dict(item.get("server") or {})
                 server["__batch_action"] = "overwrite"
@@ -3995,7 +4105,6 @@ class ServerDialog:
                     message += "\n\n" + "\n".join(f"{item['host']}: {item['status']} {item.get('reason', '')}".strip() for item in skipped)
                 messagebox.showerror(APP_TITLE, message)
                 return
-            ignored_count = max(0, len(skipped) - overwrite_count)
             if ignored_count:
                 messagebox.showinfo(APP_TITLE, self.t("batch_import_notice", new_count=len(servers), skip_count=ignored_count))
             self.result = servers
