@@ -1674,11 +1674,17 @@ def normalized_host_alias(server: dict) -> str:
     return str(server.get("host_alias") or "").strip().casefold()
 
 
-def target_fingerprint(server: dict) -> tuple[str, str, str, str, str]:
+def target_fingerprint(server: dict) -> tuple[str, str, str]:
     return (
         str(server.get("host") or "").strip().casefold(),
         str(server.get("user") or "").strip(),
         normalized_target_port(server.get("port")),
+    )
+
+
+def mount_profile_fingerprint(server: dict) -> tuple[str, str, str, str, str]:
+    return (
+        *target_fingerprint(server),
         normalized_remote_path_fingerprint(server.get("remote_path")),
         normalized_mountpoint_fingerprint(server.get("mountpoint")),
     )
