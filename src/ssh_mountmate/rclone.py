@@ -5,12 +5,14 @@ import subprocess
 import platform
 import os
 import stat
+import hashlib
+import json
 import tempfile
 import urllib.request
 import zipfile
 from pathlib import Path
 
-from .paths import managed_bin_dir
+from .paths import legacy_managed_bin_dirs, managed_bin_dir
 from .platforms import current_platform
 
 
@@ -25,6 +27,127 @@ def bundled_rclone_candidates(app_root: Path) -> list[Path]:
 
 def managed_rclone_path() -> Path:
     return managed_bin_dir() / current_platform().rclone_binary
+
+
+def managed_rclone_candidates() -> list[Path]:
+    binary = current_platform().rclone_binary
+    return [managed_rclone_path(), *[path / binary for path in legacy_managed_bin_dirs()]]
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def materialized_bundled_rclone_path(source: Path) -> Path:
+    suffix = ".exe" if current_platform().system == "Windows" else ""
+    return managed_bin_dir() / f"rclone-{file_sha256(source)[:16]}{suffix}"
+
+
+def materialized_bundled_rclone_name(path: Path) -> bool:
+    name = path.name
+    if current_platform().system == "Windows":
+        if not name.casefold().endswith(".exe"):
+            return False
+        name = name[:-4]
+    token = name.removeprefix("rclone-")
+    return len(token) == 16 and token != name and all(ch in "0123456789abcdef" for ch in token.casefold())
+
+
+def running_process_command_lines() -> list[str]:
+    system = current_platform().system
+    if system == "Windows":
+        command = (
+            "Get-CimInstance Win32_Process -Filter \"Name='rclone.exe'\" | "
+            "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
+        )
+        try:
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-Command", command],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                timeout=3,
+            )
+        except Exception:
+            return []
+        try:
+            data = json.loads(result.stdout.strip() or "[]")
+        except json.JSONDecodeError:
+            return []
+        if isinstance(data, dict):
+            data = [data]
+        return [str(item.get("CommandLine") or "") for item in data if isinstance(item, dict)]
+
+    proc = Path("/proc")
+    if system == "Linux" and proc.exists():
+        commands: list[str] = []
+        for cmdline in proc.glob("[0-9]*/cmdline"):
+            try:
+                raw = cmdline.read_bytes()
+            except OSError:
+                continue
+            if b"rclone" in raw:
+                commands.append(raw.replace(b"\x00", b" ").decode(errors="ignore"))
+        return commands
+
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "command="],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+    except Exception:
+        return []
+    return [line for line in result.stdout.splitlines() if "rclone" in line]
+
+
+def command_references_path(command: str, path: Path) -> bool:
+    text = command.casefold() if current_platform().system == "Windows" else command
+    candidates = [str(path), str(path.resolve(strict=False))]
+    for candidate in candidates:
+        needle = candidate.casefold() if current_platform().system == "Windows" else candidate
+        if needle in text:
+            return True
+    return False
+
+
+def cleanup_managed_bundled_rclones(current: Path) -> None:
+    bin_dir = managed_bin_dir()
+    if not bin_dir.exists():
+        return
+    commands = running_process_command_lines()
+    for candidate in bin_dir.iterdir():
+        if candidate == current or not candidate.is_file() or not materialized_bundled_rclone_name(candidate):
+            continue
+        if any(command_references_path(command, candidate) for command in commands):
+            continue
+        try:
+            candidate.unlink()
+        except OSError:
+            pass
+
+
+def materialize_bundled_rclone(source: Path) -> Path:
+    target = materialized_bundled_rclone_path(source)
+    if target.exists() and target.stat().st_size == source.stat().st_size:
+        cleanup_managed_bundled_rclones(target)
+        return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    shutil.copy2(source, temp)
+    if current_platform().system != "Windows":
+        mode = temp.stat().st_mode
+        temp.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    temp.replace(target)
+    cleanup_managed_bundled_rclones(target)
+    return target
 
 
 def rclone_download_arch(machine: str | None = None) -> str:
@@ -134,12 +257,17 @@ def resolve_rclone(app_root: Path, configured_path: str = "") -> str:
         path = Path(configured_path).expanduser()
         if path.exists():
             return str(path)
+    bundled: Path | None = None
     for candidate in bundled_rclone_candidates(app_root):
         if candidate.exists():
-            return str(candidate)
-    managed = managed_rclone_path()
-    if managed.exists():
-        return str(managed)
+            bundled = candidate
+            try:
+                return str(materialize_bundled_rclone(candidate))
+            except OSError:
+                continue
+    for managed in managed_rclone_candidates():
+        if managed.exists():
+            return str(managed)
     augment_process_path()
     found = shutil.which(current_platform().rclone_binary) or shutil.which("rclone")
     if found:
@@ -147,6 +275,8 @@ def resolve_rclone(app_root: Path, configured_path: str = "") -> str:
     for candidate in common_rclone_paths():
         if candidate.exists():
             return str(candidate)
+    if bundled:
+        return str(bundled)
     return ""
 
 

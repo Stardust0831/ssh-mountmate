@@ -115,7 +115,7 @@ If a bundled rclone is not available, SSH MountMate can still build the official
 https://downloads.rclone.org/rclone-current-<platform>-<arch>.zip
 ```
 
-The platform part is `windows`, `osx`, or `linux`. The architecture part is usually `amd64` for Intel/AMD 64-bit machines or `arm64` for Apple Silicon/AArch64 machines. The fallback extracted `rclone` binary is stored in SSH MountMate's user data directory under `bin/` and is preferred over PATH on later launches.
+The platform part is `windows`, `osx`, or `linux`. The architecture part is usually `amd64` for Intel/AMD 64-bit machines or `arm64` for Apple Silicon/AArch64 machines. Managed `rclone` copies are stored under `%LOCALAPPDATA%\SSHMountMate\bin` on Windows, `~/Library/Application Support/SSHMountMate/bin` on macOS, and `${XDG_DATA_HOME:-~/.local/share}/ssh-mountmate/bin` on Linux. These managed copies are preferred over PATH on later launches.
 
 The remote server is assumed to be a Linux server reachable over SSH/SFTP.
 
@@ -445,7 +445,7 @@ Release 构建会把 rclone 内置进可执行文件。构建时，SSH MountMate
 https://downloads.rclone.org/rclone-current-<platform>-<arch>.zip
 ```
 
-其中平台字段是 `windows`、`osx` 或 `linux`。架构字段通常是 Intel/AMD 64 位机器的 `amd64`，或 Apple Silicon/AArch64 机器的 `arm64`。备用下载解压出来的 `rclone` 会保存到 SSH MountMate 用户数据目录的 `bin/` 下，后续启动时优先于系统 PATH 使用。
+其中平台字段是 `windows`、`osx` 或 `linux`。架构字段通常是 Intel/AMD 64 位机器的 `amd64`，或 Apple Silicon/AArch64 机器的 `arm64`。托管的 `rclone` 副本会保存到 Windows 的 `%LOCALAPPDATA%\SSHMountMate\bin`、macOS 的 `~/Library/Application Support/SSHMountMate/bin`，以及 Linux 的 `${XDG_DATA_HOME:-~/.local/share}/ssh-mountmate/bin`。后续启动时会优先使用这些托管副本，而不是系统 PATH 里的 rclone。
 
 远端服务器默认按 Linux SSH/SFTP 服务器处理。
 
