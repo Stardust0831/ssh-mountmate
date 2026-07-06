@@ -27,7 +27,7 @@ from . import core as rsshmount
 from . import mount_process
 from .notices import THIRD_PARTY_NOTICES
 from .paths import user_data_dir
-from .rclone import augment_process_path, install_managed_rclone, managed_rclone_path, manual_install_text
+from .rclone import install_managed_rclone, manual_install_text, resolve_rclone
 from .updates import check_for_updates, format_update_info
 
 
@@ -522,10 +522,6 @@ def configure_default_fonts(root: Tk, lang: str) -> None:
             pass
 
 
-def bundled_rclone_path() -> Path:
-    return bundled_dir() / "bin" / ("rclone.exe" if os.name == "nt" else "rclone")
-
-
 def refresh_windows_path_env() -> None:
     if os.name != "nt":
         return
@@ -560,55 +556,8 @@ def refresh_windows_path_env() -> None:
     if merged:
         os.environ["PATH"] = os.pathsep.join(merged)
 
-
-def known_rclone_paths() -> list[Path]:
-    candidates: list[Path] = [managed_rclone_path()]
-    if os.name != "nt":
-        home = Path.home()
-        candidates.extend(
-            [
-                home / ".local" / "bin" / "rclone",
-                Path("/opt/homebrew/bin/rclone"),
-                Path("/usr/local/bin/rclone"),
-                Path("/opt/local/bin/rclone"),
-                Path("/usr/bin/rclone"),
-                Path("/snap/bin/rclone"),
-            ]
-        )
-        return candidates
-
-    localappdata = os.environ.get("LOCALAPPDATA")
-    programfiles = os.environ.get("ProgramFiles")
-    programfiles_x86 = os.environ.get("ProgramFiles(x86)")
-
-    if localappdata:
-        local = Path(localappdata)
-        candidates.append(local / "Microsoft" / "WinGet" / "Links" / "rclone.exe")
-        packages = local / "Microsoft" / "WinGet" / "Packages"
-        if packages.exists():
-            try:
-                candidates.extend(packages.glob("Rclone.Rclone_*/**/rclone.exe"))
-            except OSError:
-                pass
-    for root in [programfiles, programfiles_x86]:
-        if root:
-            candidates.append(Path(root) / "rclone" / "rclone.exe")
-    return candidates
-
-
 def resolve_rclone_path() -> str:
-    bundled = bundled_rclone_path()
-    if bundled.exists():
-        return str(bundled)
-    if os.name != "nt":
-        augment_process_path()
-    found = shutil.which("rclone.exe" if os.name == "nt" else "rclone") or shutil.which("rclone")
-    if found:
-        return found
-    for candidate in known_rclone_paths():
-        if candidate.exists():
-            return str(candidate)
-    return ""
+    return resolve_rclone(bundled_dir())
 
 
 def create_no_window() -> int:
@@ -2018,12 +1967,15 @@ def ssh_args_for_server(server: dict, *, connect_timeout: int | None = None) -> 
 
 
 def write_manual_remote(server: dict, rclone: str) -> None:
+    known_hosts = None
+    if connection_method_value(server) != "openssh":
+        known_hosts = rsshmount.update_app_known_hosts(server["host"], server.get("port") or "22") or rsshmount.default_known_hosts_file()
     with RCLONE_CONFIG_LOCK:
         with rsshmount.rclone_config_file_lock():
-            write_manual_remote_unlocked(server, rclone)
+            write_manual_remote_unlocked(server, rclone, known_hosts)
 
 
-def write_manual_remote_unlocked(server: dict, rclone: str) -> None:
+def write_manual_remote_unlocked(server: dict, rclone: str, known_hosts: Path | None = None) -> None:
     import configparser
 
     conf_path = rsshmount.rclone_config_path()
@@ -2056,7 +2008,6 @@ def write_manual_remote_unlocked(server: dict, rclone: str) -> None:
         else:
             parser.set(remote, "key_use_agent", "true")
 
-        known_hosts = rsshmount.update_app_known_hosts(server["host"], server.get("port") or "22") or rsshmount.default_known_hosts_file()
         if known_hosts.exists():
             parser.set(remote, "known_hosts_file", str(known_hosts))
 

@@ -76,7 +76,7 @@ def lock_name(value: str) -> str:
 
 
 @contextmanager
-def exclusive_file_lock(path: Path, *, timeout: float = 45.0, description: str = "operation"):
+def exclusive_file_lock(path: Path, *, timeout: float = 120.0, description: str = "operation"):
     path.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + timeout
     locked = False
@@ -124,11 +124,11 @@ def server_operation_lock_path(server_id: str) -> Path:
 
 
 def rclone_config_file_lock():
-    return exclusive_file_lock(rclone_config_lock_path(), description="rclone config")
+    return exclusive_file_lock(rclone_config_lock_path(), timeout=180.0, description="rclone config")
 
 
 def server_operation_file_lock(server_id: str):
-    return exclusive_file_lock(server_operation_lock_path(server_id), description=f"{server_id} mount")
+    return exclusive_file_lock(server_operation_lock_path(server_id), timeout=180.0, description=f"{server_id} mount")
 
 
 def default_known_hosts_file() -> Path:
@@ -427,18 +427,35 @@ def choose_transport(requested: str, config: dict[str, list[str]]) -> str:
     return "external"
 
 
-def write_external_remote(parser, host: str, ssh_config: str | None) -> None:
+def known_hosts_for_external_remote(host: str, ssh_config: str | None) -> Path | None:
+    port = first_ssh_value(read_ssh_config(host, ssh_config), "port", "22") if ssh_config else "22"
+    known_hosts = update_app_known_hosts(host, port) or default_known_hosts_file()
+    return known_hosts if known_hosts.exists() else None
+
+
+def write_external_remote(parser, host: str, ssh_config: str | None, known_hosts: Path | None = None) -> None:
     parser.set(host, "type", "sftp")
     parser.set(host, "ssh", ssh_cmd_for_rclone(host, ssh_config))
     parser.set(host, "shell_type", "unix")
     parser.set(host, "disable_hashcheck", "true")
-    port = first_ssh_value(read_ssh_config(host, ssh_config), "port", "22") if ssh_config else "22"
-    known_hosts = update_app_known_hosts(host, port) or default_known_hosts_file()
-    if known_hosts.exists():
+    if known_hosts:
         parser.set(host, "known_hosts_file", str(known_hosts))
 
 
-def write_native_remote(parser, host: str, config: dict[str, list[str]]) -> None:
+def known_hosts_for_native_remote(host: str, config: dict[str, list[str]]) -> str:
+    host_name = first_ssh_value(config, "hostname", host)
+    port = first_ssh_value(config, "port", "22")
+    known_hosts = update_app_known_hosts(host_name, port)
+    if not known_hosts:
+        known_hosts = first_usable_path(config.get("userknownhostsfile", []), must_exist=True)
+        if not known_hosts:
+            known_hosts_path = default_known_hosts_file()
+            if known_hosts_path.exists():
+                known_hosts = str(known_hosts_path)
+    return str(known_hosts or "")
+
+
+def write_native_remote(parser, host: str, config: dict[str, list[str]], known_hosts: str = "") -> None:
     parser.set(host, "type", "sftp")
     parser.set(host, "host", first_ssh_value(config, "hostname", host))
     parser.set(host, "user", first_ssh_value(config, "user", os.environ.get("USERNAME", "")))
@@ -452,15 +469,6 @@ def write_native_remote(parser, host: str, config: dict[str, list[str]]) -> None
     else:
         parser.set(host, "key_use_agent", "true")
 
-    host_name = first_ssh_value(config, "hostname", host)
-    port = first_ssh_value(config, "port", "22")
-    known_hosts = update_app_known_hosts(host_name, port)
-    if not known_hosts:
-        known_hosts = first_usable_path(config.get("userknownhostsfile", []), must_exist=True)
-        if not known_hosts:
-            known_hosts_path = default_known_hosts_file()
-            if known_hosts_path.exists():
-                known_hosts = str(known_hosts_path)
     if known_hosts:
         parser.set(host, "known_hosts_file", str(known_hosts))
 
@@ -471,6 +479,11 @@ def ensure_rclone_remote(host: str, ssh_config: str | None, transport: str) -> P
     conf_path.parent.mkdir(parents=True, exist_ok=True)
     resolved_ssh = read_ssh_config(host, ssh_config)
     chosen_transport = choose_transport(transport, resolved_ssh)
+    known_hosts = (
+        known_hosts_for_native_remote(host, resolved_ssh)
+        if chosen_transport == "native"
+        else known_hosts_for_external_remote(host, ssh_config)
+    )
 
     with rclone_config_file_lock():
         parser = configparser.RawConfigParser()
@@ -482,9 +495,9 @@ def ensure_rclone_remote(host: str, ssh_config: str | None, transport: str) -> P
         parser.add_section(host)
 
         if chosen_transport == "native":
-            write_native_remote(parser, host, resolved_ssh)
+            write_native_remote(parser, host, resolved_ssh, str(known_hosts or ""))
         else:
-            write_external_remote(parser, host, ssh_config)
+            write_external_remote(parser, host, ssh_config, known_hosts)
 
         with conf_path.open("w", encoding="utf-8") as fh:
             parser.write(fh)
