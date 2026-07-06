@@ -50,11 +50,13 @@ UI_SCALE_MULTIPLIER = 1.10
 DEFAULT_FONT_MIN_SIZE = 11
 SMALL_FONT_MIN_SIZE = 10
 ACTION_BUTTON_FONT_SIZE = 10
+ACTION_BUTTON_FONT_FAMILY_EN = "Segoe UI Semibold"
+ACTION_BUTTON_FONT_FAMILY_ZH = "Microsoft YaHei UI"
 ACTION_BUTTON_FONT_WEIGHT = "normal"
 CHECKBUTTON_FONT_SIZE = 11
 CHECKBOX_SIZE = 28
 HELP_ICON_SIZE = 36
-HELP_ICON_FONT_SIZE = 13
+HELP_ICON_FONT_SIZE = 11
 CAPACITY_BAR_HEIGHT = 16
 TEXT_BUTTON_PADX = 9
 TEXT_BUTTON_PADY = 4
@@ -65,8 +67,8 @@ BROWSE_BUTTON_PADX = 8
 BROWSE_BUTTON_PADY = 3
 MAIN_WINDOW_GEOMETRY = "1080x700"
 MAIN_WINDOW_MIN_SIZE = (860, 560)
-SETTINGS_WINDOW_GEOMETRY = "900x800"
-SETTINGS_WINDOW_MIN_SIZE = (820, 720)
+SETTINGS_WINDOW_GEOMETRY = "900x860"
+SETTINGS_WINDOW_MIN_SIZE = (820, 780)
 SERVER_DIALOG_GEOMETRY = "1060x840"
 SERVER_DIALOG_MIN_SIZE = (980, 760)
 UI_BASE_TK_SCALING = 96 / 72
@@ -126,15 +128,15 @@ TEXT = {
         "write_back_help": "Delay before changed files are written back to the server. Longer delays can smooth frequent small writes.",
         "dir_cache_time_help": "How long rclone keeps remote directory listings. Shorter values see server-side changes sooner but browse slower.",
         "buffer_size_help": "Memory read buffer per open file. Larger values can improve sequential reads but use more RAM.",
-        "startup_all_help": "Creates or removes login-time mount jobs for all saved configs on supported platforms.",
-        "startup_all_macos_note": "macOS login mount takes effect on the next login.",
+        "startup_all_help": "Starts SSH MountMate at sign-in and mounts all saved configs automatically on supported platforms.",
+        "startup_all_macos_note": "Auto-start mount takes effect after the next login.",
         "startup_config_failed": "Some login mount jobs could not be updated. Details were written to: {path}",
         "dependency_help": "Checks dependencies.\nrclone is bundled in releases.\nSystem mount dependencies may still be required.",
         "updates_help": "Checks the latest SSH MountMate release on GitHub.\nShows the matching download for this platform.",
         "logs_help": "Open recent rclone mount logs for a saved config. Useful for diagnosing failed mounts.",
         "licenses_help": "Show bundled third-party notices and license text.",
         "updates_title": "SSH MountMate updates",
-        "startup_all": "Mount all configs on login",
+        "startup_all": "Auto-start and mount all configs at login",
         "language": "Language",
         "save_settings": "Save settings",
         "settings_saved": "Settings saved.",
@@ -178,7 +180,7 @@ TEXT = {
         "edit_config_title": "Edit config",
         "source": "Source",
         "ssh_config": "SSH config",
-        "ssh_config_batch": "SSH config (batch)",
+        "ssh_config_batch": "Batch import",
         "sai_cluster": "SAI cluster",
         "ssh_config_file": "SSH config file",
         "browse": "Browse",
@@ -284,15 +286,15 @@ TEXT = {
         "write_back_help": "文件变更后延迟多久写回服务器。更长延迟可缓解频繁小写入带来的抖动。",
         "dir_cache_time_help": "rclone 保留远程目录列表的时间。越短越容易看到服务器端变化，但浏览会更频繁访问服务器。",
         "buffer_size_help": "每个打开文件使用的内存读取缓冲。更大可能改善顺序读取，但会占用更多内存。",
-        "startup_all_help": "在支持的平台上为全部已保存配置创建或删除登录挂载任务。",
-        "startup_all_macos_note": "macOS 登录挂载会在下次登录时生效。",
+        "startup_all_help": "在支持的平台上设置 SSH MountMate 开机自启，并在登录后自动挂载全部已保存配置。",
+        "startup_all_macos_note": "开机自启挂载会在下次登录后生效。",
         "startup_config_failed": "部分登录挂载任务未能更新，详情已写入：{path}",
         "dependency_help": "检查依赖。\nRelease 内置 rclone。\n系统挂载依赖可能仍需单独安装。",
         "updates_help": "检查 GitHub Releases 上的最新 SSH MountMate。\n显示当前平台匹配的下载包。",
         "logs_help": "打开某个已保存配置最近的 rclone 挂载日志，用于排查挂载失败。",
         "licenses_help": "查看内置第三方声明和许可证文本。",
         "updates_title": "SSH MountMate 更新",
-        "startup_all": "登录时挂载全部配置",
+        "startup_all": "开机自启并挂载全部配置",
         "language": "语言",
         "save_settings": "保存设置",
         "settings_saved": "设置已保存。",
@@ -336,7 +338,7 @@ TEXT = {
         "edit_config_title": "编辑配置",
         "source": "来源",
         "ssh_config": "SSH 配置",
-        "ssh_config_batch": "SSH 配置（批量）",
+        "ssh_config_batch": "批量导入",
         "sai_cluster": "SAI 集群",
         "ssh_config_file": "SSH 配置文件",
         "browse": "浏览",
@@ -612,7 +614,16 @@ def configure_default_fonts(root: Tk, lang: str) -> None:
 
 
 def action_button_font(lang: str) -> tuple[str, int, str]:
-    return (FONT_FAMILY_ZH if lang == "zh" else FONT_FAMILY_EN, ACTION_BUTTON_FONT_SIZE, ACTION_BUTTON_FONT_WEIGHT)
+    family = ACTION_BUTTON_FONT_FAMILY_ZH if lang == "zh" else ACTION_BUTTON_FONT_FAMILY_EN
+    return (family, ACTION_BUTTON_FONT_SIZE, ACTION_BUTTON_FONT_WEIGHT)
+
+
+def available_font_family(root, preferred: str, fallback: str) -> str:
+    try:
+        families = set(tkfont.families(root))
+    except Exception:
+        return preferred
+    return preferred if preferred in families else fallback
 
 
 def checkbutton_font(lang: str) -> tuple[str, int]:
@@ -620,7 +631,13 @@ def checkbutton_font(lang: str) -> tuple[str, int]:
 
 
 def apply_text_button_style(button: Button, lang: str) -> Button:
-    button.configure(font=action_button_font(lang), padx=TEXT_BUTTON_PADX, pady=TEXT_BUTTON_PADY)
+    family, size, weight = action_button_font(lang)
+    fallback = FONT_FAMILY_ZH if lang == "zh" else FONT_FAMILY_EN
+    button.configure(
+        font=(available_font_family(button, family, fallback), size, weight),
+        padx=TEXT_BUTTON_PADX,
+        pady=TEXT_BUTTON_PADY,
+    )
     return button
 
 
@@ -2959,7 +2976,7 @@ def help_icon(parent, text: str):
     padding = 5
     center = HELP_ICON_SIZE // 2
     icon.create_oval(padding, padding, HELP_ICON_SIZE - padding, HELP_ICON_SIZE - padding, outline="#555555", width=2)
-    icon.create_text(center, center, text="?", fill="#333333", font=("Segoe UI", HELP_ICON_FONT_SIZE, "bold"))
+    icon.create_text(center, center, text="?", fill="#333333", font=("Segoe UI", HELP_ICON_FONT_SIZE, "normal"))
     Tooltip(icon, text)
     return icon
 
