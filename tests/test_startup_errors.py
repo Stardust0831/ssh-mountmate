@@ -35,6 +35,12 @@ class StartupErrorTests(unittest.TestCase):
 
         self.assertIn("--mount-startup-all", command)
 
+    def test_capacity_cache_due_respects_success_and_failure_ttl(self):
+        self.assertTrue(gui.capacity_cache_due("server", {}, {}, now=100.0, ttl=60.0))
+        self.assertFalse(gui.capacity_cache_due("server", {"server": {"used": 1}}, {"server": 80.0}, now=100.0, ttl=60.0))
+        self.assertFalse(gui.capacity_cache_due("server", {}, {"server": 80.0}, now=100.0, ttl=60.0))
+        self.assertTrue(gui.capacity_cache_due("server", {"server": {"used": 1}}, {"server": 20.0}, now=100.0, ttl=60.0))
+
 
 if __name__ == "__main__":
     unittest.main()

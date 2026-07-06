@@ -44,6 +44,7 @@ FONT_FAMILY_ZH = "Noto Sans CJK SC"
 RCLONE_CONFIG_LOCK = threading.RLock()
 DEFAULT_MOUNT_ALL_WORKERS = 4
 DEFAULT_UNMOUNT_ALL_WORKERS = 8
+CAPACITY_CACHE_TTL_SECONDS = 120.0
 BATCH_WORKER_CHOICES = ["1", "2", "3", "4", "6", "8", "10", "12"]
 HOME_MOUNTPOINT_VALUE = "__home_mnt__"
 FORM_LABEL_CHARS = 22
@@ -1361,7 +1362,15 @@ def capacity_info(server: dict, rclone: str, status: str | None = None) -> dict:
     state = current_state(server)
     remote = state.get("remote") or rsshmount.remote_spec(remote_name(server), server.get("remote_path") or "")
     try:
-        result = run([rclone, "--config", str(rsshmount.rclone_config_path()), "about", remote, "--json"], capture=True)
+        result = subprocess.run(
+            [rclone, "--config", str(rsshmount.rclone_config_path()), "about", remote, "--json"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            timeout=12,
+            creationflags=create_no_window(),
+        )
         data = json.loads(result.stdout or "{}")
     except Exception:
         return {}
@@ -1382,6 +1391,23 @@ def capacity_info(server: dict, rclone: str, status: str | None = None) -> dict:
         return {}
     percent = int(round((used / total) * 100))
     return {"used": max(used, 0), "total": total, "percent": max(0, min(percent, 100))}
+
+
+def capacity_cache_due(
+    server_id: str,
+    capacity_cache: dict[str, dict],
+    capacity_checked_at: dict[str, float],
+    *,
+    now: float | None = None,
+    ttl: float = CAPACITY_CACHE_TTL_SECONDS,
+) -> bool:
+    if not server_id:
+        return False
+    current = time.time() if now is None else now
+    last_checked = capacity_checked_at.get(server_id)
+    if server_id not in capacity_cache and last_checked is None:
+        return True
+    return last_checked is None or current - last_checked >= ttl
 
 
 def split_remote_path(remote_path: str) -> tuple[str, str]:
@@ -2492,6 +2518,8 @@ class App:
         self.update_checking = False
         self.mount_status_cache: dict[str, str] = {}
         self.capacity_cache: dict[str, dict] = {}
+        self.capacity_checked_at: dict[str, float] = {}
+        self.capacity_refreshing = False
         self.refresh_generation = 0
         self.card_action_columns = 4
         self.resize_refresh_pending = False
@@ -2649,6 +2677,9 @@ class App:
         generation = self.refresh_generation
         servers = [dict(server) for server in self.servers]
         rclone = self.current_rclone()
+        capacity_cache_snapshot = dict(self.capacity_cache)
+        capacity_checked_snapshot = dict(self.capacity_checked_at)
+        capacity_now = time.time()
 
         def worker() -> None:
             processes = running_rclone_processes()
@@ -2661,13 +2692,29 @@ class App:
                 statuses[server_id] = status
             self.root.after(0, lambda: self.apply_mount_statuses(generation, statuses))
 
+            capacity_targets = [
+                server
+                for server in servers
+                if statuses.get(server.get("id", "")) == "mounted"
+                and capacity_cache_due(
+                    server.get("id", ""),
+                    capacity_cache_snapshot,
+                    capacity_checked_snapshot,
+                    now=capacity_now,
+                )
+            ]
+            if not capacity_targets or self.capacity_refreshing:
+                return
+            self.capacity_refreshing = True
             capacities: dict[str, dict] = {}
-            for server in servers:
+            checked_ids: list[str] = []
+            for server in capacity_targets:
                 server_id = server.get("id", "")
-                if not server_id or statuses.get(server_id) != "mounted":
+                if not server_id:
                     continue
+                checked_ids.append(server_id)
                 capacities[server_id] = capacity_info(server, rclone, statuses[server_id])
-            self.root.after(0, lambda: self.apply_capacity_infos(generation, statuses, capacities))
+            self.root.after(0, lambda: self.apply_capacity_infos(generation, statuses, capacities, checked_ids))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2679,16 +2726,23 @@ class App:
         for server_id, status in statuses.items():
             if status != "mounted":
                 self.capacity_cache.pop(server_id, None)
+                self.capacity_checked_at.pop(server_id, None)
         self.refresh_list()
 
-    def apply_capacity_infos(self, generation: int, statuses: dict[str, str], capacities: dict[str, dict]) -> None:
+    def apply_capacity_infos(self, generation: int, statuses: dict[str, str], capacities: dict[str, dict], checked_ids: list[str]) -> None:
+        self.capacity_refreshing = False
         if generation != self.refresh_generation:
             return
+        checked_at = time.time()
+        for server_id in checked_ids:
+            self.capacity_checked_at[server_id] = checked_at
         for server_id, status in statuses.items():
             if status == "mounted" and server_id in capacities:
-                self.capacity_cache[server_id] = capacities[server_id]
+                if capacities[server_id]:
+                    self.capacity_cache[server_id] = capacities[server_id]
             elif status != "mounted":
                 self.capacity_cache.pop(server_id, None)
+                self.capacity_checked_at.pop(server_id, None)
         self.refresh_list()
 
     def on_cards_mousewheel(self, event) -> None:
