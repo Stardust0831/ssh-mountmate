@@ -6,7 +6,6 @@ import platform
 import os
 import stat
 import hashlib
-import json
 import tempfile
 import urllib.request
 import zipfile
@@ -14,6 +13,7 @@ from pathlib import Path
 
 from .paths import legacy_managed_bin_dirs, managed_bin_dir
 from .platforms import current_platform
+from .rclone_processes import running_windows_rclone_command_lines
 
 
 def bundled_rclone_candidates(app_root: Path) -> list[Path]:
@@ -60,28 +60,7 @@ def materialized_bundled_rclone_name(path: Path) -> bool:
 def running_process_command_lines() -> list[str]:
     system = current_platform().system
     if system == "Windows":
-        command = (
-            "Get-CimInstance Win32_Process -Filter \"Name='rclone.exe'\" | "
-            "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
-        )
-        try:
-            result = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-Command", command],
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                timeout=3,
-            )
-        except Exception:
-            return []
-        try:
-            data = json.loads(result.stdout.strip() or "[]")
-        except json.JSONDecodeError:
-            return []
-        if isinstance(data, dict):
-            data = [data]
-        return [str(item.get("CommandLine") or "") for item in data if isinstance(item, dict)]
+        return running_windows_rclone_command_lines(timeout=3)
 
     proc = Path("/proc")
     if system == "Linux" and proc.exists():

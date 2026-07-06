@@ -1,15 +1,12 @@
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import time
 from pathlib import Path
 from typing import Callable
 
-
-def create_no_window() -> int:
-    return getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+from .rclone_processes import create_no_window, running_windows_rclone_processes
 
 
 def normalize_for_command(value: object) -> str:
@@ -41,41 +38,6 @@ def running_rclone_processes() -> dict[int, str]:
     if Path("/proc").exists():
         return running_procfs_rclone_processes()
     return running_ps_rclone_processes()
-
-
-def running_windows_rclone_processes() -> dict[int, str]:
-    command = (
-        "Get-CimInstance Win32_Process -Filter \"Name='rclone.exe'\" | "
-        "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
-    )
-    try:
-        result = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-Command", command],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            creationflags=create_no_window(),
-            timeout=5,
-        )
-    except Exception:
-        return {}
-    try:
-        data = json.loads(result.stdout.strip() or "[]")
-    except json.JSONDecodeError:
-        return {}
-    if isinstance(data, dict):
-        data = [data]
-    processes: dict[int, str] = {}
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-        try:
-            pid = int(item.get("ProcessId", 0))
-        except (TypeError, ValueError):
-            continue
-        if pid:
-            processes[pid] = str(item.get("CommandLine") or "")
-    return processes
 
 
 def running_procfs_rclone_processes(proc_root: Path = Path("/proc")) -> dict[int, str]:
