@@ -32,7 +32,7 @@ from .updates import check_for_updates, format_update_info
 
 
 APP_TITLE = "SSH MountMate"
-CACHE_SIZE_CHOICES = ["default (off)", "1G", "5G", "10G", "20G", "50G", "100G", "500G"]
+CACHE_SIZE_CHOICES = ["default (no size limit)", "1G", "5G", "10G", "20G", "50G", "100G", "500G"]
 CACHE_AGE_CHOICES = ["default (1h0m0s)", "5m", "15m", "30m", "1h", "6h", "24h", "168h"]
 MIN_FREE_CHOICES = ["default (off)", "1G", "5G", "10G", "20G", "50G", "100G"]
 WRITE_BACK_CHOICES = ["default (5s)", "0s", "5s", "10s", "30s", "1m", "5m"]
@@ -46,7 +46,6 @@ DEFAULT_MOUNT_ALL_WORKERS = 4
 DEFAULT_UNMOUNT_ALL_WORKERS = 8
 CAPACITY_CACHE_TTL_SECONDS = 120.0
 LOCAL_CAPACITY_CACHE_TTL_SECONDS = 5.0
-BATCH_WORKER_CHOICES = ["1", "2", "3", "4", "6", "8", "10", "12"]
 HOME_MOUNTPOINT_VALUE = "__home_mnt__"
 FORM_LABEL_CHARS = 22
 MACOS_STARTUP_HELPER_NAME = "SSHMountMateMountHelper"
@@ -54,7 +53,7 @@ TEXT = {
     "en": {
         "ready": "Ready",
         "loading_configs": "Loading configs...",
-        "no_configs": "No configs yet.",
+        "no_configs": "No configs yet. Click Add config to start mounting.",
         "settings": "Settings",
         "add_config": "Add config",
         "refresh": "Refresh",
@@ -87,19 +86,15 @@ TEXT = {
         "write_back": "Write-back delay",
         "dir_cache_time": "Directory cache",
         "buffer_size": "Buffer size",
-        "mount_workers": "Mount concurrency",
-        "unmount_workers": "Unmount concurrency",
         "language_help": "Auto uses Chinese on Chinese systems and English otherwise.",
         "cache_root_help": "Local folder used by rclone VFS cache. Put it on a fast disk with enough free space.",
-        "vfs_cache_mode_help": "Controls local file caching. Higher modes improve app compatibility but use more disk.",
-        "max_cache_size_help": "Upper limit for VFS cache size. Default means rclone does not enforce this limit.",
+        "vfs_cache_mode_help": "VFS cache mode controls disk caching for mounted files.\noff: no VFS disk cache.\nminimal: cache only what rclone needs for basic compatibility.\nwrites: cache changed files before upload; this is the default recommendation.\nfull: cache reads and writes for best app compatibility, using more local disk.",
+        "max_cache_size_help": "Upper limit for the VFS cache folder. Default means no size limit is enforced by rclone; it does not disable VFS caching. Use VFS cache mode = off to disable the cache.",
         "max_cache_age_help": "How long cached objects may stay before rclone can evict them. Default is 1 hour.",
         "min_free_space_help": "Keep this much local disk space free for other applications.",
         "write_back_help": "Delay before changed files are written back to the server. Longer delays can smooth frequent small writes.",
         "dir_cache_time_help": "How long rclone keeps remote directory listings. Shorter values see server-side changes sooner but browse slower.",
         "buffer_size_help": "Memory read buffer per open file. Larger values can improve sequential reads but use more RAM.",
-        "mount_workers_help": "Maximum number of configs mounted in parallel during Mount all. Higher values are faster but can trigger SSH rate limits.",
-        "unmount_workers_help": "Maximum number of configs unmounted in parallel during Unmount all. Higher values are usually safe but can make errors arrive together.",
         "startup_all_help": "Creates or removes login-time mount jobs for all saved configs on supported platforms.",
         "startup_all_macos_note": "macOS login mount takes effect on the next login.",
         "startup_config_failed": "Some login mount jobs could not be updated. Details were written to: {path}",
@@ -210,7 +205,7 @@ TEXT = {
     "zh": {
         "ready": "就绪",
         "loading_configs": "正在加载配置...",
-        "no_configs": "暂无配置。",
+        "no_configs": "暂无配置。点击“新增配置”开始挂载。",
         "settings": "设置",
         "add_config": "新增配置",
         "refresh": "刷新",
@@ -243,19 +238,15 @@ TEXT = {
         "write_back": "写回延迟",
         "dir_cache_time": "目录缓存",
         "buffer_size": "读取缓冲",
-        "mount_workers": "挂载并行数",
-        "unmount_workers": "取消挂载并行数",
         "language_help": "自动模式会在中文系统使用中文，其他系统使用英文。",
         "cache_root_help": "rclone VFS 本地缓存目录。建议放在速度较快且空间充足的磁盘。",
-        "vfs_cache_mode_help": "控制本地文件缓存方式。模式越高，应用兼容性通常越好，但会占用更多磁盘。",
-        "max_cache_size_help": "VFS 缓存最大占用空间。默认表示不由 rclone 强制限制。",
+        "vfs_cache_mode_help": "VFS 缓存模式控制挂载文件的本地磁盘缓存。\noff：不使用 VFS 磁盘缓存。\nminimal：只缓存 rclone 基础兼容所需内容。\nwrites：先缓存写入变更，再上传到服务器；这是默认推荐值。\nfull：读写都走缓存，应用兼容性最好，但会占用更多本地磁盘。",
+        "max_cache_size_help": "VFS 缓存目录的最大占用空间。默认表示 rclone 不强制限制缓存大小；这不等于关闭缓存。要关闭缓存请把 VFS 缓存模式设为 off。",
         "max_cache_age_help": "缓存对象可保留多久后允许被清理。默认是 1 小时。",
         "min_free_space_help": "为其他应用保留的本地磁盘剩余空间。",
         "write_back_help": "文件变更后延迟多久写回服务器。更长延迟可缓解频繁小写入带来的抖动。",
         "dir_cache_time_help": "rclone 保留远程目录列表的时间。越短越容易看到服务器端变化，但浏览会更频繁访问服务器。",
         "buffer_size_help": "每个打开文件使用的内存读取缓冲。更大可能改善顺序读取，但会占用更多内存。",
-        "mount_workers_help": "批量挂载时最多同时处理多少个配置。更大更快，但可能触发 SSH 连接限制。",
-        "unmount_workers_help": "批量取消挂载时最多同时处理多少个配置。通常可以比挂载更高，但错误可能集中出现。",
         "startup_all_help": "在支持的平台上为全部已保存配置创建或删除登录挂载任务。",
         "startup_all_macos_note": "macOS 登录挂载会在下次登录时生效。",
         "startup_config_failed": "部分登录挂载任务未能更新，详情已写入：{path}",
@@ -386,8 +377,6 @@ def default_settings() -> dict:
         "vfs_write_back": "",
         "dir_cache_time": "",
         "buffer_size": "",
-        "mount_all_workers": DEFAULT_MOUNT_ALL_WORKERS,
-        "unmount_all_workers": DEFAULT_UNMOUNT_ALL_WORKERS,
         "startup_all": False,
         "language": "auto",
     }
@@ -416,25 +405,13 @@ def configured_cache_dir(host: str) -> Path:
 
 
 def setting_to_choice(value: str, default_choice: str) -> str:
-    return value if value else default_choice
+    if not value or str(value).startswith("default "):
+        return default_choice
+    return value
 
 
 def choice_to_setting(value: str) -> str:
     return "" if value.startswith("default ") else value
-
-
-def bounded_int(value, default: int, minimum: int = 1, maximum: int = 12) -> int:
-    try:
-        number = int(value)
-    except (TypeError, ValueError):
-        return default
-    return max(minimum, min(maximum, number))
-
-
-def setting_worker_choice(value, default: int) -> str:
-    number = bounded_int(value, default)
-    text = str(number)
-    return text if text in BATCH_WORKER_CHOICES else str(default)
 
 
 def system_language() -> str:
@@ -2645,8 +2622,7 @@ def headless_mount_all() -> int:
     rclone = resolve_rclone_path()
     if not rclone:
         return 3
-    settings = load_settings()
-    workers = bounded_int(settings.get("mount_all_workers"), DEFAULT_MOUNT_ALL_WORKERS)
+    workers = DEFAULT_MOUNT_ALL_WORKERS
     statuses = batch_statuses_for_servers(servers)
     targets = [server for server in servers if statuses.get(server.get("id", "")) != "mounted"]
     errors: list[str] = []
@@ -2687,7 +2663,17 @@ class Tooltip:
         self.tip = Toplevel(self.widget)
         self.tip.wm_overrideredirect(True)
         self.tip.wm_geometry(f"+{x}+{y}")
-        Label(self.tip, text=self.text, bg="#f7f7d0", fg="#222222", padx=6, pady=3, font=("Segoe UI", 9)).pack()
+        Label(
+            self.tip,
+            text=self.text,
+            bg="#f7f7d0",
+            fg="#222222",
+            padx=6,
+            pady=3,
+            font=("Segoe UI", 9),
+            justify=LEFT,
+            wraplength=380,
+        ).pack()
 
     def hide(self, _event=None) -> None:
         if self.tip:
@@ -2862,15 +2848,27 @@ class App:
         for widgets in self.card_widgets.values():
             widgets["row"].pack_forget()
         if self.cards_placeholder is None:
-            self.cards_placeholder = Label(
-                self.cards_frame,
+            placeholder = Frame(self.cards_frame, bg="#202020", pady=26)
+            label = Label(
+                placeholder,
                 bg="#202020",
                 fg="#bdbdbd",
                 font=("Segoe UI", 11),
-                pady=26,
+                wraplength=520,
+                justify="center",
             )
+            label.pack(pady=(0, 10))
+            button = Button(placeholder, text=self.t("add_config"), command=self.add_config)
+            placeholder._ssh_mountmate_label = label
+            placeholder._ssh_mountmate_button = button
+            self.cards_placeholder = placeholder
             self.bind_cards_mousewheel_recursive(self.cards_placeholder)
-        self.cards_placeholder.configure(text=text)
+        self.cards_placeholder._ssh_mountmate_label.configure(text=text)
+        if self.configs_loaded and not self.servers:
+            self.cards_placeholder._ssh_mountmate_button.configure(text=self.t("add_config"))
+            self.cards_placeholder._ssh_mountmate_button.pack()
+        else:
+            self.cards_placeholder._ssh_mountmate_button.pack_forget()
         self.cards_placeholder.pack(fill=X)
 
     def hide_cards_placeholder(self) -> None:
@@ -3349,19 +3347,6 @@ class App:
         frame = Frame(window, padx=14, pady=14)
         frame.pack(fill=BOTH, expand=True)
         Label(frame, textvariable=self.dep_status, anchor="w", justify=LEFT).pack(fill=X, pady=(0, 12))
-        deps_check_button = Button(frame, text=self.t("check_dependencies"), command=self.check_dependencies_async)
-        deps_check_button.pack(fill=X, pady=3)
-        deps_install_button = Button(frame, text=self.t("install_missing_dependencies"), command=self.install_deps_async)
-        deps_install_button.pack(fill=X, pady=3)
-        updates_button = Button(frame, text=self.t("check_updates"), command=self.check_updates_async)
-        updates_button.pack(fill=X, pady=3)
-        logs_button = Button(frame, text=self.t("view_mount_logs"), command=self.open_logs)
-        logs_button.pack(fill=X, pady=3)
-        licenses_button = Button(frame, text=self.t("view_licenses"), command=lambda: self.show_text_window(self.t("view_licenses"), THIRD_PARTY_NOTICES))
-        licenses_button.pack(fill=X, pady=3)
-
-        ttk.Separator(frame).pack(fill=X, pady=12)
-
         cache_root = StringVar(value=settings.get("cache_root", default_settings()["cache_root"]))
         cache_mode = StringVar(value=settings.get("vfs_cache_mode", "writes"))
         cache_max_size = StringVar(value=setting_to_choice(settings.get("vfs_cache_max_size", ""), CACHE_SIZE_CHOICES[0]))
@@ -3370,133 +3355,120 @@ class App:
         write_back = StringVar(value=setting_to_choice(settings.get("vfs_write_back", ""), WRITE_BACK_CHOICES[0]))
         dir_cache_time = StringVar(value=setting_to_choice(settings.get("dir_cache_time", ""), DIR_CACHE_TIME_CHOICES[0]))
         buffer_size = StringVar(value=setting_to_choice(settings.get("buffer_size", ""), BUFFER_SIZE_CHOICES[0]))
-        mount_workers = StringVar(value=setting_worker_choice(settings.get("mount_all_workers"), DEFAULT_MOUNT_ALL_WORKERS))
-        unmount_workers = StringVar(value=setting_worker_choice(settings.get("unmount_all_workers"), DEFAULT_UNMOUNT_ALL_WORKERS))
         startup_all = BooleanVar(value=bool(settings.get("startup_all", False)) and startup_supported())
         language = StringVar(value=language_choice_from_setting(settings.get("language", "auto")))
 
-        def attach_help(widget, key: str) -> None:
-            Tooltip(widget, self.t(key))
+        def help_icon(parent, key: str):
+            icon = Canvas(parent, width=20, height=20, highlightthickness=0, cursor="question_arrow")
+            icon.create_oval(3, 3, 17, 17, outline="#666666", width=1)
+            icon.create_text(10, 10, text="?", fill="#444444", font=("Segoe UI", 9, "bold"))
+            Tooltip(icon, self.t(key))
+            return icon
 
-        attach_help(deps_check_button, "dependency_help")
-        attach_help(deps_install_button, "dependency_help")
-        attach_help(updates_button, "updates_help")
-        attach_help(logs_button, "logs_help")
-        attach_help(licenses_button, "licenses_help")
+        def command_row(text: str, command, help_key: str) -> None:
+            row = Frame(frame)
+            row.pack(fill=X, pady=3)
+            help_icon(row, help_key).pack(side=RIGHT, padx=(6, 0))
+            Button(row, text=text, command=command).pack(side=LEFT, fill=X, expand=True)
+
+        command_row(self.t("check_dependencies"), self.check_dependencies_async, "dependency_help")
+        command_row(self.t("install_missing_dependencies"), self.install_deps_async, "dependency_help")
+        command_row(self.t("check_updates"), self.check_updates_async, "updates_help")
+        command_row(self.t("view_mount_logs"), self.open_logs, "logs_help")
+        command_row(self.t("view_licenses"), lambda: self.show_text_window(self.t("view_licenses"), THIRD_PARTY_NOTICES), "licenses_help")
+
+        ttk.Separator(frame).pack(fill=X, pady=12)
 
         lang_row = Frame(frame)
         lang_row.pack(fill=X, pady=3)
         lang_label = Label(lang_row, text=self.t("language"), width=16, anchor="w")
         lang_label.pack(side=LEFT)
+        help_icon(lang_row, "language_help").pack(side=RIGHT, padx=(6, 0))
         language_combo = ttk.Combobox(lang_row, values=list(LANGUAGE_CHOICES.values()), textvariable=language, state="readonly")
         language_combo.pack(side=LEFT, fill=X, expand=True)
-        attach_help(lang_label, "language_help")
-        attach_help(language_combo, "language_help")
 
         cache_row = Frame(frame)
         cache_row.pack(fill=X, pady=3)
         cache_label = Label(cache_row, text=self.t("cache_root"), width=16, anchor="w")
         cache_label.pack(side=LEFT)
+        help_icon(cache_row, "cache_root_help").pack(side=RIGHT, padx=(6, 0))
+        Button(cache_row, text="...", command=lambda: self.pick_cache_root(cache_root)).pack(side=RIGHT)
         cache_entry = Entry(cache_row, textvariable=cache_root)
         cache_entry.pack(side=LEFT, fill=X, expand=True)
-        Button(cache_row, text="...", command=lambda: self.pick_cache_root(cache_root)).pack(side=RIGHT)
-        attach_help(cache_label, "cache_root_help")
-        attach_help(cache_entry, "cache_root_help")
 
         mode_row = Frame(frame)
         mode_row.pack(fill=X, pady=3)
         mode_label = Label(mode_row, text=self.t("vfs_cache_mode"), width=16, anchor="w")
         mode_label.pack(side=LEFT)
+        help_icon(mode_row, "vfs_cache_mode_help").pack(side=RIGHT, padx=(6, 0))
         mode_combo = ttk.Combobox(mode_row, values=["off", "minimal", "writes", "full"], textvariable=cache_mode, state="readonly")
         mode_combo.pack(side=LEFT, fill=X, expand=True)
-        attach_help(mode_label, "vfs_cache_mode_help")
-        attach_help(mode_combo, "vfs_cache_mode_help")
 
         size_row = Frame(frame)
         size_row.pack(fill=X, pady=3)
         size_label = Label(size_row, text=self.t("max_cache_size"), width=16, anchor="w")
         size_label.pack(side=LEFT)
+        help_icon(size_row, "max_cache_size_help").pack(side=RIGHT, padx=(6, 0))
         size_combo = ttk.Combobox(size_row, values=CACHE_SIZE_CHOICES, textvariable=cache_max_size, state="readonly")
         size_combo.pack(side=LEFT, fill=X, expand=True)
-        attach_help(size_label, "max_cache_size_help")
-        attach_help(size_combo, "max_cache_size_help")
 
         age_row = Frame(frame)
         age_row.pack(fill=X, pady=3)
         age_label = Label(age_row, text=self.t("max_cache_age"), width=16, anchor="w")
         age_label.pack(side=LEFT)
+        help_icon(age_row, "max_cache_age_help").pack(side=RIGHT, padx=(6, 0))
         age_combo = ttk.Combobox(age_row, values=CACHE_AGE_CHOICES, textvariable=cache_max_age, state="readonly")
         age_combo.pack(side=LEFT, fill=X, expand=True)
-        attach_help(age_label, "max_cache_age_help")
-        attach_help(age_combo, "max_cache_age_help")
 
         min_free_row = Frame(frame)
         min_free_row.pack(fill=X, pady=3)
         min_free_label = Label(min_free_row, text=self.t("min_free_space"), width=16, anchor="w")
         min_free_label.pack(side=LEFT)
+        help_icon(min_free_row, "min_free_space_help").pack(side=RIGHT, padx=(6, 0))
         min_free_combo = ttk.Combobox(min_free_row, values=MIN_FREE_CHOICES, textvariable=min_free_space, state="readonly")
         min_free_combo.pack(side=LEFT, fill=X, expand=True)
-        attach_help(min_free_label, "min_free_space_help")
-        attach_help(min_free_combo, "min_free_space_help")
 
         write_back_row = Frame(frame)
         write_back_row.pack(fill=X, pady=3)
         write_back_label = Label(write_back_row, text=self.t("write_back"), width=16, anchor="w")
         write_back_label.pack(side=LEFT)
+        help_icon(write_back_row, "write_back_help").pack(side=RIGHT, padx=(6, 0))
         write_back_combo = ttk.Combobox(write_back_row, values=WRITE_BACK_CHOICES, textvariable=write_back, state="readonly")
         write_back_combo.pack(side=LEFT, fill=X, expand=True)
-        attach_help(write_back_label, "write_back_help")
-        attach_help(write_back_combo, "write_back_help")
 
         dir_cache_row = Frame(frame)
         dir_cache_row.pack(fill=X, pady=3)
         dir_cache_label = Label(dir_cache_row, text=self.t("dir_cache_time"), width=16, anchor="w")
         dir_cache_label.pack(side=LEFT)
+        help_icon(dir_cache_row, "dir_cache_time_help").pack(side=RIGHT, padx=(6, 0))
         dir_cache_combo = ttk.Combobox(dir_cache_row, values=DIR_CACHE_TIME_CHOICES, textvariable=dir_cache_time, state="readonly")
         dir_cache_combo.pack(side=LEFT, fill=X, expand=True)
-        attach_help(dir_cache_label, "dir_cache_time_help")
-        attach_help(dir_cache_combo, "dir_cache_time_help")
 
         buffer_row = Frame(frame)
         buffer_row.pack(fill=X, pady=3)
         buffer_label = Label(buffer_row, text=self.t("buffer_size"), width=16, anchor="w")
         buffer_label.pack(side=LEFT)
+        help_icon(buffer_row, "buffer_size_help").pack(side=RIGHT, padx=(6, 0))
         buffer_combo = ttk.Combobox(buffer_row, values=BUFFER_SIZE_CHOICES, textvariable=buffer_size, state="readonly")
         buffer_combo.pack(side=LEFT, fill=X, expand=True)
-        attach_help(buffer_label, "buffer_size_help")
-        attach_help(buffer_combo, "buffer_size_help")
 
-        mount_workers_row = Frame(frame)
-        mount_workers_row.pack(fill=X, pady=3)
-        mount_workers_label = Label(mount_workers_row, text=self.t("mount_workers"), width=16, anchor="w")
-        mount_workers_label.pack(side=LEFT)
-        mount_workers_combo = ttk.Combobox(mount_workers_row, values=BATCH_WORKER_CHOICES, textvariable=mount_workers, state="readonly")
-        mount_workers_combo.pack(side=LEFT, fill=X, expand=True)
-        attach_help(mount_workers_label, "mount_workers_help")
-        attach_help(mount_workers_combo, "mount_workers_help")
-
-        unmount_workers_row = Frame(frame)
-        unmount_workers_row.pack(fill=X, pady=3)
-        unmount_workers_label = Label(unmount_workers_row, text=self.t("unmount_workers"), width=16, anchor="w")
-        unmount_workers_label.pack(side=LEFT)
-        unmount_workers_combo = ttk.Combobox(unmount_workers_row, values=BATCH_WORKER_CHOICES, textvariable=unmount_workers, state="readonly")
-        unmount_workers_combo.pack(side=LEFT, fill=X, expand=True)
-        attach_help(unmount_workers_label, "unmount_workers_help")
-        attach_help(unmount_workers_combo, "unmount_workers_help")
-
+        startup_row = Frame(frame)
+        startup_row.pack(fill=X, pady=8)
+        help_icon(startup_row, "startup_all_help").pack(side=RIGHT, padx=(6, 0))
         startup_check = Checkbutton(
-            frame,
+            startup_row,
             text=self.t("startup_all"),
             variable=startup_all,
             state="normal" if startup_supported() else "disabled",
         )
-        startup_check.pack(anchor="w", pady=8)
-        attach_help(startup_check, "startup_all_help")
+        startup_check.pack(side=LEFT, anchor="w")
         if sys.platform == "darwin":
             Label(frame, text=self.t("startup_all_macos_note"), fg="#666666", anchor="w").pack(fill=X, pady=(0, 6))
 
         def save() -> None:
             new_settings = load_settings()
+            new_settings.pop("mount_all_workers", None)
+            new_settings.pop("unmount_all_workers", None)
             new_settings.update(
                 {
                     "cache_root": cache_root.get().strip() or default_settings()["cache_root"],
@@ -3507,8 +3479,6 @@ class App:
                     "vfs_write_back": choice_to_setting(write_back.get().strip()),
                     "dir_cache_time": choice_to_setting(dir_cache_time.get().strip()),
                     "buffer_size": choice_to_setting(buffer_size.get().strip()),
-                    "mount_all_workers": bounded_int(mount_workers.get(), DEFAULT_MOUNT_ALL_WORKERS),
-                    "unmount_all_workers": bounded_int(unmount_workers.get(), DEFAULT_UNMOUNT_ALL_WORKERS),
                     "startup_all": bool(startup_all.get()) and startup_supported(),
                     "language": language_setting_from_choice(language.get()),
                 }
@@ -3768,14 +3738,10 @@ class App:
         threading.Thread(target=worker, daemon=True).start()
 
     def mount_all(self) -> None:
-        settings = load_settings()
-        workers = bounded_int(settings.get("mount_all_workers"), DEFAULT_MOUNT_ALL_WORKERS)
-        self.run_batch_operation("mount", workers, "mount_all_started")
+        self.run_batch_operation("mount", DEFAULT_MOUNT_ALL_WORKERS, "mount_all_started")
 
     def unmount_all(self) -> None:
-        settings = load_settings()
-        workers = bounded_int(settings.get("unmount_all_workers"), DEFAULT_UNMOUNT_ALL_WORKERS)
-        self.run_batch_operation("unmount", workers, "unmount_all_started")
+        self.run_batch_operation("unmount", DEFAULT_UNMOUNT_ALL_WORKERS, "unmount_all_started")
 
     def finish_single_operation(self, server: dict, message: str = "", error: str = "") -> None:
         self.release_server_operation(server)
