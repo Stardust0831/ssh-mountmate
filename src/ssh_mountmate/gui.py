@@ -167,6 +167,7 @@ TEXT = {
         "batch_ignore": "Ignore",
         "batch_overwrite": "Overwrite",
         "batch_select_all_import": "Import all new",
+        "batch_select_all_overwrite": "Overwrite all duplicates",
         "batch_overwrite_help": "Import is checked only for new configs.\nDuplicate configs are skipped unless Overwrite is checked.\nOverwrite updates SSH connection fields and keeps local mount settings.",
         "batch_details": "Details",
         "batch_detail_title": "Batch import details",
@@ -324,6 +325,7 @@ TEXT = {
         "batch_ignore": "忽略",
         "batch_overwrite": "覆盖",
         "batch_select_all_import": "导入全部新配置",
+        "batch_select_all_overwrite": "覆盖全部重复配置",
         "batch_overwrite_help": "只有新配置默认勾选导入。\n重复配置默认跳过；勾选覆盖后才会覆盖。\n覆盖只更新 SSH 连接字段，并保留本地挂载设置。",
         "batch_details": "详情",
         "batch_detail_title": "批量导入详情",
@@ -4058,6 +4060,7 @@ class ServerDialog:
         self.last_sai_profile_name = sai_profile_name(self.existing.get("user", ""))
         self.batch_config_path = StringVar(value=str(Path.home() / ".ssh" / "config"))
         self.batch_select_all_import = BooleanVar(value=True)
+        self.batch_select_all_overwrite = BooleanVar(value=False)
         self.window = Toplevel(root)
         self.window.title(self.t("edit_config_title") if existing else self.t("add_config_title"))
         self.window.geometry("700x620")
@@ -4098,13 +4101,10 @@ class ServerDialog:
         label_frame = Frame(parent)
         label_frame.pack(side=LEFT, fill=Y, padx=(0, 8))
         Label(label_frame, text=text, width=self.label_width(text), anchor="w").pack(side=LEFT)
-        if required or required_key:
-            star = Label(label_frame, text="*", fg="#d32f2f", anchor="w")
-            star.pack(side=LEFT, padx=(2, 0))
-            if required_key:
-                self.required_stars[required_key] = star
-                if not required:
-                    star.pack_forget()
+        star = Label(label_frame, text="*" if required else "", fg="#d32f2f", anchor="w", width=1)
+        star.pack(side=LEFT, padx=(2, 0))
+        if required_key:
+            self.required_stars[required_key] = star
 
     def row(self, label: str, key: str, default: str = "", browse=False, secret=False, parent=None, required: bool = False, required_key: str = ""):
         frame = Frame(parent or self.form, padx=10, pady=4)
@@ -4305,6 +4305,7 @@ class ServerDialog:
     def load_batch_preview(self) -> None:
         path = Path(self.batch_config_path.get()).expanduser()
         self.batch_select_all_import.set(True)
+        self.batch_select_all_overwrite.set(False)
         try:
             plan = ssh_config_batch_plan(path, self.existing_servers)
             content = annotated_ssh_config_preview(path, self.existing_servers, plan)
@@ -4341,6 +4342,14 @@ class ServerDialog:
                 import_var.set(selected)
                 if selected and overwrite_var is not None:
                     overwrite_var.set(False)
+
+    def set_all_batch_overwrites(self) -> None:
+        selected = bool(self.batch_select_all_overwrite.get())
+        for _item, import_var, overwrite_var in self.batch_conflict_actions.values():
+            if overwrite_var is not None:
+                overwrite_var.set(selected)
+                if selected:
+                    import_var.set(False)
 
     def compact_dict_text(self, value: dict | None) -> str:
         if not value:
@@ -4401,22 +4410,24 @@ class ServerDialog:
             return
         self.batch_conflicts_frame.pack(fill=X, padx=10, pady=(8, 0))
         importable_count = sum(1 for item in items if item.get("status") == "NEW")
-        if importable_count:
+        overwritable_count = sum(1 for item in items if item.get("can_overwrite"))
+        if importable_count or overwritable_count:
             control_row = Frame(self.batch_conflicts_body)
             control_row.pack(fill=X, pady=(2, 4))
-            Checkbutton(
-                control_row,
-                text=self.t("batch_select_all_import"),
-                variable=self.batch_select_all_import,
-                command=self.set_all_batch_imports,
-            ).pack(side=LEFT)
-        header = Frame(self.batch_conflicts_body)
-        header.pack(fill=X, pady=(0, 2))
-        Label(header, text="", width=11, anchor="w").pack(side=LEFT, padx=(0, 4))
-        Label(header, text=self.t("batch_import"), width=8, anchor="center").pack(side=LEFT, padx=(0, 4))
-        Label(header, text=self.t("batch_overwrite"), width=9, anchor="center").pack(side=LEFT, padx=(0, 4))
-        Label(header, text="", width=10, anchor="w").pack(side=RIGHT, padx=(4, 0))
-        Label(header, text=self.t("preview"), anchor="w").pack(side=LEFT, fill=X, expand=True)
+            if importable_count:
+                Checkbutton(
+                    control_row,
+                    text=self.t("batch_select_all_import"),
+                    variable=self.batch_select_all_import,
+                    command=self.set_all_batch_imports,
+                ).pack(side=LEFT)
+            if overwritable_count:
+                Checkbutton(
+                    control_row,
+                    text=self.t("batch_select_all_overwrite"),
+                    variable=self.batch_select_all_overwrite,
+                    command=self.set_all_batch_overwrites,
+                ).pack(side=LEFT, padx=(12, 0))
         for item in items:
             row = Frame(self.batch_conflicts_body)
             row.pack(fill=X, pady=2)
@@ -4430,29 +4441,36 @@ class ServerDialog:
                 label += f" ({match_label})"
             import_var = BooleanVar(value=item.get("status") == "NEW")
             overwrite_var = BooleanVar(value=False) if item.get("can_overwrite") else None
-            Label(row, text=item.get("status") or "", anchor="w", width=11).pack(side=LEFT, padx=(0, 4))
-            import_state = "normal" if item.get("status") == "NEW" else "disabled"
-            import_check = Checkbutton(row, text="", variable=import_var, state=import_state)
-            import_check.pack(side=LEFT, padx=(0, 4))
-            import_check.configure(width=8)
+
+            actions = Frame(row)
+            actions.pack(side=RIGHT, padx=(8, 0))
+
+            overwrite_slot = Frame(actions, width=108)
+            overwrite_slot.pack(side=LEFT)
+            overwrite_slot.pack_propagate(False)
             if overwrite_var is not None:
-                overwrite_check = Checkbutton(row, text="", variable=overwrite_var)
-                overwrite_check.pack(side=LEFT, padx=(0, 4))
-                overwrite_check.configure(width=9)
+                overwrite_check = Checkbutton(overwrite_slot, text=self.t("batch_overwrite"), variable=overwrite_var, anchor="w")
+                overwrite_check.pack(fill=X)
 
                 def on_overwrite_changed(*_args, include=import_var, overwrite=overwrite_var) -> None:
                     if overwrite.get():
                         include.set(False)
 
                 overwrite_var.trace_add("write", on_overwrite_changed)
-            else:
-                Label(row, text="", width=9).pack(side=LEFT, padx=(0, 4))
+
+            import_slot = Frame(actions, width=88)
+            import_slot.pack(side=LEFT)
+            import_slot.pack_propagate(False)
+            import_state = "normal" if item.get("status") == "NEW" else "disabled"
+            import_check = Checkbutton(import_slot, text=self.t("batch_import"), variable=import_var, state=import_state, anchor="w")
+            import_check.pack(fill=X)
+
             Button(
-                row,
+                actions,
                 text=self.t("batch_details"),
                 command=lambda current=item, include=import_var, overwrite=overwrite_var: self.show_batch_item_details(current, include, overwrite),
-            ).pack(side=RIGHT, padx=(4, 0))
-            Label(row, text=label, anchor="w").pack(side=LEFT, fill=X, expand=True)
+            ).pack(side=LEFT, padx=(4, 0))
+            Label(row, text=label, anchor="w", width=42).pack(side=LEFT, fill=X, expand=True)
 
             def on_import_changed(*_args, include=import_var, overwrite=overwrite_var) -> None:
                 if overwrite is not None and include.get():
@@ -4593,11 +4611,7 @@ class ServerDialog:
         star = self.required_stars.get(key)
         if not star:
             return
-        if visible:
-            if not star.winfo_manager():
-                star.pack(side=LEFT, padx=(2, 0))
-        else:
-            star.pack_forget()
+        star.configure(text="*" if visible else "")
 
     def update_required_stars(self) -> None:
         single_config = self.source.get() != "ssh_config_batch"
