@@ -30,6 +30,11 @@ class StartupErrorTests(unittest.TestCase):
         self.assertIn("schtasks", display)
         self.assertIn("SSHMountMate.exe", display)
 
+    def test_startup_all_command_uses_headless_batch_argument(self):
+        command = gui.startup_all_command()
+
+        self.assertIn("--mount-startup-all", command)
+
 
 if __name__ == "__main__":
     unittest.main()

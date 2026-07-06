@@ -1113,6 +1113,17 @@ def mount_status_with_processes(server: dict, processes: dict[int, str]) -> str:
     )
 
 
+def batch_statuses_for_servers(servers: list[dict]) -> dict[str, str]:
+    processes = running_rclone_processes()
+    statuses: dict[str, str] = {}
+    for server in servers:
+        server_id = server.get("id", "")
+        if not server_id:
+            continue
+        statuses[server_id] = mount_status_with_processes(server, processes)
+    return statuses
+
+
 def verified_mount_status(server: dict) -> str:
     return mount_status_with_processes(server, running_rclone_processes())
 
@@ -2218,6 +2229,13 @@ def startup_command(server_id: str) -> str:
     return f'"{pythonw}" "{Path(__file__).resolve()}" --mount-id "{server_id}"'
 
 
+def startup_all_command() -> str:
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}" --mount-startup-all'
+    pythonw = shutil.which("pythonw.exe") or shutil.which("python.exe") or "python"
+    return f'"{pythonw}" "{Path(__file__).resolve()}" --mount-startup-all'
+
+
 def startup_supported() -> bool:
     return os.name == "nt" or sys.platform == "darwin"
 
@@ -2328,6 +2346,27 @@ def disable_macos_startup(server: dict) -> None:
         path.unlink(missing_ok=True)
 
 
+WINDOWS_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+WINDOWS_STARTUP_VALUE = "SSHMountMate"
+
+
+def set_windows_startup_all(enabled: bool) -> None:
+    if os.name != "nt":
+        return
+    try:
+        import winreg
+    except ImportError as exc:
+        raise RuntimeError("Windows registry support is unavailable.") from exc
+    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, WINDOWS_RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+        if enabled:
+            winreg.SetValueEx(key, WINDOWS_STARTUP_VALUE, 0, winreg.REG_SZ, startup_all_command())
+        else:
+            try:
+                winreg.DeleteValue(key, WINDOWS_STARTUP_VALUE)
+            except FileNotFoundError:
+                pass
+
+
 def startup_setup_log_path() -> Path:
     return rsshmount.app_state_dir() / "startup-setup.log"
 
@@ -2347,8 +2386,7 @@ def enable_startup(server: dict) -> None:
         return
     if os.name != "nt":
         return
-    task_name = f"SSHMountMate-{server['id']}"
-    run(["schtasks", "/Create", "/TN", task_name, "/SC", "ONLOGON", "/TR", startup_command(server["id"]), "/F"], capture=True)
+    set_windows_startup_all(True)
 
 
 def disable_startup(server: dict) -> None:
@@ -2357,8 +2395,7 @@ def disable_startup(server: dict) -> None:
         return
     if os.name != "nt":
         return
-    task_name = f"SSHMountMate-{server['id']}"
-    subprocess.run(["schtasks", "/Delete", "/TN", task_name, "/F"], text=True, creationflags=create_no_window())
+    set_windows_startup_all(False)
 
 
 def headless_mount(server_id: str) -> int:
@@ -2374,6 +2411,39 @@ def headless_mount(server_id: str) -> int:
         pid = int(state.get("pid") or 0)
         while pid and pid_is_running(pid):
             time.sleep(30)
+    return 0
+
+
+def headless_mount_all() -> int:
+    servers = load_servers()
+    if not servers:
+        return 0
+    rclone = resolve_rclone_path()
+    if not rclone:
+        return 3
+    settings = load_settings()
+    workers = bounded_int(settings.get("mount_all_workers"), DEFAULT_MOUNT_ALL_WORKERS)
+    statuses = batch_statuses_for_servers(servers)
+    targets = [server for server in servers if statuses.get(server.get("id", "")) != "mounted"]
+    errors: list[str] = []
+
+    def run_one(server: dict) -> None:
+        mount_server(server, rclone)
+
+    if targets:
+        with ThreadPoolExecutor(max_workers=max(1, min(workers, len(targets)))) as executor:
+            futures = {executor.submit(run_one, server): server for server in targets}
+            for future in as_completed(futures):
+                server = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    errors.append(f"{server.get('name') or server.get('id')}: {exc}")
+
+    if errors:
+        log_path = append_startup_setup_log("Startup mount errors:\n" + "\n\n".join(errors))
+        print(f"Some startup mounts failed. See: {log_path}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -2975,7 +3045,10 @@ class App:
         if not startup_supported():
             return
         errors: list[str] = []
-        for server in self.servers:
+        targets = self.servers
+        if os.name == "nt":
+            targets = [self.servers[0] if self.servers else {"id": "all", "name": "All configs"}]
+        for server in targets:
             try:
                 if enabled:
                     enable_startup(server)
@@ -3141,14 +3214,7 @@ class App:
             self.show_error(str(exc))
 
     def batch_statuses(self, servers: list[dict]) -> dict[str, str]:
-        processes = running_rclone_processes()
-        statuses: dict[str, str] = {}
-        for server in servers:
-            server_id = server.get("id", "")
-            if not server_id:
-                continue
-            statuses[server_id] = mount_status_with_processes(server, processes)
-        return statuses
+        return batch_statuses_for_servers(servers)
 
     def finish_batch_operation(self, count: int, done: int, errors: list[str]) -> None:
         self.batch_operation_running = False
@@ -3266,14 +3332,7 @@ class App:
                 changed_results.append(result)
             save_servers(self.servers)
             if load_settings().get("startup_all"):
-                startup_errors: list[str] = []
-                for result in changed_results:
-                    try:
-                        enable_startup(result)
-                    except Exception as exc:
-                        startup_errors.append(self.format_startup_error(result, True, exc))
-                if startup_errors:
-                    self.report_startup_errors(startup_errors)
+                self.apply_startup_setting(True)
             if len(changed_results) > 1:
                 self.status.set(self.t("imported_configs", count=len(changed_results)))
             self.refresh_list()
@@ -4230,6 +4289,7 @@ def main() -> int:
     parser.add_argument("--licenses", action="store_true", help="Print bundled third-party notices and licenses and exit.")
     parser.add_argument("--check-update", action="store_true", help="Check the latest GitHub release and exit.")
     parser.add_argument("--mount-id")
+    parser.add_argument("--mount-startup-all", action="store_true", help="Mount all saved configs and exit.")
     args = parser.parse_args(ignore_macos_launchservice_args(sys.argv[1:]))
     if args.install_help:
         print(manual_install_text())
@@ -4246,6 +4306,8 @@ def main() -> int:
             return 1
     if args.mount_id:
         return headless_mount(args.mount_id)
+    if args.mount_startup_all:
+        return headless_mount_all()
     root = Tk()
     App(root)
     root.mainloop()
