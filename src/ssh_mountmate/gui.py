@@ -2601,6 +2601,10 @@ class App:
         self.refresh_generation = 0
         self.card_action_columns = 4
         self.resize_refresh_pending = False
+        self.last_cards_width = 0
+        self.card_widgets: dict[str, dict] = {}
+        self.card_order: tuple[str, ...] = ()
+        self.cards_placeholder = None
         self.batch_operation_running = False
         self.active_server_operations: set[str] = set()
         self.server_operation_lock = threading.Lock()
@@ -2703,34 +2707,53 @@ class App:
             self.active_server_operations.discard(server_id)
 
     def refresh_list(self) -> None:
-        for child in self.cards_frame.winfo_children():
-            child.destroy()
         if not self.configs_loaded:
-            Label(
-                self.cards_frame,
-                text=self.t("loading_configs"),
-                bg="#202020",
-                fg="#bdbdbd",
-                font=("Segoe UI", 11),
-                pady=26,
-            ).pack(fill=X)
+            self.show_cards_placeholder(self.t("loading_configs"))
             return
         if not self.servers:
-            Label(
+            self.show_cards_placeholder(self.t("no_configs"))
+            return
+        self.hide_cards_placeholder()
+        current_ids = tuple(server.get("id", "") for server in self.servers if server.get("id", ""))
+        for server_id, widgets in list(self.card_widgets.items()):
+            if server_id not in current_ids:
+                widgets["row"].destroy()
+                self.card_widgets.pop(server_id, None)
+        reorder = current_ids != self.card_order
+        for server in self.servers:
+            server_id = server.get("id", "")
+            if not server_id:
+                continue
+            if server_id not in self.card_widgets:
+                self.card_widgets[server_id] = self.create_server_card()
+                reorder = True
+            status = self.mount_status_cache.get(server_id, "checking")
+            capacity = self.capacity_cache.get(server_id, {})
+            self.update_server_card(self.card_widgets[server_id], server, status, capacity)
+        if reorder:
+            for server_id in current_ids:
+                self.card_widgets[server_id]["row"].pack_forget()
+                self.card_widgets[server_id]["row"].pack(fill=X, pady=4)
+        self.card_order = current_ids
+
+    def show_cards_placeholder(self, text: str) -> None:
+        for widgets in self.card_widgets.values():
+            widgets["row"].pack_forget()
+        if self.cards_placeholder is None:
+            self.cards_placeholder = Label(
                 self.cards_frame,
-                text=self.t("no_configs"),
                 bg="#202020",
                 fg="#bdbdbd",
                 font=("Segoe UI", 11),
                 pady=26,
-            ).pack(fill=X)
-            return
-        for server in self.servers:
-            server_id = server.get("id", "")
-            status = self.mount_status_cache.get(server_id, "checking")
-            capacity = self.capacity_cache.get(server_id, {})
-            self.add_server_card(server, status, capacity)
-        self.bind_cards_mousewheel_recursive(self.cards_frame)
+            )
+            self.bind_cards_mousewheel_recursive(self.cards_placeholder)
+        self.cards_placeholder.configure(text=text)
+        self.cards_placeholder.pack(fill=X)
+
+    def hide_cards_placeholder(self) -> None:
+        if self.cards_placeholder is not None:
+            self.cards_placeholder.pack_forget()
 
     def reload_configs_async(self) -> None:
         self.status.set(self.t("loading_configs"))
@@ -2922,6 +2945,7 @@ class App:
             delta = getattr(event, "delta", 0)
             direction = -1 if delta > 0 else 1
         self.cards_canvas.yview_scroll(direction, "units")
+        self.cards_canvas.update_idletasks()
 
     def action_button_columns_for_width(self, width: int | None = None) -> int:
         width = width or self.cards_canvas.winfo_width() or self.root.winfo_width()
@@ -2931,6 +2955,9 @@ class App:
 
     def on_cards_canvas_configure(self, event) -> None:
         self.cards_canvas.itemconfigure(self.cards_window, width=event.width)
+        if abs(event.width - self.last_cards_width) < 8:
+            return
+        self.last_cards_width = event.width
         columns = self.action_button_columns_for_width(event.width)
         if columns == self.card_action_columns:
             return
@@ -2950,27 +2977,68 @@ class App:
         for child in widget.winfo_children():
             self.bind_cards_mousewheel_recursive(child)
 
-    def add_server_card(self, server: dict, status: str = "checking", capacity: dict | None = None) -> None:
-        mounted = status == "mounted"
-        row_bg = "#2a2a2a" if mounted else "#242424"
-        muted = "#7d7d7d"
-        fg = "#f1f1f1" if mounted else "#bdbdbd"
-
-        row = Frame(self.cards_frame, bg=row_bg, padx=12, pady=10)
-        row.pack(fill=X, pady=4)
-
-        left = Frame(row, bg=row_bg, width=90)
+    def create_server_card(self) -> dict:
+        row = Frame(self.cards_frame, bg="#242424", padx=12, pady=10)
+        left = Frame(row, bg="#242424", width=90)
         left.pack(side=LEFT, fill="y")
-        Label(left, text="🛡", bg=row_bg, fg=fg, font=("Segoe UI Emoji", 28)).pack(anchor="w")
-        Label(left, text=self.status_text(status), bg=row_bg, fg=muted, font=(FONT_FAMILY_ZH if self.lang == "zh" else FONT_FAMILY_EN, 9)).pack(anchor="w", pady=(6, 0))
+        icon = Label(left, text="🛡", bg="#242424", fg="#bdbdbd", font=("Segoe UI Emoji", 28))
+        icon.pack(anchor="w")
+        status_label = Label(left, bg="#242424", fg="#7d7d7d", font=(FONT_FAMILY_ZH if self.lang == "zh" else FONT_FAMILY_EN, 9))
+        status_label.pack(anchor="w", pady=(6, 0))
 
-        actions = Frame(row, bg=row_bg)
+        actions = Frame(row, bg="#242424")
         actions.pack(side=RIGHT, anchor="e")
         for column in range(4):
             actions.grid_columnconfigure(column, minsize=42 if column < self.card_action_columns else 0)
 
-        mid = Frame(row, bg=row_bg, padx=0)
+        mid = Frame(row, bg="#242424", padx=0)
         mid.pack(side=LEFT, fill=BOTH, expand=True, padx=(0, 18))
+        font_family = FONT_FAMILY_ZH if self.lang == "zh" else FONT_FAMILY_EN
+        title = Label(mid, bg="#242424", fg="#bdbdbd", font=(font_family, 13, "bold"), anchor="w")
+        title.pack(anchor="w", fill=X)
+        capacity_label = Label(mid, bg="#242424", fg="#c8c8c8", font=(font_family, 10), anchor="w")
+        capacity_label.pack(anchor="w", fill=X)
+        capacity_bar = self.capacity_bar(mid, None, "#242424", "#7d7d7d")
+        capacity_bar.pack(fill=X, pady=(5, 4))
+        user_host = Label(mid, bg="#242424", fg="#7d7d7d", font=(font_family, 10), anchor="e")
+        user_host.pack(anchor="e", fill=X)
+        remote_path = Label(mid, bg="#242424", fg="#7d7d7d", font=(font_family, 10), anchor="e")
+        remote_path.pack(anchor="e", fill=X)
+
+        buttons: list[Button] = []
+        for _index in range(4):
+            button = Button(actions, width=3, height=1, font=("Segoe UI Emoji", 14))
+            buttons.append(button)
+        widgets = {
+            "row": row,
+            "left": left,
+            "icon": icon,
+            "status": status_label,
+            "actions": actions,
+            "mid": mid,
+            "title": title,
+            "capacity_label": capacity_label,
+            "capacity_bar": capacity_bar,
+            "user_host": user_host,
+            "remote_path": remote_path,
+            "buttons": buttons,
+        }
+        self.bind_cards_mousewheel_recursive(row)
+        return widgets
+
+    def update_server_card(self, widgets: dict, server: dict, status: str = "checking", capacity: dict | None = None) -> None:
+        mounted = status == "mounted"
+        row_bg = "#2a2a2a" if mounted else "#242424"
+        muted = "#7d7d7d"
+        fg = "#f1f1f1" if mounted else "#bdbdbd"
+        for key in ("row", "left", "actions", "mid", "icon", "status", "title", "capacity_label", "user_host", "remote_path"):
+            widgets[key].configure(bg=row_bg)
+        widgets["icon"].configure(fg=fg)
+        widgets["status"].configure(text=self.status_text(status), fg=muted)
+        actions = widgets["actions"]
+        for column in range(4):
+            actions.grid_columnconfigure(column, minsize=42 if column < self.card_action_columns else 0)
+
         drive = display_mountpoint_for_status(server, status)
         capacity = capacity or {}
         if mounted and capacity:
@@ -2985,11 +3053,11 @@ class App:
         font_family = FONT_FAMILY_ZH if self.lang == "zh" else FONT_FAMILY_EN
         reserved_width = 210 if self.card_action_columns == 2 else 260
         text_width = max(18, min(64, (self.cards_canvas.winfo_width() - reserved_width) // 8))
-        Label(mid, text=f"{drive}  {server.get('name') or server.get('id')}", bg=row_bg, fg=fg, font=(font_family, 13, "bold"), anchor="w", width=text_width).pack(anchor="w", fill=X)
-        Label(mid, text=capacity_label, bg=row_bg, fg="#c8c8c8", font=(font_family, 10), anchor="w", width=text_width).pack(anchor="w", fill=X)
-        self.capacity_bar(mid, int(capacity.get("percent", 0)) if mounted and capacity else None, row_bg, muted).pack(fill=X, pady=(5, 4))
-        Label(mid, text=f"{server.get('user', '')}@{server.get('host', '')}", bg=row_bg, fg=muted, font=(font_family, 10), anchor="e", width=text_width).pack(anchor="e", fill=X)
-        Label(mid, text=server.get("remote_path") or "~", bg=row_bg, fg=muted, font=(font_family, 10), anchor="e", width=text_width).pack(anchor="e", fill=X)
+        widgets["title"].configure(text=f"{drive}  {server.get('name') or server.get('id')}", fg=fg, width=text_width)
+        widgets["capacity_label"].configure(text=capacity_label, width=text_width)
+        self.update_capacity_bar(widgets["capacity_bar"], int(capacity.get("percent", 0)) if mounted and capacity else None, row_bg, muted)
+        widgets["user_host"].configure(text=f"{server.get('user', '')}@{server.get('host', '')}", fg=muted, width=text_width)
+        widgets["remote_path"].configure(text=server.get("remote_path") or "~", fg=muted, width=text_width)
         operation_active = self.is_server_operation_active(server)
         can_change_mount = not operation_active
         mount_tooltip = self.t("operation_busy") if operation_active else self.t("unmount") if mounted else self.t("mount")
@@ -3001,34 +3069,56 @@ class App:
         ]
         columns = self.card_action_columns
         for index, (text, tooltip, command, enabled) in enumerate(buttons):
-            self.icon_button(actions, text, tooltip, command, enabled=enabled).grid(row=index // columns, column=index % columns, padx=2, pady=2)
+            button = widgets["buttons"][index]
+            self.configure_icon_button(button, text, tooltip, command, enabled=enabled)
+            button.grid(row=index // columns, column=index % columns, padx=2, pady=2)
 
     def icon_button(self, parent, text: str, tooltip: str, command, *, enabled: bool = True):
         button = Button(parent, text=text, width=3, height=1, command=command, font=("Segoe UI Emoji", 14))
-        if not enabled:
-            button.configure(fg="#777777", command=lambda: None)
-        Tooltip(button, tooltip)
+        self.configure_icon_button(button, text, tooltip, command, enabled=enabled)
         return button
+
+    def configure_icon_button(self, button: Button, text: str, tooltip: str, command, *, enabled: bool = True) -> None:
+        button.configure(text=text, fg="#000000" if enabled else "#777777", command=command if enabled else lambda: None)
+        tip = getattr(button, "_ssh_mountmate_tooltip", None)
+        if tip is None:
+            tip = Tooltip(button, tooltip)
+            button._ssh_mountmate_tooltip = tip
+        else:
+            tip.text = tooltip
 
     def capacity_bar(self, parent, percent: int | None, bg: str, muted: str) -> Canvas:
         canvas = Canvas(parent, height=8, bg=bg, highlightthickness=0)
+        canvas._ssh_mountmate_percent = percent
+        canvas._ssh_mountmate_muted = muted
 
         def redraw(event=None) -> None:
-            width = max(canvas.winfo_width(), 1)
-            height = 8
-            canvas.delete("all")
-            canvas.create_rectangle(0, 0, width, height, fill="#3a3a3a", outline="")
-            if percent is None:
-                canvas.create_rectangle(0, 0, width, height, fill="#303030", outline="")
-                return
-            fill_width = int(width * max(0, min(percent, 100)) / 100)
-            color = "#52b788" if percent < 80 else "#f0b429" if percent < 92 else "#e55353"
-            canvas.create_rectangle(0, 0, fill_width, height, fill=color, outline="")
-            canvas.create_line(0, height - 1, width, height - 1, fill=muted)
+            self.draw_capacity_bar(canvas)
 
         canvas.bind("<Configure>", redraw)
         canvas.after_idle(redraw)
         return canvas
+
+    def update_capacity_bar(self, canvas: Canvas, percent: int | None, bg: str, muted: str) -> None:
+        canvas.configure(bg=bg)
+        canvas._ssh_mountmate_percent = percent
+        canvas._ssh_mountmate_muted = muted
+        self.draw_capacity_bar(canvas)
+
+    def draw_capacity_bar(self, canvas: Canvas) -> None:
+        percent = getattr(canvas, "_ssh_mountmate_percent", None)
+        muted = getattr(canvas, "_ssh_mountmate_muted", "#7d7d7d")
+        width = max(canvas.winfo_width(), 1)
+        height = 8
+        canvas.delete("all")
+        canvas.create_rectangle(0, 0, width, height, fill="#3a3a3a", outline="")
+        if percent is None:
+            canvas.create_rectangle(0, 0, width, height, fill="#303030", outline="")
+            return
+        fill_width = int(width * max(0, min(percent, 100)) / 100)
+        color = "#52b788" if percent < 80 else "#f0b429" if percent < 92 else "#e55353"
+        canvas.create_rectangle(0, 0, fill_width, height, fill=color, outline="")
+        canvas.create_line(0, height - 1, width, height - 1, fill=muted)
 
     def check_dependencies_async(self) -> None:
         if self.dependency_checking:
