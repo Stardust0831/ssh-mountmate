@@ -55,7 +55,7 @@ ACTION_BUTTON_FONT_FAMILY_ZH = "Microsoft YaHei UI"
 ACTION_BUTTON_FONT_WEIGHT = "normal"
 CHECKBUTTON_FONT_SIZE = 11
 CHECKBOX_SIZE = 28
-HELP_ICON_SIZE = 36
+HELP_ICON_SIZE = 42
 HELP_ICON_FONT_SIZE = 9
 CAPACITY_BAR_HEIGHT = 26
 TEXT_BUTTON_PADX = 9
@@ -166,6 +166,7 @@ TEXT = {
         "checking_capacity": "checking capacity",
         "unknown_capacity": "unknown capacity",
         "capacity_used": "{used} / {total} used ({percent}%)",
+        "full_local_path": "Full local path",
         "mounted_status": "mounted",
         "stopped_status": "stopped",
         "stale_status": "stopped",
@@ -324,6 +325,7 @@ TEXT = {
         "checking_capacity": "正在检查容量",
         "unknown_capacity": "容量未知",
         "capacity_used": "已用 {used} / {total}（{percent}%）",
+        "full_local_path": "完整本地路径",
         "mounted_status": "已挂载",
         "stopped_status": "未挂载",
         "stale_status": "未挂载",
@@ -1623,15 +1625,11 @@ def display_remote_path(remote_path: str) -> str:
     return f"$HOME/{value.strip('/')}"
 
 
-def capacity_display_path(server: dict, status: str, capacity: dict | None = None) -> str:
-    source = (capacity or {}).get("source")
-    if source in {"lustre_project_quota", "rclone_about"}:
-        return display_remote_path(server.get("remote_path") or "")
-    if status == "mounted" or source == "local_mountpoint":
-        mountpoint = current_state(server).get("mountpoint") or current_mountpoint(server)
-        if mountpoint:
-            return disk_usage_path(str(mountpoint))
-    return display_remote_path(server.get("remote_path") or "")
+def local_mount_display_path(server: dict, status: str) -> str:
+    mountpoint = display_mountpoint_for_status(server, status)
+    if not mountpoint or mountpoint == "Auto":
+        return "Auto"
+    return disk_usage_path(str(mountpoint))
 
 
 def shorten_middle_text(text: str, limit: int) -> str:
@@ -3015,7 +3013,7 @@ class Tooltip:
 
 def help_icon(parent, text: str):
     icon = Canvas(parent, width=HELP_ICON_SIZE, height=HELP_ICON_SIZE, highlightthickness=0, cursor="question_arrow")
-    padding = 5
+    padding = 3
     center = HELP_ICON_SIZE // 2
     icon.create_oval(padding, padding, HELP_ICON_SIZE - padding, HELP_ICON_SIZE - padding, outline="#555555", width=2)
     icon.create_text(center, center, text="?", fill="#333333", font=("Segoe UI", HELP_ICON_FONT_SIZE, "normal"))
@@ -3489,14 +3487,18 @@ class App:
         font_family = FONT_FAMILY_ZH if self.lang == "zh" else FONT_FAMILY_EN
         header = Frame(mid, bg="#242424")
         header.pack(fill=X)
-        title = Label(header, bg="#242424", fg="#bdbdbd", font=(font_family, CARD_TITLE_FONT_SIZE, "bold"), anchor="w")
-        title.pack(side=LEFT, fill=X, expand=True)
         user_host = Label(header, bg="#242424", fg="#909090", font=(font_family, CARD_BODY_FONT_SIZE), anchor="e")
-        user_host.pack(side=RIGHT, padx=(12, 0))
+        user_host.pack(side=RIGHT, padx=(14, 0))
+        local_info = Frame(header, bg="#242424")
+        local_info.pack(side=LEFT, fill=X, expand=True)
+        title = Label(local_info, bg="#242424", fg="#bdbdbd", font=(font_family, CARD_TITLE_FONT_SIZE, "bold"), anchor="w")
+        title.pack(side=LEFT, fill=X, expand=True)
+        local_path_button = Button(local_info, text="…", width=2, height=1, font=(font_family, CARD_BODY_FONT_SIZE), padx=2, pady=0)
+        local_path_button.pack(side=LEFT, padx=(5, 0))
         capacity_bar = self.capacity_bar(mid, None, "#242424", "#7d7d7d")
         capacity_bar.pack(fill=X, pady=(6, 3))
-        capacity_label = Label(mid, bg="#242424", fg="#c8c8c8", font=(font_family, CARD_BODY_FONT_SIZE), anchor="e")
-        capacity_label.pack(anchor="e", fill=X)
+        capacity_label = Label(mid, bg="#242424", fg="#c8c8c8", font=(font_family, CARD_BODY_FONT_SIZE), anchor="w")
+        capacity_label.pack(anchor="w", fill=X)
 
         buttons: list[Button] = []
         for _index in range(4):
@@ -3510,7 +3512,9 @@ class App:
             "actions": actions,
             "mid": mid,
             "header": header,
+            "local_info": local_info,
             "title": title,
+            "local_path_button": local_path_button,
             "capacity_label": capacity_label,
             "capacity_bar": capacity_bar,
             "user_host": user_host,
@@ -3526,8 +3530,9 @@ class App:
         row_bg = "#2a2a2a" if mounted else "#242424"
         muted = "#909090"
         fg = "#f1f1f1" if mounted else "#bdbdbd"
-        for key in ("row", "left", "actions", "mid", "header", "icon", "status", "title", "capacity_label", "user_host"):
+        for key in ("row", "left", "actions", "mid", "header", "local_info", "icon", "status", "title", "capacity_label", "user_host"):
             self.configure_if_changed(widgets[key], bg=row_bg)
+        self.configure_if_changed(widgets["local_path_button"], bg=row_bg)
         self.configure_if_changed(widgets["icon"], fg=fg)
         self.configure_if_changed(widgets["status"], text=self.status_text(status), fg=muted)
         actions = widgets["actions"]
@@ -3536,7 +3541,6 @@ class App:
                 actions.grid_columnconfigure(column, minsize=42 if column < self.card_action_columns else 0)
             widgets["action_columns"] = self.card_action_columns
 
-        drive = display_mountpoint_for_status(server, status)
         capacity = capacity or {}
         if mounted and capacity:
             capacity_label = self.t(
@@ -3548,24 +3552,39 @@ class App:
         else:
             capacity_label = self.t("checking_capacity") if mounted else self.t("unknown_capacity")
         text_width = self.card_text_width()
-        if widgets.get("text_width") != text_width:
-            for key in ("title", "capacity_label", "user_host"):
-                self.configure_if_changed(widgets[key], width=text_width)
-            widgets["text_width"] = text_width
-        title_text = f"{drive}  {server.get('name') or server.get('id')}"
+        local_path_text = local_mount_display_path(server, status)
+        name_text = server.get("name") or server.get("id")
+        title_text = f"{local_path_text}  {name_text}"
         user_host_text = f"{server.get('user', '')}@{server.get('host', '')}"
-        capacity_path_text = capacity_display_path(server, status, capacity)
-        self.configure_if_changed(widgets["title"], text=shorten_middle_text(title_text, max(18, text_width)), fg=fg)
+        remote_path_text = display_remote_path(server.get("remote_path") or "")
+        title_limit = max(18, int(text_width * 0.72))
+        user_limit = max(16, int(text_width * 0.42))
+        if widgets.get("text_width") != text_width:
+            self.configure_if_changed(widgets["title"], width=title_limit)
+            self.configure_if_changed(widgets["capacity_label"], width=text_width)
+            self.configure_if_changed(widgets["user_host"], width=user_limit)
+            widgets["text_width"] = text_width
+        self.configure_if_changed(widgets["title"], text=shorten_middle_text(title_text, title_limit), fg=fg)
         self.set_tooltip(widgets["title"], title_text)
+        self.configure_if_changed(
+            widgets["local_path_button"],
+            fg="#cfcfcf" if local_path_text and local_path_text != "Auto" else "#777777",
+            activeforeground="#ffffff",
+            activebackground="#3a3a3a",
+            relief="flat",
+            text="…",
+            command=lambda path=local_path_text: self.show_full_local_path(path),
+        )
+        self.set_tooltip(widgets["local_path_button"], self.t("full_local_path") + f": {local_path_text}")
         self.configure_if_changed(widgets["capacity_label"], text=capacity_label)
         self.update_capacity_bar(
             widgets["capacity_bar"],
             int(capacity.get("percent", 0)) if mounted and capacity else None,
             row_bg,
             muted,
-            capacity_path_text,
+            remote_path_text,
         )
-        self.configure_if_changed(widgets["user_host"], text=shorten_middle_text(user_host_text, max(16, text_width // 2)), fg=muted)
+        self.configure_if_changed(widgets["user_host"], text=shorten_middle_text(user_host_text, user_limit), fg=muted)
         self.set_tooltip(widgets["user_host"], user_host_text)
         operation_active = self.is_server_operation_active(server)
         batch_busy = self.batch_operation_running
@@ -3623,6 +3642,27 @@ class App:
     def show_disabled_action(self, message: str) -> None:
         self.status.set(message)
         messagebox.showinfo(APP_TITLE, message)
+
+    def show_full_local_path(self, path: str) -> None:
+        content = path or "Auto"
+        window = Toplevel(self.root)
+        window.title(self.t("full_local_path"))
+        window.geometry("640x160")
+        frame = Frame(window, padx=12, pady=12)
+        frame.pack(fill=BOTH, expand=True)
+        text = Text(frame, height=3, wrap="word")
+        text.insert("1.0", content)
+        text.configure(state="disabled")
+        text.pack(fill=BOTH, expand=True)
+        buttons = Frame(frame)
+        buttons.pack(fill=X, pady=(10, 0))
+
+        def copy_path() -> None:
+            window.clipboard_clear()
+            window.clipboard_append(content)
+
+        text_button(buttons, self.lang, text=self.t("copy"), command=copy_path).pack(side=RIGHT)
+        text_button(buttons, self.lang, text=self.t("close"), command=window.destroy).pack(side=RIGHT, padx=(0, 6))
 
     def capacity_bar(self, parent, percent: int | None, bg: str, muted: str) -> Canvas:
         canvas = Canvas(parent, height=CAPACITY_BAR_HEIGHT, bg=bg, highlightthickness=0, cursor="sb_h_double_arrow")

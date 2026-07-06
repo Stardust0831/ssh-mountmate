@@ -87,19 +87,15 @@ class StartupErrorTests(unittest.TestCase):
     def test_shorten_middle_text_keeps_both_ends(self):
         self.assertEqual(gui.shorten_middle_text("/very/long/path/name", 12), "/ver.../name")
 
-    def test_capacity_display_path_uses_source_location(self):
+    def test_local_mount_display_path_uses_current_mountpoint(self):
         server = {"id": "server", "mountpoint": "Z:", "remote_path": "project/data"}
 
         original_current_state = gui.current_state
         try:
             gui.current_state = lambda _server: {"mountpoint": "Z:"}
             self.assertEqual(
-                gui.capacity_display_path(server, "mounted", {"source": "local_mountpoint"}),
+                gui.local_mount_display_path(server, "mounted"),
                 gui.disk_usage_path("Z:"),
-            )
-            self.assertEqual(
-                gui.capacity_display_path(server, "mounted", {"source": "lustre_project_quota"}),
-                "$HOME/project/data",
             )
         finally:
             gui.current_state = original_current_state
