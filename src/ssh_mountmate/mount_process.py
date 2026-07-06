@@ -152,7 +152,7 @@ def mount_status_from_state(
 
     if processes is not None and not allow_pid_fallback:
         return "stale"
-    if allow_pid_fallback and pid_is_running(pid):
+    if allow_pid_fallback and pid_is_running(pid, set(processes) if processes is not None else None):
         return "mounted" if ready is not False else "stale"
     return "stale"
 

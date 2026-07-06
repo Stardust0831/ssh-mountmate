@@ -55,6 +55,24 @@ class MountProcessTests(unittest.TestCase):
 
         self.assertEqual(status, "stale")
 
+    def test_mount_status_accepts_pid_fallback_when_command_line_is_unavailable(self):
+        state = {
+            "pid": 42,
+            "remote": "host:/data",
+            "mountpoint": "/mnt/data",
+            "log": "/tmp/host.log",
+        }
+        processes = {42: ""}
+
+        status = mount_process.mount_status_from_state(
+            state,
+            processes=processes,
+            mountpoint_ready=lambda _value: True,
+            allow_pid_fallback=True,
+        )
+
+        self.assertEqual(status, "mounted")
+
     def test_mount_status_accepts_matching_command_and_ready_mountpoint(self):
         state = {
             "pid": 42,

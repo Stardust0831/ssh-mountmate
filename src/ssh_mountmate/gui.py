@@ -1109,7 +1109,7 @@ def mount_status_with_processes(server: dict, processes: dict[int, str]) -> str:
         state,
         processes=processes,
         mountpoint_ready=mountpoint_ready,
-        allow_pid_fallback=os.name != "nt",
+        allow_pid_fallback=True,
     )
 
 
