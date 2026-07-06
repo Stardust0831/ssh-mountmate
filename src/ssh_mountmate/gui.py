@@ -51,13 +51,14 @@ DEFAULT_FONT_MIN_SIZE = 11
 SMALL_FONT_MIN_SIZE = 10
 ACTION_BUTTON_FONT_SIZE = 10
 CHECKBUTTON_FONT_SIZE = 11
-HELP_ICON_SIZE = 30
-HELP_ICON_FONT_SIZE = 13
+CHECKBOX_SIZE = 28
+HELP_ICON_SIZE = 36
+HELP_ICON_FONT_SIZE = 16
 CAPACITY_BAR_HEIGHT = 16
 TEXT_BUTTON_PADX = 9
 TEXT_BUTTON_PADY = 4
 CHECKBUTTON_PADX = 7
-CHECKBUTTON_PADY = 4
+CHECKBUTTON_PADY = 5
 BROWSE_BUTTON_WIDTH = 6
 BROWSE_BUTTON_PADX = 8
 BROWSE_BUTTON_PADY = 3
@@ -594,13 +595,126 @@ def text_button(parent, lang: str, **kwargs) -> Button:
     return apply_text_button_style(Button(parent, **kwargs), lang)
 
 
-def apply_checkbutton_style(button: Checkbutton, lang: str) -> Checkbutton:
-    button.configure(font=checkbutton_font(lang), padx=CHECKBUTTON_PADX, pady=CHECKBUTTON_PADY)
-    return button
+class StyledCheckbutton(Frame):
+    def __init__(self, parent, lang: str, **kwargs):
+        super().__init__(parent)
+        self.variable: BooleanVar = kwargs.pop("variable")
+        self.command = kwargs.pop("command", None)
+        self.text = kwargs.pop("text", "")
+        self.state = kwargs.pop("state", "normal")
+        self.anchor = kwargs.pop("anchor", "w")
+        self.width = kwargs.pop("width", None)
+        self.lang = lang
+        self.canvas = Canvas(
+            self,
+            width=CHECKBOX_SIZE,
+            height=CHECKBOX_SIZE,
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2",
+        )
+        self.canvas.pack(side=LEFT, padx=(CHECKBUTTON_PADX, 5), pady=CHECKBUTTON_PADY)
+        self.label = Label(
+            self,
+            text=self.text,
+            font=checkbutton_font(lang),
+            anchor=self.anchor,
+            cursor="hand2",
+            padx=0,
+            pady=0,
+        )
+        if self.width is not None:
+            try:
+                self.label.configure(width=self.width)
+            except Exception:
+                pass
+        self.label.pack(side=LEFT, fill=X)
+        self.variable.trace_add("write", self._on_variable_changed)
+        for widget in (self, self.canvas, self.label):
+            widget.bind("<Button-1>", self._toggle)
+            widget.bind("<space>", self._toggle)
+        self.redraw()
+
+    def _toggle(self, _event=None):
+        if self.state == "disabled":
+            return "break"
+        self.variable.set(not bool(self.variable.get()))
+        if self.command:
+            self.command()
+        return "break"
+
+    def _on_variable_changed(self, *_args) -> None:
+        self.redraw()
+
+    def configure(self, cnf=None, **kwargs):  # type: ignore[override]
+        if cnf:
+            kwargs.update(cnf)
+        redraw = False
+        if "state" in kwargs:
+            self.state = kwargs.pop("state")
+            redraw = True
+        if "text" in kwargs:
+            self.text = kwargs.pop("text")
+            self.label.configure(text=self.text)
+        if "command" in kwargs:
+            self.command = kwargs.pop("command")
+        if "width" in kwargs:
+            self.width = kwargs.pop("width")
+            self.label.configure(width=self.width)
+        if "anchor" in kwargs:
+            self.anchor = kwargs.pop("anchor")
+            self.label.configure(anchor=self.anchor)
+        if kwargs:
+            super().configure(**kwargs)
+        if redraw:
+            cursor = "" if self.state == "disabled" else "hand2"
+            for widget in (self.canvas, self.label):
+                widget.configure(cursor=cursor)
+            self.redraw()
+
+    config = configure
+
+    def redraw(self) -> None:
+        checked = bool(self.variable.get())
+        disabled = self.state == "disabled"
+        self.canvas.delete("all")
+        try:
+            bg = self.master.cget("bg")
+        except Exception:
+            bg = self.cget("bg")
+        super().configure(bg=bg)
+        self.canvas.configure(bg=bg)
+        self.label.configure(bg=bg, fg="#777777" if disabled else "#111111")
+        outline = "#9a9a9a" if disabled else "#444444"
+        fill = "#efefef" if disabled else "#ffffff"
+        pad = 4
+        self.canvas.create_rectangle(
+            pad,
+            pad,
+            CHECKBOX_SIZE - pad,
+            CHECKBOX_SIZE - pad,
+            fill=fill,
+            outline=outline,
+            width=2,
+        )
+        if checked:
+            color = "#777777" if disabled else "#0b67bd"
+            self.canvas.create_line(
+                8,
+                CHECKBOX_SIZE // 2,
+                CHECKBOX_SIZE // 2 - 1,
+                CHECKBOX_SIZE - 9,
+                CHECKBOX_SIZE - 7,
+                8,
+                fill=color,
+                width=4,
+                capstyle="round",
+                joinstyle="round",
+            )
 
 
-def styled_checkbutton(parent, lang: str, **kwargs) -> Checkbutton:
-    return apply_checkbutton_style(Checkbutton(parent, **kwargs), lang)
+def styled_checkbutton(parent, lang: str, **kwargs) -> StyledCheckbutton:
+    return StyledCheckbutton(parent, lang, **kwargs)
 
 
 def browse_button(parent, lang: str, **kwargs) -> Button:
@@ -2776,11 +2890,11 @@ class Tooltip:
             text=self.text,
             bg="#f7f7d0",
             fg="#222222",
-            padx=8,
-            pady=5,
-            font=("Segoe UI", 9),
+            padx=10,
+            pady=7,
+            font=("Segoe UI", 10),
             justify=LEFT,
-            wraplength=420,
+            wraplength=520,
         ).pack()
         self.tip.update_idletasks()
         widget_x = self.widget.winfo_rootx()
@@ -2809,10 +2923,10 @@ class Tooltip:
 
 def help_icon(parent, text: str):
     icon = Canvas(parent, width=HELP_ICON_SIZE, height=HELP_ICON_SIZE, highlightthickness=0, cursor="question_arrow")
-    padding = 4
+    padding = 5
     center = HELP_ICON_SIZE // 2
-    icon.create_oval(padding, padding, HELP_ICON_SIZE - padding, HELP_ICON_SIZE - padding, outline="#666666", width=1)
-    icon.create_text(center, center, text="?", fill="#444444", font=("Segoe UI", HELP_ICON_FONT_SIZE, "bold"))
+    icon.create_oval(padding, padding, HELP_ICON_SIZE - padding, HELP_ICON_SIZE - padding, outline="#555555", width=2)
+    icon.create_text(center, center, text="?", fill="#333333", font=("Segoe UI", HELP_ICON_FONT_SIZE, "bold"))
     Tooltip(icon, text)
     return icon
 
