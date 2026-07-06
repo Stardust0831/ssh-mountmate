@@ -43,6 +43,7 @@ FONT_FAMILY_EN = "Segoe UI"
 FONT_FAMILY_ZH = "Noto Sans CJK SC"
 CARD_TITLE_FONT_SIZE = 13
 CARD_BODY_FONT_SIZE = 11
+CARD_COMPACT_FONT_SIZE = 10
 CARD_STATUS_FONT_SIZE = 10
 CARD_ICON_FONT_SIZE = 28
 CARD_BUTTON_FONT_SIZE = 14
@@ -56,7 +57,7 @@ ACTION_BUTTON_FONT_WEIGHT = "normal"
 CHECKBUTTON_FONT_SIZE = 11
 CHECKBOX_SIZE = 28
 HELP_ICON_SIZE = 42
-HELP_ICON_FONT_SIZE = 9
+HELP_ICON_FONT_SIZE = 10
 CAPACITY_BAR_HEIGHT = 26
 TEXT_BUTTON_PADX = 9
 TEXT_BUTTON_PADY = 4
@@ -3487,13 +3488,13 @@ class App:
         font_family = FONT_FAMILY_ZH if self.lang == "zh" else FONT_FAMILY_EN
         header = Frame(mid, bg="#242424")
         header.pack(fill=X)
-        user_host = Label(header, bg="#242424", fg="#909090", font=(font_family, CARD_BODY_FONT_SIZE), anchor="e")
+        user_host = Label(header, bg="#242424", fg="#909090", font=(font_family, CARD_COMPACT_FONT_SIZE), anchor="e")
         user_host.pack(side=RIGHT, padx=(14, 0))
         local_info = Frame(header, bg="#242424")
         local_info.pack(side=LEFT, fill=X, expand=True)
-        title = Label(local_info, bg="#242424", fg="#bdbdbd", font=(font_family, CARD_TITLE_FONT_SIZE, "bold"), anchor="w")
+        title = Label(local_info, bg="#242424", fg="#bdbdbd", font=(font_family, CARD_COMPACT_FONT_SIZE, "bold"), anchor="w")
         title.pack(side=LEFT, fill=X, expand=True)
-        local_path_button = Button(local_info, text="…", width=2, height=1, font=(font_family, CARD_BODY_FONT_SIZE), padx=2, pady=0)
+        local_path_button = Button(local_info, text="…", width=2, height=1, font=(font_family, CARD_COMPACT_FONT_SIZE), padx=2, pady=0)
         local_path_button.pack(side=LEFT, padx=(5, 0))
         capacity_bar = self.capacity_bar(mid, None, "#242424", "#7d7d7d")
         capacity_bar.pack(fill=X, pady=(6, 3))
@@ -3751,14 +3752,14 @@ class App:
         height = max(CAPACITY_BAR_HEIGHT, canvas.winfo_height())
         fill_width = width if percent is None else int(width * max(0, min(percent, 100)) / 100)
         color = "#303030" if percent is None else "#52b788" if percent < 80 else "#f0b429" if percent < 92 else "#e55353"
-        path_font = (FONT_FAMILY_ZH if self.lang == "zh" else FONT_FAMILY_EN, CARD_BODY_FONT_SIZE, "bold")
+        path_font = (FONT_FAMILY_ZH if self.lang == "zh" else FONT_FAMILY_EN, CARD_COMPACT_FONT_SIZE, "bold")
         text_font = tkfont.Font(font=path_font)
         text_width = text_font.measure(path_text)
-        max_text_width = max(0, width - 18)
+        max_text_width = max(0, width - 14)
         max_offset = max(0, text_width - max_text_width)
         offset = max(0, min(getattr(canvas, "_ssh_mountmate_path_offset", 0), max_offset))
         canvas._ssh_mountmate_path_offset = offset
-        x = width - 9 - max(text_width, 0) + offset
+        x = width - 7 - max(text_width, 0) + offset
         y = height // 2
         draw_state = (width, height, percent, fill_width, color, muted, path_text, offset, text_width, self.lang)
         if getattr(canvas, "_ssh_mountmate_last_draw", None) == draw_state:
@@ -3771,7 +3772,7 @@ class App:
         if getattr(canvas, "_ssh_mountmate_path_text", None) is None:
             canvas._ssh_mountmate_path_shadow = [
                 canvas.create_text(x + dx, y + dy, text=path_text, fill="#111111", font=path_font, anchor="w")
-                for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1))
+                for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1))
             ]
             canvas._ssh_mountmate_path_text = canvas.create_text(x, y, text=path_text, fill="#ffffff", font=path_font, anchor="w")
         canvas.coords(canvas._ssh_mountmate_track, 0, 0, width, height)
@@ -3780,7 +3781,7 @@ class App:
         canvas.itemconfigure(canvas._ssh_mountmate_fill, fill=color, outline="")
         canvas.coords(canvas._ssh_mountmate_line, 0, height - 1, width, height - 1)
         canvas.itemconfigure(canvas._ssh_mountmate_line, fill=muted)
-        for item, (dx, dy) in zip(getattr(canvas, "_ssh_mountmate_path_shadow", []), ((-1, 0), (1, 0), (0, -1), (0, 1))):
+        for item, (dx, dy) in zip(getattr(canvas, "_ssh_mountmate_path_shadow", []), ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1))):
             canvas.coords(item, x + dx, y + dy)
             canvas.itemconfigure(item, text=path_text, fill="#111111", font=path_font)
             canvas.tag_raise(item)
