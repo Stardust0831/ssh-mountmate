@@ -42,10 +42,13 @@ LANGUAGE_CHOICES = {"auto": "Auto", "en": "English", "zh": "中文"}
 FONT_FAMILY_EN = "Segoe UI"
 FONT_FAMILY_ZH = "Noto Sans CJK SC"
 CARD_TITLE_FONT_SIZE = 13
-CARD_BODY_FONT_SIZE = 10
-CARD_STATUS_FONT_SIZE = 9
+CARD_BODY_FONT_SIZE = 11
+CARD_STATUS_FONT_SIZE = 10
 CARD_ICON_FONT_SIZE = 28
 CARD_BUTTON_FONT_SIZE = 14
+UI_SCALE_MULTIPLIER = 1.06
+DEFAULT_FONT_MIN_SIZE = 10
+SMALL_FONT_MIN_SIZE = 9
 RCLONE_CONFIG_LOCK = threading.RLock()
 DEFAULT_MOUNT_ALL_WORKERS = 4
 DEFAULT_UNMOUNT_ALL_WORKERS = 8
@@ -509,11 +512,39 @@ def load_embedded_chinese_font() -> bool:
         return False
 
 
+def enable_process_dpi_awareness() -> None:
+    if os.name != "nt":
+        return
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+def configure_ui_scaling(root: Tk) -> None:
+    try:
+        current = float(root.tk.call("tk", "scaling"))
+        root.tk.call("tk", "scaling", max(current, current * UI_SCALE_MULTIPLIER))
+    except Exception:
+        pass
+
+
 def configure_default_fonts(root: Tk, lang: str) -> None:
     family = FONT_FAMILY_ZH if lang == "zh" and load_embedded_chinese_font() else FONT_FAMILY_EN
     for name in ["TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont", "TkCaptionFont", "TkSmallCaptionFont"]:
         try:
-            tkfont.nametofont(name).configure(family=family)
+            font = tkfont.nametofont(name)
+            min_size = SMALL_FONT_MIN_SIZE if name == "TkSmallCaptionFont" else DEFAULT_FONT_MIN_SIZE
+            size = abs(int(font.cget("size") or min_size))
+            options = {"family": family, "size": max(size, min_size)}
+            if name in {"TkDefaultFont", "TkTextFont", "TkMenuFont", "TkSmallCaptionFont"}:
+                options["weight"] = "normal"
+            font.configure(**options)
         except Exception:
             pass
 
@@ -3168,7 +3199,7 @@ class App:
         left.pack(side=LEFT, fill="y")
         icon = Label(left, text="🛡", bg="#242424", fg="#bdbdbd", font=("Segoe UI Emoji", CARD_ICON_FONT_SIZE))
         icon.pack(anchor="w")
-        status_label = Label(left, bg="#242424", fg="#7d7d7d", font=(FONT_FAMILY_ZH if self.lang == "zh" else FONT_FAMILY_EN, CARD_STATUS_FONT_SIZE))
+        status_label = Label(left, bg="#242424", fg="#909090", font=(FONT_FAMILY_ZH if self.lang == "zh" else FONT_FAMILY_EN, CARD_STATUS_FONT_SIZE))
         status_label.pack(anchor="w", pady=(6, 0))
 
         actions = Frame(row, bg="#242424")
@@ -3185,9 +3216,9 @@ class App:
         capacity_label.pack(anchor="w", fill=X)
         capacity_bar = self.capacity_bar(mid, None, "#242424", "#7d7d7d")
         capacity_bar.pack(fill=X, pady=(5, 4))
-        user_host = Label(mid, bg="#242424", fg="#7d7d7d", font=(font_family, CARD_BODY_FONT_SIZE), anchor="e")
+        user_host = Label(mid, bg="#242424", fg="#909090", font=(font_family, CARD_BODY_FONT_SIZE), anchor="e")
         user_host.pack(anchor="e", fill=X)
-        remote_path = Label(mid, bg="#242424", fg="#7d7d7d", font=(font_family, CARD_BODY_FONT_SIZE), anchor="e")
+        remote_path = Label(mid, bg="#242424", fg="#909090", font=(font_family, CARD_BODY_FONT_SIZE), anchor="e")
         remote_path.pack(anchor="e", fill=X)
 
         buttons: list[Button] = []
@@ -3216,7 +3247,7 @@ class App:
     def update_server_card(self, widgets: dict, server: dict, status: str = "checking", capacity: dict | None = None) -> None:
         mounted = status == "mounted"
         row_bg = "#2a2a2a" if mounted else "#242424"
-        muted = "#7d7d7d"
+        muted = "#909090"
         fg = "#f1f1f1" if mounted else "#bdbdbd"
         for key in ("row", "left", "actions", "mid", "icon", "status", "title", "capacity_label", "user_host", "remote_path"):
             self.configure_if_changed(widgets[key], bg=row_bg)
@@ -4941,7 +4972,9 @@ def main() -> int:
         return headless_mount(args.mount_id)
     if args.mount_startup_all:
         return headless_mount_all()
+    enable_process_dpi_awareness()
     root = Tk()
+    configure_ui_scaling(root)
     App(root)
     root.mainloop()
     return 0
