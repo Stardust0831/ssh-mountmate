@@ -24,6 +24,7 @@ from tkinter import ttk
 
 from . import VERSION
 from . import core as rsshmount
+from . import mount_process
 from .notices import THIRD_PARTY_NOTICES
 from .paths import user_data_dir
 from .rclone import augment_process_path, install_managed_rclone, managed_rclone_path, manual_install_text
@@ -611,7 +612,7 @@ def resolve_rclone_path() -> str:
 
 
 def create_no_window() -> int:
-    return getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    return mount_process.create_no_window()
 
 
 def run(cmd: list[str], *, check=True, capture=False) -> subprocess.CompletedProcess:
@@ -1082,71 +1083,15 @@ def server_state_file(server: dict) -> Path:
 
 
 def running_pid_set() -> set[int]:
-    if os.name != "nt":
-        return set()
-    result = subprocess.run(
-        ["tasklist", "/FI", "IMAGENAME eq rclone.exe", "/FO", "CSV", "/NH"],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        creationflags=create_no_window(),
-    )
-    pids: set[int] = set()
-    for line in result.stdout.splitlines():
-        parts = [part.strip().strip('"') for part in line.split(",")]
-        if len(parts) > 1 and parts[1].isdigit():
-            pids.add(int(parts[1]))
-    return pids
+    return set(running_rclone_processes())
 
 
 def running_rclone_processes() -> dict[int, str]:
-    if os.name != "nt":
-        return {}
-    command = (
-        "Get-CimInstance Win32_Process -Filter \"Name='rclone.exe'\" | "
-        "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
-    )
-    result = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-Command", command],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        creationflags=create_no_window(),
-    )
-    try:
-        data = json.loads(result.stdout.strip() or "[]")
-    except json.JSONDecodeError:
-        return {}
-    if isinstance(data, dict):
-        data = [data]
-    processes: dict[int, str] = {}
-    for item in data:
-        try:
-            pid = int(item.get("ProcessId", 0))
-        except (TypeError, ValueError):
-            continue
-        if pid:
-            processes[pid] = str(item.get("CommandLine") or "")
-    return processes
+    return mount_process.running_rclone_processes()
 
 
 def pid_is_running(pid: int, pid_set: set[int] | None = None) -> bool:
-    if pid_set is not None:
-        return pid in pid_set
-    if os.name == "nt":
-        result = subprocess.run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            creationflags=create_no_window(),
-        )
-        return str(pid) in result.stdout
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+    return mount_process.pid_is_running(pid, pid_set)
 
 
 def mount_status(server: dict) -> str:
@@ -1155,10 +1100,9 @@ def mount_status(server: dict) -> str:
         return "stopped"
     try:
         state = json.loads(state_file.read_text(encoding="utf-8"))
-        pid = int(state.get("pid", 0))
     except Exception:
         return "stale"
-    return "mounted" if pid and pid_is_running(pid) else "stale"
+    return mount_process.mount_status_from_state(state, mountpoint_ready=mountpoint_ready, allow_pid_fallback=os.name != "nt")
 
 
 def mount_status_with_pids(server: dict, pid_set: set[int]) -> str:
@@ -1168,21 +1112,18 @@ def mount_status_with_pids(server: dict, pid_set: set[int]) -> str:
     try:
         state = json.loads(state_file.read_text(encoding="utf-8"))
         pid = int(state.get("pid", 0))
+        mountpoint = str(state.get("mountpoint") or "")
     except Exception:
         return "stale"
-    return "mounted" if pid and pid_is_running(pid, pid_set) else "stale"
+    return "mounted" if pid and pid in pid_set and mountpoint and mountpoint_ready(mountpoint) else "stale"
 
 
 def command_matches_state(command: str, state: dict) -> bool:
-    command = command.casefold()
-    expected = [state.get("remote", ""), state.get("mountpoint", ""), state.get("log", "")]
-    return all(str(value).casefold() in command for value in expected if value)
+    return mount_process.command_matches_state(command, state)
 
 
 def process_command(pid: int) -> str:
-    if os.name != "nt" or not pid:
-        return ""
-    return running_rclone_processes().get(pid, "")
+    return mount_process.process_command(pid)
 
 
 def mount_status_with_processes(server: dict, processes: dict[int, str]) -> str:
@@ -1191,19 +1132,18 @@ def mount_status_with_processes(server: dict, processes: dict[int, str]) -> str:
         return "stopped"
     try:
         state = json.loads(state_file.read_text(encoding="utf-8"))
-        pid = int(state.get("pid", 0))
     except Exception:
         return "stale"
-    command = processes.get(pid)
-    if not pid or not command:
-        return "stale"
-    return "mounted" if command_matches_state(command, state) else "stale"
+    return mount_process.mount_status_from_state(
+        state,
+        processes=processes,
+        mountpoint_ready=mountpoint_ready,
+        allow_pid_fallback=os.name != "nt",
+    )
 
 
 def verified_mount_status(server: dict) -> str:
-    if os.name == "nt":
-        return mount_status_with_processes(server, running_rclone_processes())
-    return mount_status(server)
+    return mount_status_with_processes(server, running_rclone_processes())
 
 
 def mountpoint_ready(mountpoint: str) -> bool:
@@ -1274,58 +1214,16 @@ def prepare_gui_mountpoint(mountpoint: str, *, home_mountpoint: bool = False) ->
     path.mkdir(parents=True, exist_ok=True)
 
 
-def wait_for_mount_ready(
-    proc: subprocess.Popen,
-    mountpoint: str,
-    log_path: Path,
-    expected_state: dict,
-    *,
-    ready_before_start: bool,
-    timeout: float = 20.0,
-) -> None:
-    deadline = time.time() + timeout
-    ready_since = 0.0
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            break
-        ready_now = mountpoint_ready(mountpoint)
-        if ready_before_start:
-            if not ready_now:
-                ready_before_start = False
-            time.sleep(0.25)
-            continue
-        if ready_now:
-            if not ready_since:
-                ready_since = time.time()
-            if time.time() - ready_since >= 0.75:
-                if os.name == "nt":
-                    command = process_command(proc.pid)
-                    if command and not command_matches_state(command, expected_state):
-                        break
-                return
-        else:
-            ready_since = 0.0
-        time.sleep(0.25)
-    if proc.poll() is None and ready_before_start:
-        try:
-            log_path.write_text(
-                log_path.read_text(encoding="utf-8", errors="ignore")
-                + f"\nMountpoint {mountpoint} already existed before this mount attempt.\n",
-                encoding="utf-8",
-            )
-        except OSError:
-            pass
-    if proc.poll() is None:
-        proc.terminate()
-        time.sleep(0.5)
-        if proc.poll() is None:
-            proc.kill()
-    tail = ""
-    try:
-        tail = "\n".join(log_path.read_text(encoding="utf-8", errors="ignore").splitlines()[-12:])
-    except OSError:
-        pass
-    raise RuntimeError(f"Mount did not become ready. See log: {log_path}\n{tail}")
+def wait_for_mount_ready(proc: subprocess.Popen, mountpoint: str, log_path: Path, expected_state: dict, *, ready_before_start: bool, timeout: float = 20.0) -> None:
+    mount_process.wait_for_mount_ready(
+        proc,
+        mountpoint,
+        log_path,
+        expected_state,
+        ready_before_start=ready_before_start,
+        mountpoint_ready=mountpoint_ready,
+        timeout=timeout,
+    )
 
 
 def current_mountpoint(server: dict) -> str:
@@ -2238,7 +2136,6 @@ def mount_server_locked(server: dict, rclone: str, *, verify_existing: bool = Tr
     if server.get("network_mode") and os.name == "nt" and rsshmount.is_windows_drive(mountpoint):
         cmd.append("--network-mode")
 
-    log = log_path.open("ab")
     flags = (
         getattr(subprocess, "DETACHED_PROCESS", 0)
         | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -2246,7 +2143,8 @@ def mount_server_locked(server: dict, rclone: str, *, verify_existing: bool = Tr
     )
     expected_state = {"remote": remote, "mountpoint": mountpoint, "log": str(log_path)}
     mountpoint_existed = mountpoint_ready(mountpoint)
-    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, creationflags=flags)
+    with log_path.open("ab") as log:
+        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, creationflags=flags)
     wait_for_mount_ready(proc, mountpoint, log_path, expected_state, ready_before_start=mountpoint_existed)
     state = {"pid": proc.pid, "server_id": server["id"], "remote": remote, "mountpoint": mountpoint, "log": str(log_path), "rc_addr": rc_addr}
     (state_dir / f"{server['id']}.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
@@ -2282,6 +2180,10 @@ def unmount_server_locked(server: dict) -> None:
     if not pid_is_running(pid_int):
         state_file.unlink(missing_ok=True)
         return
+    command = process_command(pid_int)
+    if command and not mount_process.command_matches_state(command, state, require_log=False):
+        state_file.unlink(missing_ok=True)
+        raise RuntimeError("Recorded PID no longer belongs to this mount. Removed stale state; the current process was not stopped.")
 
     mountpoint = state.get("mountpoint") or current_mountpoint(server)
     errors: list[str] = []
@@ -2317,11 +2219,11 @@ def unmount_server_locked(server: dict) -> None:
         raise RuntimeError("Failed to unmount mountpoint.\n" + "\n\n".join(errors))
 
     time.sleep(0.5)
-    if pid_is_running(pid_int):
+    if pid_is_running(pid_int) and mount_process.process_matches_state_for_kill(pid_int, state):
         try:
             os.kill(pid_int, 15)
             time.sleep(0.5)
-            if pid_is_running(pid_int):
+            if pid_is_running(pid_int) and mount_process.process_matches_state_for_kill(pid_int, state):
                 os.kill(pid_int, 9)
         except OSError:
             pass
@@ -2706,13 +2608,13 @@ class App:
         rclone = self.current_rclone()
 
         def worker() -> None:
-            processes = running_rclone_processes() if os.name == "nt" else None
+            processes = running_rclone_processes()
             statuses: dict[str, str] = {}
             for server in servers:
                 server_id = server.get("id", "")
                 if not server_id:
                     continue
-                status = mount_status_with_processes(server, processes) if processes is not None else mount_status(server)
+                status = mount_status_with_processes(server, processes)
                 statuses[server_id] = status
             self.root.after(0, lambda: self.apply_mount_statuses(generation, statuses))
 
@@ -3264,13 +3166,13 @@ class App:
             self.show_error(str(exc))
 
     def batch_statuses(self, servers: list[dict]) -> dict[str, str]:
-        processes = running_rclone_processes() if os.name == "nt" else None
+        processes = running_rclone_processes()
         statuses: dict[str, str] = {}
         for server in servers:
             server_id = server.get("id", "")
             if not server_id:
                 continue
-            statuses[server_id] = mount_status_with_processes(server, processes) if processes is not None else mount_status(server)
+            statuses[server_id] = mount_status_with_processes(server, processes)
         return statuses
 
     def finish_batch_operation(self, count: int, done: int, errors: list[str]) -> None:

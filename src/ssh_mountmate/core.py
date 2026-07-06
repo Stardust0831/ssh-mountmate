@@ -12,6 +12,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from . import mount_process
 from .rclone import augment_process_path
 
 
@@ -547,6 +548,19 @@ def prepare_mountpoint(mountpoint: Path) -> None:
     mountpoint.mkdir(parents=True, exist_ok=True)
 
 
+def mountpoint_ready(mountpoint: Path | str) -> bool:
+    path = Path(mountpoint)
+    value = str(path)
+    try:
+        if is_windows() and is_windows_drive(value):
+            return windows_drive_in_use(value)
+        if is_windows():
+            return path.exists()
+        return path.is_mount()
+    except OSError:
+        return False
+
+
 def cmd_list_hosts(args) -> None:
     config = Path(args.ssh_config or Path.home() / ".ssh" / "config").expanduser()
     if not config.exists():
@@ -638,20 +652,17 @@ def cmd_mount(args) -> None:
             return
 
         log_path = app_state_dir() / f"{args.host}.log"
-        log = log_path.open("ab")
         creationflags = (
             getattr(subprocess, "DETACHED_PROCESS", 0)
             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             | getattr(subprocess, "CREATE_NO_WINDOW", 0)
         )
         try:
-            proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, creationflags=creationflags)
+            mountpoint_existed = mountpoint_ready(mountpoint)
+            with log_path.open("ab") as log:
+                proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, creationflags=creationflags)
         except FileNotFoundError:
             die(f"command not found: {cmd[0]}")
-
-        time.sleep(2)
-        if proc.poll() is not None:
-            die(f"mount failed; see log: {log_path}", proc.returncode or 1)
 
         state = {
             "pid": proc.pid,
@@ -660,6 +671,17 @@ def cmd_mount(args) -> None:
             "mountpoint": str(mountpoint),
             "log": str(log_path),
         }
+        try:
+            mount_process.wait_for_mount_ready(
+                proc,
+                str(mountpoint),
+                log_path,
+                state,
+                ready_before_start=mountpoint_existed,
+                mountpoint_ready=lambda value: mountpoint_ready(Path(value)),
+            )
+        except RuntimeError as exc:
+            die(str(exc), proc.returncode or 1)
         pid_file(args.host).write_text(json.dumps(state, indent=2), encoding="utf-8")
         print(f"mounted {state['remote']} at {mountpoint} with pid {proc.pid}")
         return
