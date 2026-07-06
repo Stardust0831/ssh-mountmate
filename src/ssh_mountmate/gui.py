@@ -93,8 +93,8 @@ TEXT = {
         "buffer_size": "Buffer size",
         "language_help": "Auto uses Chinese on Chinese systems and English otherwise.",
         "cache_root_help": "Local folder used by rclone VFS cache. Put it on a fast disk with enough free space.",
-        "vfs_cache_mode_help": "VFS cache mode controls disk caching for mounted files.\noff: no VFS disk cache.\nminimal: cache only what rclone needs for basic compatibility.\nwrites: cache changed files before upload; this is the default recommendation.\nfull: cache reads and writes for best app compatibility, using more local disk.",
-        "max_cache_size_help": "Upper limit for the VFS cache folder.\nDefault means rclone does not enforce a size limit.\nIt does not disable VFS caching; use VFS cache mode = off for that.",
+        "vfs_cache_mode_help": "Controls local disk caching for mounted files.\noff: no VFS disk cache.\nminimal: cache only the data rclone needs for compatibility.\nwrites: cache changed files before upload; recommended for most mounts.\nfull: cache reads and writes for best app compatibility, using more local disk.",
+        "max_cache_size_help": "Upper limit for the VFS cache folder.\nDefault means rclone does not enforce a maximum size.\nThis does not disable caching; use VFS cache mode = off to disable the cache.",
         "max_cache_age_help": "How long cached objects may stay before rclone can evict them. Default is 1 hour.",
         "min_free_space_help": "Keep this much local disk space free for other applications.",
         "write_back_help": "Delay before changed files are written back to the server. Longer delays can smooth frequent small writes.",
@@ -103,8 +103,8 @@ TEXT = {
         "startup_all_help": "Creates or removes login-time mount jobs for all saved configs on supported platforms.",
         "startup_all_macos_note": "macOS login mount takes effect on the next login.",
         "startup_config_failed": "Some login mount jobs could not be updated. Details were written to: {path}",
-        "dependency_help": "Checks dependencies.\nrclone is bundled in releases.\nSystem mount dependencies may still be required.",
-        "updates_help": "Checks the latest SSH MountMate release on GitHub.\nShows the matching download for this platform.",
+        "dependency_help": "Checks whether rclone, the system mount driver, and OpenSSH are available. Release builds include rclone, but the platform mount driver may still need to be installed.",
+        "updates_help": "Checks the latest SSH MountMate release on GitHub and shows the download that matches this platform.",
         "logs_help": "Open recent rclone mount logs for a saved config. Useful for diagnosing failed mounts.",
         "licenses_help": "Show bundled third-party notices and license text.",
         "updates_title": "SSH MountMate updates",
@@ -166,7 +166,8 @@ TEXT = {
         "batch_import": "Import",
         "batch_ignore": "Ignore",
         "batch_overwrite": "Overwrite",
-        "batch_overwrite_help": "Import is checked only for new configs.\nDuplicate configs are skipped unless Overwrite is checked.\nOverwrite updates SSH connection fields and keeps local mount settings.",
+        "batch_select_all_import": "Import all new",
+        "batch_overwrite_help": "New configs are selected for import by default. Duplicate configs are skipped unless Overwrite is checked. Overwrite updates SSH connection fields and keeps local mount settings such as remote path and mountpoint.",
         "batch_details": "Details",
         "batch_detail_title": "Batch import details",
         "batch_detail_text": "Host: {host}\nStatus: {status}\nReason: {reason}\nAction: {action}\n\nImported config:\n{server}\n\nMatched saved config:\n{match}",
@@ -180,11 +181,11 @@ TEXT = {
         "connection_method": "Connection",
         "rclone_native": "rclone native SFTP",
         "openssh": "OpenSSH",
-        "openssh_help": "OpenSSH uses your system ssh command.\nAdd passphrase-protected keys to ssh-agent first.\nSaved key passphrases are not used in this mode.",
+        "openssh_help": "OpenSSH uses your system ssh command. Add passphrase-protected keys to ssh-agent first; saved key passphrases are not used in this mode.",
         "write_ssh_config": "Write SSH config",
         "copy_key_to_ssh_dir": "Copy key to ~/.ssh",
-        "ssh_config_write_help": "Adds an SSH Host entry managed by SSH MountMate.\nThe entry is saved in ~/.ssh/ssh-mountmate.d and included from ~/.ssh/config.\nPasswords and key passphrases are not written to SSH config.",
-        "copy_key_help": "Copies the selected private key into ~/.ssh.\nThe copied key path is used in both SSH config and this mount profile.",
+        "ssh_config_write_help": "Adds an SSH Host entry managed by SSH MountMate. The entry is saved in ~/.ssh/ssh-mountmate.d and included from ~/.ssh/config. Passwords and key passphrases are not written to SSH config.",
+        "copy_key_help": "Copies the selected private key into ~/.ssh and uses the copied key path in both SSH config and this mount profile.",
         "key": "Key",
         "password_auth": "Password",
         "key_file": "Key file",
@@ -195,7 +196,7 @@ TEXT = {
         "mountpoint_preset": "Mountpoint preset",
         "custom_mountpoint": "Custom mountpoint",
         "home_mountpoint": "User folder (~/mnt/name)",
-        "mountpoint_help": "Use Auto, a drive letter on Windows, or a custom absolute folder.\nThe browse button selects a parent folder and fills a generated child mountpoint.\nmacOS/Linux folders are created if missing.\nWindows folder mountpoints need an existing parent and a non-existing target folder.",
+        "mountpoint_help": "Use Auto, a drive letter on Windows, or a custom absolute folder. The browse button selects a parent folder and fills a generated child mountpoint. macOS/Linux folders are created if missing. Windows folder mountpoints need an existing parent and a target folder that does not already exist.",
         "invalid_mountpoint": "Invalid mountpoint: {reason}",
         "save": "Save",
         "cancel": "Cancel",
@@ -249,8 +250,8 @@ TEXT = {
         "buffer_size": "读取缓冲",
         "language_help": "自动模式会在中文系统使用中文，其他系统使用英文。",
         "cache_root_help": "rclone VFS 本地缓存目录。建议放在速度较快且空间充足的磁盘。",
-        "vfs_cache_mode_help": "VFS 缓存模式控制挂载文件的本地磁盘缓存。\noff：不使用 VFS 磁盘缓存。\nminimal：只缓存 rclone 基础兼容所需内容。\nwrites：先缓存写入变更，再上传到服务器；这是默认推荐值。\nfull：读写都走缓存，应用兼容性最好，但会占用更多本地磁盘。",
-        "max_cache_size_help": "VFS 缓存目录的最大占用空间。\n默认表示 rclone 不强制限制缓存大小。\n这不等于关闭缓存；关闭缓存请把 VFS 缓存模式设为 off。",
+        "vfs_cache_mode_help": "控制挂载文件的本地磁盘缓存。\noff：不使用 VFS 磁盘缓存。\nminimal：只缓存 rclone 基础兼容所需内容。\nwrites：先缓存写入变更再上传，通常推荐。\nfull：读写都走缓存，应用兼容性最好，但更占本地磁盘。",
+        "max_cache_size_help": "限制 VFS 缓存目录的最大占用空间。\n默认表示 rclone 不限制最大大小。\n这不等于关闭缓存；要关闭缓存请把 VFS 缓存模式设为 off。",
         "max_cache_age_help": "缓存对象可保留多久后允许被清理。默认是 1 小时。",
         "min_free_space_help": "为其他应用保留的本地磁盘剩余空间。",
         "write_back_help": "文件变更后延迟多久写回服务器。更长延迟可缓解频繁小写入带来的抖动。",
@@ -259,8 +260,8 @@ TEXT = {
         "startup_all_help": "在支持的平台上为全部已保存配置创建或删除登录挂载任务。",
         "startup_all_macos_note": "macOS 登录挂载会在下次登录时生效。",
         "startup_config_failed": "部分登录挂载任务未能更新，详情已写入：{path}",
-        "dependency_help": "检查依赖。\nRelease 内置 rclone。\n系统挂载依赖可能仍需单独安装。",
-        "updates_help": "检查 GitHub Releases 上的最新 SSH MountMate。\n显示当前平台匹配的下载包。",
+        "dependency_help": "检查 rclone、系统挂载驱动和 OpenSSH 是否可用。Release 版本内置 rclone，但系统挂载驱动可能仍需单独安装。",
+        "updates_help": "检查 GitHub Releases 上的最新 SSH MountMate，并显示当前平台匹配的下载包。",
         "logs_help": "打开某个已保存配置最近的 rclone 挂载日志，用于排查挂载失败。",
         "licenses_help": "查看内置第三方声明和许可证文本。",
         "updates_title": "SSH MountMate 更新",
@@ -322,7 +323,8 @@ TEXT = {
         "batch_import": "导入",
         "batch_ignore": "忽略",
         "batch_overwrite": "覆盖",
-        "batch_overwrite_help": "只有新配置默认勾选导入。\n重复配置默认跳过；勾选覆盖后才会覆盖。\n覆盖只更新 SSH 连接字段，并保留本地挂载设置。",
+        "batch_select_all_import": "导入全部新配置",
+        "batch_overwrite_help": "新配置默认勾选导入。重复配置默认跳过；只有勾选覆盖时才会覆盖。覆盖只更新 SSH 连接字段，并保留远程路径和挂载点等本地挂载设置。",
         "batch_details": "详情",
         "batch_detail_title": "批量导入详情",
         "batch_detail_text": "Host：{host}\n状态：{status}\n原因：{reason}\n动作：{action}\n\n拟导入配置：\n{server}\n\n匹配到的已保存配置：\n{match}",
@@ -336,11 +338,11 @@ TEXT = {
         "connection_method": "连接方式",
         "rclone_native": "rclone 原生 SFTP",
         "openssh": "OpenSSH",
-        "openssh_help": "OpenSSH 会使用系统 ssh 命令。\n带短语的密钥请先加入 ssh-agent。\n此模式不会使用已保存的密钥短语。",
+        "openssh_help": "OpenSSH 会使用系统 ssh 命令。带短语的密钥请先加入 ssh-agent；此模式不会使用已保存的密钥短语。",
         "write_ssh_config": "写入 SSH config",
         "copy_key_to_ssh_dir": "复制密钥到 ~/.ssh",
-        "ssh_config_write_help": "添加由 SSH MountMate 管理的 SSH Host。\n配置会写入 ~/.ssh/ssh-mountmate.d，并由 ~/.ssh/config Include。\n密码和密钥短语不会写入 SSH config。",
-        "copy_key_help": "把选中的私钥复制到 ~/.ssh。\n复制后的密钥路径会同时用于 SSH config 和当前挂载配置。",
+        "ssh_config_write_help": "添加由 SSH MountMate 管理的 SSH Host。配置会写入 ~/.ssh/ssh-mountmate.d，并由 ~/.ssh/config Include。密码和密钥短语不会写入 SSH config。",
+        "copy_key_help": "把选中的私钥复制到 ~/.ssh，并让 SSH config 和当前挂载配置都使用复制后的密钥路径。",
         "key": "密钥",
         "password_auth": "密码",
         "key_file": "密钥文件",
@@ -351,7 +353,7 @@ TEXT = {
         "mountpoint_preset": "挂载点预设",
         "custom_mountpoint": "自定义挂载点",
         "home_mountpoint": "用户文件夹 (~/mnt/名称)",
-        "mountpoint_help": "可以使用 Auto、Windows 盘符，或自定义绝对路径文件夹。\n浏览按钮选择父文件夹，并自动填入生成的子挂载点。\nmacOS/Linux 文件夹不存在时会创建。\nWindows 文件夹挂载要求父目录已存在，目标文件夹本身不能已存在。",
+        "mountpoint_help": "可以使用 Auto、Windows 盘符，或自定义绝对路径文件夹。浏览按钮用于选择父文件夹，并自动填入生成的子挂载点。macOS/Linux 文件夹不存在时会创建；Windows 文件夹挂载要求父目录已存在，目标文件夹本身不能已存在。",
         "invalid_mountpoint": "挂载点无效：{reason}",
         "save": "保存",
         "cancel": "取消",
@@ -2679,11 +2681,11 @@ class Tooltip:
             text=self.text,
             bg="#f7f7d0",
             fg="#222222",
-            padx=6,
-            pady=3,
+            padx=8,
+            pady=5,
             font=("Segoe UI", 9),
             justify=LEFT,
-            wraplength=320,
+            wraplength=420,
         ).pack()
         self.tip.update_idletasks()
         widget_x = self.widget.winfo_rootx()
@@ -2708,6 +2710,14 @@ class Tooltip:
         if self.tip:
             self.tip.destroy()
             self.tip = None
+
+
+def help_icon(parent, text: str):
+    icon = Canvas(parent, width=20, height=20, highlightthickness=0, cursor="question_arrow")
+    icon.create_oval(3, 3, 17, 17, outline="#666666", width=1)
+    icon.create_text(10, 10, text="?", fill="#444444", font=("Segoe UI", 9, "bold"))
+    Tooltip(icon, text)
+    return icon
 
 
 class App:
@@ -3482,17 +3492,13 @@ class App:
         startup_all = BooleanVar(value=bool(settings.get("startup_all", False)) and startup_supported())
         language = StringVar(value=language_choice_from_setting(settings.get("language", "auto")))
 
-        def help_icon(parent, key: str):
-            icon = Canvas(parent, width=20, height=20, highlightthickness=0, cursor="question_arrow")
-            icon.create_oval(3, 3, 17, 17, outline="#666666", width=1)
-            icon.create_text(10, 10, text="?", fill="#444444", font=("Segoe UI", 9, "bold"))
-            Tooltip(icon, self.t(key))
-            return icon
+        def settings_help_icon(parent, key: str):
+            return help_icon(parent, self.t(key))
 
         def command_row(text: str, command, help_key: str) -> None:
             row = Frame(frame)
             row.pack(fill=X, pady=3)
-            help_icon(row, help_key).pack(side=RIGHT, padx=(6, 0))
+            settings_help_icon(row, help_key).pack(side=RIGHT, padx=(6, 0))
             Button(row, text=text, command=command).pack(side=LEFT, fill=X, expand=True)
 
         command_row(self.t("check_dependencies"), self.check_dependencies_async, "dependency_help")
@@ -3507,7 +3513,7 @@ class App:
         lang_row.pack(fill=X, pady=3)
         lang_label = Label(lang_row, text=self.t("language"), width=16, anchor="w")
         lang_label.pack(side=LEFT)
-        help_icon(lang_row, "language_help").pack(side=RIGHT, padx=(6, 0))
+        settings_help_icon(lang_row, "language_help").pack(side=RIGHT, padx=(6, 0))
         language_combo = ttk.Combobox(lang_row, values=list(LANGUAGE_CHOICES.values()), textvariable=language, state="readonly")
         language_combo.pack(side=LEFT, fill=X, expand=True)
 
@@ -3515,7 +3521,7 @@ class App:
         cache_row.pack(fill=X, pady=3)
         cache_label = Label(cache_row, text=self.t("cache_root"), width=16, anchor="w")
         cache_label.pack(side=LEFT)
-        help_icon(cache_row, "cache_root_help").pack(side=RIGHT, padx=(6, 0))
+        settings_help_icon(cache_row, "cache_root_help").pack(side=RIGHT, padx=(6, 0))
         Button(cache_row, text="...", command=lambda: self.pick_cache_root(cache_root)).pack(side=RIGHT)
         cache_entry = Entry(cache_row, textvariable=cache_root)
         cache_entry.pack(side=LEFT, fill=X, expand=True)
@@ -3524,7 +3530,7 @@ class App:
         mode_row.pack(fill=X, pady=3)
         mode_label = Label(mode_row, text=self.t("vfs_cache_mode"), width=16, anchor="w")
         mode_label.pack(side=LEFT)
-        help_icon(mode_row, "vfs_cache_mode_help").pack(side=RIGHT, padx=(6, 0))
+        settings_help_icon(mode_row, "vfs_cache_mode_help").pack(side=RIGHT, padx=(6, 0))
         mode_combo = ttk.Combobox(mode_row, values=["off", "minimal", "writes", "full"], textvariable=cache_mode, state="readonly")
         mode_combo.pack(side=LEFT, fill=X, expand=True)
 
@@ -3532,7 +3538,7 @@ class App:
         size_row.pack(fill=X, pady=3)
         size_label = Label(size_row, text=self.t("max_cache_size"), width=16, anchor="w")
         size_label.pack(side=LEFT)
-        help_icon(size_row, "max_cache_size_help").pack(side=RIGHT, padx=(6, 0))
+        settings_help_icon(size_row, "max_cache_size_help").pack(side=RIGHT, padx=(6, 0))
         size_combo = ttk.Combobox(size_row, values=CACHE_SIZE_CHOICES, textvariable=cache_max_size, state="readonly")
         size_combo.pack(side=LEFT, fill=X, expand=True)
 
@@ -3540,7 +3546,7 @@ class App:
         age_row.pack(fill=X, pady=3)
         age_label = Label(age_row, text=self.t("max_cache_age"), width=16, anchor="w")
         age_label.pack(side=LEFT)
-        help_icon(age_row, "max_cache_age_help").pack(side=RIGHT, padx=(6, 0))
+        settings_help_icon(age_row, "max_cache_age_help").pack(side=RIGHT, padx=(6, 0))
         age_combo = ttk.Combobox(age_row, values=CACHE_AGE_CHOICES, textvariable=cache_max_age, state="readonly")
         age_combo.pack(side=LEFT, fill=X, expand=True)
 
@@ -3548,7 +3554,7 @@ class App:
         min_free_row.pack(fill=X, pady=3)
         min_free_label = Label(min_free_row, text=self.t("min_free_space"), width=16, anchor="w")
         min_free_label.pack(side=LEFT)
-        help_icon(min_free_row, "min_free_space_help").pack(side=RIGHT, padx=(6, 0))
+        settings_help_icon(min_free_row, "min_free_space_help").pack(side=RIGHT, padx=(6, 0))
         min_free_combo = ttk.Combobox(min_free_row, values=MIN_FREE_CHOICES, textvariable=min_free_space, state="readonly")
         min_free_combo.pack(side=LEFT, fill=X, expand=True)
 
@@ -3556,7 +3562,7 @@ class App:
         write_back_row.pack(fill=X, pady=3)
         write_back_label = Label(write_back_row, text=self.t("write_back"), width=16, anchor="w")
         write_back_label.pack(side=LEFT)
-        help_icon(write_back_row, "write_back_help").pack(side=RIGHT, padx=(6, 0))
+        settings_help_icon(write_back_row, "write_back_help").pack(side=RIGHT, padx=(6, 0))
         write_back_combo = ttk.Combobox(write_back_row, values=WRITE_BACK_CHOICES, textvariable=write_back, state="readonly")
         write_back_combo.pack(side=LEFT, fill=X, expand=True)
 
@@ -3564,7 +3570,7 @@ class App:
         dir_cache_row.pack(fill=X, pady=3)
         dir_cache_label = Label(dir_cache_row, text=self.t("dir_cache_time"), width=16, anchor="w")
         dir_cache_label.pack(side=LEFT)
-        help_icon(dir_cache_row, "dir_cache_time_help").pack(side=RIGHT, padx=(6, 0))
+        settings_help_icon(dir_cache_row, "dir_cache_time_help").pack(side=RIGHT, padx=(6, 0))
         dir_cache_combo = ttk.Combobox(dir_cache_row, values=DIR_CACHE_TIME_CHOICES, textvariable=dir_cache_time, state="readonly")
         dir_cache_combo.pack(side=LEFT, fill=X, expand=True)
 
@@ -3572,13 +3578,13 @@ class App:
         buffer_row.pack(fill=X, pady=3)
         buffer_label = Label(buffer_row, text=self.t("buffer_size"), width=16, anchor="w")
         buffer_label.pack(side=LEFT)
-        help_icon(buffer_row, "buffer_size_help").pack(side=RIGHT, padx=(6, 0))
+        settings_help_icon(buffer_row, "buffer_size_help").pack(side=RIGHT, padx=(6, 0))
         buffer_combo = ttk.Combobox(buffer_row, values=BUFFER_SIZE_CHOICES, textvariable=buffer_size, state="readonly")
         buffer_combo.pack(side=LEFT, fill=X, expand=True)
 
         startup_row = Frame(frame)
         startup_row.pack(fill=X, pady=8)
-        help_icon(startup_row, "startup_all_help").pack(side=RIGHT, padx=(6, 0))
+        settings_help_icon(startup_row, "startup_all_help").pack(side=RIGHT, padx=(6, 0))
         startup_check = Checkbutton(
             startup_row,
             text=self.t("startup_all"),
@@ -4051,6 +4057,7 @@ class ServerDialog:
         self.batch_conflict_actions: dict[str, tuple[dict, BooleanVar, BooleanVar | None]] = {}
         self.last_sai_profile_name = sai_profile_name(self.existing.get("user", ""))
         self.batch_config_path = StringVar(value=str(Path.home() / ".ssh" / "config"))
+        self.batch_select_all_import = BooleanVar(value=True)
         self.window = Toplevel(root)
         self.window.title(self.t("edit_config_title") if existing else self.t("add_config_title"))
         self.window.geometry("700x620")
@@ -4145,6 +4152,7 @@ class ServerDialog:
         choice = ttk.Combobox(frame, values=mountpoint_choices(self.lang), state="readonly", width=18)
         choice.set(mountpoint_value_to_choice(mountpoint, self.lang))
         choice.pack(side=LEFT)
+        help_icon(frame, self.t("mountpoint_help")).pack(side=LEFT, padx=(4, 0))
         self.values["mountpoint"] = choice
         custom_entry = Entry(frame)
         if is_custom_mountpoint(mountpoint) and not is_windows_mount_drive(mountpoint):
@@ -4203,21 +4211,20 @@ class ServerDialog:
         self.label(ssh_write_frame, "")
         self.write_ssh_config_check = Checkbutton(ssh_write_frame, text=self.t("write_ssh_config"), variable=self.write_ssh_config, command=self.update_source_controls)
         self.write_ssh_config_check.pack(side=LEFT)
+        help_icon(ssh_write_frame, self.t("ssh_config_write_help")).pack(side=LEFT, padx=(4, 10))
         self.copy_key_check = Checkbutton(ssh_write_frame, text=self.t("copy_key_to_ssh_dir"), variable=self.copy_key_to_ssh, command=self.update_connection_method_controls)
-        self.copy_key_check.pack(side=LEFT, padx=(12, 0))
-        Tooltip(self.write_ssh_config_check, self.t("ssh_config_write_help"))
-        Tooltip(self.copy_key_check, self.t("copy_key_help"))
+        self.copy_key_check.pack(side=LEFT)
+        help_icon(ssh_write_frame, self.t("copy_key_help")).pack(side=LEFT, padx=(4, 0))
 
         method_frame = Frame(self.single_frame, padx=10, pady=4)
         method_frame.pack(fill=X)
         self.label(method_frame, self.t("connection_method"))
         ttk.Radiobutton(method_frame, text=self.t("rclone_native"), variable=self.connection_method, value="native", command=self.update_connection_method_controls).pack(side=LEFT)
-        ttk.Radiobutton(method_frame, text=self.t("openssh"), variable=self.connection_method, value="openssh", command=self.update_connection_method_controls).pack(side=LEFT)
-        self.connection_help = Label(self.single_frame, text=self.t("openssh_help"), fg="#666666", wraplength=520, justify=LEFT)
+        ttk.Radiobutton(method_frame, text=self.t("openssh"), variable=self.connection_method, value="openssh", command=self.update_connection_method_controls).pack(side=LEFT, padx=(8, 0))
+        help_icon(method_frame, self.t("openssh_help")).pack(side=LEFT, padx=(4, 0))
 
         self.row_remote_path(self.existing.get("remote_path", ""), parent=self.single_frame)
-        mountpoint_combo = self.row_mountpoint(self.existing.get("mountpoint", ""), parent=self.single_frame)
-        Tooltip(mountpoint_combo, self.t("mountpoint_help"))
+        self.row_mountpoint(self.existing.get("mountpoint", ""), parent=self.single_frame)
 
         self.build_batch_frame()
 
@@ -4261,9 +4268,7 @@ class ServerDialog:
         conflicts_header = Frame(self.batch_conflicts_frame)
         conflicts_header.pack(fill=X)
         Label(conflicts_header, text=self.t("batch_conflicts"), anchor="w").pack(side=LEFT)
-        help_label = Label(conflicts_header, text="?", fg="#666666")
-        help_label.pack(side=LEFT, padx=(6, 0))
-        Tooltip(help_label, self.t("batch_overwrite_help"))
+        help_icon(conflicts_header, self.t("batch_overwrite_help")).pack(side=LEFT, padx=(6, 0))
         self.batch_conflicts_body = Frame(self.batch_conflicts_frame)
         self.batch_conflicts_body.pack(fill=X)
 
@@ -4299,6 +4304,7 @@ class ServerDialog:
 
     def load_batch_preview(self) -> None:
         path = Path(self.batch_config_path.get()).expanduser()
+        self.batch_select_all_import.set(True)
         try:
             plan = ssh_config_batch_plan(path, self.existing_servers)
             content = annotated_ssh_config_preview(path, self.existing_servers, plan)
@@ -4327,6 +4333,14 @@ class ServerDialog:
         if item.get("status") == "NEW" and import_var.get():
             return "import"
         return "ignore"
+
+    def set_all_batch_imports(self) -> None:
+        selected = bool(self.batch_select_all_import.get())
+        for item, import_var, overwrite_var in self.batch_conflict_actions.values():
+            if item.get("status") == "NEW":
+                import_var.set(selected)
+                if selected and overwrite_var is not None:
+                    overwrite_var.set(False)
 
     def compact_dict_text(self, value: dict | None) -> str:
         if not value:
@@ -4386,6 +4400,23 @@ class ServerDialog:
                 self.batch_conflicts_frame.pack_forget()
             return
         self.batch_conflicts_frame.pack(fill=X, padx=10, pady=(8, 0))
+        importable_count = sum(1 for item in items if item.get("status") == "NEW")
+        if importable_count:
+            control_row = Frame(self.batch_conflicts_body)
+            control_row.pack(fill=X, pady=(2, 4))
+            Checkbutton(
+                control_row,
+                text=self.t("batch_select_all_import"),
+                variable=self.batch_select_all_import,
+                command=self.set_all_batch_imports,
+            ).pack(side=LEFT)
+        header = Frame(self.batch_conflicts_body)
+        header.pack(fill=X, pady=(0, 2))
+        Label(header, text="", width=11, anchor="w").pack(side=LEFT, padx=(0, 4))
+        Label(header, text=self.t("batch_import"), width=8, anchor="center").pack(side=LEFT, padx=(0, 4))
+        Label(header, text=self.t("batch_overwrite"), width=9, anchor="center").pack(side=LEFT, padx=(0, 4))
+        Label(header, text="", width=10, anchor="w").pack(side=RIGHT, padx=(4, 0))
+        Label(header, text=self.t("preview"), anchor="w").pack(side=LEFT, fill=X, expand=True)
         for item in items:
             row = Frame(self.batch_conflicts_body)
             row.pack(fill=X, pady=2)
@@ -4397,26 +4428,31 @@ class ServerDialog:
                 label += f" - {reason}"
             if match_label:
                 label += f" ({match_label})"
-            Label(row, text=label, anchor="w", width=42).pack(side=LEFT, fill=X, expand=True)
             import_var = BooleanVar(value=item.get("status") == "NEW")
             overwrite_var = BooleanVar(value=False) if item.get("can_overwrite") else None
-            Button(
-                row,
-                text=self.t("batch_details"),
-                command=lambda current=item, include=import_var, overwrite=overwrite_var: self.show_batch_item_details(current, include, overwrite),
-            ).pack(side=RIGHT, padx=(4, 0))
+            Label(row, text=item.get("status") or "", anchor="w", width=11).pack(side=LEFT, padx=(0, 4))
+            import_state = "normal" if item.get("status") == "NEW" else "disabled"
+            import_check = Checkbutton(row, text="", variable=import_var, state=import_state)
+            import_check.pack(side=LEFT, padx=(0, 4))
+            import_check.configure(width=8)
             if overwrite_var is not None:
-                overwrite_check = Checkbutton(row, text=self.t("batch_overwrite"), variable=overwrite_var)
-                overwrite_check.pack(side=RIGHT, padx=(4, 6))
+                overwrite_check = Checkbutton(row, text="", variable=overwrite_var)
+                overwrite_check.pack(side=LEFT, padx=(0, 4))
+                overwrite_check.configure(width=9)
 
                 def on_overwrite_changed(*_args, include=import_var, overwrite=overwrite_var) -> None:
                     if overwrite.get():
                         include.set(False)
 
                 overwrite_var.trace_add("write", on_overwrite_changed)
-            import_state = "normal" if item.get("status") == "NEW" else "disabled"
-            import_check = Checkbutton(row, text=self.t("batch_import"), variable=import_var, state=import_state)
-            import_check.pack(side=RIGHT, padx=(4, 6))
+            else:
+                Label(row, text="", width=9).pack(side=LEFT, padx=(0, 4))
+            Button(
+                row,
+                text=self.t("batch_details"),
+                command=lambda current=item, include=import_var, overwrite=overwrite_var: self.show_batch_item_details(current, include, overwrite),
+            ).pack(side=RIGHT, padx=(4, 0))
+            Label(row, text=label, anchor="w").pack(side=LEFT, fill=X, expand=True)
 
             def on_import_changed(*_args, include=import_var, overwrite=overwrite_var) -> None:
                 if overwrite is not None and include.get():
@@ -4570,14 +4606,11 @@ class ServerDialog:
         self.set_required_star("password", single_config and native_rclone and self.auth.get() == "password")
 
     def update_connection_method_controls(self) -> None:
-        if not hasattr(self, "connection_help"):
+        if not hasattr(self, "auth_buttons"):
             return
         openssh = self.connection_method.get() == "openssh" and self.source.get() != "ssh_config_batch"
         if openssh:
             self.auth.set("key")
-            self.connection_help.pack(fill=X, padx=24, pady=(0, 4))
-        else:
-            self.connection_help.pack_forget()
 
         secret_state = "disabled" if openssh else "normal"
         for key in ("key_passphrase", "password"):
