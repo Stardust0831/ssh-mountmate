@@ -34,6 +34,17 @@ def managed_rclone_candidates() -> list[Path]:
     return [managed_rclone_path(), *[path / binary for path in legacy_managed_bin_dirs()]]
 
 
+def managed_materialized_rclone_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    for directory in [managed_bin_dir(), *legacy_managed_bin_dirs()]:
+        try:
+            children = sorted(directory.iterdir(), key=lambda path: path.stat().st_mtime, reverse=True)
+        except OSError:
+            continue
+        candidates.extend(path for path in children if path.is_file() and materialized_bundled_rclone_name(path))
+    return candidates
+
+
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -247,6 +258,8 @@ def resolve_rclone(app_root: Path, configured_path: str = "") -> str:
     for managed in managed_rclone_candidates():
         if managed.exists():
             return str(managed)
+    for managed in managed_materialized_rclone_candidates():
+        return str(managed)
     augment_process_path()
     found = shutil.which(current_platform().rclone_binary) or shutil.which("rclone")
     if found:

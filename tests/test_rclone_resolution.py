@@ -32,6 +32,29 @@ class RcloneResolutionTests(unittest.TestCase):
             self.assertTrue(resolved.name.startswith("rclone-"))
             self.assertEqual(resolved.read_bytes(), b"fake-rclone")
 
+    def test_resolve_rclone_accepts_materialized_managed_binary_without_plain_rclone(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            managed_dir = root / "managed" / "bin"
+            managed_dir.mkdir(parents=True)
+            managed = managed_dir / ("rclone-3ac0dba3a883555f.exe" if rclone.current_platform().system == "Windows" else "rclone-3ac0dba3a883555f")
+            managed.write_bytes(b"fake-rclone")
+
+            original_managed_bin_dir = rclone.managed_bin_dir
+            original_legacy_managed_bin_dirs = rclone.legacy_managed_bin_dirs
+            original_bundled_rclone_candidates = rclone.bundled_rclone_candidates
+            try:
+                rclone.managed_bin_dir = lambda: managed_dir
+                rclone.legacy_managed_bin_dirs = lambda: []
+                rclone.bundled_rclone_candidates = lambda _app_root: []
+                resolved = Path(rclone.resolve_rclone(root / "app"))
+            finally:
+                rclone.managed_bin_dir = original_managed_bin_dir
+                rclone.legacy_managed_bin_dirs = original_legacy_managed_bin_dirs
+                rclone.bundled_rclone_candidates = original_bundled_rclone_candidates
+
+            self.assertEqual(resolved, managed)
+
 
 if __name__ == "__main__":
     unittest.main()
