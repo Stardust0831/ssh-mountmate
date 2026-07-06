@@ -59,7 +59,7 @@ CHECKBUTTON_FONT_SIZE = 11
 CHECKBOX_SIZE = 28
 HELP_ICON_SIZE = 42
 HELP_ICON_FONT_SIZE = 10
-CAPACITY_BAR_HEIGHT = 32
+CAPACITY_BAR_HEIGHT = 38
 TEXT_BUTTON_PADX = 9
 TEXT_BUTTON_PADY = 4
 CHECKBUTTON_PADX = 7
@@ -3489,13 +3489,13 @@ class App:
         font_family = FONT_FAMILY_ZH if self.lang == "zh" else FONT_FAMILY_EN
         header = Frame(mid, bg="#242424")
         header.pack(fill=X)
-        title = Label(header, bg="#242424", fg="#bdbdbd", font=(font_family, CARD_TITLE_FONT_SIZE, "bold"), anchor="w")
+        title = Label(header, bg="#242424", fg="#bdbdbd", font=(font_family, CARD_BODY_FONT_SIZE, "bold"), anchor="w")
         title.pack(fill=X)
-        capacity_label = Label(mid, bg="#242424", fg="#c8c8c8", font=(font_family, CARD_BODY_FONT_SIZE), anchor="w")
+        capacity_label = Label(mid, bg="#242424", fg="#c8c8c8", font=(font_family, CAPACITY_PATH_FONT_SIZE), anchor="w")
         capacity_label.pack(anchor="w", fill=X, pady=(2, 0))
         capacity_bar = self.capacity_bar(mid, None, "#242424", "#7d7d7d")
         capacity_bar.pack(fill=X, pady=(5, 3))
-        user_host = Label(mid, bg="#242424", fg="#909090", font=(font_family, CARD_BODY_FONT_SIZE), anchor="e")
+        user_host = Label(mid, bg="#242424", fg="#909090", font=(font_family, CAPACITY_PATH_FONT_SIZE), anchor="e")
         user_host.pack(anchor="e", fill=X)
 
         buttons: list[Button] = []
