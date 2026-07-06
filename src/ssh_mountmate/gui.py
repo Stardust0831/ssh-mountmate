@@ -56,7 +56,7 @@ ACTION_BUTTON_FONT_WEIGHT = "normal"
 CHECKBUTTON_FONT_SIZE = 11
 CHECKBOX_SIZE = 28
 HELP_ICON_SIZE = 36
-HELP_ICON_FONT_SIZE = 11
+HELP_ICON_FONT_SIZE = 10
 CAPACITY_BAR_HEIGHT = 16
 TEXT_BUTTON_PADX = 9
 TEXT_BUTTON_PADY = 4
@@ -180,7 +180,7 @@ TEXT = {
         "edit_config_title": "Edit config",
         "source": "Source",
         "ssh_config": "SSH config",
-        "ssh_config_batch": "Batch import",
+        "ssh_config_batch": "SSH config (batch)",
         "sai_cluster": "SAI cluster",
         "ssh_config_file": "SSH config file",
         "browse": "Browse",
@@ -338,7 +338,7 @@ TEXT = {
         "edit_config_title": "编辑配置",
         "source": "来源",
         "ssh_config": "SSH 配置",
-        "ssh_config_batch": "批量导入",
+        "ssh_config_batch": "SSH 配置（批量）",
         "sai_cluster": "SAI 集群",
         "ssh_config_file": "SSH 配置文件",
         "browse": "浏览",
@@ -2138,6 +2138,15 @@ def duplicate_reason_text(status: str) -> str:
         "SAME TARGET": "same HostName/User/Port already exists",
         "INVALID": "invalid config",
     }.get(status, "")
+
+
+def batch_plan_row_label(item: dict) -> str:
+    host = item.get("host") or ""
+    match = item.get("match") or {}
+    match_label = match.get("name") or match.get("host_alias") or match.get("id") or ""
+    if match_label and match_label != host:
+        return f"{host} ({match_label})"
+    return host
 
 
 def ssh_config_batch_servers(config_path: str | Path, existing_servers: list[dict] | None = None) -> tuple[list[dict], list[str]]:
@@ -4691,14 +4700,7 @@ class ServerDialog:
         for item in items:
             row = Frame(self.batch_conflicts_body)
             row.pack(fill=X, pady=2)
-            match = item.get("match") or {}
-            match_label = match.get("name") or match.get("host_alias") or match.get("id") or ""
-            reason = item.get("reason") or ""
-            label = f"{item['host']} - {item['status']}"
-            if reason:
-                label += f" - {reason}"
-            if match_label:
-                label += f" ({match_label})"
+            label = batch_plan_row_label(item)
             import_var = BooleanVar(value=item.get("status") == "NEW")
             overwrite_var = BooleanVar(value=False) if item.get("can_overwrite") else None
 
