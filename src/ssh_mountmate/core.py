@@ -154,6 +154,7 @@ def scan_host_keys(host: str, port: str | int) -> list[str]:
     keyscan = shutil.which("ssh-keyscan")
     if not keyscan or not host:
         return []
+    marker = known_hosts_marker(host, port)
     cmd = [
         keyscan,
         "-T",
@@ -183,9 +184,11 @@ def scan_host_keys(host: str, port: str | int) -> list[str]:
         if not line or line.startswith("#"):
             continue
         parts = line.split()
-        if len(parts) >= 3 and parts[1].startswith(("ssh-", "ecdsa-")) and line not in seen:
-            lines.append(line)
-            seen.add(line)
+        if len(parts) >= 3 and parts[1].startswith(("ssh-", "ecdsa-")):
+            normalized = " ".join([marker, *parts[1:]])
+            if normalized not in seen:
+                lines.append(normalized)
+                seen.add(normalized)
     return lines
 
 
@@ -345,8 +348,10 @@ def choose_transport(requested: str, config: dict[str, list[str]]) -> str:
 
 
 def known_hosts_for_external_remote(host: str, ssh_config: str | None) -> Path | None:
-    port = first_ssh_value(read_ssh_config(host, ssh_config), "port", "22") if ssh_config else "22"
-    known_hosts = update_app_known_hosts(host, port) or default_known_hosts_file()
+    resolved = read_ssh_config(host, ssh_config) if ssh_config else {}
+    host_name = first_ssh_value(resolved, "hostname", host)
+    port = first_ssh_value(resolved, "port", "22") if resolved else "22"
+    known_hosts = update_app_known_hosts(host_name, port) or default_known_hosts_file()
     return known_hosts if known_hosts.exists() else None
 
 
@@ -390,17 +395,19 @@ def write_native_remote(parser, host: str, config: dict[str, list[str]], known_h
         parser.set(host, "known_hosts_file", str(known_hosts))
 
 
-def ensure_rclone_remote(host: str, ssh_config: str | None, transport: str) -> Path:
+def ensure_rclone_remote(host: str, ssh_config: str | None, transport: str, *, host_key_validation: bool = True) -> Path:
     validate_host(host)
     conf_path = rclone_config_path()
     conf_path.parent.mkdir(parents=True, exist_ok=True)
     resolved_ssh = read_ssh_config(host, ssh_config)
     chosen_transport = choose_transport(transport, resolved_ssh)
-    known_hosts = (
-        known_hosts_for_native_remote(host, resolved_ssh)
-        if chosen_transport == "native"
-        else known_hosts_for_external_remote(host, ssh_config)
-    )
+    known_hosts = None
+    if host_key_validation:
+        known_hosts = (
+            known_hosts_for_native_remote(host, resolved_ssh)
+            if chosen_transport == "native"
+            else known_hosts_for_external_remote(host, ssh_config)
+        )
 
     with rclone_config_file_lock():
         parser = configparser.RawConfigParser()

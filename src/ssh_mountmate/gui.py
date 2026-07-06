@@ -690,6 +690,67 @@ def ensure_user_ssh_dir() -> Path:
     return ssh_dir
 
 
+def windows_restrict_ssh_permissions(path: Path) -> None:
+    if os.name != "nt":
+        return
+    target = str(path)
+    script = r'''
+param([string]$Path)
+$item = Get-Item -LiteralPath $Path -ErrorAction Stop
+$acl = New-Object System.Security.AccessControl.FileSecurity
+if ($item.PSIsContainer) {
+  $acl = New-Object System.Security.AccessControl.DirectorySecurity
+}
+$user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$system = New-Object System.Security.Principal.SecurityIdentifier "S-1-5-18"
+$inheritance = [System.Security.AccessControl.InheritanceFlags]::None
+$propagation = [System.Security.AccessControl.PropagationFlags]::None
+if ($item.PSIsContainer) {
+  $inheritance = [System.Security.AccessControl.InheritanceFlags]"ContainerInherit, ObjectInherit"
+}
+$rights = [System.Security.AccessControl.FileSystemRights]::FullControl
+$access = [System.Security.AccessControl.AccessControlType]::Allow
+$acl.SetOwner($user)
+$acl.SetAccessRuleProtection($true, $false)
+$acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($user, $rights, $inheritance, $propagation, $access)))
+$acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($system, $rights, $inheritance, $propagation, $access)))
+Set-Acl -LiteralPath $Path -AclObject $acl
+'''
+    try:
+        run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+                "-Path",
+                target,
+            ],
+            check=True,
+            capture=True,
+        )
+        return
+    except Exception:
+        pass
+    commands = [
+        ["icacls", target, "/inheritance:r"],
+        ["icacls", target, "/remove:g", "*S-1-5-32-545", "*S-1-5-11", "*S-1-1-0"],
+        ["icacls", target, "/grant:r", "*S-1-5-18:F"],
+    ]
+    username = os.environ.get("USERNAME", "")
+    domain = os.environ.get("USERDOMAIN", "")
+    if username:
+        account = f"{domain}\\{username}" if domain else username
+        commands.insert(2, ["icacls", target, "/grant:r", f"{account}:F"])
+    for command in commands:
+        try:
+            run(command, check=False, capture=True)
+        except Exception:
+            continue
+
+
 def ensure_managed_ssh_include() -> None:
     ssh_dir = ensure_user_ssh_dir()
     managed_ssh_config_dir().mkdir(parents=True, exist_ok=True)
@@ -702,12 +763,15 @@ def ensure_managed_ssh_include() -> None:
     include = ssh_config_include_line()
     if config.exists():
         text = config.read_text(encoding="utf-8", errors="ignore")
+        include_exists = False
         for line in text.splitlines():
             stripped = line.strip()
             if stripped.lower() == include.lower():
-                return
-        prefix = "" if text.endswith(("\n", "\r")) or not text else "\n"
-        config.write_text(f"{text}{prefix}{include}\n", encoding="utf-8")
+                include_exists = True
+                break
+        if not include_exists:
+            prefix = "" if text.endswith(("\n", "\r")) or not text else "\n"
+            config.write_text(f"{text}{prefix}{include}\n", encoding="utf-8")
     else:
         config.write_text(f"{include}\n", encoding="utf-8")
     if os.name != "nt":
@@ -715,6 +779,10 @@ def ensure_managed_ssh_include() -> None:
             config.chmod(0o600)
         except OSError:
             pass
+    else:
+        windows_restrict_ssh_permissions(ssh_dir)
+        windows_restrict_ssh_permissions(managed_ssh_config_dir())
+        windows_restrict_ssh_permissions(config)
 
 
 def ssh_safe_name(value: str) -> str:
@@ -857,6 +925,8 @@ def write_managed_ssh_config(server: dict) -> Path:
             target.chmod(0o600)
         except OSError:
             pass
+    else:
+        windows_restrict_ssh_permissions(target)
     return target
 
 
@@ -2100,9 +2170,9 @@ def ssh_args_for_server(server: dict, *, connect_timeout: int | None = None) -> 
     return parts
 
 
-def write_manual_remote(server: dict, rclone: str) -> None:
+def write_manual_remote(server: dict, rclone: str, *, host_key_validation: bool = True) -> None:
     known_hosts = None
-    if connection_method_value(server) != "openssh":
+    if host_key_validation and connection_method_value(server) != "openssh":
         known_hosts = rsshmount.update_app_known_hosts(server["host"], server.get("port") or "22") or rsshmount.default_known_hosts_file()
     with RCLONE_CONFIG_LOCK:
         with rsshmount.rclone_config_file_lock():
@@ -2142,25 +2212,99 @@ def write_manual_remote_unlocked(server: dict, rclone: str, known_hosts: Path | 
         else:
             parser.set(remote, "key_use_agent", "true")
 
-        if known_hosts.exists():
+        if known_hosts and known_hosts.exists():
             parser.set(remote, "known_hosts_file", str(known_hosts))
 
     with conf_path.open("w", encoding="utf-8") as fh:
         parser.write(fh)
 
 
-def ensure_remote(server: dict, rclone: str) -> None:
+def ensure_remote(server: dict, rclone: str, *, host_key_validation: bool = True) -> None:
     with RCLONE_CONFIG_LOCK:
         if connection_method_value(server) == "openssh":
-            write_manual_remote(server, rclone)
+            write_manual_remote(server, rclone, host_key_validation=host_key_validation)
         elif server["mode"] == "ssh_config":
-            rsshmount.ensure_rclone_remote(server["host_alias"], None, "auto")
+            rsshmount.ensure_rclone_remote(server["host_alias"], None, "auto", host_key_validation=host_key_validation)
         else:
-            write_manual_remote(server, rclone)
+            write_manual_remote(server, rclone, host_key_validation=host_key_validation)
 
 
 def remote_name(server: dict) -> str:
     return server_remote_name_for_state(server)
+
+
+def mount_log_tail(log_path: Path, lines: int = 24) -> str:
+    try:
+        return "\n".join(log_path.read_text(encoding="utf-8", errors="ignore").splitlines()[-lines:])
+    except OSError:
+        return ""
+
+
+def log_has_known_hosts_mismatch(log_path: Path) -> bool:
+    tail = mount_log_tail(log_path, 80).casefold()
+    return "knownhosts: key mismatch" in tail or "known_hosts: key mismatch" in tail
+
+
+def mount_command(
+    server: dict,
+    rclone: str,
+    settings: dict,
+    *,
+    remote: str,
+    mountpoint: str,
+    cache_dir: Path,
+    log_path: Path,
+    rc_addr: str,
+) -> list[str]:
+    cmd = [
+        rclone,
+        "--config",
+        str(rsshmount.rclone_config_path()),
+        "--rc",
+        "--rc-no-auth",
+        "--rc-addr",
+        rc_addr,
+        "mount",
+        remote,
+        mountpoint,
+        "--vfs-cache-mode",
+        server.get("cache_mode") or settings.get("vfs_cache_mode", "writes"),
+        "--vfs-fast-fingerprint",
+        "--links",
+        "--cache-dir",
+        str(cache_dir),
+        "--log-file",
+        str(log_path),
+        "--volname",
+        server.get("name") or remote_name(server),
+    ]
+    if settings.get("vfs_cache_max_size"):
+        cmd.extend(["--vfs-cache-max-size", settings["vfs_cache_max_size"]])
+    if settings.get("vfs_cache_max_age"):
+        cmd.extend(["--vfs-cache-max-age", settings["vfs_cache_max_age"]])
+    if settings.get("vfs_cache_min_free_space"):
+        cmd.extend(["--vfs-cache-min-free-space", settings["vfs_cache_min_free_space"]])
+    if settings.get("vfs_write_back"):
+        cmd.extend(["--vfs-write-back", settings["vfs_write_back"]])
+    if settings.get("dir_cache_time"):
+        cmd.extend(["--dir-cache-time", settings["dir_cache_time"]])
+    if settings.get("buffer_size"):
+        cmd.extend(["--buffer-size", settings["buffer_size"]])
+    if server.get("network_mode") and os.name == "nt" and rsshmount.is_windows_drive(mountpoint):
+        cmd.append("--network-mode")
+    return cmd
+
+
+def run_mount_command(cmd: list[str], mountpoint: str, log_path: Path, expected_state: dict, *, mountpoint_existed: bool) -> subprocess.Popen:
+    flags = (
+        getattr(subprocess, "DETACHED_PROCESS", 0)
+        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    )
+    with log_path.open("ab") as log:
+        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, creationflags=flags)
+    wait_for_mount_ready(proc, mountpoint, log_path, expected_state, ready_before_start=mountpoint_existed)
+    return proc
 
 
 def mount_server(server: dict, rclone: str, *, verify_existing: bool = True) -> dict:
@@ -2185,52 +2329,28 @@ def mount_server_locked(server: dict, rclone: str, *, verify_existing: bool = Tr
     log_path = state_dir / f"{remote_name(server)}.log"
     rc_addr = f"127.0.0.1:{free_local_port()}"
 
-    cmd = [
+    cmd = mount_command(
+        server,
         rclone,
-        "--config",
-        str(rsshmount.rclone_config_path()),
-        "--rc",
-        "--rc-no-auth",
-        "--rc-addr",
-        rc_addr,
-        "mount",
-        remote,
-        mountpoint,
-        "--vfs-cache-mode",
-        server.get("cache_mode") or settings.get("vfs_cache_mode", "writes"),
-        "--vfs-fast-fingerprint",
-        "--cache-dir",
-        str(cache_dir),
-        "--log-file",
-        str(log_path),
-        "--volname",
-        server.get("name") or remote_name(server),
-    ]
-    if settings.get("vfs_cache_max_size"):
-        cmd.extend(["--vfs-cache-max-size", settings["vfs_cache_max_size"]])
-    if settings.get("vfs_cache_max_age"):
-        cmd.extend(["--vfs-cache-max-age", settings["vfs_cache_max_age"]])
-    if settings.get("vfs_cache_min_free_space"):
-        cmd.extend(["--vfs-cache-min-free-space", settings["vfs_cache_min_free_space"]])
-    if settings.get("vfs_write_back"):
-        cmd.extend(["--vfs-write-back", settings["vfs_write_back"]])
-    if settings.get("dir_cache_time"):
-        cmd.extend(["--dir-cache-time", settings["dir_cache_time"]])
-    if settings.get("buffer_size"):
-        cmd.extend(["--buffer-size", settings["buffer_size"]])
-    if server.get("network_mode") and os.name == "nt" and rsshmount.is_windows_drive(mountpoint):
-        cmd.append("--network-mode")
-
-    flags = (
-        getattr(subprocess, "DETACHED_PROCESS", 0)
-        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        settings,
+        remote=remote,
+        mountpoint=mountpoint,
+        cache_dir=cache_dir,
+        log_path=log_path,
+        rc_addr=rc_addr,
     )
     expected_state = {"remote": remote, "mountpoint": mountpoint, "log": str(log_path)}
     mountpoint_existed = mountpoint_ready(mountpoint)
-    with log_path.open("ab") as log:
-        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, creationflags=flags)
-    wait_for_mount_ready(proc, mountpoint, log_path, expected_state, ready_before_start=mountpoint_existed)
+    try:
+        proc = run_mount_command(cmd, mountpoint, log_path, expected_state, mountpoint_existed=mountpoint_existed)
+    except RuntimeError:
+        if connection_method_value(server) != "openssh" and log_has_known_hosts_mismatch(log_path):
+            with log_path.open("a", encoding="utf-8", errors="ignore") as log:
+                log.write("\nSSH MountMate: host key mismatch detected; retrying once without rclone known_hosts_file.\n")
+            ensure_remote(server, rclone, host_key_validation=False)
+            proc = run_mount_command(cmd, mountpoint, log_path, expected_state, mountpoint_existed=mountpoint_ready(mountpoint))
+        else:
+            raise
     state = {"pid": proc.pid, "server_id": server["id"], "remote": remote, "mountpoint": mountpoint, "log": str(log_path), "rc_addr": rc_addr}
     (state_dir / f"{server['id']}.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
     return state

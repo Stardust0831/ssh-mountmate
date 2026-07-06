@@ -255,6 +255,8 @@ For rclone SFTP remotes, the app maintains its own `known_hosts` file and refres
 
 If host key scanning is unavailable, the app falls back to the user's default OpenSSH `known_hosts` file.
 
+If rclone still reports `knownhosts: key mismatch`, SSH MountMate records that in the mount log and retries that mount once without passing a rclone `known_hosts_file`. This fallback is intended for cluster frontends or load-balanced SSH endpoints where `ssh-keyscan` and the actual connection can see different host keys.
+
 ## Capacity Display
 
 For mounted connections, SSH MountMate shows used and total capacity on each card. On Lustre paths, it first tries to read the remote directory's project ID with `lfs project -d` and then reads project quota with `lfs quota -p`. If the path is not on Lustre, `lfs` is unavailable, or the project has no nonzero hard block limit, the app falls back to `rclone about`.
@@ -584,6 +586,8 @@ SSH MountMate 会尽量启用 rclone 的 host key 校验。
 对于 rclone SFTP remote，程序会维护自己的 `known_hosts` 文件，并用 `ssh-keyscan` 按目标 host 和 port 刷新服务器返回的 host key。这可以避免一种常见情况：OpenSSH 可以连接，但用户 `~/.ssh/known_hosts` 里只保存了一种 key，rclone 选择了另一种 key 后拒绝连接。
 
 如果无法扫描 host key，程序会回退使用用户默认的 OpenSSH `known_hosts` 文件。
+
+如果 rclone 仍然报 `knownhosts: key mismatch`，SSH MountMate 会把该情况写入挂载日志，并对本次挂载自动重试一次，不再向 rclone 传入 `known_hosts_file`。这个兜底主要面向集群入口或负载均衡 SSH 入口，也就是 `ssh-keyscan` 看到的 host key 可能和实际连接时不同的场景。
 
 ## 容量显示
 
