@@ -2945,7 +2945,6 @@ class App:
             delta = getattr(event, "delta", 0)
             direction = -1 if delta > 0 else 1
         self.cards_canvas.yview_scroll(direction, "units")
-        self.cards_canvas.update_idletasks()
 
     def action_button_columns_for_width(self, width: int | None = None) -> int:
         width = width or self.cards_canvas.winfo_width() or self.root.winfo_width()
@@ -2976,6 +2975,23 @@ class App:
         widget.bind("<Button-5>", self.on_cards_mousewheel)
         for child in widget.winfo_children():
             self.bind_cards_mousewheel_recursive(child)
+
+    def configure_if_changed(self, widget, **options) -> None:
+        changed = {}
+        for key, value in options.items():
+            try:
+                current = widget.cget(key)
+            except Exception:
+                current = None
+            if current != value and str(current) != str(value):
+                changed[key] = value
+        if changed:
+            widget.configure(**changed)
+
+    def card_text_width(self) -> int:
+        canvas_width = self.last_cards_width or self.cards_canvas.winfo_width() or self.root.winfo_width()
+        reserved_width = 210 if self.card_action_columns == 2 else 260
+        return max(18, min(64, (canvas_width - reserved_width) // 8))
 
     def create_server_card(self) -> dict:
         row = Frame(self.cards_frame, bg="#242424", padx=12, pady=10)
@@ -3022,6 +3038,8 @@ class App:
             "user_host": user_host,
             "remote_path": remote_path,
             "buttons": buttons,
+            "action_columns": None,
+            "text_width": None,
         }
         self.bind_cards_mousewheel_recursive(row)
         return widgets
@@ -3032,12 +3050,14 @@ class App:
         muted = "#7d7d7d"
         fg = "#f1f1f1" if mounted else "#bdbdbd"
         for key in ("row", "left", "actions", "mid", "icon", "status", "title", "capacity_label", "user_host", "remote_path"):
-            widgets[key].configure(bg=row_bg)
-        widgets["icon"].configure(fg=fg)
-        widgets["status"].configure(text=self.status_text(status), fg=muted)
+            self.configure_if_changed(widgets[key], bg=row_bg)
+        self.configure_if_changed(widgets["icon"], fg=fg)
+        self.configure_if_changed(widgets["status"], text=self.status_text(status), fg=muted)
         actions = widgets["actions"]
-        for column in range(4):
-            actions.grid_columnconfigure(column, minsize=42 if column < self.card_action_columns else 0)
+        if widgets.get("action_columns") != self.card_action_columns:
+            for column in range(4):
+                actions.grid_columnconfigure(column, minsize=42 if column < self.card_action_columns else 0)
+            widgets["action_columns"] = self.card_action_columns
 
         drive = display_mountpoint_for_status(server, status)
         capacity = capacity or {}
@@ -3050,14 +3070,16 @@ class App:
             )
         else:
             capacity_label = self.t("checking_capacity") if mounted else self.t("unknown_capacity")
-        font_family = FONT_FAMILY_ZH if self.lang == "zh" else FONT_FAMILY_EN
-        reserved_width = 210 if self.card_action_columns == 2 else 260
-        text_width = max(18, min(64, (self.cards_canvas.winfo_width() - reserved_width) // 8))
-        widgets["title"].configure(text=f"{drive}  {server.get('name') or server.get('id')}", fg=fg, width=text_width)
-        widgets["capacity_label"].configure(text=capacity_label, width=text_width)
+        text_width = self.card_text_width()
+        if widgets.get("text_width") != text_width:
+            for key in ("title", "capacity_label", "user_host", "remote_path"):
+                self.configure_if_changed(widgets[key], width=text_width)
+            widgets["text_width"] = text_width
+        self.configure_if_changed(widgets["title"], text=f"{drive}  {server.get('name') or server.get('id')}", fg=fg)
+        self.configure_if_changed(widgets["capacity_label"], text=capacity_label)
         self.update_capacity_bar(widgets["capacity_bar"], int(capacity.get("percent", 0)) if mounted and capacity else None, row_bg, muted)
-        widgets["user_host"].configure(text=f"{server.get('user', '')}@{server.get('host', '')}", fg=muted, width=text_width)
-        widgets["remote_path"].configure(text=server.get("remote_path") or "~", fg=muted, width=text_width)
+        self.configure_if_changed(widgets["user_host"], text=f"{server.get('user', '')}@{server.get('host', '')}", fg=muted)
+        self.configure_if_changed(widgets["remote_path"], text=server.get("remote_path") or "~", fg=muted)
         operation_active = self.is_server_operation_active(server)
         can_change_mount = not operation_active
         mount_tooltip = self.t("operation_busy") if operation_active else self.t("unmount") if mounted else self.t("mount")
@@ -3091,6 +3113,11 @@ class App:
         canvas = Canvas(parent, height=8, bg=bg, highlightthickness=0)
         canvas._ssh_mountmate_percent = percent
         canvas._ssh_mountmate_muted = muted
+        canvas._ssh_mountmate_track = None
+        canvas._ssh_mountmate_fill = None
+        canvas._ssh_mountmate_line = None
+        canvas._ssh_mountmate_last_draw = None
+        canvas._ssh_mountmate_redraw_pending = False
 
         def redraw(event=None) -> None:
             self.draw_capacity_bar(canvas)
@@ -3100,25 +3127,54 @@ class App:
         return canvas
 
     def update_capacity_bar(self, canvas: Canvas, percent: int | None, bg: str, muted: str) -> None:
-        canvas.configure(bg=bg)
+        current = (
+            getattr(canvas, "_ssh_mountmate_percent", None),
+            getattr(canvas, "_ssh_mountmate_muted", None),
+            str(canvas.cget("bg")),
+        )
+        updated = (percent, muted, bg)
+        self.configure_if_changed(canvas, bg=bg)
         canvas._ssh_mountmate_percent = percent
         canvas._ssh_mountmate_muted = muted
-        self.draw_capacity_bar(canvas)
+        if current != updated:
+            self.draw_capacity_bar(canvas)
 
     def draw_capacity_bar(self, canvas: Canvas) -> None:
         percent = getattr(canvas, "_ssh_mountmate_percent", None)
         muted = getattr(canvas, "_ssh_mountmate_muted", "#7d7d7d")
-        width = max(canvas.winfo_width(), 1)
-        height = 8
-        canvas.delete("all")
-        canvas.create_rectangle(0, 0, width, height, fill="#3a3a3a", outline="")
-        if percent is None:
-            canvas.create_rectangle(0, 0, width, height, fill="#303030", outline="")
+        width = canvas.winfo_width()
+        if width <= 2:
+            if not getattr(canvas, "_ssh_mountmate_redraw_pending", False):
+                canvas._ssh_mountmate_redraw_pending = True
+
+                def redraw_later() -> None:
+                    canvas._ssh_mountmate_redraw_pending = False
+                    try:
+                        if canvas.winfo_exists():
+                            self.draw_capacity_bar(canvas)
+                    except Exception:
+                        return
+
+                canvas.after_idle(redraw_later)
             return
-        fill_width = int(width * max(0, min(percent, 100)) / 100)
-        color = "#52b788" if percent < 80 else "#f0b429" if percent < 92 else "#e55353"
-        canvas.create_rectangle(0, 0, fill_width, height, fill=color, outline="")
-        canvas.create_line(0, height - 1, width, height - 1, fill=muted)
+        height = 8
+        fill_width = width if percent is None else int(width * max(0, min(percent, 100)) / 100)
+        color = "#303030" if percent is None else "#52b788" if percent < 80 else "#f0b429" if percent < 92 else "#e55353"
+        draw_state = (width, height, percent, fill_width, color, muted)
+        if getattr(canvas, "_ssh_mountmate_last_draw", None) == draw_state:
+            return
+        canvas._ssh_mountmate_last_draw = draw_state
+        if getattr(canvas, "_ssh_mountmate_track", None) is None:
+            canvas._ssh_mountmate_track = canvas.create_rectangle(0, 0, width, height, fill="#3a3a3a", outline="")
+            canvas._ssh_mountmate_fill = canvas.create_rectangle(0, 0, fill_width, height, fill=color, outline="")
+            canvas._ssh_mountmate_line = canvas.create_line(0, height - 1, width, height - 1, fill=muted)
+            return
+        canvas.coords(canvas._ssh_mountmate_track, 0, 0, width, height)
+        canvas.itemconfigure(canvas._ssh_mountmate_track, fill="#3a3a3a", outline="")
+        canvas.coords(canvas._ssh_mountmate_fill, 0, 0, fill_width, height)
+        canvas.itemconfigure(canvas._ssh_mountmate_fill, fill=color, outline="")
+        canvas.coords(canvas._ssh_mountmate_line, 0, height - 1, width, height - 1)
+        canvas.itemconfigure(canvas._ssh_mountmate_line, fill=muted)
 
     def check_dependencies_async(self) -> None:
         if self.dependency_checking:
