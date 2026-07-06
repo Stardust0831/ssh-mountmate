@@ -41,20 +41,18 @@ BUFFER_SIZE_CHOICES = ["default (16Mi)", "0", "8Mi", "16Mi", "32Mi", "64Mi", "12
 LANGUAGE_CHOICES = {"auto": "Auto", "en": "English", "zh": "中文"}
 FONT_FAMILY_EN = "Segoe UI"
 FONT_FAMILY_ZH = "Noto Sans CJK SC"
-DEFAULT_UI_FONT_SIZE = 10
-SMALL_UI_FONT_SIZE = 9
-CARD_TITLE_FONT_SIZE = 14
-CARD_BODY_FONT_SIZE = 11
-CARD_STATUS_FONT_SIZE = 10
-CARD_ICON_FONT_SIZE = 30
-CARD_BUTTON_FONT_SIZE = 15
+CARD_TITLE_FONT_SIZE = 13
+CARD_BODY_FONT_SIZE = 10
+CARD_STATUS_FONT_SIZE = 9
+CARD_ICON_FONT_SIZE = 28
+CARD_BUTTON_FONT_SIZE = 14
 RCLONE_CONFIG_LOCK = threading.RLock()
 DEFAULT_MOUNT_ALL_WORKERS = 4
 DEFAULT_UNMOUNT_ALL_WORKERS = 8
 CAPACITY_CACHE_TTL_SECONDS = 120.0
 LOCAL_CAPACITY_CACHE_TTL_SECONDS = 5.0
 HOME_MOUNTPOINT_VALUE = "__home_mnt__"
-FORM_LABEL_CHARS = 22
+FORM_LABEL_CHARS = 16
 MACOS_STARTUP_HELPER_NAME = "SSHMountMateMountHelper"
 TEXT = {
     "en": {
@@ -96,7 +94,7 @@ TEXT = {
         "language_help": "Auto uses Chinese on Chinese systems and English otherwise.",
         "cache_root_help": "Local folder used by rclone VFS cache. Put it on a fast disk with enough free space.",
         "vfs_cache_mode_help": "VFS cache mode controls disk caching for mounted files.\noff: no VFS disk cache.\nminimal: cache only what rclone needs for basic compatibility.\nwrites: cache changed files before upload; this is the default recommendation.\nfull: cache reads and writes for best app compatibility, using more local disk.",
-        "max_cache_size_help": "Upper limit for the VFS cache folder. Default means no size limit is enforced by rclone; it does not disable VFS caching. Use VFS cache mode = off to disable the cache.",
+        "max_cache_size_help": "Upper limit for the VFS cache folder.\nDefault means rclone does not enforce a size limit.\nIt does not disable VFS caching; use VFS cache mode = off for that.",
         "max_cache_age_help": "How long cached objects may stay before rclone can evict them. Default is 1 hour.",
         "min_free_space_help": "Keep this much local disk space free for other applications.",
         "write_back_help": "Delay before changed files are written back to the server. Longer delays can smooth frequent small writes.",
@@ -105,8 +103,8 @@ TEXT = {
         "startup_all_help": "Creates or removes login-time mount jobs for all saved configs on supported platforms.",
         "startup_all_macos_note": "macOS login mount takes effect on the next login.",
         "startup_config_failed": "Some login mount jobs could not be updated. Details were written to: {path}",
-        "dependency_help": "Checks dependencies. rclone is bundled in releases; Windows system dependencies can use winget, but the manual help also shows direct installer links.",
-        "updates_help": "Checks the latest SSH MountMate release on GitHub and shows the matching download for this platform.",
+        "dependency_help": "Checks dependencies.\nrclone is bundled in releases.\nSystem mount dependencies may still be required.",
+        "updates_help": "Checks the latest SSH MountMate release on GitHub.\nShows the matching download for this platform.",
         "logs_help": "Open recent rclone mount logs for a saved config. Useful for diagnosing failed mounts.",
         "licenses_help": "Show bundled third-party notices and license text.",
         "updates_title": "SSH MountMate updates",
@@ -168,7 +166,7 @@ TEXT = {
         "batch_import": "Import",
         "batch_ignore": "Ignore",
         "batch_overwrite": "Overwrite",
-        "batch_overwrite_help": "Overwrite updates the saved SSH connection fields and keeps local mount settings such as remote path and mountpoint.",
+        "batch_overwrite_help": "Import is checked only for new configs.\nDuplicate configs are skipped unless Overwrite is checked.\nOverwrite updates SSH connection fields and keeps local mount settings.",
         "batch_details": "Details",
         "batch_detail_title": "Batch import details",
         "batch_detail_text": "Host: {host}\nStatus: {status}\nReason: {reason}\nAction: {action}\n\nImported config:\n{server}\n\nMatched saved config:\n{match}",
@@ -182,11 +180,11 @@ TEXT = {
         "connection_method": "Connection",
         "rclone_native": "rclone native SFTP",
         "openssh": "OpenSSH",
-        "openssh_help": "OpenSSH uses your system ssh command. Add passphrase-protected keys to ssh-agent first; saved key passphrases are not used in this mode.",
+        "openssh_help": "OpenSSH uses your system ssh command.\nAdd passphrase-protected keys to ssh-agent first.\nSaved key passphrases are not used in this mode.",
         "write_ssh_config": "Write SSH config",
         "copy_key_to_ssh_dir": "Copy key to ~/.ssh",
-        "ssh_config_write_help": "Creates an app-managed Host entry under ~/.ssh/ssh-mountmate.d and includes it from ~/.ssh/config. Passwords and key passphrases are never written there.",
-        "copy_key_help": "Copies the selected private key into ~/.ssh and writes the copied path to SSH config and this mount profile.",
+        "ssh_config_write_help": "Adds an SSH Host entry managed by SSH MountMate.\nThe entry is saved in ~/.ssh/ssh-mountmate.d and included from ~/.ssh/config.\nPasswords and key passphrases are not written to SSH config.",
+        "copy_key_help": "Copies the selected private key into ~/.ssh.\nThe copied key path is used in both SSH config and this mount profile.",
         "key": "Key",
         "password_auth": "Password",
         "key_file": "Key file",
@@ -197,7 +195,7 @@ TEXT = {
         "mountpoint_preset": "Mountpoint preset",
         "custom_mountpoint": "Custom mountpoint",
         "home_mountpoint": "User folder (~/mnt/name)",
-        "mountpoint_help": "Use Auto, a drive letter on Windows, or a custom absolute folder. The browse button selects the parent folder and fills a generated child mountpoint. macOS/Linux folders are created if missing. Windows folder mountpoints need an existing parent and a non-existing target folder.",
+        "mountpoint_help": "Use Auto, a drive letter on Windows, or a custom absolute folder.\nThe browse button selects a parent folder and fills a generated child mountpoint.\nmacOS/Linux folders are created if missing.\nWindows folder mountpoints need an existing parent and a non-existing target folder.",
         "invalid_mountpoint": "Invalid mountpoint: {reason}",
         "save": "Save",
         "cancel": "Cancel",
@@ -252,7 +250,7 @@ TEXT = {
         "language_help": "自动模式会在中文系统使用中文，其他系统使用英文。",
         "cache_root_help": "rclone VFS 本地缓存目录。建议放在速度较快且空间充足的磁盘。",
         "vfs_cache_mode_help": "VFS 缓存模式控制挂载文件的本地磁盘缓存。\noff：不使用 VFS 磁盘缓存。\nminimal：只缓存 rclone 基础兼容所需内容。\nwrites：先缓存写入变更，再上传到服务器；这是默认推荐值。\nfull：读写都走缓存，应用兼容性最好，但会占用更多本地磁盘。",
-        "max_cache_size_help": "VFS 缓存目录的最大占用空间。默认表示 rclone 不强制限制缓存大小；这不等于关闭缓存。要关闭缓存请把 VFS 缓存模式设为 off。",
+        "max_cache_size_help": "VFS 缓存目录的最大占用空间。\n默认表示 rclone 不强制限制缓存大小。\n这不等于关闭缓存；关闭缓存请把 VFS 缓存模式设为 off。",
         "max_cache_age_help": "缓存对象可保留多久后允许被清理。默认是 1 小时。",
         "min_free_space_help": "为其他应用保留的本地磁盘剩余空间。",
         "write_back_help": "文件变更后延迟多久写回服务器。更长延迟可缓解频繁小写入带来的抖动。",
@@ -261,8 +259,8 @@ TEXT = {
         "startup_all_help": "在支持的平台上为全部已保存配置创建或删除登录挂载任务。",
         "startup_all_macos_note": "macOS 登录挂载会在下次登录时生效。",
         "startup_config_failed": "部分登录挂载任务未能更新，详情已写入：{path}",
-        "dependency_help": "检查依赖。Release 内置 rclone；Windows 系统依赖可以使用 winget，手动说明里也会给出直接下载安装入口。",
-        "updates_help": "检查 GitHub Releases 上的最新 SSH MountMate，并显示当前平台匹配的下载包。",
+        "dependency_help": "检查依赖。\nRelease 内置 rclone。\n系统挂载依赖可能仍需单独安装。",
+        "updates_help": "检查 GitHub Releases 上的最新 SSH MountMate。\n显示当前平台匹配的下载包。",
         "logs_help": "打开某个已保存配置最近的 rclone 挂载日志，用于排查挂载失败。",
         "licenses_help": "查看内置第三方声明和许可证文本。",
         "updates_title": "SSH MountMate 更新",
@@ -324,7 +322,7 @@ TEXT = {
         "batch_import": "导入",
         "batch_ignore": "忽略",
         "batch_overwrite": "覆盖",
-        "batch_overwrite_help": "覆盖只更新已保存配置里的 SSH 连接字段，并保留远程路径、挂载点等本地挂载设置。",
+        "batch_overwrite_help": "只有新配置默认勾选导入。\n重复配置默认跳过；勾选覆盖后才会覆盖。\n覆盖只更新 SSH 连接字段，并保留本地挂载设置。",
         "batch_details": "详情",
         "batch_detail_title": "批量导入详情",
         "batch_detail_text": "Host：{host}\n状态：{status}\n原因：{reason}\n动作：{action}\n\n拟导入配置：\n{server}\n\n匹配到的已保存配置：\n{match}",
@@ -338,11 +336,11 @@ TEXT = {
         "connection_method": "连接方式",
         "rclone_native": "rclone 原生 SFTP",
         "openssh": "OpenSSH",
-        "openssh_help": "OpenSSH 会使用系统 ssh 命令。带短语的密钥请先加入 ssh-agent；此模式不会使用已保存的密钥短语。",
+        "openssh_help": "OpenSSH 会使用系统 ssh 命令。\n带短语的密钥请先加入 ssh-agent。\n此模式不会使用已保存的密钥短语。",
         "write_ssh_config": "写入 SSH config",
         "copy_key_to_ssh_dir": "复制密钥到 ~/.ssh",
-        "ssh_config_write_help": "在 ~/.ssh/ssh-mountmate.d 下创建由应用管理的 Host，并从 ~/.ssh/config Include。密码和密钥短语不会写入 SSH config。",
-        "copy_key_help": "把选中的私钥复制到 ~/.ssh，并把复制后的路径写入 SSH config 和当前挂载配置。",
+        "ssh_config_write_help": "添加由 SSH MountMate 管理的 SSH Host。\n配置会写入 ~/.ssh/ssh-mountmate.d，并由 ~/.ssh/config Include。\n密码和密钥短语不会写入 SSH config。",
+        "copy_key_help": "把选中的私钥复制到 ~/.ssh。\n复制后的密钥路径会同时用于 SSH config 和当前挂载配置。",
         "key": "密钥",
         "password_auth": "密码",
         "key_file": "密钥文件",
@@ -353,7 +351,7 @@ TEXT = {
         "mountpoint_preset": "挂载点预设",
         "custom_mountpoint": "自定义挂载点",
         "home_mountpoint": "用户文件夹 (~/mnt/名称)",
-        "mountpoint_help": "可以使用 Auto、Windows 盘符，或自定义绝对路径文件夹。浏览按钮选择父文件夹，并自动填入生成的子挂载点。macOS/Linux 文件夹不存在时会创建；Windows 文件夹挂载要求父目录已存在，目标文件夹本身不能已存在。",
+        "mountpoint_help": "可以使用 Auto、Windows 盘符，或自定义绝对路径文件夹。\n浏览按钮选择父文件夹，并自动填入生成的子挂载点。\nmacOS/Linux 文件夹不存在时会创建。\nWindows 文件夹挂载要求父目录已存在，目标文件夹本身不能已存在。",
         "invalid_mountpoint": "挂载点无效：{reason}",
         "save": "保存",
         "cancel": "取消",
@@ -509,33 +507,11 @@ def load_embedded_chinese_font() -> bool:
 
 def configure_default_fonts(root: Tk, lang: str) -> None:
     family = FONT_FAMILY_ZH if lang == "zh" and load_embedded_chinese_font() else FONT_FAMILY_EN
-    font_sizes = {
-        "TkDefaultFont": DEFAULT_UI_FONT_SIZE,
-        "TkTextFont": DEFAULT_UI_FONT_SIZE,
-        "TkMenuFont": DEFAULT_UI_FONT_SIZE,
-        "TkHeadingFont": DEFAULT_UI_FONT_SIZE,
-        "TkCaptionFont": DEFAULT_UI_FONT_SIZE,
-        "TkSmallCaptionFont": SMALL_UI_FONT_SIZE,
-    }
-    for name, size in font_sizes.items():
+    for name in ["TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont", "TkCaptionFont", "TkSmallCaptionFont"]:
         try:
-            tkfont.nametofont(name).configure(family=family, size=size)
+            tkfont.nametofont(name).configure(family=family)
         except Exception:
             pass
-
-
-def enable_dpi_awareness() -> None:
-    if os.name != "nt":
-        return
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
-        return
-    except Exception:
-        pass
-    try:
-        ctypes.windll.user32.SetProcessDPIAware()
-    except Exception:
-        pass
 
 
 def refresh_windows_path_env() -> None:
@@ -925,7 +901,8 @@ def write_managed_ssh_config(server: dict) -> Path:
     ensure_managed_ssh_include()
     target = managed_ssh_config_file(host_alias)
     lines = [
-        "# Managed by SSH MountMate. Edit from the app when possible.",
+        "# Managed by SSH MountMate.",
+        "# Prefer editing this Host from the SSH MountMate app.",
         f"Host {ssh_config_quote(host_alias)}",
         f"    HostName {ssh_config_quote(host)}",
         f"    User {ssh_config_quote(user)}",
@@ -2695,11 +2672,8 @@ class Tooltip:
     def show(self, _event=None) -> None:
         if self.tip or not self.text:
             return
-        x = self.widget.winfo_rootx() + 18
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
         self.tip = Toplevel(self.widget)
         self.tip.wm_overrideredirect(True)
-        self.tip.wm_geometry(f"+{x}+{y}")
         Label(
             self.tip,
             text=self.text,
@@ -2709,8 +2683,26 @@ class Tooltip:
             pady=3,
             font=("Segoe UI", 9),
             justify=LEFT,
-            wraplength=380,
+            wraplength=320,
         ).pack()
+        self.tip.update_idletasks()
+        widget_x = self.widget.winfo_rootx()
+        widget_y = self.widget.winfo_rooty()
+        widget_width = self.widget.winfo_width()
+        preferred_x = widget_x + widget_width + 14
+        preferred_y = widget_y + self.widget.winfo_height() + 10
+        screen_width = self.widget.winfo_screenwidth()
+        screen_height = self.widget.winfo_screenheight()
+        width = self.tip.winfo_reqwidth()
+        height = self.tip.winfo_reqheight()
+        if preferred_x + width + 8 <= screen_width:
+            x = preferred_x
+        else:
+            x = widget_x - width - 14
+        if x < 8:
+            x = min(max(8, preferred_x), max(8, screen_width - width - 8))
+        y = min(preferred_y, screen_height - height - 8)
+        self.tip.wm_geometry(f"+{max(8, x)}+{max(8, y)}")
 
     def hide(self, _event=None) -> None:
         if self.tip:
@@ -2722,8 +2714,8 @@ class App:
     def __init__(self, root: Tk):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("900x560")
-        self.root.minsize(660, 420)
+        self.root.geometry("820x500")
+        self.root.minsize(600, 380)
         self.settings = load_settings()
         self.lang = effective_language(self.settings)
         configure_default_fonts(self.root, self.lang)
@@ -3416,9 +3408,68 @@ class App:
         settings = load_settings()
         window = Toplevel(self.root)
         window.title(self.t("settings"))
-        window.geometry("560x700")
-        frame = Frame(window, padx=14, pady=14)
-        frame.pack(fill=BOTH, expand=True)
+        window.geometry("600x620")
+        window.minsize(520, 420)
+        content_frame = Frame(window)
+        content_frame.pack(side="top", fill=BOTH, expand=True)
+        canvas = Canvas(content_frame, highlightthickness=0)
+        scrollbar = Scrollbar(content_frame, orient="vertical", command=canvas.yview)
+        frame = Frame(canvas, padx=14, pady=14)
+        form_window = canvas.create_window((0, 0), window=frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=LEFT, fill=BOTH, expand=True)
+        scrollbar.pack(side=RIGHT, fill=Y)
+
+        def update_scrollregion(_event=None) -> None:
+            canvas.update_idletasks()
+            bbox = canvas.bbox("all")
+            if not bbox:
+                canvas.configure(scrollregion=(0, 0, canvas.winfo_width(), canvas.winfo_height()))
+                return
+            x1, y1, x2, y2 = bbox
+            content_height = y2 - y1
+            canvas.configure(
+                scrollregion=(0, 0, max(x2 - x1, canvas.winfo_width()), max(content_height, canvas.winfo_height()))
+            )
+            if content_height <= canvas.winfo_height():
+                canvas.yview_moveto(0)
+
+        def on_canvas_configure(event) -> None:
+            canvas.itemconfigure(form_window, width=event.width)
+            update_scrollregion()
+
+        def can_scroll() -> bool:
+            bbox = canvas.bbox("all")
+            return bool(bbox and (bbox[3] - bbox[1]) > canvas.winfo_height())
+
+        def on_mousewheel(event):
+            if not can_scroll():
+                canvas.yview_moveto(0)
+                return "break"
+            if getattr(event, "num", None) == 4:
+                direction = -1
+            elif getattr(event, "num", None) == 5:
+                direction = 1
+            else:
+                direction = -1 if getattr(event, "delta", 0) > 0 else 1
+            canvas.yview_scroll(direction, "units")
+            return "break"
+
+        def bind_mousewheel_recursive(widget) -> None:
+            widget.bind("<MouseWheel>", on_mousewheel)
+            widget.bind("<Button-4>", on_mousewheel)
+            widget.bind("<Button-5>", on_mousewheel)
+            for child in widget.winfo_children():
+                bind_mousewheel_recursive(child)
+
+        frame.bind("<Configure>", update_scrollregion)
+        canvas.bind("<Configure>", on_canvas_configure)
+        window.bind("<MouseWheel>", on_mousewheel)
+        window.bind("<Button-4>", on_mousewheel)
+        window.bind("<Button-5>", on_mousewheel)
+        canvas.bind("<MouseWheel>", on_mousewheel)
+        canvas.bind("<Button-4>", on_mousewheel)
+        canvas.bind("<Button-5>", on_mousewheel)
         Label(frame, textvariable=self.dep_status, anchor="w", justify=LEFT).pack(fill=X, pady=(0, 12))
         cache_root = StringVar(value=settings.get("cache_root", default_settings()["cache_root"]))
         cache_mode = StringVar(value=settings.get("vfs_cache_mode", "writes"))
@@ -3567,7 +3618,11 @@ class App:
             self.status.set(self.t("settings_saved"))
             window.destroy()
 
-        Button(frame, text=self.t("save_settings"), command=save).pack(fill=X, pady=(12, 0))
+        buttons = Frame(window, padx=14, pady=10)
+        buttons.pack(side="bottom", fill=X)
+        Button(buttons, text=self.t("save_settings"), command=save).pack(fill=X)
+        bind_mousewheel_recursive(frame)
+        update_scrollregion()
 
     def pick_cache_root(self, variable: StringVar) -> None:
         path = filedialog.askdirectory(initialdir=variable.get() or str(Path.home()))
@@ -3993,13 +4048,13 @@ class ServerDialog:
         self.copy_key_to_ssh = BooleanVar(value=bool(self.existing.get("copy_key_to_ssh_dir", False)))
         self.values: dict[str, Entry] = {}
         self.required_stars: dict[str, Label] = {}
-        self.batch_conflict_actions: dict[str, tuple[dict, StringVar]] = {}
+        self.batch_conflict_actions: dict[str, tuple[dict, BooleanVar, BooleanVar | None]] = {}
         self.last_sai_profile_name = sai_profile_name(self.existing.get("user", ""))
         self.batch_config_path = StringVar(value=str(Path.home() / ".ssh" / "config"))
         self.window = Toplevel(root)
         self.window.title(self.t("edit_config_title") if existing else self.t("add_config_title"))
-        self.window.geometry("660x600")
-        self.window.minsize(560, 420)
+        self.window.geometry("700x620")
+        self.window.minsize(620, 460)
         self.window.resizable(True, True)
         self.buttons_frame = Frame(self.window, padx=10, pady=10)
         self.buttons_frame.pack(side="bottom", fill=X)
@@ -4024,16 +4079,13 @@ class ServerDialog:
         self.form.bind("<Button-4>", self.on_mousewheel)
         self.form.bind("<Button-5>", self.on_mousewheel)
         self.build()
-        self.window.bind_all("<MouseWheel>", self.on_mousewheel)
-        self.window.bind_all("<Button-4>", self.on_mousewheel)
-        self.window.bind_all("<Button-5>", self.on_mousewheel)
         self.window.bind("<Destroy>", self.on_destroy)
 
     def t(self, key: str, **kwargs) -> str:
         return tr_lang(self.lang, key, **kwargs)
 
     def label_width(self, text: str) -> int:
-        return max(FORM_LABEL_CHARS, len(str(text or "")) + (3 if text else 0))
+        return FORM_LABEL_CHARS
 
     def label(self, parent, text: str, *, required: bool = False, required_key: str = "") -> None:
         label_frame = Frame(parent)
@@ -4266,22 +4318,15 @@ class ServerDialog:
             "overwrite": self.t("batch_overwrite"),
         }.get(action, action)
 
-    def batch_action_from_label(self, label: str) -> str:
-        if label == self.t("batch_import"):
-            return "import"
-        if label == self.t("batch_overwrite"):
-            return "overwrite"
-        return "ignore"
-
     def batch_item_default_action(self, item: dict) -> str:
         return "import" if item.get("status") == "NEW" else "ignore"
 
-    def batch_item_action_choices(self, item: dict) -> list[str]:
-        status = item.get("status")
-        actions = ["import", "ignore"] if status == "NEW" else ["ignore"]
-        if item.get("can_overwrite"):
-            actions.append("overwrite")
-        return [self.batch_action_label(action) for action in actions]
+    def batch_item_action_from_vars(self, item: dict, import_var: BooleanVar, overwrite_var: BooleanVar | None) -> str:
+        if overwrite_var is not None and overwrite_var.get():
+            return "overwrite"
+        if item.get("status") == "NEW" and import_var.get():
+            return "import"
+        return "ignore"
 
     def compact_dict_text(self, value: dict | None) -> str:
         if not value:
@@ -4293,13 +4338,14 @@ class ServerDialog:
                 lines.append(f"{key}: {value.get(key)}")
         return "\n".join(lines) if lines else "-"
 
-    def show_batch_item_details(self, item: dict, action_var: StringVar) -> None:
+    def show_batch_item_details(self, item: dict, import_var: BooleanVar, overwrite_var: BooleanVar | None = None) -> None:
+        action = self.batch_item_action_from_vars(item, import_var, overwrite_var)
         text = self.t(
             "batch_detail_text",
             host=item.get("host") or "",
             status=item.get("status") or "",
             reason=item.get("reason") or "",
-            action=self.batch_action_label(action_var.get()),
+            action=self.batch_action_label(action),
             server=self.compact_dict_text(item.get("server")),
             match=self.compact_dict_text(item.get("match")),
         )
@@ -4352,18 +4398,32 @@ class ServerDialog:
             if match_label:
                 label += f" ({match_label})"
             Label(row, text=label, anchor="w", width=42).pack(side=LEFT, fill=X, expand=True)
-            action = StringVar(value=self.batch_item_default_action(item))
-            values = self.batch_item_action_choices(item)
-            combo = ttk.Combobox(row, values=values, width=12, state="readonly")
-            combo.set(self.batch_action_label(action.get()))
+            import_var = BooleanVar(value=item.get("status") == "NEW")
+            overwrite_var = BooleanVar(value=False) if item.get("can_overwrite") else None
+            Button(
+                row,
+                text=self.t("batch_details"),
+                command=lambda current=item, include=import_var, overwrite=overwrite_var: self.show_batch_item_details(current, include, overwrite),
+            ).pack(side=RIGHT, padx=(4, 0))
+            if overwrite_var is not None:
+                overwrite_check = Checkbutton(row, text=self.t("batch_overwrite"), variable=overwrite_var)
+                overwrite_check.pack(side=RIGHT, padx=(4, 6))
 
-            def on_action_changed(_event=None, var=action, widget=combo):
-                var.set(self.batch_action_from_label(widget.get()))
+                def on_overwrite_changed(*_args, include=import_var, overwrite=overwrite_var) -> None:
+                    if overwrite.get():
+                        include.set(False)
 
-            combo.bind("<<ComboboxSelected>>", on_action_changed)
-            combo.pack(side=RIGHT)
-            Button(row, text=self.t("batch_details"), command=lambda current=item, var=action: self.show_batch_item_details(current, var)).pack(side=RIGHT, padx=(4, 6))
-            self.batch_conflict_actions[str(item["host"])] = (item, action)
+                overwrite_var.trace_add("write", on_overwrite_changed)
+            import_state = "normal" if item.get("status") == "NEW" else "disabled"
+            import_check = Checkbutton(row, text=self.t("batch_import"), variable=import_var, state=import_state)
+            import_check.pack(side=RIGHT, padx=(4, 6))
+
+            def on_import_changed(*_args, include=import_var, overwrite=overwrite_var) -> None:
+                if overwrite is not None and include.get():
+                    overwrite.set(False)
+
+            import_var.trace_add("write", on_import_changed)
+            self.batch_conflict_actions[str(item["host"])] = (item, import_var, overwrite_var)
         self.update_scrollregion()
 
     def on_canvas_configure(self, event) -> None:
@@ -4412,10 +4472,7 @@ class ServerDialog:
             self.bind_mousewheel_recursive(child)
 
     def on_destroy(self, event) -> None:
-        if event.widget is self.window:
-            self.window.unbind_all("<MouseWheel>")
-            self.window.unbind_all("<Button-4>")
-            self.window.unbind_all("<Button-5>")
+        pass
 
     def pick_file(self, key: str) -> None:
         path = filedialog.askopenfilename()
@@ -4654,7 +4711,11 @@ class ServerDialog:
             ignored_count = 0
             for item in plan.get("items", []):
                 action_entry = action_items.get(str(item.get("host") or ""))
-                action = action_entry[1].get() if action_entry else self.batch_item_default_action(item)
+                action = (
+                    self.batch_item_action_from_vars(item, action_entry[1], action_entry[2])
+                    if action_entry
+                    else self.batch_item_default_action(item)
+                )
                 if action == "ignore":
                     ignored_count += 1
                     continue
@@ -4837,7 +4898,6 @@ def main() -> int:
         return headless_mount(args.mount_id)
     if args.mount_startup_all:
         return headless_mount_all()
-    enable_dpi_awareness()
     root = Tk()
     App(root)
     root.mainloop()

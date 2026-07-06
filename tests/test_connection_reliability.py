@@ -94,6 +94,35 @@ class ConnectionReliabilityTests(unittest.TestCase):
             self.assertEqual(copied.read_text(encoding="utf-8"), "PRIVATE KEY")
             self.assertIn(copied, restricted)
 
+    def test_write_managed_ssh_config_uses_clear_app_header(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            ssh_dir = Path(temp_name) / ".ssh"
+            key_file = Path(temp_name) / "id_ed25519"
+            key_file.write_text("PRIVATE KEY", encoding="utf-8")
+            server = {
+                "host_alias": "SAI-user",
+                "host": "c1.example",
+                "user": "user",
+                "port": "12022",
+                "key_file": str(key_file),
+            }
+
+            original_user_ssh_dir = gui.user_ssh_dir
+            original_restrict = gui.windows_restrict_ssh_permissions
+            try:
+                gui.user_ssh_dir = lambda: ssh_dir
+                gui.windows_restrict_ssh_permissions = lambda _path: None
+                path = gui.write_managed_ssh_config(server)
+            finally:
+                gui.user_ssh_dir = original_user_ssh_dir
+                gui.windows_restrict_ssh_permissions = original_restrict
+
+            content = path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(content[0], "# Managed by SSH MountMate.")
+            self.assertEqual(content[1], "# Prefer editing this Host from the SSH MountMate app.")
+            self.assertIn("Host SAI-user", content)
+            self.assertNotIn("Password", "\n".join(content))
+
 
 if __name__ == "__main__":
     unittest.main()
