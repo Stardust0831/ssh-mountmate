@@ -45,6 +45,7 @@ RCLONE_CONFIG_LOCK = threading.RLock()
 DEFAULT_MOUNT_ALL_WORKERS = 4
 DEFAULT_UNMOUNT_ALL_WORKERS = 8
 CAPACITY_CACHE_TTL_SECONDS = 120.0
+LOCAL_CAPACITY_CACHE_TTL_SECONDS = 5.0
 BATCH_WORKER_CHOICES = ["1", "2", "3", "4", "6", "8", "10", "12"]
 HOME_MOUNTPOINT_VALUE = "__home_mnt__"
 FORM_LABEL_CHARS = 22
@@ -1307,6 +1308,38 @@ def remote_path_for_capacity(server: dict) -> str:
     return remote_path or "."
 
 
+def disk_usage_path(mountpoint: str, *, windows: bool | None = None) -> str:
+    value = str(mountpoint or "").strip()
+    is_windows = os.name == "nt" if windows is None else windows
+    if is_windows and rsshmount.is_windows_drive(value):
+        return f"{value[0].upper()}:\\"
+    return str(Path(value).expanduser())
+
+
+def capacity_from_usage(total: int, used: int) -> dict:
+    if total <= 0:
+        return {}
+    used = max(int(used), 0)
+    percent = int(round((used / int(total)) * 100))
+    return {"used": used, "total": int(total), "percent": max(0, min(percent, 100))}
+
+
+def local_mount_capacity_info(server: dict, status: str | None = None) -> dict:
+    if (status or verified_mount_status(server)) != "mounted":
+        return {}
+    mountpoint = current_state(server).get("mountpoint") or current_mountpoint(server)
+    if not mountpoint:
+        return {}
+    try:
+        usage = shutil.disk_usage(disk_usage_path(str(mountpoint)))
+    except (OSError, ValueError):
+        return {}
+    capacity = capacity_from_usage(usage.total, usage.used)
+    if capacity:
+        capacity["source"] = "local_mountpoint"
+    return capacity
+
+
 def lustre_project_capacity_info(server: dict) -> dict:
     if server.get("auth") == "password" and not (server.get("source") == "ssh_config" or server.get("ssh_config_managed")):
         return {}
@@ -1353,7 +1386,7 @@ printf '%s\n' "$quota_out"
     return parse_lustre_quota_kbytes(result.stdout)
 
 
-def capacity_info(server: dict, rclone: str, status: str | None = None) -> dict:
+def remote_capacity_info(server: dict, rclone: str, status: str | None = None) -> dict:
     if (status or verified_mount_status(server)) != "mounted":
         return {}
     lustre_capacity = lustre_project_capacity_info(server)
@@ -1390,7 +1423,16 @@ def capacity_info(server: dict, rclone: str, status: str | None = None) -> dict:
     if not total or used is None:
         return {}
     percent = int(round((used / total) * 100))
-    return {"used": max(used, 0), "total": total, "percent": max(0, min(percent, 100))}
+    return {"used": max(used, 0), "total": total, "percent": max(0, min(percent, 100)), "source": "rclone_about"}
+
+
+def capacity_info(server: dict, rclone: str, status: str | None = None, *, allow_remote_probe: bool = True) -> dict:
+    local_capacity = local_mount_capacity_info(server, status)
+    if local_capacity:
+        return local_capacity
+    if not allow_remote_probe:
+        return {}
+    return remote_capacity_info(server, rclone, status)
 
 
 def capacity_cache_due(
@@ -1408,6 +1450,21 @@ def capacity_cache_due(
     if server_id not in capacity_cache and last_checked is None:
         return True
     return last_checked is None or current - last_checked >= ttl
+
+
+def local_capacity_cache_due(
+    server_id: str,
+    capacity_checked_at: dict[str, float],
+    *,
+    now: float | None = None,
+) -> bool:
+    return capacity_cache_due(
+        server_id,
+        {},
+        capacity_checked_at,
+        now=now,
+        ttl=LOCAL_CAPACITY_CACHE_TTL_SECONDS,
+    )
 
 
 def split_remote_path(remote_path: str) -> tuple[str, str]:
@@ -2519,7 +2576,9 @@ class App:
         self.mount_status_cache: dict[str, str] = {}
         self.capacity_cache: dict[str, dict] = {}
         self.capacity_checked_at: dict[str, float] = {}
+        self.remote_capacity_checked_at: dict[str, float] = {}
         self.capacity_refreshing = False
+        self.local_capacity_refreshing = False
         self.refresh_generation = 0
         self.card_action_columns = 4
         self.resize_refresh_pending = False
@@ -2533,6 +2592,7 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.exit_app)
         self.refresh_list()
         self.root.after_idle(self.start_background_startup)
+        self.schedule_local_capacity_refresh()
 
     def t(self, key: str, **kwargs) -> str:
         return tr_lang(self.lang, key, **kwargs)
@@ -2669,6 +2729,45 @@ class App:
         self.refresh_list()
         self.refresh_mount_status_async()
 
+    def schedule_local_capacity_refresh(self) -> None:
+        self.root.after(int(LOCAL_CAPACITY_CACHE_TTL_SECONDS * 1000), self.refresh_local_capacity_async)
+
+    def refresh_local_capacity_async(self) -> None:
+        self.schedule_local_capacity_refresh()
+        if self.local_capacity_refreshing or not self.configs_loaded:
+            return
+        statuses = dict(self.mount_status_cache)
+        capacity_checked_snapshot = dict(self.capacity_checked_at)
+        capacity_now = time.time()
+        targets = [
+            dict(server)
+            for server in self.servers
+            if statuses.get(server.get("id", "")) == "mounted"
+            and local_capacity_cache_due(
+                server.get("id", ""),
+                capacity_checked_snapshot,
+                now=capacity_now,
+            )
+        ]
+        if not targets:
+            return
+        self.local_capacity_refreshing = True
+
+        def worker() -> None:
+            capacities: dict[str, dict] = {}
+            checked_ids: list[str] = []
+            for server in targets:
+                server_id = server.get("id", "")
+                if not server_id:
+                    continue
+                checked_ids.append(server_id)
+                capacity = local_mount_capacity_info(server, "mounted")
+                if capacity:
+                    capacities[server_id] = capacity
+            self.root.after(0, lambda: self.apply_local_capacity_infos(capacities, checked_ids))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def refresh_mount_status_async(self) -> None:
         if self.status_refreshing:
             return
@@ -2677,8 +2776,8 @@ class App:
         generation = self.refresh_generation
         servers = [dict(server) for server in self.servers]
         rclone = self.current_rclone()
-        capacity_cache_snapshot = dict(self.capacity_cache)
         capacity_checked_snapshot = dict(self.capacity_checked_at)
+        remote_capacity_checked_snapshot = dict(self.remote_capacity_checked_at)
         capacity_now = time.time()
 
         def worker() -> None:
@@ -2692,29 +2791,49 @@ class App:
                 statuses[server_id] = status
             self.root.after(0, lambda: self.apply_mount_statuses(generation, statuses))
 
-            capacity_targets = [
+            local_capacity_targets = [
                 server
                 for server in servers
                 if statuses.get(server.get("id", "")) == "mounted"
-                and capacity_cache_due(
+                and local_capacity_cache_due(
                     server.get("id", ""),
-                    capacity_cache_snapshot,
                     capacity_checked_snapshot,
                     now=capacity_now,
                 )
             ]
-            if not capacity_targets or self.capacity_refreshing:
-                return
-            self.capacity_refreshing = True
             capacities: dict[str, dict] = {}
             checked_ids: list[str] = []
-            for server in capacity_targets:
+            remote_targets: list[dict] = []
+            for server in local_capacity_targets:
                 server_id = server.get("id", "")
                 if not server_id:
                     continue
                 checked_ids.append(server_id)
-                capacities[server_id] = capacity_info(server, rclone, statuses[server_id])
-            self.root.after(0, lambda: self.apply_capacity_infos(generation, statuses, capacities, checked_ids))
+                capacity = local_mount_capacity_info(server, statuses[server_id])
+                if capacity:
+                    capacities[server_id] = capacity
+                elif capacity_cache_due(
+                    server_id,
+                    {},
+                    remote_capacity_checked_snapshot,
+                    now=capacity_now,
+                    ttl=CAPACITY_CACHE_TTL_SECONDS,
+                ):
+                    remote_targets.append(server)
+            if checked_ids:
+                self.root.after(0, lambda: self.apply_capacity_infos(generation, statuses, capacities, checked_ids))
+            if not remote_targets or self.capacity_refreshing:
+                return
+            self.capacity_refreshing = True
+            remote_capacities: dict[str, dict] = {}
+            remote_checked_ids: list[str] = []
+            for server in remote_targets:
+                server_id = server.get("id", "")
+                if not server_id:
+                    continue
+                remote_checked_ids.append(server_id)
+                remote_capacities[server_id] = remote_capacity_info(server, rclone, statuses[server_id])
+            self.root.after(0, lambda: self.apply_remote_capacity_infos(generation, statuses, remote_capacities, remote_checked_ids))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2727,10 +2846,10 @@ class App:
             if status != "mounted":
                 self.capacity_cache.pop(server_id, None)
                 self.capacity_checked_at.pop(server_id, None)
+                self.remote_capacity_checked_at.pop(server_id, None)
         self.refresh_list()
 
     def apply_capacity_infos(self, generation: int, statuses: dict[str, str], capacities: dict[str, dict], checked_ids: list[str]) -> None:
-        self.capacity_refreshing = False
         if generation != self.refresh_generation:
             return
         checked_at = time.time()
@@ -2744,6 +2863,36 @@ class App:
                 self.capacity_cache.pop(server_id, None)
                 self.capacity_checked_at.pop(server_id, None)
         self.refresh_list()
+
+    def apply_remote_capacity_infos(self, generation: int, statuses: dict[str, str], capacities: dict[str, dict], checked_ids: list[str]) -> None:
+        self.capacity_refreshing = False
+        checked_at = time.time()
+        for server_id in checked_ids:
+            self.remote_capacity_checked_at[server_id] = checked_at
+        self.apply_capacity_infos(generation, statuses, capacities, checked_ids)
+
+    def apply_local_capacity_infos(self, capacities: dict[str, dict], checked_ids: list[str]) -> None:
+        self.local_capacity_refreshing = False
+        checked_at = time.time()
+        statuses = dict(self.mount_status_cache)
+        for server_id in checked_ids:
+            if statuses.get(server_id) == "mounted":
+                self.capacity_checked_at[server_id] = checked_at
+        changed = False
+        for server_id, capacity in capacities.items():
+            if statuses.get(server_id) != "mounted":
+                continue
+            if self.capacity_cache.get(server_id) != capacity:
+                self.capacity_cache[server_id] = capacity
+                changed = True
+        for server_id, status in statuses.items():
+            if status != "mounted":
+                changed = server_id in self.capacity_cache or changed
+                self.capacity_cache.pop(server_id, None)
+                self.capacity_checked_at.pop(server_id, None)
+                self.remote_capacity_checked_at.pop(server_id, None)
+        if changed:
+            self.refresh_list()
 
     def on_cards_mousewheel(self, event) -> None:
         if getattr(event, "num", None) == 4:

@@ -2,4 +2,4 @@
 
 APP_NAME = "SSH MountMate"
 APP_ID = "ssh-mountmate"
-VERSION = "0.2.1-rc.8"
+VERSION = "0.2.1-rc.9"

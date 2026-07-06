@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import unittest
+from collections import namedtuple
 
 from ssh_mountmate import gui
 
@@ -40,6 +41,43 @@ class StartupErrorTests(unittest.TestCase):
         self.assertFalse(gui.capacity_cache_due("server", {"server": {"used": 1}}, {"server": 80.0}, now=100.0, ttl=60.0))
         self.assertFalse(gui.capacity_cache_due("server", {}, {"server": 80.0}, now=100.0, ttl=60.0))
         self.assertTrue(gui.capacity_cache_due("server", {"server": {"used": 1}}, {"server": 20.0}, now=100.0, ttl=60.0))
+
+    def test_windows_disk_usage_path_normalizes_drive_root(self):
+        self.assertEqual(gui.disk_usage_path("z:", windows=True), "Z:\\")
+        self.assertEqual(gui.disk_usage_path("Z:\\", windows=True), "Z:\\")
+
+    def test_capacity_info_prefers_local_mountpoint_without_remote_probe(self):
+        usage = namedtuple("usage", "total used free")(1000, 250, 750)
+        server = {"id": "server", "mountpoint": "/mnt/server"}
+
+        original_current_state = gui.current_state
+        original_current_mountpoint = gui.current_mountpoint
+        original_disk_usage = gui.shutil.disk_usage
+        original_remote_capacity_info = gui.remote_capacity_info
+        try:
+            gui.current_state = lambda _server: {"mountpoint": "/mnt/server"}
+            gui.current_mountpoint = lambda _server: "/mnt/server"
+            gui.shutil.disk_usage = lambda _path: usage
+
+            def fail_remote(*_args, **_kwargs):
+                raise AssertionError("remote capacity should not be queried when local capacity is available")
+
+            gui.remote_capacity_info = fail_remote
+            capacity = gui.capacity_info(server, "rclone", "mounted")
+        finally:
+            gui.current_state = original_current_state
+            gui.current_mountpoint = original_current_mountpoint
+            gui.shutil.disk_usage = original_disk_usage
+            gui.remote_capacity_info = original_remote_capacity_info
+
+        self.assertEqual(capacity["source"], "local_mountpoint")
+        self.assertEqual(capacity["used"], 250)
+        self.assertEqual(capacity["total"], 1000)
+        self.assertEqual(capacity["percent"], 25)
+
+    def test_local_capacity_cache_due_uses_short_ttl(self):
+        self.assertFalse(gui.local_capacity_cache_due("server", {"server": 100.0}, now=104.0))
+        self.assertTrue(gui.local_capacity_cache_due("server", {"server": 100.0}, now=106.0))
 
 
 if __name__ == "__main__":
