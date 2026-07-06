@@ -2799,10 +2799,8 @@ class App:
 
         actions = Frame(row, bg=row_bg)
         actions.pack(side=RIGHT, anchor="e")
-        actions.grid_columnconfigure(0, minsize=42)
-        actions.grid_columnconfigure(1, minsize=42)
-        actions.grid_columnconfigure(2, minsize=42)
-        actions.grid_columnconfigure(3, minsize=42)
+        for column in range(4):
+            actions.grid_columnconfigure(column, minsize=42 if column < self.card_action_columns else 0)
 
         mid = Frame(row, bg=row_bg, padx=0)
         mid.pack(side=LEFT, fill=BOTH, expand=True, padx=(0, 18))
@@ -2818,13 +2816,13 @@ class App:
         else:
             capacity_label = self.t("checking_capacity") if mounted else self.t("unknown_capacity")
         font_family = FONT_FAMILY_ZH if self.lang == "zh" else FONT_FAMILY_EN
-        text_width = max(18, min(64, (self.cards_canvas.winfo_width() - 260) // 8))
+        reserved_width = 210 if self.card_action_columns == 2 else 260
+        text_width = max(18, min(64, (self.cards_canvas.winfo_width() - reserved_width) // 8))
         Label(mid, text=f"{drive}  {server.get('name') or server.get('id')}", bg=row_bg, fg=fg, font=(font_family, 13, "bold"), anchor="w", width=text_width).pack(anchor="w", fill=X)
         Label(mid, text=capacity_label, bg=row_bg, fg="#c8c8c8", font=(font_family, 10), anchor="w", width=text_width).pack(anchor="w", fill=X)
         self.capacity_bar(mid, int(capacity.get("percent", 0)) if mounted and capacity else None, row_bg, muted).pack(fill=X, pady=(5, 4))
         Label(mid, text=f"{server.get('user', '')}@{server.get('host', '')}", bg=row_bg, fg=muted, font=(font_family, 10), anchor="e", width=text_width).pack(anchor="e", fill=X)
         Label(mid, text=server.get("remote_path") or "~", bg=row_bg, fg=muted, font=(font_family, 10), anchor="e", width=text_width).pack(anchor="e", fill=X)
-
         operation_active = self.is_server_operation_active(server)
         can_change_mount = not operation_active
         mount_tooltip = self.t("operation_busy") if operation_active else self.t("unmount") if mounted else self.t("mount")
