@@ -50,10 +50,11 @@ UI_SCALE_MULTIPLIER = 1.10
 DEFAULT_FONT_MIN_SIZE = 11
 SMALL_FONT_MIN_SIZE = 10
 ACTION_BUTTON_FONT_SIZE = 10
+ACTION_BUTTON_FONT_WEIGHT = "normal"
 CHECKBUTTON_FONT_SIZE = 11
 CHECKBOX_SIZE = 28
 HELP_ICON_SIZE = 36
-HELP_ICON_FONT_SIZE = 16
+HELP_ICON_FONT_SIZE = 13
 CAPACITY_BAR_HEIGHT = 16
 TEXT_BUTTON_PADX = 9
 TEXT_BUTTON_PADY = 4
@@ -68,6 +69,9 @@ SETTINGS_WINDOW_GEOMETRY = "900x800"
 SETTINGS_WINDOW_MIN_SIZE = (820, 720)
 SERVER_DIALOG_GEOMETRY = "1060x840"
 SERVER_DIALOG_MIN_SIZE = (980, 760)
+UI_BASE_TK_SCALING = 96 / 72
+WINDOW_DPI_SCALE_WEIGHT = 0.45
+MAX_WINDOW_DPI_SCALE = 1.45
 RCLONE_CONFIG_LOCK = threading.RLock()
 DEFAULT_MOUNT_ALL_WORKERS = 4
 DEFAULT_UNMOUNT_ALL_WORKERS = 8
@@ -553,6 +557,35 @@ def configure_ui_scaling(root: Tk) -> None:
         pass
 
 
+def window_dpi_scale(root) -> float:
+    try:
+        tk_scaling = float(root.tk.call("tk", "scaling"))
+    except Exception:
+        return 1.0
+    raw_scale = max(1.0, tk_scaling / UI_BASE_TK_SCALING)
+    return min(MAX_WINDOW_DPI_SCALE, 1.0 + (raw_scale - 1.0) * WINDOW_DPI_SCALE_WEIGHT)
+
+
+def scale_size(root, width: int, height: int) -> tuple[int, int]:
+    scale = window_dpi_scale(root)
+    return int(width * scale), int(height * scale)
+
+
+def parse_geometry_size(geometry: str) -> tuple[int, int]:
+    width, height = geometry.split("x", 1)
+    return int(width), int(height)
+
+
+def scaled_geometry(root, geometry: str) -> str:
+    width, height = scale_size(root, *parse_geometry_size(geometry))
+    return f"{width}x{height}"
+
+
+def apply_scaled_window_bounds(window, geometry: str, min_size: tuple[int, int]) -> None:
+    window.geometry(scaled_geometry(window, geometry))
+    window.minsize(*scale_size(window, *min_size))
+
+
 def configure_default_fonts(root: Tk, lang: str) -> None:
     family = FONT_FAMILY_ZH if lang == "zh" and load_embedded_chinese_font() else FONT_FAMILY_EN
     for name in ["TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont", "TkCaptionFont", "TkSmallCaptionFont"]:
@@ -579,7 +612,7 @@ def configure_default_fonts(root: Tk, lang: str) -> None:
 
 
 def action_button_font(lang: str) -> tuple[str, int, str]:
-    return (FONT_FAMILY_ZH if lang == "zh" else FONT_FAMILY_EN, ACTION_BUTTON_FONT_SIZE, "bold")
+    return (FONT_FAMILY_ZH if lang == "zh" else FONT_FAMILY_EN, ACTION_BUTTON_FONT_SIZE, ACTION_BUTTON_FONT_WEIGHT)
 
 
 def checkbutton_font(lang: str) -> tuple[str, int]:
@@ -2935,8 +2968,7 @@ class App:
     def __init__(self, root: Tk):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry(MAIN_WINDOW_GEOMETRY)
-        self.root.minsize(*MAIN_WINDOW_MIN_SIZE)
+        apply_scaled_window_bounds(self.root, MAIN_WINDOW_GEOMETRY, MAIN_WINDOW_MIN_SIZE)
         self.settings = load_settings()
         self.lang = effective_language(self.settings)
         configure_default_fonts(self.root, self.lang)
@@ -3629,8 +3661,7 @@ class App:
         settings = load_settings()
         window = Toplevel(self.root)
         window.title(self.t("settings"))
-        window.geometry(SETTINGS_WINDOW_GEOMETRY)
-        window.minsize(*SETTINGS_WINDOW_MIN_SIZE)
+        apply_scaled_window_bounds(window, SETTINGS_WINDOW_GEOMETRY, SETTINGS_WINDOW_MIN_SIZE)
         content_frame = Frame(window)
         content_frame.pack(side="top", fill=BOTH, expand=True)
         canvas = Canvas(content_frame, highlightthickness=0)
@@ -3949,7 +3980,8 @@ class App:
     def show_text_window(self, title: str, content: str) -> None:
         window = Toplevel(self.root)
         window.title(title)
-        window.geometry("720x420")
+        window.geometry(scaled_geometry(window, "720x420"))
+        window.minsize(*scale_size(window, 620, 360))
         frame = Frame(window, padx=10, pady=10)
         frame.pack(fill=BOTH, expand=True)
         scrollbar = Scrollbar(frame)
@@ -3979,8 +4011,7 @@ class App:
             return
         window = Toplevel(self.root)
         window.title(self.t("view_mount_logs"))
-        window.geometry("560x180")
-        window.minsize(520, 170)
+        apply_scaled_window_bounds(window, "560x180", (520, 170))
         frame = Frame(window, padx=12, pady=12)
         frame.pack(fill=BOTH, expand=True)
         choices: dict[str, dict] = {}
@@ -4274,8 +4305,7 @@ class ServerDialog:
         self.batch_select_all_overwrite = BooleanVar(value=False)
         self.window = Toplevel(root)
         self.window.title(self.t("edit_config_title") if existing else self.t("add_config_title"))
-        self.window.geometry(SERVER_DIALOG_GEOMETRY)
-        self.window.minsize(*SERVER_DIALOG_MIN_SIZE)
+        apply_scaled_window_bounds(self.window, SERVER_DIALOG_GEOMETRY, SERVER_DIALOG_MIN_SIZE)
         self.window.resizable(True, True)
         self.buttons_frame = Frame(self.window, padx=10, pady=10)
         self.buttons_frame.pack(side="bottom", fill=X)
@@ -4588,8 +4618,7 @@ class ServerDialog:
     def show_text_window(self, title: str, content: str) -> None:
         window = Toplevel(self.window)
         window.title(title)
-        window.geometry("760x500")
-        window.minsize(620, 420)
+        apply_scaled_window_bounds(window, "760x500", (620, 420))
         frame = Frame(window, padx=10, pady=10)
         frame.pack(fill=BOTH, expand=True)
         scrollbar = Scrollbar(frame)
