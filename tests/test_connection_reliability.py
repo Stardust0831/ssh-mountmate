@@ -65,6 +65,99 @@ class ConnectionReliabilityTests(unittest.TestCase):
 
         self.assertIn("--links", cmd)
 
+    def test_default_mount_command_uses_conservative_cache_settings(self):
+        cmd = gui.mount_command(
+            {"id": "server", "name": "server"},
+            "rclone",
+            gui.default_settings(),
+            remote="server:",
+            mountpoint="/mnt/server",
+            cache_dir=Path("/tmp/cache"),
+            log_path=Path("/tmp/server.log"),
+            rc_addr="127.0.0.1:1234",
+        )
+
+        self.assertEqual(cmd[cmd.index("--vfs-cache-mode") + 1], "minimal")
+        self.assertEqual(cmd[cmd.index("--vfs-cache-max-size") + 1], "10G")
+        self.assertEqual(cmd[cmd.index("--vfs-cache-min-free-space") + 1], "10G")
+        self.assertNotIn("--vfs-write-back", cmd)
+        self.assertEqual(cmd[cmd.index("--dir-cache-time") + 1], "30s")
+
+    def test_mount_command_only_passes_write_back_for_write_cache_modes(self):
+        settings = gui.default_settings() | {"vfs_cache_mode": "minimal", "vfs_write_back": "0s"}
+        cmd = gui.mount_command(
+            {"id": "server", "name": "server"},
+            "rclone",
+            settings,
+            remote="server:",
+            mountpoint="/mnt/server",
+            cache_dir=Path("/tmp/cache"),
+            log_path=Path("/tmp/server.log"),
+            rc_addr="127.0.0.1:1234",
+        )
+        self.assertNotIn("--vfs-write-back", cmd)
+
+        settings["vfs_cache_mode"] = "full"
+        cmd = gui.mount_command(
+            {"id": "server", "name": "server"},
+            "rclone",
+            settings,
+            remote="server:",
+            mountpoint="/mnt/server",
+            cache_dir=Path("/tmp/cache"),
+            log_path=Path("/tmp/server.log"),
+            rc_addr="127.0.0.1:1234",
+        )
+        self.assertEqual(cmd[cmd.index("--vfs-write-back") + 1], "0s")
+
+    def test_migrate_legacy_default_cache_settings_to_conservative_defaults(self):
+        migrated = gui.migrate_settings(
+            gui.default_settings() | {"vfs_cache_mode": "writes", "vfs_cache_max_size": "", "vfs_cache_min_free_space": "", "dir_cache_time": ""},
+            {"vfs_cache_mode": "writes", "vfs_cache_max_size": "", "vfs_cache_min_free_space": "", "dir_cache_time": ""},
+        )
+
+        self.assertEqual(migrated["vfs_cache_mode"], "minimal")
+        self.assertEqual(migrated["vfs_cache_max_size"], "10G")
+        self.assertEqual(migrated["vfs_cache_min_free_space"], "10G")
+        self.assertEqual(migrated["vfs_write_back"], "0s")
+        self.assertEqual(migrated["dir_cache_time"], "30s")
+        self.assertEqual(migrated["settings_schema_version"], gui.SETTINGS_SCHEMA_VERSION)
+
+    def test_migrate_preserves_custom_write_cache_settings(self):
+        migrated = gui.migrate_settings(
+            gui.default_settings() | {"vfs_cache_mode": "writes", "vfs_cache_max_size": "50G", "vfs_cache_min_free_space": "5G", "dir_cache_time": "1m"},
+            {"vfs_cache_mode": "writes", "vfs_cache_max_size": "50G", "vfs_cache_min_free_space": "5G", "dir_cache_time": "1m"},
+        )
+
+        self.assertEqual(migrated["vfs_cache_mode"], "writes")
+        self.assertEqual(migrated["vfs_cache_max_size"], "50G")
+        self.assertEqual(migrated["vfs_cache_min_free_space"], "5G")
+        self.assertEqual(migrated["dir_cache_time"], "1m")
+
+    def test_migrate_local_v2_off_default_to_minimal(self):
+        migrated = gui.migrate_settings(
+            gui.default_settings() | {"vfs_cache_mode": "off", "vfs_write_back": ""},
+            {"settings_schema_version": 2, "vfs_cache_mode": "off", "vfs_write_back": ""},
+        )
+
+        self.assertEqual(migrated["vfs_cache_mode"], "minimal")
+        self.assertEqual(migrated["vfs_write_back"], "0s")
+
+    def test_refresh_mounted_directory_caches_only_for_mounted_servers(self):
+        servers = [{"id": "mounted", "name": "mounted"}, {"id": "stopped", "name": "stopped"}]
+        refreshed: list[str] = []
+
+        def fake_status(server, processes):
+            return "mounted" if server["id"] == "mounted" else "stopped"
+
+        with mock.patch.object(gui, "running_rclone_processes", return_value={}):
+            with mock.patch.object(gui, "mount_status_with_processes", side_effect=fake_status):
+                with mock.patch.object(gui, "refresh_remote_cache", side_effect=lambda server, rclone: refreshed.append(server["id"])):
+                    errors = gui.refresh_mounted_directory_caches(servers, "rclone")
+
+        self.assertEqual(errors, [])
+        self.assertEqual(refreshed, ["mounted"])
+
     def test_log_has_known_hosts_mismatch(self):
         with tempfile.TemporaryDirectory() as temp_name:
             log_path = Path(temp_name) / "mount.log"
