@@ -4445,25 +4445,21 @@ class ServerDialog:
             actions = Frame(row)
             actions.pack(side=RIGHT, padx=(8, 0))
 
-            overwrite_slot = Frame(actions, width=108)
-            overwrite_slot.pack(side=LEFT)
-            overwrite_slot.pack_propagate(False)
             if overwrite_var is not None:
-                overwrite_check = Checkbutton(overwrite_slot, text=self.t("batch_overwrite"), variable=overwrite_var, anchor="w")
-                overwrite_check.pack(fill=X)
+                overwrite_check = Checkbutton(actions, text=self.t("batch_overwrite"), variable=overwrite_var, anchor="w", width=10)
+                overwrite_check.pack(side=LEFT)
 
                 def on_overwrite_changed(*_args, include=import_var, overwrite=overwrite_var) -> None:
                     if overwrite.get():
                         include.set(False)
 
                 overwrite_var.trace_add("write", on_overwrite_changed)
+            else:
+                Label(actions, text="", width=10).pack(side=LEFT)
 
-            import_slot = Frame(actions, width=88)
-            import_slot.pack(side=LEFT)
-            import_slot.pack_propagate(False)
             import_state = "normal" if item.get("status") == "NEW" else "disabled"
-            import_check = Checkbutton(import_slot, text=self.t("batch_import"), variable=import_var, state=import_state, anchor="w")
-            import_check.pack(fill=X)
+            import_check = Checkbutton(actions, text=self.t("batch_import"), variable=import_var, state=import_state, anchor="w", width=8)
+            import_check.pack(side=LEFT)
 
             Button(
                 actions,
