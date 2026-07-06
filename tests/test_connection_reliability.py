@@ -72,6 +72,28 @@ class ConnectionReliabilityTests(unittest.TestCase):
 
             self.assertTrue(gui.log_has_known_hosts_mismatch(log_path))
 
+    def test_copy_key_to_user_ssh_restricts_copied_key(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            source = root / "id_ed25519"
+            source.write_text("PRIVATE KEY", encoding="utf-8")
+            ssh_dir = root / ".ssh"
+            restricted: list[Path] = []
+
+            original_user_ssh_dir = gui.user_ssh_dir
+            original_restrict = gui.windows_restrict_ssh_permissions
+            try:
+                gui.user_ssh_dir = lambda: ssh_dir
+                gui.windows_restrict_ssh_permissions = lambda path: restricted.append(Path(path))
+                copied = Path(gui.copy_key_to_user_ssh(str(source), "SAI-user"))
+            finally:
+                gui.user_ssh_dir = original_user_ssh_dir
+                gui.windows_restrict_ssh_permissions = original_restrict
+
+            self.assertEqual(copied, ssh_dir / "SAI-user")
+            self.assertEqual(copied.read_text(encoding="utf-8"), "PRIVATE KEY")
+            self.assertIn(copied, restricted)
+
 
 if __name__ == "__main__":
     unittest.main()

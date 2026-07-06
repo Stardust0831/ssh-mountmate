@@ -882,6 +882,7 @@ def copy_key_to_user_ssh(source: str, host_alias: str) -> str:
     suffix = source_path.suffix
     target = ssh_dir / f"{base}{suffix}"
     if source_path.resolve() == target.resolve():
+        windows_restrict_ssh_permissions(target)
         return str(target)
     if target.exists():
         for index in range(2, 1000):
@@ -897,6 +898,7 @@ def copy_key_to_user_ssh(source: str, host_alias: str) -> str:
             target.chmod(0o600)
         except OSError:
             pass
+    windows_restrict_ssh_permissions(target)
     return str(target)
 
 
