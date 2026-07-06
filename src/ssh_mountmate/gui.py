@@ -46,9 +46,18 @@ CARD_BODY_FONT_SIZE = 11
 CARD_STATUS_FONT_SIZE = 10
 CARD_ICON_FONT_SIZE = 28
 CARD_BUTTON_FONT_SIZE = 14
-UI_SCALE_MULTIPLIER = 1.06
-DEFAULT_FONT_MIN_SIZE = 10
-SMALL_FONT_MIN_SIZE = 9
+UI_SCALE_MULTIPLIER = 1.10
+DEFAULT_FONT_MIN_SIZE = 11
+SMALL_FONT_MIN_SIZE = 10
+HELP_ICON_SIZE = 26
+HELP_ICON_FONT_SIZE = 11
+CAPACITY_BAR_HEIGHT = 12
+MAIN_WINDOW_GEOMETRY = "980x640"
+MAIN_WINDOW_MIN_SIZE = (760, 520)
+SETTINGS_WINDOW_GEOMETRY = "760x760"
+SETTINGS_WINDOW_MIN_SIZE = (700, 680)
+SERVER_DIALOG_GEOMETRY = "860x760"
+SERVER_DIALOG_MIN_SIZE = (820, 700)
 RCLONE_CONFIG_LOCK = threading.RLock()
 DEFAULT_MOUNT_ALL_WORKERS = 4
 DEFAULT_UNMOUNT_ALL_WORKERS = 8
@@ -547,6 +556,15 @@ def configure_default_fonts(root: Tk, lang: str) -> None:
             font.configure(**options)
         except Exception:
             pass
+    try:
+        style = ttk.Style(root)
+        default_font = tkfont.nametofont("TkDefaultFont")
+        style.configure(".", font=default_font)
+        style.configure("TCheckbutton", font=default_font, padding=(2, 3))
+        style.configure("TRadiobutton", font=default_font, padding=(2, 3))
+        style.configure("TCombobox", font=default_font)
+    except Exception:
+        pass
 
 
 def refresh_windows_path_env() -> None:
@@ -2746,9 +2764,11 @@ class Tooltip:
 
 
 def help_icon(parent, text: str):
-    icon = Canvas(parent, width=20, height=20, highlightthickness=0, cursor="question_arrow")
-    icon.create_oval(3, 3, 17, 17, outline="#666666", width=1)
-    icon.create_text(10, 10, text="?", fill="#444444", font=("Segoe UI", 9, "bold"))
+    icon = Canvas(parent, width=HELP_ICON_SIZE, height=HELP_ICON_SIZE, highlightthickness=0, cursor="question_arrow")
+    padding = 4
+    center = HELP_ICON_SIZE // 2
+    icon.create_oval(padding, padding, HELP_ICON_SIZE - padding, HELP_ICON_SIZE - padding, outline="#666666", width=1)
+    icon.create_text(center, center, text="?", fill="#444444", font=("Segoe UI", HELP_ICON_FONT_SIZE, "bold"))
     Tooltip(icon, text)
     return icon
 
@@ -2757,8 +2777,8 @@ class App:
     def __init__(self, root: Tk):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("820x500")
-        self.root.minsize(600, 380)
+        self.root.geometry(MAIN_WINDOW_GEOMETRY)
+        self.root.minsize(*MAIN_WINDOW_MIN_SIZE)
         self.settings = load_settings()
         self.lang = effective_language(self.settings)
         configure_default_fonts(self.root, self.lang)
@@ -2830,9 +2850,9 @@ class App:
         top = Frame(self.root, padx=10, pady=8)
         top.pack(fill=X)
         Label(top, text="ssh-mountmate").pack(side=LEFT)
-        Button(top, text=self.t("settings"), command=self.open_settings).pack(side=RIGHT, padx=6)
-        Button(top, text=self.t("add_config"), command=self.add_config).pack(side=RIGHT, padx=6)
-        Button(top, text=self.t("refresh"), command=self.reload_configs_async).pack(side=RIGHT)
+        Button(top, text=self.t("settings"), command=self.open_settings, padx=10, pady=4).pack(side=RIGHT, padx=6)
+        Button(top, text=self.t("add_config"), command=self.add_config, padx=10, pady=4).pack(side=RIGHT, padx=6)
+        Button(top, text=self.t("refresh"), command=self.reload_configs_async, padx=10, pady=4).pack(side=RIGHT)
 
         body = Frame(self.root, padx=10, pady=4)
         body.pack(fill=BOTH, expand=True)
@@ -2856,9 +2876,9 @@ class App:
         bottom = Frame(self.root, padx=10, pady=8)
         bottom.pack(fill=X)
         Label(bottom, textvariable=self.status).pack(side=LEFT)
-        self.unmount_all_button = Button(bottom, text=self.t("unmount_all"), command=self.unmount_all)
+        self.unmount_all_button = Button(bottom, text=self.t("unmount_all"), command=self.unmount_all, padx=10, pady=4)
         self.unmount_all_button.pack(side=RIGHT, padx=(6, 0))
-        self.mount_all_button = Button(bottom, text=self.t("mount_all"), command=self.mount_all)
+        self.mount_all_button = Button(bottom, text=self.t("mount_all"), command=self.mount_all, padx=10, pady=4)
         self.mount_all_button.pack(side=RIGHT)
         self.update_batch_buttons()
 
@@ -3338,7 +3358,7 @@ class App:
         messagebox.showinfo(APP_TITLE, message)
 
     def capacity_bar(self, parent, percent: int | None, bg: str, muted: str) -> Canvas:
-        canvas = Canvas(parent, height=8, bg=bg, highlightthickness=0)
+        canvas = Canvas(parent, height=CAPACITY_BAR_HEIGHT, bg=bg, highlightthickness=0)
         canvas._ssh_mountmate_percent = percent
         canvas._ssh_mountmate_muted = muted
         canvas._ssh_mountmate_track = None
@@ -3385,7 +3405,7 @@ class App:
 
                 canvas.after_idle(redraw_later)
             return
-        height = 8
+        height = max(CAPACITY_BAR_HEIGHT, canvas.winfo_height())
         fill_width = width if percent is None else int(width * max(0, min(percent, 100)) / 100)
         color = "#303030" if percent is None else "#52b788" if percent < 80 else "#f0b429" if percent < 92 else "#e55353"
         draw_state = (width, height, percent, fill_width, color, muted)
@@ -3451,8 +3471,8 @@ class App:
         settings = load_settings()
         window = Toplevel(self.root)
         window.title(self.t("settings"))
-        window.geometry("600x620")
-        window.minsize(520, 420)
+        window.geometry(SETTINGS_WINDOW_GEOMETRY)
+        window.minsize(*SETTINGS_WINDOW_MIN_SIZE)
         content_frame = Frame(window)
         content_frame.pack(side="top", fill=BOTH, expand=True)
         canvas = Canvas(content_frame, highlightthickness=0)
@@ -3532,7 +3552,7 @@ class App:
             row = Frame(frame)
             row.pack(fill=X, pady=3)
             settings_help_icon(row, help_key).pack(side=RIGHT, padx=(6, 0))
-            Button(row, text=text, command=command).pack(side=LEFT, fill=X, expand=True)
+            Button(row, text=text, command=command, padx=10, pady=4).pack(side=LEFT, fill=X, expand=True)
 
         command_row(self.t("check_dependencies"), self.check_dependencies_async, "dependency_help")
         command_row(self.t("install_missing_dependencies"), self.install_deps_async, "dependency_help")
@@ -3623,6 +3643,8 @@ class App:
             text=self.t("startup_all"),
             variable=startup_all,
             state="normal" if startup_supported() else "disabled",
+            padx=4,
+            pady=2,
         )
         startup_check.pack(side=LEFT, anchor="w")
         if sys.platform == "darwin":
@@ -3659,7 +3681,7 @@ class App:
 
         buttons = Frame(window, padx=14, pady=10)
         buttons.pack(side="bottom", fill=X)
-        Button(buttons, text=self.t("save_settings"), command=save).pack(fill=X)
+        Button(buttons, text=self.t("save_settings"), command=save, padx=10, pady=6).pack(fill=X)
         bind_mousewheel_recursive(frame)
         update_scrollregion()
 
@@ -4094,8 +4116,8 @@ class ServerDialog:
         self.batch_select_all_overwrite = BooleanVar(value=False)
         self.window = Toplevel(root)
         self.window.title(self.t("edit_config_title") if existing else self.t("add_config_title"))
-        self.window.geometry("700x620")
-        self.window.minsize(620, 460)
+        self.window.geometry(SERVER_DIALOG_GEOMETRY)
+        self.window.minsize(*SERVER_DIALOG_MIN_SIZE)
         self.window.resizable(True, True)
         self.buttons_frame = Frame(self.window, padx=10, pady=10)
         self.buttons_frame.pack(side="bottom", fill=X)
@@ -4146,7 +4168,7 @@ class ServerDialog:
         entry.pack(side=LEFT, fill=X, expand=True)
         self.values[key] = entry
         if browse:
-            Button(frame, text="...", command=lambda: self.pick_file(key)).pack(side=RIGHT)
+            Button(frame, text="...", command=lambda: self.pick_file(key), width=4, padx=6).pack(side=RIGHT)
         return entry
 
     def row_combo(self, label: str, key: str, values: list[str], default: str = "", parent=None, required: bool = False):
@@ -4190,7 +4212,7 @@ class ServerDialog:
             custom_entry.insert(0, mountpoint)
         custom_entry.pack(side=LEFT, fill=X, expand=True, padx=(6, 0))
         self.values["custom_mountpoint"] = custom_entry
-        browse_button = Button(frame, text="...", command=self.pick_mountpoint_folder)
+        browse_button = Button(frame, text="...", command=self.pick_mountpoint_folder, width=4, padx=6)
         browse_button.pack(side=RIGHT)
         self.mountpoint_browse_button = browse_button
         choice.bind("<<ComboboxSelected>>", lambda _event: self.update_mountpoint_controls())
@@ -4203,11 +4225,11 @@ class ServerDialog:
         self.label(source_frame, self.t("source"))
         source_options = Frame(source_frame)
         source_options.pack(side=LEFT, fill=X, expand=True)
-        ttk.Radiobutton(source_options, text=self.t("ssh_config"), variable=self.source, value="ssh_config", command=self.on_source_changed).pack(side=LEFT, padx=(0, 12))
+        ttk.Radiobutton(source_options, text=self.t("ssh_config"), variable=self.source, value="ssh_config", command=self.on_source_changed).pack(side=LEFT, padx=(0, 16))
         if not self.existing:
-            ttk.Radiobutton(source_options, text=self.t("ssh_config_batch"), variable=self.source, value="ssh_config_batch", command=self.on_source_changed).pack(side=LEFT, padx=(0, 12))
-        ttk.Radiobutton(source_options, text=self.t("sai_cluster"), variable=self.source, value="sai_cluster", command=self.on_source_changed).pack(side=LEFT, padx=(0, 12))
-        ttk.Radiobutton(source_options, text=self.t("manual"), variable=self.source, value="manual", command=self.on_source_changed).pack(side=LEFT, padx=(0, 12))
+            ttk.Radiobutton(source_options, text=self.t("ssh_config_batch"), variable=self.source, value="ssh_config_batch", command=self.on_source_changed).pack(side=LEFT, padx=(0, 16))
+        ttk.Radiobutton(source_options, text=self.t("sai_cluster"), variable=self.source, value="sai_cluster", command=self.on_source_changed).pack(side=LEFT, padx=(0, 16))
+        ttk.Radiobutton(source_options, text=self.t("manual"), variable=self.source, value="manual", command=self.on_source_changed).pack(side=LEFT, padx=(0, 16))
 
         self.single_frame = Frame(self.form)
         self.single_frame.pack(fill=X)
@@ -4241,9 +4263,11 @@ class ServerDialog:
         ssh_write_frame.pack(fill=X)
         self.label(ssh_write_frame, "")
         self.write_ssh_config_check = Checkbutton(ssh_write_frame, text=self.t("write_ssh_config"), variable=self.write_ssh_config, command=self.update_source_controls)
+        self.write_ssh_config_check.configure(padx=4, pady=2)
         self.write_ssh_config_check.pack(side=LEFT)
         help_icon(ssh_write_frame, self.t("ssh_config_write_help")).pack(side=LEFT, padx=(4, 10))
         self.copy_key_check = Checkbutton(ssh_write_frame, text=self.t("copy_key_to_ssh_dir"), variable=self.copy_key_to_ssh, command=self.update_connection_method_controls)
+        self.copy_key_check.configure(padx=4, pady=2)
         self.copy_key_check.pack(side=LEFT)
         help_icon(ssh_write_frame, self.t("copy_key_help")).pack(side=LEFT, padx=(4, 0))
 
@@ -4259,9 +4283,9 @@ class ServerDialog:
 
         self.build_batch_frame()
 
-        self.save_button = Button(self.buttons_frame, text=self.t("save"), command=self.save)
+        self.save_button = Button(self.buttons_frame, text=self.t("save"), command=self.save, padx=12, pady=5)
         self.save_button.pack(side=RIGHT)
-        Button(self.buttons_frame, text=self.t("cancel"), command=self.window.destroy).pack(side=RIGHT, padx=6)
+        Button(self.buttons_frame, text=self.t("cancel"), command=self.window.destroy, padx=12, pady=5).pack(side=RIGHT, padx=6)
 
         self.update_source_controls()
         self.update_connection_method_controls()
@@ -4281,7 +4305,7 @@ class ServerDialog:
         file_entry.pack(side=LEFT, fill=X, expand=True)
         file_entry.bind("<Return>", lambda _event: self.load_batch_preview())
         file_entry.bind("<FocusOut>", lambda _event: self.load_batch_preview())
-        Button(file_row, text=self.t("browse"), command=self.pick_batch_config).pack(side=RIGHT, padx=(6, 0))
+        Button(file_row, text=self.t("browse"), command=self.pick_batch_config, padx=10, pady=3).pack(side=RIGHT, padx=(6, 0))
 
         Label(self.batch_frame, text=self.t("preview"), anchor="w").pack(fill=X, padx=10, pady=(8, 2))
         preview_frame = Frame(self.batch_frame, padx=10)
@@ -4451,6 +4475,8 @@ class ServerDialog:
                     text=self.t("batch_select_all_import"),
                     variable=self.batch_select_all_import,
                     command=self.set_all_batch_imports,
+                    padx=4,
+                    pady=2,
                 ).pack(side=LEFT)
             if overwritable_count:
                 Checkbutton(
@@ -4458,6 +4484,8 @@ class ServerDialog:
                     text=self.t("batch_select_all_overwrite"),
                     variable=self.batch_select_all_overwrite,
                     command=self.set_all_batch_overwrites,
+                    padx=4,
+                    pady=2,
                 ).pack(side=LEFT, padx=(12, 0))
         for item in items:
             row = Frame(self.batch_conflicts_body)
@@ -4477,7 +4505,7 @@ class ServerDialog:
             actions.pack(side=RIGHT, padx=(8, 0))
 
             if overwrite_var is not None:
-                overwrite_check = Checkbutton(actions, text=self.t("batch_overwrite"), variable=overwrite_var, anchor="w", width=10)
+                overwrite_check = Checkbutton(actions, text=self.t("batch_overwrite"), variable=overwrite_var, anchor="w", width=10, padx=4, pady=2)
                 overwrite_check.pack(side=LEFT)
 
                 def on_overwrite_changed(*_args, include=import_var, overwrite=overwrite_var) -> None:
@@ -4489,7 +4517,7 @@ class ServerDialog:
                 Label(actions, text="", width=10).pack(side=LEFT)
 
             import_state = "normal" if item.get("status") == "NEW" else "disabled"
-            import_check = Checkbutton(actions, text=self.t("batch_import"), variable=import_var, state=import_state, anchor="w", width=8)
+            import_check = Checkbutton(actions, text=self.t("batch_import"), variable=import_var, state=import_state, anchor="w", width=8, padx=4, pady=2)
             import_check.pack(side=LEFT)
 
             Button(
