@@ -41,6 +41,13 @@ BUFFER_SIZE_CHOICES = ["default (16Mi)", "0", "8Mi", "16Mi", "32Mi", "64Mi", "12
 LANGUAGE_CHOICES = {"auto": "Auto", "en": "English", "zh": "中文"}
 FONT_FAMILY_EN = "Segoe UI"
 FONT_FAMILY_ZH = "Noto Sans CJK SC"
+DEFAULT_UI_FONT_SIZE = 10
+SMALL_UI_FONT_SIZE = 9
+CARD_TITLE_FONT_SIZE = 14
+CARD_BODY_FONT_SIZE = 11
+CARD_STATUS_FONT_SIZE = 10
+CARD_ICON_FONT_SIZE = 30
+CARD_BUTTON_FONT_SIZE = 15
 RCLONE_CONFIG_LOCK = threading.RLock()
 DEFAULT_MOUNT_ALL_WORKERS = 4
 DEFAULT_UNMOUNT_ALL_WORKERS = 8
@@ -113,9 +120,13 @@ TEXT = {
         "mount": "Mount",
         "unmount": "Unmount",
         "open_folder": "Open mounted folder",
+        "open_folder_disabled": "Mount this config before opening its folder.",
         "edit_mount": "Edit mount information",
         "edit_mounted_disabled": "Unmount before editing this config",
+        "edit_batch_disabled": "Wait for the batch operation to finish before editing.",
         "delete_config": "Delete this config",
+        "delete_mounted_disabled": "Unmount before deleting this config.",
+        "delete_batch_disabled": "Wait for the batch operation to finish before deleting.",
         "refresh_remote": "Refresh remote directory cache",
         "refresh_unavailable": "Remount this config to enable refresh",
         "view_log": "View mount log",
@@ -265,9 +276,13 @@ TEXT = {
         "mount": "挂载",
         "unmount": "取消挂载",
         "open_folder": "打开挂载目录",
+        "open_folder_disabled": "请先挂载此配置，再打开对应文件夹。",
         "edit_mount": "编辑挂载信息",
         "edit_mounted_disabled": "请先取消挂载，再编辑此配置",
+        "edit_batch_disabled": "请等待批量操作完成后再编辑。",
         "delete_config": "删除此配置",
+        "delete_mounted_disabled": "请先取消挂载，再删除此配置。",
+        "delete_batch_disabled": "请等待批量操作完成后再删除。",
         "refresh_remote": "刷新远程目录缓存",
         "refresh_unavailable": "重新挂载后才能刷新缓存",
         "view_log": "查看挂载日志",
@@ -494,11 +509,33 @@ def load_embedded_chinese_font() -> bool:
 
 def configure_default_fonts(root: Tk, lang: str) -> None:
     family = FONT_FAMILY_ZH if lang == "zh" and load_embedded_chinese_font() else FONT_FAMILY_EN
-    for name in ["TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont", "TkCaptionFont", "TkSmallCaptionFont"]:
+    font_sizes = {
+        "TkDefaultFont": DEFAULT_UI_FONT_SIZE,
+        "TkTextFont": DEFAULT_UI_FONT_SIZE,
+        "TkMenuFont": DEFAULT_UI_FONT_SIZE,
+        "TkHeadingFont": DEFAULT_UI_FONT_SIZE,
+        "TkCaptionFont": DEFAULT_UI_FONT_SIZE,
+        "TkSmallCaptionFont": SMALL_UI_FONT_SIZE,
+    }
+    for name, size in font_sizes.items():
         try:
-            tkfont.nametofont(name).configure(family=family)
+            tkfont.nametofont(name).configure(family=family, size=size)
         except Exception:
             pass
+
+
+def enable_dpi_awareness() -> None:
+    if os.name != "nt":
+        return
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
 
 
 def refresh_windows_path_env() -> None:
@@ -2685,8 +2722,8 @@ class App:
     def __init__(self, root: Tk):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("760x460")
-        self.root.minsize(560, 360)
+        self.root.geometry("900x560")
+        self.root.minsize(660, 420)
         self.settings = load_settings()
         self.lang = effective_language(self.settings)
         configure_default_fonts(self.root, self.lang)
@@ -2739,6 +2776,14 @@ class App:
     def rebuild(self) -> None:
         for child in self.root.winfo_children():
             child.destroy()
+        self.card_widgets = {}
+        self.card_order = ()
+        self.cards_placeholder = None
+        self.mount_all_button = None
+        self.unmount_all_button = None
+        self.last_cards_width = 0
+        self.resize_refresh_pending = False
+        self.card_action_columns = 4
         self.build()
         self.refresh_list()
 
@@ -2853,7 +2898,7 @@ class App:
                 placeholder,
                 bg="#202020",
                 fg="#bdbdbd",
-                font=("Segoe UI", 11),
+                font=(FONT_FAMILY_ZH if self.lang == "zh" else FONT_FAMILY_EN, CARD_BODY_FONT_SIZE),
                 wraplength=520,
                 justify="center",
             )
@@ -3117,9 +3162,9 @@ class App:
         row = Frame(self.cards_frame, bg="#242424", padx=12, pady=10)
         left = Frame(row, bg="#242424", width=90)
         left.pack(side=LEFT, fill="y")
-        icon = Label(left, text="🛡", bg="#242424", fg="#bdbdbd", font=("Segoe UI Emoji", 28))
+        icon = Label(left, text="🛡", bg="#242424", fg="#bdbdbd", font=("Segoe UI Emoji", CARD_ICON_FONT_SIZE))
         icon.pack(anchor="w")
-        status_label = Label(left, bg="#242424", fg="#7d7d7d", font=(FONT_FAMILY_ZH if self.lang == "zh" else FONT_FAMILY_EN, 9))
+        status_label = Label(left, bg="#242424", fg="#7d7d7d", font=(FONT_FAMILY_ZH if self.lang == "zh" else FONT_FAMILY_EN, CARD_STATUS_FONT_SIZE))
         status_label.pack(anchor="w", pady=(6, 0))
 
         actions = Frame(row, bg="#242424")
@@ -3130,20 +3175,20 @@ class App:
         mid = Frame(row, bg="#242424", padx=0)
         mid.pack(side=LEFT, fill=BOTH, expand=True, padx=(0, 18))
         font_family = FONT_FAMILY_ZH if self.lang == "zh" else FONT_FAMILY_EN
-        title = Label(mid, bg="#242424", fg="#bdbdbd", font=(font_family, 13, "bold"), anchor="w")
+        title = Label(mid, bg="#242424", fg="#bdbdbd", font=(font_family, CARD_TITLE_FONT_SIZE, "bold"), anchor="w")
         title.pack(anchor="w", fill=X)
-        capacity_label = Label(mid, bg="#242424", fg="#c8c8c8", font=(font_family, 10), anchor="w")
+        capacity_label = Label(mid, bg="#242424", fg="#c8c8c8", font=(font_family, CARD_BODY_FONT_SIZE), anchor="w")
         capacity_label.pack(anchor="w", fill=X)
         capacity_bar = self.capacity_bar(mid, None, "#242424", "#7d7d7d")
         capacity_bar.pack(fill=X, pady=(5, 4))
-        user_host = Label(mid, bg="#242424", fg="#7d7d7d", font=(font_family, 10), anchor="e")
+        user_host = Label(mid, bg="#242424", fg="#7d7d7d", font=(font_family, CARD_BODY_FONT_SIZE), anchor="e")
         user_host.pack(anchor="e", fill=X)
-        remote_path = Label(mid, bg="#242424", fg="#7d7d7d", font=(font_family, 10), anchor="e")
+        remote_path = Label(mid, bg="#242424", fg="#7d7d7d", font=(font_family, CARD_BODY_FONT_SIZE), anchor="e")
         remote_path.pack(anchor="e", fill=X)
 
         buttons: list[Button] = []
         for _index in range(4):
-            button = Button(actions, width=3, height=1, font=("Segoe UI Emoji", 14))
+            button = Button(actions, width=3, height=1, font=("Segoe UI Emoji", CARD_BUTTON_FONT_SIZE))
             buttons.append(button)
         widgets = {
             "row": row,
@@ -3201,13 +3246,33 @@ class App:
         self.configure_if_changed(widgets["user_host"], text=f"{server.get('user', '')}@{server.get('host', '')}", fg=muted)
         self.configure_if_changed(widgets["remote_path"], text=server.get("remote_path") or "~", fg=muted)
         operation_active = self.is_server_operation_active(server)
+        batch_busy = self.batch_operation_running
         can_change_mount = not operation_active
         mount_tooltip = self.t("operation_busy") if operation_active else self.t("unmount") if mounted else self.t("mount")
+        open_tooltip = self.t("operation_busy") if operation_active else self.t("open_folder") if mounted else self.t("open_folder_disabled")
+        edit_tooltip = (
+            self.t("operation_busy")
+            if operation_active
+            else self.t("edit_batch_disabled")
+            if batch_busy
+            else self.t("edit_mounted_disabled")
+            if mounted
+            else self.t("edit_mount")
+        )
+        delete_tooltip = (
+            self.t("operation_busy")
+            if operation_active
+            else self.t("delete_batch_disabled")
+            if batch_busy
+            else self.t("delete_mounted_disabled")
+            if mounted
+            else self.t("delete_config")
+        )
         buttons = [
             ("■" if mounted else "▶", mount_tooltip, lambda s=server: self.toggle_mount(s), can_change_mount),
-            ("📂", self.t("open_folder"), lambda s=server: self.open_folder(s), mounted and not operation_active),
-            ("✎", self.t("edit_mounted_disabled") if mounted else self.t("edit_mount"), lambda s=server: self.edit_server(s), not mounted and can_change_mount and not self.batch_operation_running),
-            ("🗑", self.t("delete_config"), lambda s=server: self.delete_server(s), not mounted and can_change_mount and not self.batch_operation_running),
+            ("📂", open_tooltip, lambda s=server: self.open_folder(s), mounted and not operation_active),
+            ("✎", edit_tooltip, lambda s=server: self.edit_server(s), not mounted and can_change_mount and not batch_busy),
+            ("🗑", delete_tooltip, lambda s=server: self.delete_server(s), not mounted and can_change_mount and not batch_busy),
         ]
         columns = self.card_action_columns
         for index, (text, tooltip, command, enabled) in enumerate(buttons):
@@ -3216,18 +3281,26 @@ class App:
             button.grid(row=index // columns, column=index % columns, padx=2, pady=2)
 
     def icon_button(self, parent, text: str, tooltip: str, command, *, enabled: bool = True):
-        button = Button(parent, text=text, width=3, height=1, command=command, font=("Segoe UI Emoji", 14))
+        button = Button(parent, text=text, width=3, height=1, command=command, font=("Segoe UI Emoji", CARD_BUTTON_FONT_SIZE))
         self.configure_icon_button(button, text, tooltip, command, enabled=enabled)
         return button
 
     def configure_icon_button(self, button: Button, text: str, tooltip: str, command, *, enabled: bool = True) -> None:
-        button.configure(text=text, fg="#000000" if enabled else "#777777", command=command if enabled else lambda: None)
+        button.configure(
+            text=text,
+            fg="#000000" if enabled else "#777777",
+            command=command if enabled else lambda message=tooltip: self.show_disabled_action(message),
+        )
         tip = getattr(button, "_ssh_mountmate_tooltip", None)
         if tip is None:
             tip = Tooltip(button, tooltip)
             button._ssh_mountmate_tooltip = tip
         else:
             tip.text = tooltip
+
+    def show_disabled_action(self, message: str) -> None:
+        self.status.set(message)
+        messagebox.showinfo(APP_TITLE, message)
 
     def capacity_bar(self, parent, percent: int | None, bg: str, muted: str) -> Canvas:
         canvas = Canvas(parent, height=8, bg=bg, highlightthickness=0)
@@ -4764,6 +4837,7 @@ def main() -> int:
         return headless_mount(args.mount_id)
     if args.mount_startup_all:
         return headless_mount_all()
+    enable_dpi_awareness()
     root = Tk()
     App(root)
     root.mainloop()
