@@ -575,6 +575,28 @@ def run(cmd: list[str], *, check=True, capture=False) -> subprocess.CompletedPro
     )
 
 
+def command_display(cmd: object) -> str:
+    if isinstance(cmd, (list, tuple)):
+        if os.name == "nt":
+            return subprocess.list2cmdline([str(part) for part in cmd])
+        return shlex.join(str(part) for part in cmd)
+    return str(cmd)
+
+
+def process_error_details(exc: subprocess.CalledProcessError) -> str:
+    lines = [
+        f"Command: {command_display(exc.cmd)}",
+        f"Exit code: {exc.returncode}",
+    ]
+    stdout = str(getattr(exc, "stdout", "") or getattr(exc, "output", "") or "").strip()
+    stderr = str(getattr(exc, "stderr", "") or "").strip()
+    if stdout:
+        lines.extend(["stdout:", stdout])
+    if stderr:
+        lines.extend(["stderr:", stderr])
+    return "\n".join(lines)
+
+
 def free_local_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -2326,7 +2348,7 @@ def enable_startup(server: dict) -> None:
     if os.name != "nt":
         return
     task_name = f"SSHMountMate-{server['id']}"
-    run(["schtasks", "/Create", "/TN", task_name, "/SC", "ONLOGON", "/TR", startup_command(server["id"]), "/F"])
+    run(["schtasks", "/Create", "/TN", task_name, "/SC", "ONLOGON", "/TR", startup_command(server["id"]), "/F"], capture=True)
 
 
 def disable_startup(server: dict) -> None:
@@ -2967,9 +2989,11 @@ class App:
     def format_startup_error(self, server: dict, enabled: bool, exc: Exception) -> str:
         action = "enable" if enabled else "disable"
         name = server.get("name") or server.get("id") or "<unknown>"
+        server_id = server.get("id") or "<unknown>"
+        details = process_error_details(exc) if isinstance(exc, subprocess.CalledProcessError) else str(exc)
         return (
-            f"{name}: failed to {action} login mount\n"
-            f"{exc}\n"
+            f"{name} (id: {server_id}): failed to {action} login mount\n"
+            f"{details}\n"
             f"{traceback.format_exc().rstrip()}"
         )
 
