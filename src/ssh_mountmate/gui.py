@@ -45,6 +45,7 @@ CARD_TITLE_FONT_SIZE = 13
 CARD_BODY_FONT_SIZE = 11
 CARD_COMPACT_FONT_SIZE = 10
 CAPACITY_PATH_FONT_SIZE = 9
+CAPACITY_PATH_Y_OFFSET = -4
 CARD_STATUS_FONT_SIZE = 10
 CARD_ICON_FONT_SIZE = 28
 CARD_BUTTON_FONT_SIZE = 14
@@ -200,6 +201,8 @@ TEXT = {
         "batch_select_all_import": "Import all new",
         "batch_select_all_overwrite": "Overwrite all duplicates",
         "batch_overwrite_help": "Import is checked only for new configs.\nDuplicate configs are skipped unless Overwrite is checked.\nOverwrite updates SSH connection fields and keeps local mount settings.",
+        "batch_overwrite_protected": "Matched saved config is mounted or busy. Unmount it from the main window before overwriting.",
+        "batch_overwrite_difference": "Different fields are highlighted below.",
         "batch_details": "Details",
         "batch_detail_title": "Batch import details",
         "batch_detail_text": "Host: {host}\nStatus: {status}\nReason: {reason}\nAction: {action}\n\nImported config:\n{server}\n\nMatched saved config:\n{match}",
@@ -359,6 +362,8 @@ TEXT = {
         "batch_select_all_import": "导入全部新配置",
         "batch_select_all_overwrite": "覆盖全部重复配置",
         "batch_overwrite_help": "只有新配置默认勾选导入。\n重复配置默认跳过；勾选覆盖后才会覆盖。\n覆盖只更新 SSH 连接字段，并保留本地挂载设置。",
+        "batch_overwrite_protected": "匹配到的已保存配置正在挂载或忙碌；请先在主界面取消挂载再覆盖。",
+        "batch_overwrite_difference": "不同字段已在下方高亮。",
         "batch_details": "详情",
         "batch_detail_title": "批量导入详情",
         "batch_detail_text": "Host：{host}\n状态：{status}\n原因：{reason}\n动作：{action}\n\n拟导入配置：\n{server}\n\n匹配到的已保存配置：\n{match}",
@@ -654,6 +659,7 @@ class StyledCheckbutton(Frame):
         super().__init__(parent)
         self.variable: BooleanVar = kwargs.pop("variable")
         self.command = kwargs.pop("command", None)
+        self.disabled_command = kwargs.pop("disabled_command", None)
         self.text = kwargs.pop("text", "")
         self.state = kwargs.pop("state", "normal")
         self.anchor = kwargs.pop("anchor", "w")
@@ -691,6 +697,8 @@ class StyledCheckbutton(Frame):
 
     def _toggle(self, _event=None):
         if self.state == "disabled":
+            if self.disabled_command:
+                self.disabled_command()
             return "break"
         self.variable.set(not bool(self.variable.get()))
         if self.command:
@@ -712,6 +720,8 @@ class StyledCheckbutton(Frame):
             self.label.configure(text=self.text)
         if "command" in kwargs:
             self.command = kwargs.pop("command")
+        if "disabled_command" in kwargs:
+            self.disabled_command = kwargs.pop("disabled_command")
         if "width" in kwargs:
             self.width = kwargs.pop("width")
             self.label.configure(width=self.width)
@@ -2116,10 +2126,11 @@ def merge_batch_overwrite(existing: dict, imported: dict) -> dict:
     return merged
 
 
-def ssh_config_batch_plan(config_path: str | Path, existing_servers: list[dict] | None = None) -> dict:
+def ssh_config_batch_plan(config_path: str | Path, existing_servers: list[dict] | None = None, protected_ids: set[str] | None = None) -> dict:
     path = Path(config_path).expanduser()
     hosts = list_ssh_config_hosts(path)
     existing = [dict(server, __batch_existing=True) for server in (existing_servers or [])]
+    protected_ids = {str(server_id) for server_id in (protected_ids or set()) if server_id}
     accepted: list[dict] = []
     skipped: list[dict] = []
     errors: list[dict] = []
@@ -2143,6 +2154,9 @@ def ssh_config_batch_plan(config_path: str | Path, existing_servers: list[dict] 
         reason, matched = batch_duplicate_match(server, [*existing, *accepted])
         if reason:
             can_overwrite = bool(matched and matched.get("__batch_existing"))
+            overwrite_protected = bool(can_overwrite and str(matched.get("id") or "") in protected_ids)
+            if overwrite_protected:
+                can_overwrite = False
             if matched:
                 matched = {key: value for key, value in matched.items() if key != "__batch_existing"}
             item = {
@@ -2152,13 +2166,22 @@ def ssh_config_batch_plan(config_path: str | Path, existing_servers: list[dict] 
                 "server": server,
                 "match": matched,
                 "can_overwrite": can_overwrite,
+                "overwrite_protected": overwrite_protected,
             }
             skipped.append(item)
             items.append(item)
             statuses[host_alias] = item
             continue
         accepted.append(server)
-        item = {"host": host_alias, "status": "NEW", "reason": "", "server": server, "match": None, "can_overwrite": False}
+        item = {
+            "host": host_alias,
+            "status": "NEW",
+            "reason": "",
+            "server": server,
+            "match": None,
+            "can_overwrite": False,
+            "overwrite_protected": False,
+        }
         items.append(item)
         statuses[host_alias] = item
     return {"servers": accepted, "skipped": skipped, "errors": errors, "statuses": statuses, "hosts": hosts, "items": items}
@@ -2180,6 +2203,19 @@ def batch_plan_row_label(item: dict) -> str:
     if match_label and match_label != host:
         return f"{host} ({match_label})"
     return host
+
+
+def batch_status_badge_style(status: str) -> tuple[str, str, str]:
+    normalized = str(status or "").upper()
+    if normalized == "NEW":
+        return "#1f5137", "#d7f5e5", "#4aa36b"
+    if normalized == "INVALID":
+        return "#5c2a2a", "#ffd8d8", "#b85c5c"
+    if normalized == "SAME HOST":
+        return "#51421f", "#ffe8a6", "#a07926"
+    if normalized == "SAME TARGET":
+        return "#463b2c", "#f5dfc6", "#9a7449"
+    return "#3a3a3a", "#e3e3e3", "#6f6f6f"
 
 
 def ssh_config_batch_servers(config_path: str | Path, existing_servers: list[dict] | None = None) -> tuple[list[dict], list[str]]:
@@ -3706,8 +3742,8 @@ class App:
         text_font = tkfont.Font(font=path_font)
         text_width = text_font.measure(path_text)
         x = width - 7 - max(text_width, 0)
-        y = height // 2
-        draw_state = (width, height, percent, fill_width, color, muted, path_text, text_width, self.lang)
+        y = height // 2 + CAPACITY_PATH_Y_OFFSET
+        draw_state = (width, height, percent, fill_width, color, muted, path_text, text_width, self.lang, CAPACITY_PATH_Y_OFFSET)
         if getattr(canvas, "_ssh_mountmate_last_draw", None) == draw_state:
             return
         canvas._ssh_mountmate_last_draw = draw_state
@@ -4253,46 +4289,57 @@ class App:
             self.show_error(error)
 
     def add_config(self) -> None:
-        dialog = ServerDialog(self.root, rclone=self.current_rclone(), lang=self.lang, existing_servers=self.servers)
+        dialog = ServerDialog(
+            self.root,
+            rclone=self.current_rclone(),
+            lang=self.lang,
+            existing_servers=self.servers,
+            protected_overwrite_ids=self.protected_overwrite_ids(self.servers),
+        )
         self.root.wait_window(dialog.window)
         if dialog.result:
             results = dialog.result if isinstance(dialog.result, list) else [dialog.result]
-            used_ids = {server.get("id", "") for server in self.servers}
-            used_names: set[str] = set()
-            used_mount_folders: set[str] = set()
-            for server in self.servers:
-                add_used_server_name(server_name_base(server), used_names, used_mount_folders)
-            changed_results: list[dict] = []
-            for result in results:
-                action = result.pop("__batch_action", "")
-                target_id = result.pop("__batch_target_id", "")
-                if action == "overwrite" and target_id:
-                    for index, existing in enumerate(self.servers):
-                        if str(existing.get("id") or "") == str(target_id):
-                            merged = merge_batch_overwrite(existing, result)
-                            used_names_without_target: set[str] = set()
-                            used_mount_folders_without_target: set[str] = set()
-                            for other_index, other in enumerate(self.servers):
-                                if other_index != index:
-                                    add_used_server_name(server_name_base(other), used_names_without_target, used_mount_folders_without_target)
-                            merged["name"] = make_unique_server_name(server_name_base(merged), used_names_without_target, used_mount_folders_without_target)
-                            self.servers[index] = merged
-                            changed_results.append(merged)
-                            break
-                    continue
-                result["name"] = make_unique_server_name(server_name_base(result), used_names, used_mount_folders)
-                add_used_server_name(result["name"], used_names, used_mount_folders)
-                result["id"] = make_unique_server_id(result.get("id") or result.get("name", ""), used_ids)
-                used_ids.add(result["id"])
-                self.servers.append(result)
-                changed_results.append(result)
-            save_servers(self.servers)
-            if load_settings().get("startup_all"):
-                self.apply_startup_setting(True)
-            if len(changed_results) > 1:
-                self.status.set(self.t("imported_configs", count=len(changed_results)))
-            self.refresh_list()
-            self.refresh_mount_status_async()
+            self.apply_config_results(results)
+
+    def apply_config_results(self, results: list[dict]) -> None:
+        used_ids = {server.get("id", "") for server in self.servers}
+        used_names: set[str] = set()
+        used_mount_folders: set[str] = set()
+        for server in self.servers:
+            add_used_server_name(server_name_base(server), used_names, used_mount_folders)
+        changed_results: list[dict] = []
+        for result in results:
+            action = result.pop("__batch_action", "")
+            target_id = result.pop("__batch_target_id", "")
+            if action == "overwrite" and target_id:
+                for index, existing in enumerate(self.servers):
+                    if str(existing.get("id") or "") == str(target_id):
+                        merged = merge_batch_overwrite(existing, result)
+                        used_names_without_target: set[str] = set()
+                        used_mount_folders_without_target: set[str] = set()
+                        for other_index, other in enumerate(self.servers):
+                            if other_index != index:
+                                add_used_server_name(server_name_base(other), used_names_without_target, used_mount_folders_without_target)
+                        merged["name"] = make_unique_server_name(server_name_base(merged), used_names_without_target, used_mount_folders_without_target)
+                        self.servers[index] = merged
+                        changed_results.append(merged)
+                        break
+                continue
+            result["name"] = make_unique_server_name(server_name_base(result), used_names, used_mount_folders)
+            add_used_server_name(result["name"], used_names, used_mount_folders)
+            result["id"] = make_unique_server_id(result.get("id") or result.get("name", ""), used_ids)
+            used_ids.add(result["id"])
+            self.servers.append(result)
+            changed_results.append(result)
+        if not changed_results:
+            return
+        save_servers(self.servers)
+        if load_settings().get("startup_all"):
+            self.apply_startup_setting(True)
+        if len(changed_results) > 1:
+            self.status.set(self.t("imported_configs", count=len(changed_results)))
+        self.refresh_list()
+        self.refresh_mount_status_async()
 
     def edit_server(self, server: dict) -> None:
         if self.batch_operation_running or self.is_server_operation_active(server):
@@ -4402,14 +4449,31 @@ class App:
             self.rclone = resolve_rclone_path()
         return self.rclone
 
+    def protected_overwrite_ids(self, servers: list[dict]) -> set[str]:
+        statuses = batch_statuses_for_servers(servers)
+        protected = {str(server_id) for server_id, status in statuses.items() if status == "mounted"}
+        with self.server_operation_lock:
+            protected.update(str(server_id) for server_id in self.active_server_operations if server_id)
+        return protected
+
 
 class ServerDialog:
-    def __init__(self, root: Tk, *, rclone: str, lang: str, existing: dict | None = None, existing_servers: list[dict] | None = None):
+    def __init__(
+        self,
+        root: Tk,
+        *,
+        rclone: str,
+        lang: str,
+        existing: dict | None = None,
+        existing_servers: list[dict] | None = None,
+        protected_overwrite_ids: set[str] | None = None,
+    ):
         self.result = None
         self.rclone = rclone
         self.lang = lang
         self.existing = existing or {}
         self.existing_servers = [dict(server) for server in (existing_servers or [])]
+        self.protected_overwrite_ids = {str(server_id) for server_id in (protected_overwrite_ids or set()) if server_id}
         existing_source = self.existing.get("source")
         if not existing_source and self.existing.get("mode") == "ssh_config":
             existing_source = "ssh_config"
@@ -4670,7 +4734,7 @@ class ServerDialog:
         self.batch_select_all_import.set(True)
         self.batch_select_all_overwrite.set(False)
         try:
-            plan = ssh_config_batch_plan(path, self.existing_servers)
+            plan = ssh_config_batch_plan(path, self.existing_servers, self.protected_overwrite_ids)
             content = annotated_ssh_config_preview(path, self.existing_servers, plan)
         except Exception as exc:
             plan = None
@@ -4698,6 +4762,9 @@ class ServerDialog:
             return "import"
         return "ignore"
 
+    def handle_protected_batch_overwrite(self, item: dict) -> None:
+        self.show_batch_item_details(item, BooleanVar(value=False), None, force_reason=self.t("batch_overwrite_protected"))
+
     def set_all_batch_imports(self) -> None:
         selected = bool(self.batch_select_all_import.get())
         for item, import_var, overwrite_var in self.batch_conflict_actions.values():
@@ -4724,20 +4791,66 @@ class ServerDialog:
                 lines.append(f"{key}: {value.get(key)}")
         return "\n".join(lines) if lines else "-"
 
-    def show_batch_item_details(self, item: dict, import_var: BooleanVar, overwrite_var: BooleanVar | None = None) -> None:
+    def batch_detail_config_texts(self, item: dict) -> tuple[str, str, list[int]]:
+        server = item.get("server") or {}
+        match = item.get("match") or {}
+        if not server and not match:
+            return "-", "-", []
+        keys = ["name", "host_alias", "host", "user", "port", "auth", "key_file", "connection_method", "remote_path", "mountpoint"]
+        server_lines: list[str] = []
+        match_lines: list[str] = []
+        highlight_indexes: list[int] = []
+        for key in keys:
+            server_value = server.get(key)
+            match_value = match.get(key)
+            if server_value in (None, "") and match_value in (None, ""):
+                continue
+            server_lines.append(f"{key}: {server_value if server_value not in (None, '') else '-'}")
+            match_lines.append(f"{key}: {match_value if match_value not in (None, '') else '-'}")
+            if str(server_value or "") != str(match_value or ""):
+                highlight_indexes.append(len(server_lines))
+        return "\n".join(server_lines) if server_lines else "-", "\n".join(match_lines) if match_lines else "-", highlight_indexes
+
+    def batch_detail_highlight_lines(self, text: str, highlight_indexes: list[int]) -> list[int]:
+        lines = text.splitlines()
+        imported_line = next((index for index, line in enumerate(lines, 1) if line in {"Imported config:", "拟导入配置："}), 0)
+        matched_line = next((index for index, line in enumerate(lines, 1) if line in {"Matched saved config:", "匹配到的已保存配置："}), 0)
+        result: list[int] = []
+        for offset in highlight_indexes:
+            if imported_line:
+                result.append(imported_line + offset)
+            if matched_line:
+                result.append(matched_line + offset)
+        return result
+
+    def show_batch_item_details(
+        self,
+        item: dict,
+        import_var: BooleanVar,
+        overwrite_var: BooleanVar | None = None,
+        force_reason: str = "",
+    ) -> None:
         action = self.batch_item_action_from_vars(item, import_var, overwrite_var)
+        reason = item.get("reason") or ""
+        if force_reason:
+            reason = f"{reason}\n{force_reason}".strip()
+        if item.get("overwrite_protected") and self.t("batch_overwrite_protected") not in reason:
+            reason = f"{reason}\n{self.t('batch_overwrite_protected')}".strip()
+        server_text, match_text, highlight_indexes = self.batch_detail_config_texts(item)
+        if highlight_indexes:
+            reason = f"{reason}\n{self.t('batch_overwrite_difference')}".strip()
         text = self.t(
             "batch_detail_text",
             host=item.get("host") or "",
             status=item.get("status") or "",
-            reason=item.get("reason") or "",
+            reason=reason,
             action=self.batch_action_label(action),
-            server=self.compact_dict_text(item.get("server")),
-            match=self.compact_dict_text(item.get("match")),
+            server=server_text,
+            match=match_text,
         )
-        self.show_text_window(self.t("batch_detail_title"), text)
+        self.show_text_window(self.t("batch_detail_title"), text, highlight_lines=self.batch_detail_highlight_lines(text, highlight_indexes))
 
-    def show_text_window(self, title: str, content: str) -> None:
+    def show_text_window(self, title: str, content: str, highlight_lines: list[int] | None = None) -> None:
         window = Toplevel(self.window)
         window.title(title)
         apply_scaled_window_bounds(window, "760x500", (620, 420))
@@ -4747,6 +4860,10 @@ class ServerDialog:
         text = Text(frame, wrap="word", yscrollcommand=scrollbar.set)
         scrollbar.configure(command=text.yview)
         text.insert("1.0", content)
+        if highlight_lines:
+            text.tag_configure("changed", background="#fff3bf")
+            for line in highlight_lines:
+                text.tag_add("changed", f"{line}.0", f"{line}.end")
         text.configure(state="disabled")
         text.pack(side=LEFT, fill=BOTH, expand=True)
         scrollbar.pack(side=RIGHT, fill=Y)
@@ -4813,7 +4930,23 @@ class ServerDialog:
 
                 overwrite_var.trace_add("write", on_overwrite_changed)
             else:
-                Label(actions, text="", width=10).pack(side=LEFT)
+                if item.get("overwrite_protected"):
+                    protected_overwrite = styled_checkbutton(
+                        actions,
+                        self.lang,
+                        text=self.t("batch_overwrite"),
+                        variable=BooleanVar(value=False),
+                        state="disabled",
+                        disabled_command=lambda current=item: self.handle_protected_batch_overwrite(current),
+                        anchor="w",
+                        width=10,
+                    )
+                    protected_overwrite.pack(side=LEFT)
+                    Tooltip(protected_overwrite, self.t("batch_overwrite_protected"))
+                    for child in protected_overwrite.winfo_children():
+                        Tooltip(child, self.t("batch_overwrite_protected"))
+                else:
+                    Label(actions, text="", width=10).pack(side=LEFT)
 
             import_state = "normal" if item.get("status") == "NEW" else "disabled"
             import_check = styled_checkbutton(actions, self.lang, text=self.t("batch_import"), variable=import_var, state=import_state, anchor="w", width=8)
@@ -4825,7 +4958,24 @@ class ServerDialog:
                 text=self.t("batch_details"),
                 command=lambda current=item, include=import_var, overwrite=overwrite_var: self.show_batch_item_details(current, include, overwrite),
             ).pack(side=LEFT, padx=(4, 0))
-            Label(row, text=label, anchor="w", width=42).pack(side=LEFT, fill=X, expand=True)
+            status_bg, status_fg, status_border = batch_status_badge_style(item.get("status", ""))
+            status_badge = Label(
+                row,
+                text=item.get("status") or "",
+                anchor="center",
+                bg=status_bg,
+                fg=status_fg,
+                bd=1,
+                relief="solid",
+                highlightthickness=1,
+                highlightbackground=status_border,
+                font=(FONT_FAMILY_ZH if self.lang == "zh" else FONT_FAMILY_EN, CAPACITY_PATH_FONT_SIZE, "bold"),
+                padx=6,
+                pady=2,
+                width=11,
+            )
+            status_badge.pack(side=LEFT, padx=(0, 8))
+            Label(row, text=label, anchor="w", width=34).pack(side=LEFT, fill=X, expand=True)
 
             def on_import_changed(*_args, include=import_var, overwrite=overwrite_var) -> None:
                 if overwrite is not None and include.get():
@@ -5103,7 +5253,12 @@ class ServerDialog:
     def save(self) -> None:
         source = self.source.get()
         if source == "ssh_config_batch":
-            plan = ssh_config_batch_plan(self.batch_config_path.get(), self.existing_servers)
+            protected_overwrite_ids = set(self.protected_overwrite_ids)
+            for existing_server in self.existing_servers:
+                server_id = str(existing_server.get("id") or "")
+                if server_id and verified_mount_status(existing_server) == "mounted":
+                    protected_overwrite_ids.add(server_id)
+            plan = ssh_config_batch_plan(self.batch_config_path.get(), self.existing_servers, protected_overwrite_ids)
             action_items = self.batch_conflict_actions
             if not action_items:
                 self.update_batch_conflicts(plan)
@@ -5132,6 +5287,10 @@ class ServerDialog:
                     continue
                 match = item.get("match") or {}
                 if not match.get("id"):
+                    ignored_count += 1
+                    continue
+                if str(match.get("id") or "") in protected_overwrite_ids:
+                    item["reason"] = f"{item.get('reason') or ''} {self.t('batch_overwrite_protected')}".strip()
                     ignored_count += 1
                     continue
                 server = dict(item.get("server") or {})

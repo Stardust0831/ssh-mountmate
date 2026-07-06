@@ -123,6 +123,96 @@ class ConnectionReliabilityTests(unittest.TestCase):
             self.assertIn("Host SAI-user", content)
             self.assertNotIn("Password", "\n".join(content))
 
+    def test_batch_plan_disables_overwrite_for_protected_match(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            config_path = Path(temp_name) / "config"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "Host cluster",
+                        "  HostName cluster.example",
+                        "  User user",
+                        "  Port 22",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            existing = {
+                "id": "cluster",
+                "name": "cluster",
+                "host_alias": "cluster",
+                "host": "cluster.example",
+                "user": "user",
+                "port": "22",
+            }
+
+            plan = gui.ssh_config_batch_plan(config_path, [existing], protected_ids={"cluster"})
+
+        item = plan["items"][0]
+        self.assertEqual(item["status"], "SAME")
+        self.assertFalse(item["can_overwrite"])
+        self.assertTrue(item["overwrite_protected"])
+
+    def test_batch_plan_allows_overwrite_for_unprotected_same_match(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            config_path = Path(temp_name) / "config"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "Host cluster",
+                        "  HostName cluster.example",
+                        "  User user",
+                        "  Port 22",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            existing = {
+                "id": "cluster",
+                "name": "cluster",
+                "host_alias": "cluster",
+                "host": "cluster.example",
+                "user": "user",
+                "port": "22",
+            }
+
+            plan = gui.ssh_config_batch_plan(config_path, [existing])
+
+        item = plan["items"][0]
+        self.assertEqual(item["status"], "SAME")
+        self.assertTrue(item["can_overwrite"])
+        self.assertFalse(item["overwrite_protected"])
+
+    def test_batch_plan_marks_protected_same_host_without_direct_overwrite(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            config_path = Path(temp_name) / "config"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "Host cluster",
+                        "  HostName new.example",
+                        "  User user",
+                        "  Port 22",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            existing = {
+                "id": "cluster",
+                "name": "cluster",
+                "host_alias": "cluster",
+                "host": "old.example",
+                "user": "user",
+                "port": "22",
+            }
+
+            plan = gui.ssh_config_batch_plan(config_path, [existing], protected_ids={"cluster"})
+
+        item = plan["items"][0]
+        self.assertEqual(item["status"], "SAME HOST")
+        self.assertFalse(item["can_overwrite"])
+        self.assertTrue(item["overwrite_protected"])
+
 
 if __name__ == "__main__":
     unittest.main()
