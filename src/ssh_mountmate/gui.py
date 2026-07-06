@@ -56,8 +56,8 @@ ACTION_BUTTON_FONT_WEIGHT = "normal"
 CHECKBUTTON_FONT_SIZE = 11
 CHECKBOX_SIZE = 28
 HELP_ICON_SIZE = 36
-HELP_ICON_FONT_SIZE = 10
-CAPACITY_BAR_HEIGHT = 16
+HELP_ICON_FONT_SIZE = 9
+CAPACITY_BAR_HEIGHT = 26
 TEXT_BUTTON_PADX = 9
 TEXT_BUTTON_PADY = 4
 CHECKBUTTON_PADX = 7
@@ -65,12 +65,12 @@ CHECKBUTTON_PADY = 5
 BROWSE_BUTTON_WIDTH = 6
 BROWSE_BUTTON_PADX = 8
 BROWSE_BUTTON_PADY = 3
-MAIN_WINDOW_GEOMETRY = "1080x700"
-MAIN_WINDOW_MIN_SIZE = (860, 560)
-SETTINGS_WINDOW_GEOMETRY = "900x860"
-SETTINGS_WINDOW_MIN_SIZE = (820, 780)
-SERVER_DIALOG_GEOMETRY = "1060x840"
-SERVER_DIALOG_MIN_SIZE = (980, 760)
+MAIN_WINDOW_GEOMETRY = "970x700"
+MAIN_WINDOW_MIN_SIZE = (775, 560)
+SETTINGS_WINDOW_GEOMETRY = "810x860"
+SETTINGS_WINDOW_MIN_SIZE = (740, 780)
+SERVER_DIALOG_GEOMETRY = "955x840"
+SERVER_DIALOG_MIN_SIZE = (880, 760)
 UI_BASE_TK_SCALING = 96 / 72
 WINDOW_DPI_SCALE_WEIGHT = 0.45
 MAX_WINDOW_DPI_SCALE = 1.45
@@ -1610,6 +1610,39 @@ def format_capacity_bytes(size: int) -> str:
         if abs(size) >= factor:
             return f"{size / factor:.1f} {unit}"
     return f"{size} B"
+
+
+def display_remote_path(remote_path: str) -> str:
+    value = (remote_path or "").strip().replace("\\", "/")
+    if not value or value == "~":
+        return "$HOME"
+    if value.startswith("/"):
+        return value
+    if value.startswith("$HOME"):
+        return value
+    return f"$HOME/{value.strip('/')}"
+
+
+def capacity_display_path(server: dict, status: str, capacity: dict | None = None) -> str:
+    source = (capacity or {}).get("source")
+    if source in {"lustre_project_quota", "rclone_about"}:
+        return display_remote_path(server.get("remote_path") or "")
+    if status == "mounted" or source == "local_mountpoint":
+        mountpoint = current_state(server).get("mountpoint") or current_mountpoint(server)
+        if mountpoint:
+            return disk_usage_path(str(mountpoint))
+    return display_remote_path(server.get("remote_path") or "")
+
+
+def shorten_middle_text(text: str, limit: int) -> str:
+    value = str(text or "")
+    if limit <= 0 or len(value) <= limit:
+        return value
+    if limit <= 3:
+        return "." * limit
+    head = max(1, (limit - 3) // 2)
+    tail = max(1, limit - 3 - head)
+    return f"{value[:head]}...{value[-tail:]}"
 
 
 def parse_lustre_project_line(output: str) -> int | None:
@@ -3429,6 +3462,14 @@ class App:
         reserved_width = 210 if self.card_action_columns == 2 else 260
         return max(18, min(64, (canvas_width - reserved_width) // 8))
 
+    def set_tooltip(self, widget, text: str) -> None:
+        tip = getattr(widget, "_ssh_mountmate_tooltip", None)
+        if tip is None:
+            tip = Tooltip(widget, text)
+            widget._ssh_mountmate_tooltip = tip
+        else:
+            tip.text = text
+
     def create_server_card(self) -> dict:
         row = Frame(self.cards_frame, bg="#242424", padx=12, pady=10)
         left = Frame(row, bg="#242424", width=90)
@@ -3446,16 +3487,16 @@ class App:
         mid = Frame(row, bg="#242424", padx=0)
         mid.pack(side=LEFT, fill=BOTH, expand=True, padx=(0, 18))
         font_family = FONT_FAMILY_ZH if self.lang == "zh" else FONT_FAMILY_EN
-        title = Label(mid, bg="#242424", fg="#bdbdbd", font=(font_family, CARD_TITLE_FONT_SIZE, "bold"), anchor="w")
-        title.pack(anchor="w", fill=X)
-        capacity_label = Label(mid, bg="#242424", fg="#c8c8c8", font=(font_family, CARD_BODY_FONT_SIZE), anchor="w")
-        capacity_label.pack(anchor="w", fill=X)
+        header = Frame(mid, bg="#242424")
+        header.pack(fill=X)
+        title = Label(header, bg="#242424", fg="#bdbdbd", font=(font_family, CARD_TITLE_FONT_SIZE, "bold"), anchor="w")
+        title.pack(side=LEFT, fill=X, expand=True)
+        user_host = Label(header, bg="#242424", fg="#909090", font=(font_family, CARD_BODY_FONT_SIZE), anchor="e")
+        user_host.pack(side=RIGHT, padx=(12, 0))
         capacity_bar = self.capacity_bar(mid, None, "#242424", "#7d7d7d")
-        capacity_bar.pack(fill=X, pady=(5, 4))
-        user_host = Label(mid, bg="#242424", fg="#909090", font=(font_family, CARD_BODY_FONT_SIZE), anchor="e")
-        user_host.pack(anchor="e", fill=X)
-        remote_path = Label(mid, bg="#242424", fg="#909090", font=(font_family, CARD_BODY_FONT_SIZE), anchor="e")
-        remote_path.pack(anchor="e", fill=X)
+        capacity_bar.pack(fill=X, pady=(6, 3))
+        capacity_label = Label(mid, bg="#242424", fg="#c8c8c8", font=(font_family, CARD_BODY_FONT_SIZE), anchor="e")
+        capacity_label.pack(anchor="e", fill=X)
 
         buttons: list[Button] = []
         for _index in range(4):
@@ -3468,11 +3509,11 @@ class App:
             "status": status_label,
             "actions": actions,
             "mid": mid,
+            "header": header,
             "title": title,
             "capacity_label": capacity_label,
             "capacity_bar": capacity_bar,
             "user_host": user_host,
-            "remote_path": remote_path,
             "buttons": buttons,
             "action_columns": None,
             "text_width": None,
@@ -3485,7 +3526,7 @@ class App:
         row_bg = "#2a2a2a" if mounted else "#242424"
         muted = "#909090"
         fg = "#f1f1f1" if mounted else "#bdbdbd"
-        for key in ("row", "left", "actions", "mid", "icon", "status", "title", "capacity_label", "user_host", "remote_path"):
+        for key in ("row", "left", "actions", "mid", "header", "icon", "status", "title", "capacity_label", "user_host"):
             self.configure_if_changed(widgets[key], bg=row_bg)
         self.configure_if_changed(widgets["icon"], fg=fg)
         self.configure_if_changed(widgets["status"], text=self.status_text(status), fg=muted)
@@ -3508,14 +3549,24 @@ class App:
             capacity_label = self.t("checking_capacity") if mounted else self.t("unknown_capacity")
         text_width = self.card_text_width()
         if widgets.get("text_width") != text_width:
-            for key in ("title", "capacity_label", "user_host", "remote_path"):
+            for key in ("title", "capacity_label", "user_host"):
                 self.configure_if_changed(widgets[key], width=text_width)
             widgets["text_width"] = text_width
-        self.configure_if_changed(widgets["title"], text=f"{drive}  {server.get('name') or server.get('id')}", fg=fg)
+        title_text = f"{drive}  {server.get('name') or server.get('id')}"
+        user_host_text = f"{server.get('user', '')}@{server.get('host', '')}"
+        capacity_path_text = capacity_display_path(server, status, capacity)
+        self.configure_if_changed(widgets["title"], text=shorten_middle_text(title_text, max(18, text_width)), fg=fg)
+        self.set_tooltip(widgets["title"], title_text)
         self.configure_if_changed(widgets["capacity_label"], text=capacity_label)
-        self.update_capacity_bar(widgets["capacity_bar"], int(capacity.get("percent", 0)) if mounted and capacity else None, row_bg, muted)
-        self.configure_if_changed(widgets["user_host"], text=f"{server.get('user', '')}@{server.get('host', '')}", fg=muted)
-        self.configure_if_changed(widgets["remote_path"], text=server.get("remote_path") or "~", fg=muted)
+        self.update_capacity_bar(
+            widgets["capacity_bar"],
+            int(capacity.get("percent", 0)) if mounted and capacity else None,
+            row_bg,
+            muted,
+            capacity_path_text,
+        )
+        self.configure_if_changed(widgets["user_host"], text=shorten_middle_text(user_host_text, max(16, text_width // 2)), fg=muted)
+        self.set_tooltip(widgets["user_host"], user_host_text)
         operation_active = self.is_server_operation_active(server)
         batch_busy = self.batch_operation_running
         can_change_mount = not operation_active
@@ -3574,12 +3625,18 @@ class App:
         messagebox.showinfo(APP_TITLE, message)
 
     def capacity_bar(self, parent, percent: int | None, bg: str, muted: str) -> Canvas:
-        canvas = Canvas(parent, height=CAPACITY_BAR_HEIGHT, bg=bg, highlightthickness=0)
+        canvas = Canvas(parent, height=CAPACITY_BAR_HEIGHT, bg=bg, highlightthickness=0, cursor="sb_h_double_arrow")
         canvas._ssh_mountmate_percent = percent
         canvas._ssh_mountmate_muted = muted
+        canvas._ssh_mountmate_path = ""
+        canvas._ssh_mountmate_path_offset = 0
+        canvas._ssh_mountmate_path_drag_start_x = None
+        canvas._ssh_mountmate_path_drag_start_offset = 0
         canvas._ssh_mountmate_track = None
         canvas._ssh_mountmate_fill = None
         canvas._ssh_mountmate_line = None
+        canvas._ssh_mountmate_path_shadow = []
+        canvas._ssh_mountmate_path_text = None
         canvas._ssh_mountmate_last_draw = None
         canvas._ssh_mountmate_redraw_pending = False
 
@@ -3587,25 +3644,55 @@ class App:
             self.draw_capacity_bar(canvas)
 
         canvas.bind("<Configure>", redraw)
+        canvas.bind("<ButtonPress-1>", self.on_capacity_path_drag_start)
+        canvas.bind("<B1-Motion>", self.on_capacity_path_drag)
+        canvas.bind("<ButtonRelease-1>", self.on_capacity_path_drag_end)
+        canvas._ssh_mountmate_tooltip = Tooltip(canvas, "")
         canvas.after_idle(redraw)
         return canvas
 
-    def update_capacity_bar(self, canvas: Canvas, percent: int | None, bg: str, muted: str) -> None:
+    def update_capacity_bar(self, canvas: Canvas, percent: int | None, bg: str, muted: str, path_text: str = "") -> None:
         current = (
             getattr(canvas, "_ssh_mountmate_percent", None),
             getattr(canvas, "_ssh_mountmate_muted", None),
+            getattr(canvas, "_ssh_mountmate_path", ""),
             str(canvas.cget("bg")),
         )
-        updated = (percent, muted, bg)
+        updated = (percent, muted, path_text, bg)
         self.configure_if_changed(canvas, bg=bg)
+        if getattr(canvas, "_ssh_mountmate_path", "") != path_text:
+            canvas._ssh_mountmate_path_offset = 0
         canvas._ssh_mountmate_percent = percent
         canvas._ssh_mountmate_muted = muted
+        canvas._ssh_mountmate_path = path_text
+        tip = getattr(canvas, "_ssh_mountmate_tooltip", None)
+        if tip is not None:
+            tip.text = path_text
         if current != updated:
             self.draw_capacity_bar(canvas)
+
+    def on_capacity_path_drag_start(self, event) -> None:
+        canvas = event.widget
+        canvas._ssh_mountmate_path_drag_start_x = event.x
+        canvas._ssh_mountmate_path_drag_start_offset = getattr(canvas, "_ssh_mountmate_path_offset", 0)
+
+    def on_capacity_path_drag(self, event) -> None:
+        canvas = event.widget
+        start_x = getattr(canvas, "_ssh_mountmate_path_drag_start_x", None)
+        if start_x is None:
+            return
+        start_offset = getattr(canvas, "_ssh_mountmate_path_drag_start_offset", 0)
+        canvas._ssh_mountmate_path_offset = start_offset + (event.x - start_x)
+        self.draw_capacity_bar(canvas)
+
+    def on_capacity_path_drag_end(self, event) -> None:
+        canvas = event.widget
+        canvas._ssh_mountmate_path_drag_start_x = None
 
     def draw_capacity_bar(self, canvas: Canvas) -> None:
         percent = getattr(canvas, "_ssh_mountmate_percent", None)
         muted = getattr(canvas, "_ssh_mountmate_muted", "#7d7d7d")
+        path_text = getattr(canvas, "_ssh_mountmate_path", "")
         width = canvas.winfo_width()
         if width <= 2:
             if not getattr(canvas, "_ssh_mountmate_redraw_pending", False):
@@ -3624,7 +3711,16 @@ class App:
         height = max(CAPACITY_BAR_HEIGHT, canvas.winfo_height())
         fill_width = width if percent is None else int(width * max(0, min(percent, 100)) / 100)
         color = "#303030" if percent is None else "#52b788" if percent < 80 else "#f0b429" if percent < 92 else "#e55353"
-        draw_state = (width, height, percent, fill_width, color, muted)
+        path_font = (FONT_FAMILY_ZH if self.lang == "zh" else FONT_FAMILY_EN, CARD_BODY_FONT_SIZE, "bold")
+        text_font = tkfont.Font(font=path_font)
+        text_width = text_font.measure(path_text)
+        max_text_width = max(0, width - 18)
+        max_offset = max(0, text_width - max_text_width)
+        offset = max(0, min(getattr(canvas, "_ssh_mountmate_path_offset", 0), max_offset))
+        canvas._ssh_mountmate_path_offset = offset
+        x = width - 9 - max(text_width, 0) + offset
+        y = height // 2
+        draw_state = (width, height, percent, fill_width, color, muted, path_text, offset, text_width, self.lang)
         if getattr(canvas, "_ssh_mountmate_last_draw", None) == draw_state:
             return
         canvas._ssh_mountmate_last_draw = draw_state
@@ -3632,13 +3728,26 @@ class App:
             canvas._ssh_mountmate_track = canvas.create_rectangle(0, 0, width, height, fill="#3a3a3a", outline="")
             canvas._ssh_mountmate_fill = canvas.create_rectangle(0, 0, fill_width, height, fill=color, outline="")
             canvas._ssh_mountmate_line = canvas.create_line(0, height - 1, width, height - 1, fill=muted)
-            return
+        if getattr(canvas, "_ssh_mountmate_path_text", None) is None:
+            canvas._ssh_mountmate_path_shadow = [
+                canvas.create_text(x + dx, y + dy, text=path_text, fill="#111111", font=path_font, anchor="w")
+                for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1))
+            ]
+            canvas._ssh_mountmate_path_text = canvas.create_text(x, y, text=path_text, fill="#ffffff", font=path_font, anchor="w")
         canvas.coords(canvas._ssh_mountmate_track, 0, 0, width, height)
         canvas.itemconfigure(canvas._ssh_mountmate_track, fill="#3a3a3a", outline="")
         canvas.coords(canvas._ssh_mountmate_fill, 0, 0, fill_width, height)
         canvas.itemconfigure(canvas._ssh_mountmate_fill, fill=color, outline="")
         canvas.coords(canvas._ssh_mountmate_line, 0, height - 1, width, height - 1)
         canvas.itemconfigure(canvas._ssh_mountmate_line, fill=muted)
+        for item, (dx, dy) in zip(getattr(canvas, "_ssh_mountmate_path_shadow", []), ((-1, 0), (1, 0), (0, -1), (0, 1))):
+            canvas.coords(item, x + dx, y + dy)
+            canvas.itemconfigure(item, text=path_text, fill="#111111", font=path_font)
+            canvas.tag_raise(item)
+        canvas.coords(canvas._ssh_mountmate_path_text, x, y)
+        canvas.itemconfigure(canvas._ssh_mountmate_path_text, text=path_text, fill="#ffffff", font=path_font)
+        canvas.tag_raise(canvas._ssh_mountmate_path_text)
+        canvas.tag_raise(canvas._ssh_mountmate_line)
 
     def check_dependencies_async(self) -> None:
         if self.dependency_checking:

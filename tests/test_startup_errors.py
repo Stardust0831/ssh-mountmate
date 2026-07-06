@@ -79,6 +79,31 @@ class StartupErrorTests(unittest.TestCase):
         self.assertFalse(gui.local_capacity_cache_due("server", {"server": 100.0}, now=104.0))
         self.assertTrue(gui.local_capacity_cache_due("server", {"server": 100.0}, now=106.0))
 
+    def test_display_remote_path_expands_home_paths(self):
+        self.assertEqual(gui.display_remote_path(""), "$HOME")
+        self.assertEqual(gui.display_remote_path("project/data"), "$HOME/project/data")
+        self.assertEqual(gui.display_remote_path("/scratch/project"), "/scratch/project")
+
+    def test_shorten_middle_text_keeps_both_ends(self):
+        self.assertEqual(gui.shorten_middle_text("/very/long/path/name", 12), "/ver.../name")
+
+    def test_capacity_display_path_uses_source_location(self):
+        server = {"id": "server", "mountpoint": "Z:", "remote_path": "project/data"}
+
+        original_current_state = gui.current_state
+        try:
+            gui.current_state = lambda _server: {"mountpoint": "Z:"}
+            self.assertEqual(
+                gui.capacity_display_path(server, "mounted", {"source": "local_mountpoint"}),
+                gui.disk_usage_path("Z:"),
+            )
+            self.assertEqual(
+                gui.capacity_display_path(server, "mounted", {"source": "lustre_project_quota"}),
+                "$HOME/project/data",
+            )
+        finally:
+            gui.current_state = original_current_state
+
     def test_simple_mount_status_accepts_running_pid_without_command_line(self):
         state = {"pid": 42, "remote": "host:/data", "mountpoint": "Z:"}
 
