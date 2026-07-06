@@ -3491,12 +3491,12 @@ class App:
         header.pack(fill=X)
         title = Label(header, bg="#242424", fg="#bdbdbd", font=(font_family, CARD_TITLE_FONT_SIZE, "bold"), anchor="w")
         title.pack(fill=X)
-        user_host = Label(mid, bg="#242424", fg="#909090", font=(font_family, CARD_COMPACT_FONT_SIZE), anchor="w")
-        user_host.pack(anchor="w", fill=X, pady=(2, 0))
+        capacity_label = Label(mid, bg="#242424", fg="#c8c8c8", font=(font_family, CARD_BODY_FONT_SIZE), anchor="w")
+        capacity_label.pack(anchor="w", fill=X, pady=(2, 0))
         capacity_bar = self.capacity_bar(mid, None, "#242424", "#7d7d7d")
         capacity_bar.pack(fill=X, pady=(5, 3))
-        capacity_label = Label(mid, bg="#242424", fg="#c8c8c8", font=(font_family, CARD_BODY_FONT_SIZE), anchor="w")
-        capacity_label.pack(anchor="w", fill=X)
+        user_host = Label(mid, bg="#242424", fg="#909090", font=(font_family, CARD_BODY_FONT_SIZE), anchor="e")
+        user_host.pack(anchor="e", fill=X)
 
         buttons: list[Button] = []
         for _index in range(4):
