@@ -136,7 +136,7 @@ TEXT = {
         "capacity_used": "{used} / {total} used ({percent}%)",
         "mounted_status": "mounted",
         "stopped_status": "stopped",
-        "stale_status": "stale",
+        "stale_status": "stopped",
         "checking_status": "checking",
         "mounted_at": "Mounted {remote} at {mountpoint}",
         "unmounted": "Unmounted.",
@@ -292,7 +292,7 @@ TEXT = {
         "capacity_used": "已用 {used} / {total}（{percent}%）",
         "mounted_status": "已挂载",
         "stopped_status": "未挂载",
-        "stale_status": "状态过期",
+        "stale_status": "未挂载",
         "checking_status": "检查中",
         "mounted_at": "已挂载 {remote} 到 {mountpoint}",
         "unmounted": "已取消挂载。",
@@ -1074,8 +1074,8 @@ def mount_status(server: dict) -> str:
     try:
         state = json.loads(state_file.read_text(encoding="utf-8"))
     except Exception:
-        return "stale"
-    return mount_process.mount_status_from_state(state, mountpoint_ready=mountpoint_ready, allow_pid_fallback=os.name != "nt")
+        return "stopped"
+    return simple_mount_status_from_state(state)
 
 
 def mount_status_with_pids(server: dict, pid_set: set[int]) -> str:
@@ -1084,11 +1084,9 @@ def mount_status_with_pids(server: dict, pid_set: set[int]) -> str:
         return "stopped"
     try:
         state = json.loads(state_file.read_text(encoding="utf-8"))
-        pid = int(state.get("pid", 0))
-        mountpoint = str(state.get("mountpoint") or "")
     except Exception:
-        return "stale"
-    return "mounted" if pid and pid in pid_set and mountpoint and mountpoint_ready(mountpoint) else "stale"
+        return "stopped"
+    return simple_mount_status_from_state(state, pid_set=pid_set)
 
 
 def command_matches_state(command: str, state: dict) -> bool:
@@ -1106,13 +1104,33 @@ def mount_status_with_processes(server: dict, processes: dict[int, str]) -> str:
     try:
         state = json.loads(state_file.read_text(encoding="utf-8"))
     except Exception:
-        return "stale"
-    return mount_process.mount_status_from_state(
-        state,
-        processes=processes,
-        mountpoint_ready=mountpoint_ready,
-        allow_pid_fallback=True,
-    )
+        return "stopped"
+    return simple_mount_status_from_state(state, processes=processes)
+
+
+def simple_mount_status_from_state(
+    state: dict,
+    *,
+    processes: dict[int, str] | None = None,
+    pid_set: set[int] | None = None,
+) -> str:
+    try:
+        pid = int(state.get("pid", 0))
+    except (TypeError, ValueError):
+        pid = 0
+    mountpoint = str(state.get("mountpoint") or "")
+    if pid:
+        command = processes.get(pid, "") if processes is not None else process_command(pid)
+        if command:
+            return "mounted" if mount_process.command_matches_mount(command, state) else "stopped"
+        if processes is not None:
+            if pid in processes:
+                return "mounted"
+        elif pid_is_running(pid, pid_set):
+            return "mounted"
+    if mountpoint and mountpoint_ready(mountpoint):
+        return "mounted"
+    return "stopped"
 
 
 def batch_statuses_for_servers(servers: list[dict]) -> dict[str, str]:
@@ -2233,9 +2251,10 @@ def unmount_server_locked(server: dict) -> None:
     if os.name == "nt":
         command = running_rclone_processes().get(int(pid), "")
         if not command:
-            state_file.unlink(missing_ok=True)
-            return
-        if not command_matches_state(command, state):
+            if not pid_is_running(pid_int):
+                state_file.unlink(missing_ok=True)
+                return
+        elif not command_matches_state(command, state):
             state_file.unlink(missing_ok=True)
             raise RuntimeError("Recorded PID no longer belongs to this mount. Removed stale state; the current rclone process was not stopped.")
         result = subprocess.run(["taskkill", "/PID", pid, "/T"], text=True, creationflags=create_no_window())

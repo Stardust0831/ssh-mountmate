@@ -79,6 +79,22 @@ class StartupErrorTests(unittest.TestCase):
         self.assertFalse(gui.local_capacity_cache_due("server", {"server": 100.0}, now=104.0))
         self.assertTrue(gui.local_capacity_cache_due("server", {"server": 100.0}, now=106.0))
 
+    def test_simple_mount_status_accepts_running_pid_without_command_line(self):
+        state = {"pid": 42, "remote": "host:/data", "mountpoint": "Z:"}
+
+        self.assertEqual(gui.simple_mount_status_from_state(state, processes={42: ""}), "mounted")
+
+    def test_simple_mount_status_uses_ready_mountpoint_as_mounted(self):
+        state = {"pid": 42, "remote": "host:/data", "mountpoint": "Z:"}
+        original_mountpoint_ready = gui.mountpoint_ready
+        try:
+            gui.mountpoint_ready = lambda _mountpoint: True
+            status = gui.simple_mount_status_from_state(state, processes={})
+        finally:
+            gui.mountpoint_ready = original_mountpoint_ready
+
+        self.assertEqual(status, "mounted")
+
 
 if __name__ == "__main__":
     unittest.main()
