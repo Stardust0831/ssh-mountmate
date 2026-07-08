@@ -32,12 +32,13 @@ from .updates import check_for_updates, format_update_info
 
 
 APP_TITLE = "SSH MountMate"
-SETTINGS_SCHEMA_VERSION = 3
-CACHE_SIZE_CHOICES = ["10G", "1G", "5G", "20G", "50G", "100G", "500G", "default (no size limit)"]
+SETTINGS_SCHEMA_VERSION = 5
+VFS_CACHE_MODE_CHOICES = ["writes", "off", "minimal", "full"]
+CACHE_SIZE_CHOICES = ["default (no size limit)", "1G", "5G", "10G", "20G", "50G", "100G", "500G"]
 CACHE_AGE_CHOICES = ["default (1h0m0s)", "5m", "15m", "30m", "1h", "6h", "24h", "168h"]
-MIN_FREE_CHOICES = ["10G", "default (off)", "1G", "5G", "20G", "50G", "100G"]
-WRITE_BACK_CHOICES = ["0s", "default (5s)", "5s", "10s", "30s", "1m", "5m"]
-DIR_CACHE_TIME_CHOICES = ["30s", "5s", "15s", "1m", "5m", "15m", "1h", "default (5m0s)"]
+MIN_FREE_CHOICES = ["default (off)", "1G", "5G", "10G", "20G", "50G", "100G"]
+WRITE_BACK_CHOICES = ["default (5s)", "0s", "5s", "10s", "30s", "1m", "5m"]
+DIR_CACHE_TIME_CHOICES = ["default (5m0s)", "5s", "15s", "30s", "1m", "5m", "15m", "1h"]
 BUFFER_SIZE_CHOICES = ["default (16Mi)", "0", "8Mi", "16Mi", "32Mi", "64Mi", "128Mi"]
 LANGUAGE_CHOICES = {"auto": "Auto", "en": "English", "zh": "中文"}
 FONT_FAMILY_EN = "Segoe UI"
@@ -128,12 +129,12 @@ TEXT = {
         "buffer_size": "Buffer size",
         "language_help": "Auto uses Chinese on Chinese systems and English otherwise.",
         "cache_root_help": "Local folder used by rclone VFS cache. Put it on a fast disk with enough free space.",
-        "vfs_cache_mode_help": "VFS cache mode controls local disk caching for mounted files.\noff: no VFS disk cache.\nminimal: default; caches only compatibility data, not ordinary read-only file content.\nwrites/full: writes may finish locally before upload to the server completes.",
-        "max_cache_size_help": "Upper limit for the VFS cache folder when VFS caching is enabled. 10G is the default recommendation. The default/no-limit option means rclone does not enforce a maximum size.",
+        "vfs_cache_mode_help": "VFS cache mode controls local disk caching for mounted files.\nwrites is SSH MountMate's original default.\nminimal caches only compatibility data, not ordinary read-only file content.\nwrites/full may finish writes locally before upload to the server completes.",
+        "max_cache_size_help": "Upper limit for the VFS cache folder when VFS caching is enabled. Default means rclone does not enforce a maximum size.",
         "max_cache_age_help": "How long cached objects may stay before rclone can evict them. Default is 1 hour.",
-        "min_free_space_help": "Keep this much local disk space free for other applications when VFS caching is enabled. 10G is the default recommendation.",
+        "min_free_space_help": "Keep this much local disk space free for other applications when VFS caching is enabled. Default means rclone does not enforce this limit.",
         "write_back_help": "Delay before changed files are written back to the server. Only applies to writes/full VFS cache modes.",
-        "dir_cache_time_help": "How long rclone keeps remote directory listings and file metadata. 30s is the default recommendation. Shorter values see server-side changes sooner but may slow browsing large or high-latency servers.",
+        "dir_cache_time_help": "How long rclone keeps remote directory listings and file metadata. Default uses rclone's default: 5 minutes. Shorter values see server-side changes sooner but may slow browsing large or high-latency servers.",
         "write_cache_confirm": "The selected VFS cache mode may report file writes as complete after data reaches the local cache, while upload to the server continues in the background.\n\nBefore closing the app, disconnecting, or shutting down, make sure uploads have finished.\n\nContinue with this cache mode?",
         "buffer_size_help": "Memory read buffer per open file. Larger values can improve sequential reads but use more RAM.",
         "startup_all_help": "Starts SSH MountMate at sign-in and mounts all saved configs automatically on supported platforms.",
@@ -293,12 +294,12 @@ TEXT = {
         "buffer_size": "读取缓冲",
         "language_help": "自动模式会在中文系统使用中文，其他系统使用英文。",
         "cache_root_help": "rclone VFS 本地缓存目录。建议放在速度较快且空间充足的磁盘。",
-        "vfs_cache_mode_help": "VFS 缓存模式控制挂载文件的本地磁盘缓存。\noff：不使用 VFS 磁盘缓存。\nminimal：默认值，只缓存兼容性所需内容，不缓存普通只读文件内容。\nwrites/full：文件可能先写入本地缓存，之后才继续上传到服务器。",
-        "max_cache_size_help": "启用 VFS 缓存时，限制缓存目录最大占用空间。默认推荐 10G。default/no-limit 表示 rclone 不限制最大大小。",
+        "vfs_cache_mode_help": "VFS 缓存模式控制挂载文件的本地磁盘缓存。\nwrites 是 SSH MountMate 初版默认值。\nminimal 只缓存兼容性所需内容，不缓存普通只读文件内容。\nwrites/full 可能先在本地完成写入，之后才继续上传到服务器。",
+        "max_cache_size_help": "启用 VFS 缓存时，限制缓存目录最大占用空间。默认表示 rclone 不限制最大大小。",
         "max_cache_age_help": "缓存对象可保留多久后允许被清理。默认是 1 小时。",
-        "min_free_space_help": "启用 VFS 缓存时，为其他应用保留的本地磁盘剩余空间。默认推荐 10G。",
+        "min_free_space_help": "启用 VFS 缓存时，为其他应用保留的本地磁盘剩余空间。默认表示 rclone 不强制保留。",
         "write_back_help": "文件变更后延迟多久写回服务器。仅在 writes/full VFS 缓存模式下生效。",
-        "dir_cache_time_help": "rclone 保留远程目录列表和文件属性的时间。默认推荐 30s。时间越短越容易看到服务器端变化，但浏览大目录或高延迟服务器时可能更慢。",
+        "dir_cache_time_help": "rclone 保留远程目录列表和文件属性的时间。default 使用 rclone 默认值：5 分钟。时间越短越容易看到服务器端变化，但浏览大目录或高延迟服务器时可能更慢。",
         "write_cache_confirm": "当前选择的 VFS 缓存模式可能会让文件先写入本地缓存，界面看起来写入已完成，但实际上传到服务器仍在后台继续。\n\n关闭程序、断网或关机前，请确认上传已经完成。\n\n是否继续使用这个缓存模式？",
         "buffer_size_help": "每个打开文件使用的内存读取缓冲。更大可能改善顺序读取，但会占用更多内存。",
         "startup_all_help": "在支持的平台上设置 SSH MountMate 开机自启，并在登录后自动挂载全部已保存配置。",
@@ -434,12 +435,12 @@ def default_settings() -> dict:
     return {
         "settings_schema_version": SETTINGS_SCHEMA_VERSION,
         "cache_root": str(rsshmount.xdg_cache_home()),
-        "vfs_cache_mode": "minimal",
-        "vfs_cache_max_size": "10G",
+        "vfs_cache_mode": "writes",
+        "vfs_cache_max_size": "",
         "vfs_cache_max_age": "",
-        "vfs_cache_min_free_space": "10G",
-        "vfs_write_back": "0s",
-        "dir_cache_time": "30s",
+        "vfs_cache_min_free_space": "",
+        "vfs_write_back": "",
+        "dir_cache_time": "",
         "buffer_size": "",
         "startup_all": False,
         "language": "auto",
@@ -456,14 +457,30 @@ def migrate_settings(settings: dict, raw_settings: dict) -> dict:
             and raw_settings.get("dir_cache_time", "") == ""
         )
         if legacy_default_cache:
-            settings["vfs_cache_mode"] = "minimal"
-            settings["vfs_cache_max_size"] = "10G"
-            settings["vfs_cache_min_free_space"] = "10G"
-            settings["vfs_write_back"] = "0s"
-            settings["dir_cache_time"] = "30s"
+            settings["vfs_cache_mode"] = "writes"
+            settings["vfs_cache_max_size"] = ""
+            settings["vfs_cache_min_free_space"] = ""
+            settings["vfs_write_back"] = ""
+            settings["dir_cache_time"] = ""
     elif version < 3 and raw_settings.get("vfs_cache_mode") == "off":
-        settings["vfs_cache_mode"] = "minimal"
-        settings["vfs_write_back"] = "0s"
+        settings["vfs_cache_mode"] = "writes"
+        settings["vfs_write_back"] = ""
+    elif version < 4:
+        rc_default_cache = (
+            raw_settings.get("vfs_cache_mode") == "minimal"
+            and raw_settings.get("vfs_cache_max_size") == "10G"
+            and raw_settings.get("vfs_cache_min_free_space") == "10G"
+            and raw_settings.get("vfs_write_back") == "0s"
+            and raw_settings.get("dir_cache_time") == "30s"
+        )
+        if rc_default_cache:
+            settings["vfs_cache_mode"] = "writes"
+            settings["vfs_cache_max_size"] = ""
+            settings["vfs_cache_min_free_space"] = ""
+            settings["vfs_write_back"] = ""
+            settings["dir_cache_time"] = ""
+    elif version < 5 and raw_settings.get("vfs_cache_mode", "") == "":
+        settings["vfs_cache_mode"] = "writes"
     settings["settings_schema_version"] = SETTINGS_SCHEMA_VERSION
     return settings
 
@@ -2579,7 +2596,7 @@ def write_manual_remote_unlocked(server: dict, rclone: str, known_hosts: Path | 
         else:
             parser.set(remote, "key_use_agent", "true")
 
-        if known_hosts and known_hosts.exists():
+        if known_hosts and rsshmount.is_readable_file(known_hosts):
             parser.set(remote, "known_hosts_file", str(known_hosts))
 
     with conf_path.open("w", encoding="utf-8") as fh:
@@ -2623,7 +2640,7 @@ def mount_command(
     log_path: Path,
     rc_addr: str,
 ) -> list[str]:
-    cache_mode = server.get("cache_mode") or settings.get("vfs_cache_mode", default_settings()["vfs_cache_mode"])
+    cache_mode = server.get("cache_mode") or settings.get("vfs_cache_mode", default_settings()["vfs_cache_mode"]) or "writes"
     cmd = [
         rclone,
         "--config",
@@ -2635,8 +2652,6 @@ def mount_command(
         "mount",
         remote,
         mountpoint,
-        "--vfs-cache-mode",
-        cache_mode,
         "--vfs-fast-fingerprint",
         "--links",
         "--cache-dir",
@@ -2646,6 +2661,7 @@ def mount_command(
         "--volname",
         server.get("name") or remote_name(server),
     ]
+    cmd.extend(["--vfs-cache-mode", cache_mode])
     if settings.get("vfs_cache_max_size"):
         cmd.extend(["--vfs-cache-max-size", settings["vfs_cache_max_size"]])
     if settings.get("vfs_cache_max_age"):
@@ -3966,7 +3982,7 @@ class App:
         canvas.bind("<Button-5>", on_mousewheel)
         Label(frame, textvariable=self.dep_status, anchor="w", justify=LEFT).pack(fill=X, pady=(0, 12))
         cache_root = StringVar(value=settings.get("cache_root", default_settings()["cache_root"]))
-        cache_mode = StringVar(value=settings.get("vfs_cache_mode", default_settings()["vfs_cache_mode"]))
+        cache_mode = StringVar(value=setting_to_choice(settings.get("vfs_cache_mode", default_settings()["vfs_cache_mode"]), VFS_CACHE_MODE_CHOICES[0]))
         cache_max_size = StringVar(value=setting_to_choice(settings.get("vfs_cache_max_size", default_settings()["vfs_cache_max_size"]), CACHE_SIZE_CHOICES[0]))
         cache_max_age = StringVar(value=setting_to_choice(settings.get("vfs_cache_max_age", ""), CACHE_AGE_CHOICES[0]))
         min_free_space = StringVar(value=setting_to_choice(settings.get("vfs_cache_min_free_space", default_settings()["vfs_cache_min_free_space"]), MIN_FREE_CHOICES[0]))
@@ -4015,7 +4031,7 @@ class App:
         mode_label = Label(mode_row, text=self.t("vfs_cache_mode"), width=16, anchor="w")
         mode_label.pack(side=LEFT)
         settings_help_icon(mode_row, "vfs_cache_mode_help").pack(side=RIGHT, padx=(6, 0))
-        mode_combo = ttk.Combobox(mode_row, values=["off", "minimal", "writes", "full"], textvariable=cache_mode, state="readonly")
+        mode_combo = ttk.Combobox(mode_row, values=VFS_CACHE_MODE_CHOICES, textvariable=cache_mode, state="readonly")
         mode_combo.pack(side=LEFT, fill=X, expand=True)
 
         size_row = Frame(frame)
@@ -4051,7 +4067,7 @@ class App:
         write_back_combo.pack(side=LEFT, fill=X, expand=True)
 
         def sync_write_back_state(*_args) -> None:
-            write_back_combo.configure(state="readonly" if cache_mode.get() in {"writes", "full"} else "disabled")
+            write_back_combo.configure(state="readonly" if choice_to_setting(cache_mode.get()) in {"writes", "full"} else "disabled")
 
         cache_mode.trace_add("write", sync_write_back_state)
         sync_write_back_state()
@@ -4087,11 +4103,7 @@ class App:
             Label(frame, text=self.t("startup_all_macos_note"), fg="#666666", anchor="w").pack(fill=X, pady=(0, 6))
 
         def save() -> None:
-            selected_cache_mode = cache_mode.get() or default_settings()["vfs_cache_mode"]
-            previous_cache_mode = settings.get("vfs_cache_mode", default_settings()["vfs_cache_mode"])
-            if selected_cache_mode in {"writes", "full"} and selected_cache_mode != previous_cache_mode:
-                if not messagebox.askyesno(APP_TITLE, self.t("write_cache_confirm")):
-                    return
+            selected_cache_mode = choice_to_setting(cache_mode.get().strip())
             new_settings = load_settings()
             new_settings.pop("mount_all_workers", None)
             new_settings.pop("unmount_all_workers", None)

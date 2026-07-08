@@ -131,6 +131,14 @@ def app_known_hosts_file() -> Path:
     return app_config_dir() / "known_hosts"
 
 
+def is_readable_file(path: str | Path) -> bool:
+    try:
+        with Path(path).open("rb"):
+            return True
+    except OSError:
+        return False
+
+
 def known_hosts_marker(host: str, port: str | int) -> str:
     port_value = str(port or "22")
     return f"[{host}]:{port_value}" if port_value != "22" else host
@@ -333,6 +341,15 @@ def first_usable_path(values: list[str], *, must_exist: bool = False) -> str:
     return ""
 
 
+def first_readable_path(values: list[str]) -> str:
+    for value in values:
+        for item in value.split():
+            path = usable_ssh_path(item)
+            if path and is_readable_file(path):
+                return path
+    return ""
+
+
 def ssh_config_needs_external_transport(config: dict[str, list[str]]) -> bool:
     proxy_jump = first_ssh_value(config, "proxyjump", "none").lower()
     proxy_command = first_ssh_value(config, "proxycommand", "none").lower()
@@ -352,7 +369,7 @@ def known_hosts_for_external_remote(host: str, ssh_config: str | None) -> Path |
     host_name = first_ssh_value(resolved, "hostname", host)
     port = first_ssh_value(resolved, "port", "22") if resolved else "22"
     known_hosts = update_app_known_hosts(host_name, port) or default_known_hosts_file()
-    return known_hosts if known_hosts.exists() else None
+    return known_hosts if is_readable_file(known_hosts) else None
 
 
 def write_external_remote(parser, host: str, ssh_config: str | None, known_hosts: Path | None = None) -> None:
@@ -369,10 +386,10 @@ def known_hosts_for_native_remote(host: str, config: dict[str, list[str]]) -> st
     port = first_ssh_value(config, "port", "22")
     known_hosts = update_app_known_hosts(host_name, port)
     if not known_hosts:
-        known_hosts = first_usable_path(config.get("userknownhostsfile", []), must_exist=True)
+        known_hosts = first_readable_path(config.get("userknownhostsfile", []))
         if not known_hosts:
             known_hosts_path = default_known_hosts_file()
-            if known_hosts_path.exists():
+            if is_readable_file(known_hosts_path):
                 known_hosts = str(known_hosts_path)
     return str(known_hosts or "")
 

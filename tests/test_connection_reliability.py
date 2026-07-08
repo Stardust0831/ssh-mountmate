@@ -51,6 +51,25 @@ class ConnectionReliabilityTests(unittest.TestCase):
             parser.read(conf_path)
             self.assertFalse(parser.has_option("server", "known_hosts_file"))
 
+    def test_write_manual_remote_skips_unreadable_known_hosts_file(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            conf_path = Path(temp_name) / "rclone.conf"
+            known_hosts = Path(temp_name) / "known_hosts"
+            known_hosts.write_text("host ssh-ed25519 AAAA\n", encoding="utf-8")
+            server = {"id": "server", "host": "host", "user": "user", "port": "22", "auth": "key", "key_file": "id_ed25519"}
+
+            original_path = core.rclone_config_path
+            try:
+                core.rclone_config_path = lambda: conf_path
+                with mock.patch.object(core, "is_readable_file", return_value=False):
+                    gui.write_manual_remote_unlocked(server, "rclone", known_hosts)
+            finally:
+                core.rclone_config_path = original_path
+
+            parser = configparser.RawConfigParser()
+            parser.read(conf_path)
+            self.assertFalse(parser.has_option("server", "known_hosts_file"))
+
     def test_mount_command_enables_links(self):
         cmd = gui.mount_command(
             {"id": "server", "name": "server", "cache_mode": "writes"},
@@ -65,7 +84,7 @@ class ConnectionReliabilityTests(unittest.TestCase):
 
         self.assertIn("--links", cmd)
 
-    def test_default_mount_command_uses_conservative_cache_settings(self):
+    def test_default_mount_command_uses_original_write_cache_default(self):
         cmd = gui.mount_command(
             {"id": "server", "name": "server"},
             "rclone",
@@ -77,11 +96,11 @@ class ConnectionReliabilityTests(unittest.TestCase):
             rc_addr="127.0.0.1:1234",
         )
 
-        self.assertEqual(cmd[cmd.index("--vfs-cache-mode") + 1], "minimal")
-        self.assertEqual(cmd[cmd.index("--vfs-cache-max-size") + 1], "10G")
-        self.assertEqual(cmd[cmd.index("--vfs-cache-min-free-space") + 1], "10G")
+        self.assertEqual(cmd[cmd.index("--vfs-cache-mode") + 1], "writes")
+        self.assertNotIn("--vfs-cache-max-size", cmd)
+        self.assertNotIn("--vfs-cache-min-free-space", cmd)
         self.assertNotIn("--vfs-write-back", cmd)
-        self.assertEqual(cmd[cmd.index("--dir-cache-time") + 1], "30s")
+        self.assertNotIn("--dir-cache-time", cmd)
 
     def test_mount_command_only_passes_write_back_for_write_cache_modes(self):
         settings = gui.default_settings() | {"vfs_cache_mode": "minimal", "vfs_write_back": "0s"}
@@ -110,17 +129,17 @@ class ConnectionReliabilityTests(unittest.TestCase):
         )
         self.assertEqual(cmd[cmd.index("--vfs-write-back") + 1], "0s")
 
-    def test_migrate_legacy_default_cache_settings_to_conservative_defaults(self):
+    def test_migrate_legacy_default_cache_settings_to_original_defaults(self):
         migrated = gui.migrate_settings(
             gui.default_settings() | {"vfs_cache_mode": "writes", "vfs_cache_max_size": "", "vfs_cache_min_free_space": "", "dir_cache_time": ""},
             {"vfs_cache_mode": "writes", "vfs_cache_max_size": "", "vfs_cache_min_free_space": "", "dir_cache_time": ""},
         )
 
-        self.assertEqual(migrated["vfs_cache_mode"], "minimal")
-        self.assertEqual(migrated["vfs_cache_max_size"], "10G")
-        self.assertEqual(migrated["vfs_cache_min_free_space"], "10G")
-        self.assertEqual(migrated["vfs_write_back"], "0s")
-        self.assertEqual(migrated["dir_cache_time"], "30s")
+        self.assertEqual(migrated["vfs_cache_mode"], "writes")
+        self.assertEqual(migrated["vfs_cache_max_size"], "")
+        self.assertEqual(migrated["vfs_cache_min_free_space"], "")
+        self.assertEqual(migrated["vfs_write_back"], "")
+        self.assertEqual(migrated["dir_cache_time"], "")
         self.assertEqual(migrated["settings_schema_version"], gui.SETTINGS_SCHEMA_VERSION)
 
     def test_migrate_preserves_custom_write_cache_settings(self):
@@ -134,14 +153,40 @@ class ConnectionReliabilityTests(unittest.TestCase):
         self.assertEqual(migrated["vfs_cache_min_free_space"], "5G")
         self.assertEqual(migrated["dir_cache_time"], "1m")
 
-    def test_migrate_local_v2_off_default_to_minimal(self):
+    def test_migrate_local_v2_off_default_to_original_default(self):
         migrated = gui.migrate_settings(
             gui.default_settings() | {"vfs_cache_mode": "off", "vfs_write_back": ""},
             {"settings_schema_version": 2, "vfs_cache_mode": "off", "vfs_write_back": ""},
         )
 
-        self.assertEqual(migrated["vfs_cache_mode"], "minimal")
-        self.assertEqual(migrated["vfs_write_back"], "0s")
+        self.assertEqual(migrated["vfs_cache_mode"], "writes")
+        self.assertEqual(migrated["vfs_write_back"], "")
+
+    def test_migrate_rc_cache_defaults_to_original_defaults(self):
+        migrated = gui.migrate_settings(
+            gui.default_settings()
+            | {
+                "vfs_cache_mode": "minimal",
+                "vfs_cache_max_size": "10G",
+                "vfs_cache_min_free_space": "10G",
+                "vfs_write_back": "0s",
+                "dir_cache_time": "30s",
+            },
+            {
+                "settings_schema_version": 3,
+                "vfs_cache_mode": "minimal",
+                "vfs_cache_max_size": "10G",
+                "vfs_cache_min_free_space": "10G",
+                "vfs_write_back": "0s",
+                "dir_cache_time": "30s",
+            },
+        )
+
+        self.assertEqual(migrated["vfs_cache_mode"], "writes")
+        self.assertEqual(migrated["vfs_cache_max_size"], "")
+        self.assertEqual(migrated["vfs_cache_min_free_space"], "")
+        self.assertEqual(migrated["vfs_write_back"], "")
+        self.assertEqual(migrated["dir_cache_time"], "")
 
     def test_refresh_mounted_directory_caches_only_for_mounted_servers(self):
         servers = [{"id": "mounted", "name": "mounted"}, {"id": "stopped", "name": "stopped"}]
