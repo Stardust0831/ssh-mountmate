@@ -247,17 +247,17 @@ ssh-add --apple-use-keychain ~/.ssh/id_ed25519
 rclone obscure
 ```
 
-转换后写入 SSH MountMate 私有的 rclone 配置。这样可以避免明文保存，但这不是强加密；本机用户账号和配置目录仍应视为敏感数据。
+转换后写入 SSH MountMate 私有的 rclone 配置。这样可以避免明文保存，但这不是强加密。在 macOS 和 Linux 上，SSH MountMate 会把配置文件权限限制为仅文件所有者可读写。本机用户账号和配置目录仍应视为敏感数据。
 
 ## 主机指纹校验
 
 SSH MountMate 会尽量启用 rclone 的 host key 校验。
 
-对于 rclone SFTP remote，程序会维护自己的 `known_hosts` 文件，并用 `ssh-keyscan` 按目标 host 和 port 刷新服务器返回的 host key。这可以避免一种常见情况：OpenSSH 可以连接，但用户 `~/.ssh/known_hosts` 里只保存了一种 key，rclone 选择了另一种 key 后拒绝连接。
+对于 rclone SFTP remote，程序会维护自己的 `known_hosts` 文件。首次连接某个 host 和 port 时，会记录 `ssh-keyscan` 返回的 key；后续连接会固定使用这些 key，不再用网络扫描结果覆盖。
 
 如果无法扫描 host key，程序会回退使用用户默认的 OpenSSH `known_hosts` 文件。
 
-如果 rclone 仍然报 `knownhosts: key mismatch`，SSH MountMate 会把该情况写入挂载日志，并对本次挂载自动重试一次，不再向 rclone 传入 `known_hosts_file`。这个兜底主要面向集群入口或负载均衡 SSH 入口，也就是 `ssh-keyscan` 看到的 host key 可能和实际连接时不同的场景。
+如果 rclone 报 `knownhosts: key mismatch`，SSH MountMate 会停止挂载，不会关闭校验重试。请先向服务器管理员核实新指纹，再从程序托管的 `known_hosts` 文件中删除该主机的旧记录并重试。
 
 ## 容量显示
 

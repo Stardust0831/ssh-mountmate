@@ -1,9 +1,11 @@
 import configparser
 import ctypes
+import io
 import os
 import shlex
 import shutil
 import subprocess
+import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -111,6 +113,10 @@ def rclone_config_lock_path() -> Path:
     return app_config_dir() / "rclone.conf.lock"
 
 
+def known_hosts_lock_path() -> Path:
+    return app_config_dir() / "known_hosts.lock"
+
+
 def server_operation_lock_path(server_id: str) -> Path:
     return app_lock_dir() / f"{lock_name(server_id)}.lock"
 
@@ -129,6 +135,40 @@ def default_known_hosts_file() -> Path:
 
 def app_known_hosts_file() -> Path:
     return app_config_dir() / "known_hosts"
+
+
+def is_readable_file(path: str | Path) -> bool:
+    try:
+        with Path(path).open("rb"):
+            return True
+    except OSError:
+        return False
+
+
+def write_private_text(path: str | Path, content: str) -> Path:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
+    temp = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        temp.chmod(0o600)
+        temp.replace(target)
+        target.chmod(0o600)
+    except Exception:
+        temp.unlink(missing_ok=True)
+        raise
+    return target
+
+
+def restrict_private_file(path: str | Path) -> None:
+    if os.name == "nt":
+        return
+    try:
+        Path(path).chmod(0o600)
+    except OSError:
+        pass
 
 
 def known_hosts_marker(host: str, port: str | int) -> str:
@@ -192,10 +232,7 @@ def scan_host_keys(host: str, port: str | int) -> list[str]:
     return lines
 
 
-def update_app_known_hosts(host: str, port: str | int) -> Path | None:
-    scanned = scan_host_keys(host, port)
-    if not scanned:
-        return None
+def update_app_known_hosts_unlocked(host: str, port: str | int) -> Path | None:
     path = app_known_hosts_file()
     marker = known_hosts_marker(host, port)
     try:
@@ -204,15 +241,25 @@ def update_app_known_hosts(host: str, port: str | int) -> Path | None:
         return None
     try:
         existing = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    except OSError:
+    except FileNotFoundError:
         existing = []
-    kept = [line for line in existing if not known_hosts_line_matches(line, marker)]
+    except OSError:
+        return None
+    if any(known_hosts_line_matches(line, marker) for line in existing):
+        return path if is_readable_file(path) else None
+    scanned = scan_host_keys(host, port)
+    if not scanned:
+        return None
     try:
-        path.write_text("\n".join([*kept, *scanned, ""]), encoding="utf-8")
-        path.chmod(0o600)
+        write_private_text(path, "\n".join([*existing, *scanned, ""]))
     except OSError:
         return None
     return path
+
+
+def update_app_known_hosts(host: str, port: str | int) -> Path | None:
+    with exclusive_file_lock(known_hosts_lock_path(), timeout=30.0, description="known_hosts"):
+        return update_app_known_hosts_unlocked(host, port)
 
 
 def winfsp_paths() -> list[Path]:
@@ -333,6 +380,15 @@ def first_usable_path(values: list[str], *, must_exist: bool = False) -> str:
     return ""
 
 
+def first_readable_path(values: list[str]) -> str:
+    for value in values:
+        for item in value.split():
+            path = usable_ssh_path(item)
+            if path and is_readable_file(path):
+                return path
+    return ""
+
+
 def ssh_config_needs_external_transport(config: dict[str, list[str]]) -> bool:
     proxy_jump = first_ssh_value(config, "proxyjump", "none").lower()
     proxy_command = first_ssh_value(config, "proxycommand", "none").lower()
@@ -352,7 +408,7 @@ def known_hosts_for_external_remote(host: str, ssh_config: str | None) -> Path |
     host_name = first_ssh_value(resolved, "hostname", host)
     port = first_ssh_value(resolved, "port", "22") if resolved else "22"
     known_hosts = update_app_known_hosts(host_name, port) or default_known_hosts_file()
-    return known_hosts if known_hosts.exists() else None
+    return known_hosts if is_readable_file(known_hosts) else None
 
 
 def write_external_remote(parser, host: str, ssh_config: str | None, known_hosts: Path | None = None) -> None:
@@ -369,10 +425,10 @@ def known_hosts_for_native_remote(host: str, config: dict[str, list[str]]) -> st
     port = first_ssh_value(config, "port", "22")
     known_hosts = update_app_known_hosts(host_name, port)
     if not known_hosts:
-        known_hosts = first_usable_path(config.get("userknownhostsfile", []), must_exist=True)
+        known_hosts = first_readable_path(config.get("userknownhostsfile", []))
         if not known_hosts:
             known_hosts_path = default_known_hosts_file()
-            if known_hosts_path.exists():
+            if is_readable_file(known_hosts_path):
                 known_hosts = str(known_hosts_path)
     return str(known_hosts or "")
 
@@ -423,8 +479,9 @@ def ensure_rclone_remote(host: str, ssh_config: str | None, transport: str, *, h
         else:
             write_external_remote(parser, host, ssh_config, known_hosts)
 
-        with conf_path.open("w", encoding="utf-8") as fh:
-            parser.write(fh)
+        content = io.StringIO()
+        parser.write(content)
+        write_private_text(conf_path, content.getvalue())
 
     return conf_path
 
