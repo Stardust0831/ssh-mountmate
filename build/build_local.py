@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import shutil
 import subprocess
 import sys
@@ -90,15 +91,10 @@ def prepare_rclone_binary(root: Path) -> Path:
     return rclone
 
 
-def main() -> int:
-    root = Path(__file__).resolve().parents[1]
-    dist = root / "dist"
-    work = root / "build" / "pyinstaller-work"
-    if dist.exists():
-        shutil.rmtree(dist)
+def build_variant(root: Path, assets: Path, rclone: Path, mode: str) -> int:
+    dist = root / "dist" / mode
+    work = root / "build" / f"pyinstaller-work-{mode}"
     data_separator = ";" if sys.platform.startswith("win") else ":"
-    assets = prepare_assets(root)
-    rclone = prepare_rclone_binary(root)
     cmd = [
         sys.executable,
         "-m",
@@ -106,7 +102,7 @@ def main() -> int:
         "--name",
         "SSHMountMate",
         "--windowed",
-        "--onefile",
+        "--onefile" if mode == "onefile" else "--onedir",
         "--distpath",
         str(dist),
         "--workpath",
@@ -120,6 +116,24 @@ def main() -> int:
         str(root / "launcher.py"),
     ]
     return subprocess.call(cmd)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=("onefile", "onedir", "both"), default="both")
+    args = parser.parse_args(argv)
+    root = Path(__file__).resolve().parents[1]
+    dist = root / "dist"
+    if dist.exists():
+        shutil.rmtree(dist)
+    assets = prepare_assets(root)
+    rclone = prepare_rclone_binary(root)
+    modes = ("onefile", "onedir") if args.mode == "both" else (args.mode,)
+    for mode in modes:
+        result = build_variant(root, assets, rclone, mode)
+        if result:
+            return result
+    return 0
 
 
 if __name__ == "__main__":

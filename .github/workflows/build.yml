@@ -60,7 +60,7 @@ jobs:
 
       - name: List artifacts
         shell: bash
-        run: find dist -maxdepth 2 -type f -print
+        run: find dist -maxdepth 4 -type f -print
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

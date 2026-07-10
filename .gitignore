@@ -5,6 +5,7 @@ __pycache__/
 *.tmp
 
 .venv/
+.venv-build/
 venv/
 env/
 
@@ -13,7 +14,7 @@ dist/
 release/
 build/generated-assets/
 build/generated-bin/
-build/pyinstaller-work/
+build/pyinstaller-work*/
 build/*.spec
 
 .DS_Store

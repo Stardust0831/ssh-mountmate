@@ -22,8 +22,10 @@ It uses rclone for the actual mount operation and provides a small GUI around th
 - Show copyable manual install commands when automatic installation cannot finish.
 - Configure global rclone VFS cache options in the GUI.
 - Show mount status, capacity usage, logs, and common actions per connection.
+- Show the real rclone upload queue and remote-transfer progress after local file copies appear complete.
+- Verify remote directory contents on refresh and expose refresh/transfer actions from connection-card context menus.
 - Mount or unmount all saved connections from the main window.
-- Build single-file executables for Windows, macOS, and Linux with GitHub Actions.
+- Build both single-file and faster-starting onedir packages for Windows, macOS, and Linux with GitHub Actions.
 
 ## Requirements
 
@@ -134,7 +136,9 @@ Use the latest GitHub Release and download the package for your platform:
 
 Release builds are produced by GitHub Actions from the same Python source tree.
 
-Each release zip contains only the platform executable. Bundled third-party notices can be viewed from Settings or with:
+The names above are backward-compatible onefile packages. Each platform also has an `-onedir.zip` package. Extract the complete onedir package and launch the executable inside it; keeping its adjacent files together avoids onefile extraction on every start and usually starts faster.
+
+Bundled third-party notices can be viewed from Settings or with:
 
 ```bash
 SSHMountMate --licenses
@@ -259,6 +263,14 @@ If host key scanning is unavailable, the app falls back to the user's default Op
 
 If rclone reports `knownhosts: key mismatch`, SSH MountMate stops the mount rather than disabling validation. Verify the new fingerprint with the server administrator before removing that host's old entry from the app-managed `known_hosts` file and trying again.
 
+## Transfers And Remote Refresh
+
+Mounted connection cards show rclone's real VFS upload queue. The Transfer center displays active files, remote bytes transferred, speed, and queued files. A file is only shown as cloud-synced after rclone reports no queued or active uploads. SSH MountMate warns before unmounting or exiting while uploads remain.
+
+Refresh clears the VFS directory cache, actively reloads the requested directory, and verifies it with a direct remote listing. If local writes are still queued, the result states that the verified remote snapshot does not yet include those uploads.
+
+Right-click a connection card for Open, Refresh, Transfers, and Log actions. On Windows, Settings can register the same Refresh and Transfers commands in Explorer. The registration points back to the same `SSHMountMate.exe`; no helper executable is installed. A short-lived right-click process forwards its request to the running app over authenticated loopback IPC and exits.
+
 ## Capacity Display
 
 For mounted connections, SSH MountMate shows used and total capacity on each card. On Lustre paths, it first tries to read the remote directory's project ID with `lfs project -d` and then reads project quota with `lfs quota -p`. If the path is not on Lustre, `lfs` is unavailable, or the project has no nonzero hard block limit, the app falls back to `rclone about`.
@@ -270,6 +282,7 @@ The Settings window contains:
 - dependency checks
 - program update check
 - mount log access
+- transfer center and Windows Explorer context-menu registration
 - language selection
 - Windows/macOS login startup mount option
 - rclone VFS cache root
@@ -296,10 +309,11 @@ python -m pip install -e ".[build]"
 python build/build_local.py
 ```
 
-The executable is written to:
+Both variants are written to:
 
 ```text
-dist/
+dist/onefile/
+dist/onedir/
 ```
 
 PyInstaller builds for the current operating system. Use GitHub Actions or native machines to build all three platforms.
