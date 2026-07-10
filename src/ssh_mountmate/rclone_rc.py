@@ -111,6 +111,14 @@ def transfer_snapshot(rc_addr: str) -> dict:
     return build_transfer_snapshot(queue, vfs, core)
 
 
+def process_id(rc_addr: str, *, timeout: float = 0.75) -> int:
+    payload = rc_call(rc_addr, "core/pid", timeout=timeout)
+    try:
+        return int(payload.get("pid") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def refresh_remote_snapshot(rc_addr: str, remote: str, relative_dir: str = "", *, recursive: bool = False) -> dict:
     queue = rc_call(rc_addr, "vfs/queue")
     queue_items = [item for item in queue.get("queue", []) if isinstance(item, dict)]

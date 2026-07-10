@@ -265,7 +265,7 @@ If rclone reports `knownhosts: key mismatch`, SSH MountMate stops the mount rath
 
 ## Transfers And Remote Refresh
 
-Mounted connection cards show rclone's real VFS upload queue. The Transfer center displays active files, remote bytes transferred, speed, and queued files. A file is only shown as cloud-synced after rclone reports no queued or active uploads. SSH MountMate warns before unmounting or exiting while uploads remain.
+Mounted connection cards show rclone's real VFS upload queue. When an upload starts, that connection gets its own bottom-right progress window; multiple active connections are stacked separately. The Transfer center remains available for manually viewing all mounts together. A file is only shown as cloud-synced after rclone reports no queued or active uploads. SSH MountMate warns before unmounting or exiting while uploads remain.
 
 Refresh clears the VFS directory cache, actively reloads the requested directory, and verifies it with a direct remote listing. If local writes are still queued, the result states that the verified remote snapshot does not yet include those uploads.
 

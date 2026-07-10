@@ -54,6 +54,12 @@ class RcloneRcTests(unittest.TestCase):
         self.assertTrue(rclone_rc.transfer_matches("project/data.bin", "/remote/project/data.bin"))
         self.assertFalse(rclone_rc.transfer_matches("project/a.bin", "project/b.bin"))
 
+    def test_process_id_uses_short_rc_timeout(self):
+        with mock.patch.object(rclone_rc, "rc_call", return_value={"pid": 42}) as call:
+            self.assertEqual(rclone_rc.process_id("127.0.0.1:1234"), 42)
+
+        call.assert_called_once_with("127.0.0.1:1234", "core/pid", timeout=0.75)
+
 
 if __name__ == "__main__":
     unittest.main()

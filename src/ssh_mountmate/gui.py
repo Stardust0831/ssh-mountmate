@@ -31,6 +31,7 @@ from . import rclone_rc
 from .notices import THIRD_PARTY_NOTICES
 from .paths import user_data_dir
 from .rclone import install_managed_rclone, manual_install_text, resolve_rclone
+from .rclone_processes import running_windows_rclone_process_ids
 from .shell_integration import register_windows_context_menu, unregister_windows_context_menu
 from .updates import check_for_updates, format_update_info
 
@@ -89,6 +90,11 @@ DEFAULT_UNMOUNT_ALL_WORKERS = 8
 CAPACITY_CACHE_TTL_SECONDS = 120.0
 LOCAL_CAPACITY_CACHE_TTL_SECONDS = 5.0
 TRANSFER_REFRESH_INTERVAL_MS = 1500
+TRANSFER_POPUP_WIDTH = 410
+TRANSFER_POPUP_HEIGHT = 148
+TRANSFER_POPUP_GAP = 10
+TRANSFER_POPUP_MARGIN = 18
+TRANSFER_POPUP_COMPLETE_MS = 4000
 HOME_MOUNTPOINT_VALUE = "__home_mnt__"
 FORM_LABEL_CHARS = 16
 MACOS_STARTUP_HELPER_NAME = "SSHMountMateMountHelper"
@@ -111,7 +117,8 @@ TEXT = {
         "upload_error": "Upload needs attention: {count} error(s)",
         "upload_unknown": "Upload status unavailable",
         "confirming_sync": "Confirming cloud sync...",
-        "auto_show_transfers": "Open this window when an upload starts",
+        "auto_show_transfers": "Show a bottom-right progress window for each upload",
+        "upload_progress_title": "Uploading with {name}",
         "pending_exit": "{count} file(s) are still queued or uploading. Exiting SSH MountMate will not unmount them, but you will lose upload visibility. Exit anyway?",
         "pending_unmount": "{count} file(s) are still queued or uploading for {name}. Unmounting now can interrupt them. Unmount anyway?",
         "pending_unmount_all": "{count} file(s) are still queued or uploading. Unmounting all now can interrupt them. Continue?",
@@ -298,7 +305,8 @@ TEXT = {
         "upload_error": "上传需要处理：{count} 个错误",
         "upload_unknown": "无法获取上传状态",
         "confirming_sync": "正在确认云端同步状态...",
-        "auto_show_transfers": "开始上传时自动打开此窗口",
+        "auto_show_transfers": "每个配置开始上传时显示右下角进度窗",
+        "upload_progress_title": "{name} 正在上传",
         "pending_exit": "仍有 {count} 个文件等待上传或正在上传。退出 SSH MountMate 不会自动取消挂载，但将无法继续查看上传状态。仍要退出吗？",
         "pending_unmount": "{name} 仍有 {count} 个文件等待上传或正在上传。现在取消挂载可能中断上传。仍要继续吗？",
         "pending_unmount_all": "仍有 {count} 个文件等待上传或正在上传。现在全部取消挂载可能中断上传。仍要继续吗？",
@@ -675,6 +683,22 @@ def enable_process_dpi_awareness() -> None:
         ctypes.windll.user32.SetProcessDPIAware()
     except Exception:
         pass
+
+
+def window_work_area(window) -> tuple[int, int, int, int]:
+    if os.name == "nt":
+        class Rect(ctypes.Structure):
+            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+        try:
+            rect = Rect()
+            system_parameters_info = ctypes.windll.user32.SystemParametersInfoW
+            system_parameters_info.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint]
+            if system_parameters_info(0x0030, 0, ctypes.byref(rect), 0):
+                return rect.left, rect.top, rect.right, rect.bottom
+        except (AttributeError, OSError):
+            pass
+    return 0, 0, window.winfo_screenwidth(), window.winfo_screenheight()
 
 
 def configure_ui_scaling(root: Tk) -> None:
@@ -1589,13 +1613,45 @@ def simple_mount_status_from_state(
 
 
 def batch_statuses_for_servers(servers: list[dict]) -> dict[str, str]:
-    processes = running_rclone_processes()
     statuses: dict[str, str] = {}
+    states: dict[str, dict] = {}
+    rc_targets: list[tuple[str, dict]] = []
     for server in servers:
         server_id = server.get("id", "")
         if not server_id:
             continue
-        statuses[server_id] = mount_status_with_processes(server, processes)
+        state = current_state(server)
+        states[server_id] = state
+        if not state:
+            statuses[server_id] = "stopped"
+        elif state.get("rc_addr"):
+            rc_targets.append((server_id, state))
+
+    def verify_rc(target: tuple[str, dict]) -> tuple[str, bool]:
+        server_id, state = target
+        try:
+            expected_pid = int(state.get("pid") or 0)
+            return server_id, bool(expected_pid and rclone_rc.process_id(str(state["rc_addr"])) == expected_pid)
+        except Exception:
+            return server_id, False
+
+    if rc_targets:
+        with ThreadPoolExecutor(max_workers=min(8, len(rc_targets))) as executor:
+            for server_id, mounted in executor.map(verify_rc, rc_targets):
+                if mounted:
+                    statuses[server_id] = "mounted"
+
+    unresolved = [server for server in servers if server.get("id") and server.get("id") not in statuses]
+    if os.name == "nt":
+        pid_set = running_windows_rclone_process_ids()
+        for server in unresolved:
+            server_id = server["id"]
+            statuses[server_id] = simple_mount_status_from_state(states[server_id], pid_set=pid_set)
+    else:
+        processes = running_rclone_processes()
+        for server in unresolved:
+            server_id = server["id"]
+            statuses[server_id] = simple_mount_status_from_state(states[server_id], processes=processes)
     return statuses
 
 
@@ -2882,11 +2938,11 @@ def refresh_remote_cache(server: dict, rclone: str) -> dict:
 
 
 def refresh_mounted_directory_caches(servers: list[dict], rclone: str) -> list[str]:
-    processes = running_rclone_processes()
+    statuses = batch_statuses_for_servers(servers)
     errors: list[str] = []
     for server in servers:
         server_id = server.get("id", "")
-        if not server_id or mount_status_with_processes(server, processes) != "mounted":
+        if not server_id or statuses.get(server_id) != "mounted":
             continue
         try:
             refresh_remote_cache(server, rclone)
@@ -3222,6 +3278,12 @@ def help_icon(parent, text: str):
     return icon
 
 
+def snapshot_has_upload_activity(snapshot: dict) -> bool:
+    if int(snapshot.get("queued") or 0) > 0 or int(snapshot.get("uploading") or 0) > 0:
+        return True
+    return any(item.get("uploading") for item in snapshot.get("files", []) if isinstance(item, dict))
+
+
 class App:
     def __init__(self, root: Tk):
         self.root = root
@@ -3250,7 +3312,8 @@ class App:
         self.transfer_refreshing = False
         self.transfer_window = None
         self.transfer_window_body = None
-        self.transfer_activity_seen = False
+        self.transfer_popups: dict[str, dict] = {}
+        self.dismissed_transfer_popups: set[str] = set()
         self.capacity_refreshing = False
         self.local_capacity_refreshing = False
         self.refresh_generation = 0
@@ -3522,7 +3585,7 @@ class App:
                 self.transfer_errors.pop(server_id, None)
                 self.transfer_idle_counts.pop(server_id, None)
         if not targets:
-            self.transfer_activity_seen = False
+            self.update_transfer_popups(set())
             return
         self.transfer_refreshing = True
 
@@ -3564,12 +3627,160 @@ class App:
             self.transfer_idle_counts[server_id] = 0
         self.transfer_snapshots.update(snapshots)
         self.transfer_errors = errors
-        active = any(not snapshot.get("synced", False) for snapshot in snapshots.values())
-        if active and not self.transfer_activity_seen and self.settings.get("auto_show_transfers", True):
-            self.show_transfer_center()
-        self.transfer_activity_seen = active
+        active_ids = {
+            server_id
+            for server_id, snapshot in self.transfer_snapshots.items()
+            if snapshot_has_upload_activity(snapshot)
+        }
+        self.update_transfer_popups(active_ids)
         self.refresh_list()
         self.refresh_transfer_center()
+
+    def update_transfer_popups(self, active_ids: set[str]) -> None:
+        self.dismissed_transfer_popups.intersection_update(active_ids)
+        auto_show = bool(self.settings.get("auto_show_transfers", True))
+        if auto_show:
+            ordered_ids = [server.get("id", "") for server in self.servers if server.get("id", "") in active_ids]
+            ordered_ids.extend(sorted(active_ids.difference(ordered_ids)))
+            for server_id in ordered_ids:
+                if server_id not in self.dismissed_transfer_popups:
+                    self.show_transfer_popup(server_id)
+        for server_id in list(self.transfer_popups):
+            if server_id in active_ids:
+                self.refresh_transfer_popup(server_id, complete=False)
+            elif self.mount_status_cache.get(server_id) != "mounted":
+                self.close_transfer_popup(server_id)
+            else:
+                snapshot = self.transfer_snapshots.get(server_id, {})
+                confirmed = bool(snapshot.get("synced")) and server_id not in self.transfer_errors
+                self.refresh_transfer_popup(server_id, complete=confirmed)
+        self.position_transfer_popups()
+
+    def server_name(self, server_id: str) -> str:
+        server = next((item for item in self.servers if item.get("id") == server_id), {})
+        return str(server.get("name") or server_id)
+
+    def show_transfer_popup(self, server_id: str) -> None:
+        current = self.transfer_popups.get(server_id)
+        if current and current["window"].winfo_exists():
+            return
+        window = Toplevel(self.root)
+        window.withdraw()
+        window.title(self.t("upload_progress_title", name=self.server_name(server_id)))
+        window.resizable(False, False)
+        window.attributes("-topmost", True)
+        frame = Frame(window, padx=14, pady=12)
+        frame.pack(fill=BOTH, expand=True)
+        Label(
+            frame,
+            text=shorten_middle_text(self.server_name(server_id), 38),
+            anchor="w",
+            font=(FONT_FAMILY_ZH if self.lang == "zh" else FONT_FAMILY_EN, CARD_BODY_FONT_SIZE, "bold"),
+        ).pack(fill=X)
+        summary = Label(frame, anchor="w", justify=LEFT, wraplength=TRANSFER_POPUP_WIDTH - 32)
+        summary.pack(fill=X, pady=(8, 5))
+        progress = ttk.Progressbar(frame, maximum=100, mode="determinate")
+        progress.pack(fill=X)
+        detail = Label(frame, anchor="w", justify=LEFT, fg="#666666")
+        detail.pack(fill=X, pady=(5, 0))
+        window.protocol("WM_DELETE_WINDOW", lambda: self.close_transfer_popup(server_id, dismissed=True))
+        self.transfer_popups[server_id] = {
+            "window": window,
+            "summary": summary,
+            "progress": progress,
+            "detail": detail,
+            "close_after": None,
+        }
+        self.refresh_transfer_popup(server_id, complete=False)
+        window.after_idle(lambda: self.show_transfer_popup_without_focus(window))
+
+    def show_transfer_popup_without_focus(self, window) -> None:
+        self.position_transfer_popups()
+        if os.name == "nt":
+            try:
+                window.update_idletasks()
+                handle = window.winfo_id()
+                get_window_style = ctypes.windll.user32.GetWindowLongPtrW
+                get_window_style.argtypes = [ctypes.c_void_p, ctypes.c_int]
+                get_window_style.restype = ctypes.c_ssize_t
+                set_window_style = ctypes.windll.user32.SetWindowLongPtrW
+                set_window_style.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_ssize_t]
+                set_window_style.restype = ctypes.c_ssize_t
+                extended_style = get_window_style(ctypes.c_void_p(handle), -20)
+                set_window_style(ctypes.c_void_p(handle), -20, extended_style | 0x08000000)
+                show_window = ctypes.windll.user32.ShowWindow
+                show_window.argtypes = [ctypes.c_void_p, ctypes.c_int]
+                set_window_pos = ctypes.windll.user32.SetWindowPos
+                set_window_pos.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_uint,
+                ]
+                window.deiconify()
+                show_window(ctypes.c_void_p(handle), 4)
+                set_window_pos(ctypes.c_void_p(handle), ctypes.c_void_p(-1), 0, 0, 0, 0, 0x0013)
+                return
+            except (AttributeError, OSError):
+                pass
+        window.deiconify()
+
+    def refresh_transfer_popup(self, server_id: str, *, complete: bool) -> None:
+        popup = self.transfer_popups.get(server_id)
+        if not popup or not popup["window"].winfo_exists():
+            self.transfer_popups.pop(server_id, None)
+            return
+        close_after = popup.get("close_after")
+        if not complete and close_after is not None:
+            popup["window"].after_cancel(close_after)
+            popup["close_after"] = None
+        summary, progress = self.transfer_summary(server_id, True)
+        if complete:
+            summary, progress = self.t("cloud_synced"), 100.0
+        popup["summary"].configure(text=summary)
+        popup["progress"].configure(value=progress)
+        snapshot = self.transfer_snapshots.get(server_id, {})
+        files = snapshot.get("files", []) if not complete else []
+        popup["detail"].configure(
+            text="  |  ".join(
+                f"{shorten_middle_text(Path(str(item.get('name') or 'file')).name, 28)} {int(item.get('percentage') or 0)}%"
+                for item in files[:2]
+            )
+        )
+        if complete and popup.get("close_after") is None:
+            popup["close_after"] = popup["window"].after(
+                TRANSFER_POPUP_COMPLETE_MS,
+                lambda: self.close_transfer_popup(server_id),
+            )
+
+    def close_transfer_popup(self, server_id: str, *, dismissed: bool = False) -> None:
+        popup = self.transfer_popups.pop(server_id, None)
+        if popup:
+            popup["window"].destroy()
+        if dismissed:
+            self.dismissed_transfer_popups.add(server_id)
+        self.position_transfer_popups()
+
+    def close_all_transfer_popups(self) -> None:
+        for server_id in list(self.transfer_popups):
+            self.close_transfer_popup(server_id)
+
+    def position_transfer_popups(self) -> None:
+        visible = [popup["window"] for popup in self.transfer_popups.values() if popup["window"].winfo_exists()]
+        for index, window in enumerate(reversed(visible)):
+            left, top, right, bottom = window_work_area(window)
+            x = max(left, right - TRANSFER_POPUP_WIDTH - TRANSFER_POPUP_MARGIN)
+            y = max(
+                top,
+                bottom
+                - TRANSFER_POPUP_MARGIN
+                - (index + 1) * TRANSFER_POPUP_HEIGHT
+                - index * TRANSFER_POPUP_GAP,
+            )
+            window.geometry(f"{TRANSFER_POPUP_WIDTH}x{TRANSFER_POPUP_HEIGHT}+{x}+{y}")
 
     def upload_status_unknown(self, server_id: str) -> bool:
         return self.mount_status_cache.get(server_id) == "mounted" and (
@@ -3624,6 +3835,8 @@ class App:
         def update_auto_show() -> None:
             self.settings["auto_show_transfers"] = bool(auto_value.get())
             save_settings(self.settings)
+            if not auto_value.get():
+                self.close_all_transfer_popups()
 
         Checkbutton(controls, text=self.t("auto_show_transfers"), variable=auto_value, command=update_auto_show).pack(side=LEFT)
         text_button(controls, self.lang, text=self.t("close"), command=window.withdraw).pack(side=RIGHT)
@@ -3708,14 +3921,7 @@ class App:
         capacity_now = time.time()
 
         def worker() -> None:
-            processes = running_rclone_processes()
-            statuses: dict[str, str] = {}
-            for server in servers:
-                server_id = server.get("id", "")
-                if not server_id:
-                    continue
-                status = mount_status_with_processes(server, processes)
-                statuses[server_id] = status
+            statuses = batch_statuses_for_servers(servers)
             self.root.after(0, lambda: self.apply_mount_statuses(generation, statuses))
 
             local_capacity_targets = [

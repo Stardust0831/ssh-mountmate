@@ -12,6 +12,63 @@ from ssh_mountmate import core, gui
 
 
 class ConnectionReliabilityTests(unittest.TestCase):
+    def test_batch_statuses_use_rc_then_fast_windows_pid_fallback(self):
+        servers = [{"id": "rc"}, {"id": "legacy"}, {"id": "missing"}]
+        states = {
+            "rc": {"pid": 10, "rc_addr": "127.0.0.1:1001"},
+            "legacy": {"pid": 20},
+            "missing": {},
+        }
+
+        with mock.patch.object(gui, "current_state", side_effect=lambda server: states[server["id"]]):
+            with mock.patch.object(gui.rclone_rc, "process_id", return_value=10):
+                with mock.patch.object(gui, "running_windows_rclone_process_ids", return_value={20}):
+                    with mock.patch.object(gui.os, "name", "nt"):
+                        statuses = gui.batch_statuses_for_servers(servers)
+
+        self.assertEqual(statuses, {"rc": "mounted", "legacy": "mounted", "missing": "stopped"})
+
+    def test_upload_activity_requires_real_queue_or_upload(self):
+        self.assertFalse(gui.snapshot_has_upload_activity({"synced": False, "queued": 0, "files": []}))
+        self.assertTrue(gui.snapshot_has_upload_activity({"queued": 1, "files": []}))
+        self.assertTrue(gui.snapshot_has_upload_activity({"queued": 0, "files": [{"uploading": True}]}))
+
+    def test_transfer_popups_open_only_for_active_configurations(self):
+        app = object.__new__(gui.App)
+        app.settings = {"auto_show_transfers": True}
+        app.servers = [{"id": "uploading-config"}]
+        app.dismissed_transfer_popups = set()
+        app.transfer_popups = {}
+        app.transfer_snapshots = {}
+        app.transfer_errors = {}
+        app.mount_status_cache = {"uploading-config": "mounted"}
+        app.show_transfer_popup = mock.Mock()
+        app.refresh_transfer_popup = mock.Mock()
+        app.position_transfer_popups = mock.Mock()
+
+        app.update_transfer_popups({"uploading-config"})
+
+        app.show_transfer_popup.assert_called_once_with("uploading-config")
+        app.position_transfer_popups.assert_called_once()
+
+    def test_transfer_popup_waits_for_confirmed_empty_queue_before_completing(self):
+        app = object.__new__(gui.App)
+        app.settings = {"auto_show_transfers": True}
+        app.servers = [{"id": "config"}]
+        app.dismissed_transfer_popups = set()
+        app.transfer_popups = {"config": {}}
+        app.transfer_snapshots = {"config": {"synced": False, "queued": 0, "files": []}}
+        app.transfer_errors = {}
+        app.mount_status_cache = {"config": "mounted"}
+        app.show_transfer_popup = mock.Mock()
+        app.refresh_transfer_popup = mock.Mock()
+        app.close_transfer_popup = mock.Mock()
+        app.position_transfer_popups = mock.Mock()
+
+        app.update_transfer_popups(set())
+
+        app.refresh_transfer_popup.assert_called_once_with("config", complete=False)
+
     def test_scan_host_keys_normalizes_to_rclone_marker(self):
         output = "\n".join(
             [
@@ -271,13 +328,9 @@ class ConnectionReliabilityTests(unittest.TestCase):
         servers = [{"id": "mounted", "name": "mounted"}, {"id": "stopped", "name": "stopped"}]
         refreshed: list[str] = []
 
-        def fake_status(server, processes):
-            return "mounted" if server["id"] == "mounted" else "stopped"
-
-        with mock.patch.object(gui, "running_rclone_processes", return_value={}):
-            with mock.patch.object(gui, "mount_status_with_processes", side_effect=fake_status):
-                with mock.patch.object(gui, "refresh_remote_cache", side_effect=lambda server, rclone: refreshed.append(server["id"])):
-                    errors = gui.refresh_mounted_directory_caches(servers, "rclone")
+        with mock.patch.object(gui, "batch_statuses_for_servers", return_value={"mounted": "mounted", "stopped": "stopped"}):
+            with mock.patch.object(gui, "refresh_remote_cache", side_effect=lambda server, rclone: refreshed.append(server["id"])):
+                errors = gui.refresh_mounted_directory_caches(servers, "rclone")
 
         self.assertEqual(errors, [])
         self.assertEqual(refreshed, ["mounted"])

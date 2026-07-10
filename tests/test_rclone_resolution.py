@@ -3,11 +3,25 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from ssh_mountmate import rclone
 
 
 class RcloneResolutionTests(unittest.TestCase):
+    def test_existing_materialized_bundled_rclone_skips_process_cleanup(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            source = root / "rclone"
+            source.write_bytes(b"fake-rclone")
+            target = root / "rclone-existing"
+            target.write_bytes(b"fake-rclone")
+            with mock.patch.object(rclone, "materialized_bundled_rclone_path", return_value=target):
+                with mock.patch.object(rclone, "cleanup_managed_bundled_rclones") as cleanup:
+                    self.assertEqual(rclone.materialize_bundled_rclone(source), target)
+
+            cleanup.assert_not_called()
+
     def test_resolve_rclone_materializes_bundled_binary(self):
         with tempfile.TemporaryDirectory() as temp_name:
             root = Path(temp_name)
