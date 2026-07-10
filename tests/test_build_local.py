@@ -16,7 +16,8 @@ class BuildLocalTests(unittest.TestCase):
         command = call.call_args.args[0]
         self.assertIn("--onedir", command)
         self.assertNotIn("--onefile", command)
-        self.assertIn("/repo/dist/onedir", command)
+        dist_path = Path(command[command.index("--distpath") + 1])
+        self.assertEqual(dist_path.parts[-2:], ("dist", "onedir"))
 
 
 if __name__ == "__main__":
