@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import configparser
+import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -31,6 +33,55 @@ class ConnectionReliabilityTests(unittest.TestCase):
                 "[c1.example]:12022 ssh-rsa AAAATEST2",
             ],
         )
+
+    def test_update_app_known_hosts_keeps_pinned_keys_without_rescanning(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            known_hosts = Path(temp_name) / "known_hosts"
+            original = "[c1.example]:12022 ssh-ed25519 AAAAPINNED\n"
+            known_hosts.write_text(original, encoding="utf-8")
+
+            with mock.patch.object(core, "app_known_hosts_file", return_value=known_hosts):
+                with mock.patch.object(core, "known_hosts_lock_path", return_value=Path(temp_name) / "known_hosts.lock"):
+                    with mock.patch.object(core, "scan_host_keys") as scan_mock:
+                        result = core.update_app_known_hosts("c1.example", "12022")
+
+            self.assertEqual(result, known_hosts)
+            self.assertEqual(known_hosts.read_text(encoding="utf-8"), original)
+            scan_mock.assert_not_called()
+
+    def test_update_app_known_hosts_adds_first_seen_keys(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            known_hosts = Path(temp_name) / "known_hosts"
+            scanned = ["[c1.example]:12022 ssh-ed25519 AAAAFIRST"]
+
+            with mock.patch.object(core, "app_known_hosts_file", return_value=known_hosts):
+                with mock.patch.object(core, "known_hosts_lock_path", return_value=Path(temp_name) / "known_hosts.lock"):
+                    with mock.patch.object(core, "scan_host_keys", return_value=scanned):
+                        result = core.update_app_known_hosts("c1.example", "12022")
+
+            self.assertEqual(result, known_hosts)
+            self.assertEqual(known_hosts.read_text(encoding="utf-8"), scanned[0] + "\n")
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits are not available on Windows")
+    def test_write_private_text_restricts_permissions(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            path = Path(temp_name) / "private.conf"
+
+            core.write_private_text(path, "secret")
+
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits are not available on Windows")
+    def test_load_servers_restricts_existing_file_permissions(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            path = Path(temp_name) / "servers.json"
+            path.write_text("[]", encoding="utf-8")
+            path.chmod(0o644)
+
+            with mock.patch.object(gui, "servers_path", return_value=path):
+                self.assertEqual(gui.load_servers(), [])
+
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
     def test_write_manual_remote_can_remove_known_hosts_file(self):
         with tempfile.TemporaryDirectory() as temp_name:
@@ -84,7 +135,7 @@ class ConnectionReliabilityTests(unittest.TestCase):
 
         self.assertIn("--links", cmd)
 
-    def test_default_mount_command_uses_original_write_cache_default(self):
+    def test_default_mount_command_uses_recommended_cache_defaults(self):
         cmd = gui.mount_command(
             {"id": "server", "name": "server"},
             "rclone",
@@ -96,11 +147,12 @@ class ConnectionReliabilityTests(unittest.TestCase):
             rc_addr="127.0.0.1:1234",
         )
 
-        self.assertEqual(cmd[cmd.index("--vfs-cache-mode") + 1], "writes")
+        self.assertEqual(cmd[cmd.index("--vfs-cache-mode") + 1], "full")
+        self.assertEqual(cmd[cmd.index("--vfs-cache-max-age") + 1], "30m")
         self.assertNotIn("--vfs-cache-max-size", cmd)
         self.assertNotIn("--vfs-cache-min-free-space", cmd)
-        self.assertNotIn("--vfs-write-back", cmd)
-        self.assertNotIn("--dir-cache-time", cmd)
+        self.assertEqual(cmd[cmd.index("--vfs-write-back") + 1], "0s")
+        self.assertEqual(cmd[cmd.index("--dir-cache-time") + 1], "5m")
 
     def test_mount_command_only_passes_write_back_for_write_cache_modes(self):
         settings = gui.default_settings() | {"vfs_cache_mode": "minimal", "vfs_write_back": "0s"}
@@ -129,17 +181,18 @@ class ConnectionReliabilityTests(unittest.TestCase):
         )
         self.assertEqual(cmd[cmd.index("--vfs-write-back") + 1], "0s")
 
-    def test_migrate_legacy_default_cache_settings_to_original_defaults(self):
+    def test_migrate_legacy_default_cache_settings_to_recommended_defaults(self):
         migrated = gui.migrate_settings(
             gui.default_settings() | {"vfs_cache_mode": "writes", "vfs_cache_max_size": "", "vfs_cache_min_free_space": "", "dir_cache_time": ""},
             {"vfs_cache_mode": "writes", "vfs_cache_max_size": "", "vfs_cache_min_free_space": "", "dir_cache_time": ""},
         )
 
-        self.assertEqual(migrated["vfs_cache_mode"], "writes")
+        self.assertEqual(migrated["vfs_cache_mode"], "full")
         self.assertEqual(migrated["vfs_cache_max_size"], "")
+        self.assertEqual(migrated["vfs_cache_max_age"], "30m")
         self.assertEqual(migrated["vfs_cache_min_free_space"], "")
-        self.assertEqual(migrated["vfs_write_back"], "")
-        self.assertEqual(migrated["dir_cache_time"], "")
+        self.assertEqual(migrated["vfs_write_back"], "0s")
+        self.assertEqual(migrated["dir_cache_time"], "5m")
         self.assertEqual(migrated["settings_schema_version"], gui.SETTINGS_SCHEMA_VERSION)
 
     def test_migrate_preserves_custom_write_cache_settings(self):
@@ -153,16 +206,18 @@ class ConnectionReliabilityTests(unittest.TestCase):
         self.assertEqual(migrated["vfs_cache_min_free_space"], "5G")
         self.assertEqual(migrated["dir_cache_time"], "1m")
 
-    def test_migrate_local_v2_off_default_to_original_default(self):
+    def test_migrate_local_v2_off_default_to_recommended_default(self):
         migrated = gui.migrate_settings(
             gui.default_settings() | {"vfs_cache_mode": "off", "vfs_write_back": ""},
             {"settings_schema_version": 2, "vfs_cache_mode": "off", "vfs_write_back": ""},
         )
 
-        self.assertEqual(migrated["vfs_cache_mode"], "writes")
-        self.assertEqual(migrated["vfs_write_back"], "")
+        self.assertEqual(migrated["vfs_cache_mode"], "full")
+        self.assertEqual(migrated["vfs_cache_max_age"], "30m")
+        self.assertEqual(migrated["vfs_write_back"], "0s")
+        self.assertEqual(migrated["dir_cache_time"], "5m")
 
-    def test_migrate_rc_cache_defaults_to_original_defaults(self):
+    def test_migrate_rc_cache_defaults_to_recommended_defaults(self):
         migrated = gui.migrate_settings(
             gui.default_settings()
             | {
@@ -182,11 +237,35 @@ class ConnectionReliabilityTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(migrated["vfs_cache_mode"], "writes")
+        self.assertEqual(migrated["vfs_cache_mode"], "full")
         self.assertEqual(migrated["vfs_cache_max_size"], "")
+        self.assertEqual(migrated["vfs_cache_max_age"], "30m")
         self.assertEqual(migrated["vfs_cache_min_free_space"], "")
-        self.assertEqual(migrated["vfs_write_back"], "")
-        self.assertEqual(migrated["dir_cache_time"], "")
+        self.assertEqual(migrated["vfs_write_back"], "0s")
+        self.assertEqual(migrated["dir_cache_time"], "5m")
+
+    def test_migrate_rc2_cache_defaults_to_recommended_defaults(self):
+        migrated = gui.migrate_settings(
+            gui.default_settings()
+            | {
+                "vfs_cache_mode": "writes",
+                "vfs_cache_max_age": "",
+                "vfs_write_back": "",
+                "dir_cache_time": "",
+            },
+            {
+                "settings_schema_version": 5,
+                "vfs_cache_mode": "writes",
+                "vfs_cache_max_age": "",
+                "vfs_write_back": "",
+                "dir_cache_time": "",
+            },
+        )
+
+        self.assertEqual(migrated["vfs_cache_mode"], "full")
+        self.assertEqual(migrated["vfs_cache_max_age"], "30m")
+        self.assertEqual(migrated["vfs_write_back"], "0s")
+        self.assertEqual(migrated["dir_cache_time"], "5m")
 
     def test_refresh_mounted_directory_caches_only_for_mounted_servers(self):
         servers = [{"id": "mounted", "name": "mounted"}, {"id": "stopped", "name": "stopped"}]
@@ -202,13 +281,6 @@ class ConnectionReliabilityTests(unittest.TestCase):
 
         self.assertEqual(errors, [])
         self.assertEqual(refreshed, ["mounted"])
-
-    def test_log_has_known_hosts_mismatch(self):
-        with tempfile.TemporaryDirectory() as temp_name:
-            log_path = Path(temp_name) / "mount.log"
-            log_path.write_text("ssh: handshake failed: knownhosts: key mismatch\n", encoding="utf-8")
-
-            self.assertTrue(gui.log_has_known_hosts_mismatch(log_path))
 
     def test_copy_key_to_user_ssh_restricts_copied_key(self):
         with tempfile.TemporaryDirectory() as temp_name:

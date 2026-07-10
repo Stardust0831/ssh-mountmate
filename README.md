@@ -247,17 +247,17 @@ Passwords and key passphrases are passed through:
 rclone obscure
 ```
 
-The obscured value is stored in SSH MountMate's private rclone config. This avoids plain-text storage, but it is not strong encryption. Treat the local user account and its config directory as sensitive.
+The obscured value is stored in SSH MountMate's private rclone config. This avoids plain-text storage, but it is not strong encryption. On macOS and Linux, SSH MountMate writes configuration files with owner-only permissions. Treat the local user account and its config directory as sensitive.
 
 ## Host Key Validation
 
 SSH MountMate enables rclone host key validation when possible.
 
-For rclone SFTP remotes, the app maintains its own `known_hosts` file and refreshes entries with `ssh-keyscan` for the target host and port. This helps avoid cases where OpenSSH succeeds but rclone rejects the server because only one host key type was present in the user's `~/.ssh/known_hosts`.
+For rclone SFTP remotes, the app maintains its own `known_hosts` file. The first connection to a host and port records the keys returned by `ssh-keyscan`; later connections keep those pinned keys instead of replacing them from the network.
 
 If host key scanning is unavailable, the app falls back to the user's default OpenSSH `known_hosts` file.
 
-If rclone still reports `knownhosts: key mismatch`, SSH MountMate records that in the mount log and retries that mount once without passing a rclone `known_hosts_file`. This fallback is intended for cluster frontends or load-balanced SSH endpoints where `ssh-keyscan` and the actual connection can see different host keys.
+If rclone reports `knownhosts: key mismatch`, SSH MountMate stops the mount rather than disabling validation. Verify the new fingerprint with the server administrator before removing that host's old entry from the app-managed `known_hosts` file and trying again.
 
 ## Capacity Display
 
