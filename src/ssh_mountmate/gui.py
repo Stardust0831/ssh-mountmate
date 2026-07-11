@@ -2954,7 +2954,25 @@ def refresh_mounted_directory_caches(servers: list[dict], rclone: str) -> list[s
     return errors
 
 
+def normalize_explorer_refresh_path(local_path: str, *, windows: bool | None = None) -> str:
+    value = str(local_path or "")
+    is_windows = os.name == "nt" if windows is None else windows
+    if not is_windows:
+        return value
+    if value.startswith('"'):
+        value = value[1:]
+    if value.endswith('"'):
+        value = value[:-1] + "\\"
+    return value
+
+
+def normalize_refresh_relative_path(relative: str) -> str:
+    value = str(relative or "").replace("\\", "/").strip("/")
+    return "" if value in {"", ".", '"'} else value
+
+
 def refresh_mounted_path(local_path: str) -> dict:
+    local_path = normalize_explorer_refresh_path(local_path)
     requested = os.path.normcase(os.path.abspath(os.path.expanduser(local_path)))
     for server in load_servers():
         state = current_state(server)
@@ -2968,7 +2986,7 @@ def refresh_mounted_path(local_path: str) -> dict:
         except ValueError:
             continue
         relative = os.path.relpath(requested, root)
-        relative_dir = "" if relative == "." else relative.replace("\\", "/")
+        relative_dir = normalize_refresh_relative_path(relative)
         rc_addr = str(state.get("rc_addr") or "")
         remote = str(state.get("remote") or rsshmount.remote_spec(remote_name(server), server.get("remote_path") or ""))
         if not rc_addr:

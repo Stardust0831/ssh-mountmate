@@ -12,7 +12,7 @@ class ShellIntegrationTests(unittest.TestCase):
             command = shell_integration.windows_command_line("--refresh-path", "%V")
 
         self.assertIn('"C:\\Program Files\\SSH MountMate\\SSHMountMate.exe"', command)
-        self.assertTrue(command.endswith('"%V"'))
+        self.assertTrue(command.endswith('"%V\\."'))
 
     def test_transfer_command_does_not_add_empty_argument(self):
         with mock.patch.object(shell_integration, "application_command", return_value=["SSHMountMate.exe"]):

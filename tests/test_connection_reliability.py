@@ -12,6 +12,16 @@ from ssh_mountmate import core, gui
 
 
 class ConnectionReliabilityTests(unittest.TestCase):
+    def test_explorer_refresh_path_repairs_trailing_drive_quote(self):
+        self.assertEqual(gui.normalize_explorer_refresh_path('Y:"', windows=True), "Y:\\")
+        self.assertEqual(gui.normalize_explorer_refresh_path('"C:\\Mount Folder"', windows=True), "C:\\Mount Folder\\")
+
+    def test_refresh_relative_path_normalizes_mount_root(self):
+        self.assertEqual(gui.normalize_refresh_relative_path("."), "")
+        self.assertEqual(gui.normalize_refresh_relative_path("\\"), "")
+        self.assertEqual(gui.normalize_refresh_relative_path('"'), "")
+        self.assertEqual(gui.normalize_refresh_relative_path("folder\\child"), "folder/child")
+
     def test_batch_statuses_use_rc_then_fast_windows_pid_fallback(self):
         servers = [{"id": "rc"}, {"id": "legacy"}, {"id": "missing"}]
         states = {

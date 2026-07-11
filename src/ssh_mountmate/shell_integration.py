@@ -26,7 +26,7 @@ def windows_command_line(*args: str) -> str:
     placeholder = values[-1] if values and values[-1].startswith("%") else ""
     command_args = values[:-1] if placeholder else values
     command = subprocess.list2cmdline([*application_command(), *command_args])
-    return f'{command} "{placeholder}"' if placeholder else command
+    return f'{command} "{placeholder}\\."' if placeholder else command
 
 
 def register_windows_context_menu() -> None:
