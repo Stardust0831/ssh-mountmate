@@ -150,7 +150,9 @@ Program updates can be checked from Settings -> Check for updates, or from the c
 SSHMountMate --check-update
 ```
 
-The update check reads the latest GitHub Release and shows the matching download asset for the current platform and CPU architecture.
+Packaged builds preserve the current onefile or onedir package type. The in-app updater downloads the matching GitHub Release asset, verifies GitHub's published SHA-256 digest, rejects unsafe ZIP paths, stages the new build beside the current installation, and restarts SSH MountMate after confirmation. If the new process exits during startup, the updater restores and relaunches the previous build. Existing rclone mounts and uploads continue while the GUI restarts.
+
+Automatic installation requires SSH MountMate to be extracted to a permanent, user-writable folder. Builds launched directly from a ZIP temporary directory and assets without a trusted SHA-256 digest remain manual-update only. Automatic background checks can be disabled in Settings.
 
 Check CPU architecture:
 

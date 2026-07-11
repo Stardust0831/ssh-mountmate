@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import platform
 import re
+import shutil
+import stat
 import sys
 import urllib.parse
 import urllib.error
 import urllib.request
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,6 +26,8 @@ RELEASES_PAGE = f"https://github.com/{REPO}/releases"
 class ReleaseAsset:
     name: str
     url: str
+    digest: str = ""
+    size: int = 0
 
 
 @dataclass(slots=True)
@@ -126,7 +132,11 @@ def release_assets(raw_assets: list[dict[str, Any]]) -> list[ReleaseAsset]:
         name = str(item.get("name") or "")
         url = str(item.get("browser_download_url") or "")
         if name and url:
-            assets.append(ReleaseAsset(name=name, url=url))
+            try:
+                size = int(item.get("size") or 0)
+            except (TypeError, ValueError):
+                size = 0
+            assets.append(ReleaseAsset(name=name, url=url, digest=str(item.get("digest") or ""), size=max(0, size)))
     return assets
 
 
@@ -214,6 +224,103 @@ def check_for_updates(current_version: str, timeout: float = 8.0) -> UpdateInfo:
         expected_asset=expected,
         body=str(data.get("body") or ""),
     )
+
+
+def verified_sha256(asset: ReleaseAsset) -> str:
+    match = re.fullmatch(r"sha256:([0-9a-fA-F]{64})", asset.digest.strip())
+    if not match:
+        raise RuntimeError("This release asset does not provide a trusted SHA-256 digest. Open the release page and update manually.")
+    return match.group(1).lower()
+
+
+def validate_asset_url(url: str) -> None:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in {"github.com", "www.github.com"}:
+        raise RuntimeError("Automatic updates only accept HTTPS assets hosted on github.com.")
+
+
+def download_verified_asset(
+    asset: ReleaseAsset,
+    destination: Path,
+    *,
+    timeout: float = 30.0,
+    progress=None,
+) -> Path:
+    validate_asset_url(asset.url)
+    expected_digest = verified_sha256(asset)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".part")
+    temporary.unlink(missing_ok=True)
+    request = urllib.request.Request(asset.url, headers={"User-Agent": "SSHMountMate-self-update"})
+    digest = hashlib.sha256()
+    received = 0
+    maximum = max(asset.size, 1) if asset.size else 512 * 1024 * 1024
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response, temporary.open("wb") as output:
+            final_host = urllib.parse.urlparse(response.geturl()).hostname
+            if final_host not in {"github.com", "www.github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"}:
+                raise RuntimeError("GitHub redirected the update download to an unexpected host.")
+            header_size = int(response.headers.get("Content-Length") or 0)
+            total = asset.size or header_size
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                received += len(chunk)
+                if received > maximum + 1024 * 1024:
+                    raise RuntimeError("Downloaded update is larger than the published release asset.")
+                output.write(chunk)
+                digest.update(chunk)
+                if progress:
+                    progress(received, total)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    if asset.size and received != asset.size:
+        temporary.unlink(missing_ok=True)
+        raise RuntimeError(f"Downloaded update size mismatch: expected {asset.size}, received {received}.")
+    actual_digest = digest.hexdigest()
+    if actual_digest != expected_digest:
+        temporary.unlink(missing_ok=True)
+        raise RuntimeError("Downloaded update failed SHA-256 verification.")
+    temporary.replace(destination)
+    return destination
+
+
+def safe_extract_zip(archive: Path, destination: Path, *, max_files: int = 20000, max_size: int = 2 * 1024**3) -> Path:
+    if destination.exists():
+        shutil.rmtree(destination)
+    destination.mkdir(parents=True)
+    root = destination.resolve()
+    total_size = 0
+    with zipfile.ZipFile(archive) as bundle:
+        members = bundle.infolist()
+        if len(members) > max_files:
+            raise RuntimeError("Update archive contains too many files.")
+        for member in members:
+            normalized = member.filename.replace("\\", "/")
+            parts = Path(normalized).parts
+            if not normalized or normalized.startswith("/") or ".." in parts or re.match(r"^[A-Za-z]:", normalized):
+                raise RuntimeError(f"Unsafe path in update archive: {member.filename}")
+            mode = member.external_attr >> 16
+            if stat.S_ISLNK(mode):
+                raise RuntimeError(f"Symbolic links are not allowed in update archives: {member.filename}")
+            total_size += max(0, member.file_size)
+            if total_size > max_size:
+                raise RuntimeError("Update archive expands beyond the safety limit.")
+            target = (root / normalized).resolve()
+            if not target.is_relative_to(root):
+                raise RuntimeError(f"Unsafe path in update archive: {member.filename}")
+            if member.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with bundle.open(member) as source, target.open("wb") as output:
+                shutil.copyfileobj(source, output)
+            permissions = mode & 0o777
+            if permissions:
+                target.chmod(permissions)
+    return destination
 
 
 def format_update_info(info: UpdateInfo, *, language: str = "en") -> str:
