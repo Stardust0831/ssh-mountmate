@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from unittest import mock
 
 from ssh_mountmate import rclone_processes
 
@@ -44,6 +45,24 @@ class RcloneProcessesTests(unittest.TestCase):
                 102: '"C:\\Program Files\\rclone\\rclone.exe" mount host:/data Y:',
             },
         )
+
+    def test_parse_windows_tasklist_process_ids_filters_rclone_images(self):
+        output = "\n".join(
+            [
+                '"rclone.exe","1,234","Console","1","12,000 K"',
+                '"rclone-3ac0dba3a883555f.exe","5678","Console","1","20,000 K"',
+                '"python.exe","9999","Console","1","30,000 K"',
+            ]
+        )
+
+        self.assertEqual(rclone_processes.parse_windows_tasklist_process_ids(output), {1234, 5678})
+
+    def test_windows_process_id_scan_prefers_native_api(self):
+        with mock.patch.object(rclone_processes, "running_windows_rclone_process_ids_native", return_value={42}):
+            with mock.patch.object(rclone_processes.subprocess, "run") as run:
+                self.assertEqual(rclone_processes.running_windows_rclone_process_ids(), {42})
+
+        run.assert_not_called()
 
 
 if __name__ == "__main__":

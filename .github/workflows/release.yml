@@ -21,17 +21,17 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            asset: SSHMountMate-windows-x64.zip
+            asset: SSHMountMate-windows-x64
           - os: windows-11-arm
-            asset: SSHMountMate-windows-arm64.zip
+            asset: SSHMountMate-windows-arm64
           - os: macos-15-intel
-            asset: SSHMountMate-macos-x64.zip
+            asset: SSHMountMate-macos-x64
           - os: macos-14
-            asset: SSHMountMate-macos-arm64.zip
+            asset: SSHMountMate-macos-arm64
           - os: ubuntu-latest
-            asset: SSHMountMate-linux-x64.zip
+            asset: SSHMountMate-linux-x64
           - os: ubuntu-24.04-arm
-            asset: SSHMountMate-linux-arm64.zip
+            asset: SSHMountMate-linux-arm64
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -73,20 +73,22 @@ jobs:
           dist = root / "dist"
           release = root / "release"
           release.mkdir(parents=True, exist_ok=True)
-          asset = release / "${{ matrix.asset }}"
-
-          with zipfile.ZipFile(asset, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-              for path in dist.rglob("*"):
-                  if path.is_file():
-                      zf.write(path, path.relative_to(dist))
-
-          print(asset)
+          outputs = [
+              (release / "${{ matrix.asset }}.zip", dist / "onefile"),
+              (release / "${{ matrix.asset }}-onedir.zip", dist / "onedir"),
+          ]
+          for asset, source in outputs:
+              with zipfile.ZipFile(asset, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                  for path in source.rglob("*"):
+                      if path.is_file():
+                          zf.write(path, path.relative_to(source))
+              print(asset)
 
       - name: Upload packaged asset
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
-          path: release/${{ matrix.asset }}
+          path: release/*.zip
 
   release:
     needs: build

@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import platform
 import re
+import sys
 import urllib.parse
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 
@@ -98,8 +100,24 @@ def current_platform_name(system: str | None = None) -> str:
     return "linux"
 
 
-def expected_asset_name(system: str | None = None, machine: str | None = None) -> str:
-    return f"SSHMountMate-{current_platform_name(system)}-{current_arch(machine)}.zip"
+def running_onedir() -> bool:
+    if not getattr(sys, "frozen", False):
+        return False
+    bundle_root = getattr(sys, "_MEIPASS", "")
+    if not bundle_root:
+        return False
+    bundle = Path(bundle_root).resolve()
+    executable_dir = Path(sys.executable).resolve().parent
+    roots = [executable_dir]
+    if executable_dir.name == "MacOS" and executable_dir.parent.name == "Contents":
+        roots.append(executable_dir.parent)
+    return any(bundle == root or bundle.is_relative_to(root) for root in roots)
+
+
+def expected_asset_name(system: str | None = None, machine: str | None = None, *, onedir: bool | None = None) -> str:
+    use_onedir = running_onedir() if onedir is None else onedir
+    suffix = "-onedir" if use_onedir else ""
+    return f"SSHMountMate-{current_platform_name(system)}-{current_arch(machine)}{suffix}.zip"
 
 
 def release_assets(raw_assets: list[dict[str, Any]]) -> list[ReleaseAsset]:

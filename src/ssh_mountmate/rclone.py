@@ -13,7 +13,7 @@ from pathlib import Path
 
 from .paths import legacy_managed_bin_dirs, managed_bin_dir
 from .platforms import current_platform
-from .rclone_processes import running_windows_rclone_command_lines
+from .rclone_processes import running_windows_rclone_command_lines, running_windows_rclone_process_paths_native
 
 
 def bundled_rclone_candidates(app_root: Path) -> list[Path]:
@@ -112,11 +112,22 @@ def cleanup_managed_bundled_rclones(current: Path) -> None:
     bin_dir = managed_bin_dir()
     if not bin_dir.exists():
         return
-    commands = running_process_command_lines()
+    if current_platform().system == "Windows":
+        process_paths = running_windows_rclone_process_paths_native()
+        running_paths = {
+            os.path.normcase(os.path.abspath(path))
+            for path in (process_paths or {}).values()
+        }
+        commands: list[str] = []
+    else:
+        running_paths = set()
+        commands = running_process_command_lines()
     for candidate in bin_dir.iterdir():
         if candidate == current or not candidate.is_file() or not materialized_bundled_rclone_name(candidate):
             continue
-        if any(command_references_path(command, candidate) for command in commands):
+        if os.path.normcase(os.path.abspath(candidate)) in running_paths:
+            continue
+        if commands and any(command_references_path(command, candidate) for command in commands):
             continue
         try:
             candidate.unlink()
@@ -127,7 +138,6 @@ def cleanup_managed_bundled_rclones(current: Path) -> None:
 def materialize_bundled_rclone(source: Path) -> Path:
     target = materialized_bundled_rclone_path(source)
     if target.exists() and target.stat().st_size == source.stat().st_size:
-        cleanup_managed_bundled_rclones(target)
         return target
     target.parent.mkdir(parents=True, exist_ok=True)
     temp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
