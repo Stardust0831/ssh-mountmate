@@ -150,7 +150,9 @@ SSHMountMate --licenses
 SSHMountMate --check-update
 ```
 
-检查更新会读取 GitHub 最新 Release，并显示当前平台和 CPU 架构对应的下载包。
+打包版本会保持当前 onefile 或 onedir 包型。应用内更新器会下载 GitHub Release 中匹配的附件，校验 GitHub 发布的 SHA-256 摘要，拒绝不安全的 ZIP 路径，把新版本暂存在当前安装目录旁，并在用户确认后重启 SSH MountMate。如果新进程启动后立即退出，更新器会恢复并重新启动旧版本。GUI 重启期间，已有 rclone 挂载和上传会继续运行。
+
+自动安装要求 SSH MountMate 已完整解压到固定且当前用户可写的目录。从 ZIP 临时目录直接运行，或 Release 附件没有可信 SHA-256 摘要时，只提供手动更新。可以在设置中关闭后台自动检查。
 
 判断 CPU 架构：
 

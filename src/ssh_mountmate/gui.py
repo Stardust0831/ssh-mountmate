@@ -17,7 +17,9 @@ import time
 import uuid
 import shlex
 import traceback
+import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 from tkinter import BOTH, END, LEFT, RIGHT, X, Y, BooleanVar, Button, Canvas, Checkbutton, Entry, Frame, Label, Menu, Scrollbar, StringVar, Text, Tk, Toplevel, filedialog, messagebox
 from tkinter import font as tkfont
@@ -33,11 +35,12 @@ from .paths import user_data_dir
 from .rclone import install_managed_rclone, manual_install_text, resolve_rclone
 from .rclone_processes import running_windows_rclone_process_ids
 from .shell_integration import register_windows_context_menu, unregister_windows_context_menu
-from .updates import check_for_updates, format_update_info
+from . import self_update
+from .updates import UpdateInfo, check_for_updates, format_update_info, verified_sha256
 
 
 APP_TITLE = "SSH MountMate"
-SETTINGS_SCHEMA_VERSION = 6
+SETTINGS_SCHEMA_VERSION = 7
 VFS_CACHE_MODE_CHOICES = ["full", "writes", "off", "minimal"]
 CACHE_SIZE_CHOICES = ["default (no size limit)", "1G", "5G", "10G", "20G", "50G", "100G", "500G"]
 CACHE_AGE_CHOICES = ["30m", "default (1h0m0s)", "5m", "15m", "1h", "6h", "24h", "168h"]
@@ -142,6 +145,17 @@ TEXT = {
         "check_updates": "Check for updates",
         "checking_updates": "Checking for updates...",
         "update_check_failed": "Update check failed",
+        "auto_check_updates": "Check for updates automatically",
+        "download_install_update": "Download and install",
+        "open_release_page": "Open release page",
+        "update_downloading": "Downloading update: {percent}%",
+        "update_extracting": "Verifying and extracting update...",
+        "update_staging": "Preparing update beside the current installation...",
+        "update_ready": "Update verified and ready. Restart SSH MountMate to install it.",
+        "restart_install": "Restart and install",
+        "update_manual_only": "Automatic installation is unavailable for this build. Use the release page to update manually.",
+        "update_unverified": "The matching asset has no trusted SHA-256 digest. Automatic installation is disabled.",
+        "update_restart_pending": "Uploads are still active. SSH MountMate will restart, while existing mounts and rclone uploads continue running. Upload visibility will be briefly unavailable. Continue?",
         "view_mount_logs": "View mount logs",
         "view_licenses": "View licenses",
         "register_shell_menu": "Register Explorer context menu",
@@ -175,7 +189,7 @@ TEXT = {
         "startup_all_macos_note": "Auto-start mount takes effect after the next login.",
         "startup_config_failed": "Some login mount jobs could not be updated. Details were written to: {path}",
         "dependency_help": "Checks dependencies.\nrclone is bundled in releases.\nSystem mount dependencies may still be required.",
-        "updates_help": "Checks the latest SSH MountMate release on GitHub.\nShows the matching download for this platform.",
+        "updates_help": "Checks GitHub Releases for the matching onefile or onedir package.\nPackaged builds can download, verify, install, restart, and roll back automatically.",
         "logs_help": "Open recent rclone mount logs for a saved config. Useful for diagnosing failed mounts.",
         "licenses_help": "Show bundled third-party notices and license text.",
         "updates_title": "SSH MountMate updates",
@@ -330,6 +344,17 @@ TEXT = {
         "check_updates": "检查程序更新",
         "checking_updates": "正在检查程序更新...",
         "update_check_failed": "检查更新失败",
+        "auto_check_updates": "自动检查程序更新",
+        "download_install_update": "下载并安装",
+        "open_release_page": "打开 Release 页面",
+        "update_downloading": "正在下载更新：{percent}%",
+        "update_extracting": "正在校验并解压更新...",
+        "update_staging": "正在当前安装目录旁准备更新...",
+        "update_ready": "更新已校验并准备完成。重启 SSH MountMate 即可安装。",
+        "restart_install": "重启并安装",
+        "update_manual_only": "此构建无法自动安装，请打开 Release 页面手动更新。",
+        "update_unverified": "匹配附件没有可信的 SHA-256 摘要，已禁用自动安装。",
+        "update_restart_pending": "当前仍有上传活动。SSH MountMate 会重启，现有挂载和 rclone 上传会继续运行，但上传进度会短暂不可见。仍要继续吗？",
         "view_mount_logs": "查看挂载日志",
         "view_licenses": "查看许可证",
         "register_shell_menu": "注册资源管理器右键菜单",
@@ -363,7 +388,7 @@ TEXT = {
         "startup_all_macos_note": "开机自启挂载会在下次登录后生效。",
         "startup_config_failed": "部分登录挂载任务未能更新，详情已写入：{path}",
         "dependency_help": "检查依赖。\nRelease 内置 rclone。\n系统挂载依赖可能仍需单独安装。",
-        "updates_help": "检查 GitHub Releases 上的最新 SSH MountMate。\n显示当前平台匹配的下载包。",
+        "updates_help": "检查 GitHub Releases 中匹配当前 onefile 或 onedir 的安装包。\n打包版本可自动下载、校验、安装、重启，并在启动失败时回滚。",
         "logs_help": "打开某个已保存配置最近的 rclone 挂载日志，用于排查挂载失败。",
         "licenses_help": "查看内置第三方声明和许可证文本。",
         "updates_title": "SSH MountMate 更新",
@@ -501,6 +526,7 @@ def default_settings() -> dict:
         "buffer_size": "",
         "startup_all": False,
         "auto_show_transfers": True,
+        "auto_check_updates": True,
         "language": "auto",
     }
 
@@ -3320,6 +3346,9 @@ class App:
         self.status_refreshing = False
         self.dependency_checking = False
         self.update_checking = False
+        self.update_download_running = False
+        self.update_window = None
+        self.prepared_update: self_update.UpdatePlan | None = None
         self.mount_status_cache: dict[str, str] = {}
         self.capacity_cache: dict[str, dict] = {}
         self.capacity_checked_at: dict[str, float] = {}
@@ -3352,6 +3381,9 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.exit_app)
         self.refresh_list()
         self.root.after_idle(self.start_background_startup)
+        if self.settings.get("auto_check_updates", True):
+            self.root.after(8000, lambda: self.check_updates_async(silent=True))
+        self.root.after(15000, lambda: threading.Thread(target=self_update.cleanup_update_cache, daemon=True).start())
         self.schedule_local_capacity_refresh()
         self.schedule_transfer_refresh()
 
@@ -4531,6 +4563,7 @@ class App:
         dir_cache_time = StringVar(value=setting_to_choice(settings.get("dir_cache_time", default_settings()["dir_cache_time"]), DIR_CACHE_TIME_CHOICES[0]))
         buffer_size = StringVar(value=setting_to_choice(settings.get("buffer_size", ""), BUFFER_SIZE_CHOICES[0]))
         startup_all = BooleanVar(value=bool(settings.get("startup_all", False)) and startup_supported())
+        auto_check_updates = BooleanVar(value=bool(settings.get("auto_check_updates", True)))
         language = StringVar(value=language_choice_from_setting(settings.get("language", "auto")))
 
         def settings_help_icon(parent, key: str):
@@ -4646,6 +4679,16 @@ class App:
         if sys.platform == "darwin":
             Label(frame, text=self.t("startup_all_macos_note"), fg="#666666", anchor="w").pack(fill=X, pady=(0, 6))
 
+        update_row = Frame(frame)
+        update_row.pack(fill=X, pady=8)
+        settings_help_icon(update_row, "updates_help").pack(side=RIGHT, padx=(6, 0))
+        styled_checkbutton(
+            update_row,
+            self.lang,
+            text=self.t("auto_check_updates"),
+            variable=auto_check_updates,
+        ).pack(side=LEFT, anchor="w")
+
         def save() -> None:
             selected_cache_mode = choice_to_setting(cache_mode.get().strip())
             new_settings = load_settings()
@@ -4662,6 +4705,7 @@ class App:
                     "dir_cache_time": choice_to_setting(dir_cache_time.get().strip()),
                     "buffer_size": choice_to_setting(buffer_size.get().strip()),
                     "startup_all": bool(startup_all.get()) and startup_supported(),
+                    "auto_check_updates": bool(auto_check_updates.get()),
                     "language": language_setting_from_choice(language.get()),
                 }
             )
@@ -4760,31 +4804,157 @@ class App:
         self.status.set(self.t("deps_failed"))
         self.show_error(message)
 
-    def check_updates_async(self) -> None:
+    def check_updates_async(self, *, silent: bool = False) -> None:
         if self.update_checking:
             return
         self.update_checking = True
-        self.status.set(self.t("checking_updates"))
-        threading.Thread(target=self.check_updates, daemon=True).start()
+        if not silent:
+            self.status.set(self.t("checking_updates"))
+        threading.Thread(target=self.check_updates, args=(silent,), daemon=True).start()
 
-    def check_updates(self) -> None:
+    def check_updates(self, silent: bool = False) -> None:
         try:
             info = check_for_updates(VERSION)
-            content = format_update_info(info, language=self.lang)
-            self.root.after(0, lambda: self.on_update_check_done(content))
+            self.root.after(0, lambda: self.on_update_check_done(info, silent))
         except Exception as exc:
             message = f"{self.t('update_check_failed')}: {exc}"
-            self.root.after(0, lambda: self.on_update_check_failed(message))
+            self.root.after(0, lambda: self.on_update_check_failed(message, silent))
 
-    def on_update_check_done(self, content: str) -> None:
+    def on_update_check_done(self, info: UpdateInfo, silent: bool = False) -> None:
         self.update_checking = False
         self.status.set(self.t("ready"))
-        self.show_text_window(self.t("updates_title"), content)
+        if silent and not info.is_newer:
+            return
+        self.show_update_window(info)
 
-    def on_update_check_failed(self, message: str) -> None:
+    def on_update_check_failed(self, message: str, silent: bool = False) -> None:
         self.update_checking = False
-        self.status.set(self.t("update_check_failed"))
-        self.show_error(message)
+        self.status.set(self.t("ready") if silent else self.t("update_check_failed"))
+        if not silent:
+            self.show_error(message)
+
+    def show_update_window(self, info: UpdateInfo) -> None:
+        if self.update_window is not None and self.update_window.winfo_exists():
+            self.update_window.destroy()
+        window = Toplevel(self.root)
+        window.title(self.t("updates_title"))
+        apply_scaled_window_bounds(window, "760x560", (620, 420))
+        self.update_window = window
+        content = format_update_info(info, language=self.lang)
+        frame = Frame(window, padx=12, pady=12)
+        frame.pack(fill=BOTH, expand=True)
+        text = Text(frame, wrap="word", height=18)
+        text.insert("1.0", content)
+        text.configure(state="disabled")
+        text.pack(fill=BOTH, expand=True)
+        status_value = StringVar(value="")
+        Label(frame, textvariable=status_value, anchor="w", justify=LEFT, wraplength=700).pack(fill=X, pady=(10, 5))
+        progress = ttk.Progressbar(frame, maximum=100, mode="determinate")
+        progress.pack(fill=X)
+        buttons = Frame(window, padx=12, pady=10)
+        buttons.pack(fill=X)
+        text_button(
+            buttons,
+            self.lang,
+            text=self.t("open_release_page"),
+            command=lambda: webbrowser.open(info.release_url),
+        ).pack(side=LEFT)
+        install_button = text_button(buttons, self.lang, text=self.t("download_install_update"), command=lambda: None)
+        install_button.pack(side=RIGHT)
+        text_button(buttons, self.lang, text=self.t("close"), command=window.destroy).pack(side=RIGHT, padx=6)
+
+        installable = bool(info.is_newer and info.asset and getattr(sys, "frozen", False))
+        if installable:
+            try:
+                verified_sha256(info.asset)
+            except Exception:
+                installable = False
+                status_value.set(self.t("update_unverified"))
+        elif info.is_newer and not getattr(sys, "frozen", False):
+            status_value.set(self.t("update_manual_only"))
+        if not info.is_newer:
+            installable = False
+        if not info.asset:
+            installable = False
+        if not installable:
+            install_button.configure(state="disabled")
+            return
+
+        def window_exists() -> bool:
+            try:
+                return bool(window.winfo_exists())
+            except Exception:
+                return False
+
+        def set_progress(phase: str, current: int, total: int) -> None:
+            if not window_exists():
+                return
+            if phase == "download":
+                percent = int(current * 100 / total) if total else 0
+                status_value.set(self.t("update_downloading", percent=percent))
+                progress.stop()
+                progress.configure(mode="determinate", value=percent)
+            else:
+                status_value.set(self.t("update_extracting") if phase == "extract" else self.t("update_staging"))
+                progress.configure(mode="indeterminate")
+                progress.start(12)
+
+        def prepared(plan: self_update.UpdatePlan) -> None:
+            self.update_download_running = False
+            self.prepared_update = plan
+            if not window_exists():
+                return
+            progress.stop()
+            progress.configure(mode="determinate", value=100)
+            status_value.set(self.t("update_ready"))
+            install_button.configure(
+                state="normal",
+                text=self.t("restart_install"),
+                command=lambda: self.restart_with_update(plan),
+            )
+
+        def failed(message: str) -> None:
+            self.update_download_running = False
+            if not window_exists():
+                return
+            progress.stop()
+            progress.configure(mode="determinate", value=0)
+            status_value.set(f"{self.t('update_check_failed')}: {message}")
+            install_button.configure(state="normal", text=self.t("download_install_update"), command=start_download)
+
+        def worker() -> None:
+            try:
+                plan = self_update.prepare_update(
+                    info.asset,
+                    info.latest_version,
+                    progress=lambda phase, current, total: self.root.after(
+                        0, lambda p=phase, c=current, t=total: set_progress(p, c, t)
+                    ),
+                )
+                self.root.after(0, lambda: prepared(plan))
+            except Exception as exc:
+                self.root.after(0, lambda message=str(exc): failed(message))
+
+        def start_download() -> None:
+            if self.update_download_running:
+                return
+            self.update_download_running = True
+            install_button.configure(state="disabled")
+            threading.Thread(target=worker, daemon=True).start()
+
+        install_button.configure(command=start_download)
+
+    def restart_with_update(self, plan: self_update.UpdatePlan) -> None:
+        active_uploads = any(snapshot_has_upload_activity(snapshot) for snapshot in self.transfer_snapshots.values())
+        if active_uploads and not messagebox.askyesno(APP_TITLE, self.t("update_restart_pending")):
+            return
+        try:
+            self_update.launch_update(plan)
+        except Exception as exc:
+            self.show_error(str(exc))
+            return
+        self.command_server.close()
+        self.root.destroy()
 
     def show_text_window(self, title: str, content: str) -> None:
         window = Toplevel(self.root)

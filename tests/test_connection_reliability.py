@@ -12,6 +12,16 @@ from ssh_mountmate import core, gui
 
 
 class ConnectionReliabilityTests(unittest.TestCase):
+    def test_append_refresh_log_includes_timestamp_and_content(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            path = Path(temp_name) / "refresh.log"
+            with mock.patch.object(gui, "refresh_log_path", return_value=path):
+                gui.append_refresh_log("refresh failed")
+
+            content = path.read_text(encoding="utf-8")
+            self.assertIn("refresh failed", content)
+            self.assertIn("====", content)
+
     def test_explorer_refresh_path_repairs_trailing_drive_quote(self):
         self.assertEqual(gui.normalize_explorer_refresh_path('Y:"', windows=True), "Y:\\")
         self.assertEqual(gui.normalize_explorer_refresh_path('"C:\\Mount Folder"', windows=True), "C:\\Mount Folder\\")
