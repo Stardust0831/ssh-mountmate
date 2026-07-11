@@ -39,23 +39,26 @@ class SelfUpdateTests(unittest.TestCase):
         )
 
     def test_current_install_layout_detects_onedir(self):
+        executable = "/opt/SSHMountMate/SSHMountMate"
         with mock.patch.object(self_update.sys, "frozen", True, create=True):
-            with mock.patch.object(self_update.sys, "executable", "/opt/SSHMountMate/SSHMountMate"):
+            with mock.patch.object(self_update.sys, "executable", executable):
                 with mock.patch.object(self_update.sys, "platform", "linux"):
                     with mock.patch.object(self_update, "running_onedir", return_value=True):
                         layout = self_update.current_install_layout()
 
         self.assertEqual(layout.kind, "directory")
-        self.assertEqual(layout.target, Path("/opt/SSHMountMate"))
+        self.assertEqual(layout.target, Path(executable).resolve().parent)
         self.assertEqual(layout.executable_relative, Path("SSHMountMate"))
 
     def test_current_install_layout_detects_macos_app(self):
+        executable = "/Applications/SSHMountMate.app/Contents/MacOS/SSHMountMate"
         with mock.patch.object(self_update.sys, "frozen", True, create=True):
-            with mock.patch.object(self_update.sys, "executable", "/Applications/SSHMountMate.app/Contents/MacOS/SSHMountMate"):
+            with mock.patch.object(self_update.sys, "executable", executable):
                 with mock.patch.object(self_update.sys, "platform", "darwin"):
                     layout = self_update.current_install_layout()
 
-        self.assertEqual(layout.target, Path("/Applications/SSHMountMate.app"))
+        expected_target = next(parent for parent in Path(executable).resolve().parents if parent.suffix.casefold() == ".app")
+        self.assertEqual(layout.target, expected_target)
         self.assertEqual(layout.executable_relative, Path("Contents/MacOS/SSHMountMate"))
 
     def test_find_and_stage_onedir_payload(self):
