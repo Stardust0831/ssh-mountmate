@@ -296,7 +296,7 @@ fn stable_folder_name(value: &str) -> String {
     }
 }
 
-fn path_key(path: &Path, windows: bool) -> String {
+pub(crate) fn path_key(path: &Path, windows: bool) -> String {
     let value = path.to_string_lossy().replace('\\', "/");
     if windows {
         value.trim_end_matches('/').to_ascii_lowercase()

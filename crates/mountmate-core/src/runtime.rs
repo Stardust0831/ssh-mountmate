@@ -13,7 +13,7 @@ use std::os::windows::process::CommandExt;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System, UpdateKind};
 use thiserror::Error;
 
-use crate::mountpoint::system_mountpoint_ready;
+use crate::mountpoint::{path_key, system_mountpoint_ready};
 use crate::paths::AppPaths;
 use crate::process::{MountStatus, argv_matches_state};
 use crate::rc::HttpRcClient;
@@ -36,6 +36,8 @@ pub enum RuntimeError {
     AlreadyMounted(String),
     #[error("invalid mountpoint {path}: {message}")]
     InvalidMountpoint { path: PathBuf, message: String },
+    #[error("mountpoint is already reserved by another connection: {0}")]
+    MountpointReserved(PathBuf),
     #[error("process operation failed: {0}")]
     Process(String),
     #[error("mount did not become ready; log: {log}\n{tail}")]
@@ -301,6 +303,15 @@ impl<'a> MountRuntime<'a> {
             }
             self.remove_state(&server.id)?;
         }
+        let allocation_lock = FileLock::acquire(
+            &self.paths.mount_allocation_lock(),
+            Duration::from_secs(180),
+        )?;
+        if self.mountpoint_reserved_by_other(&server.id, request.mountpoint) {
+            return Err(RuntimeError::MountpointReserved(
+                request.mountpoint.to_owned(),
+            ));
+        }
         self.mountpoints
             .prepare(request.mountpoint)
             .map_err(|message| RuntimeError::InvalidMountpoint {
@@ -362,6 +373,7 @@ impl<'a> MountRuntime<'a> {
             let _ = self.stop_if_owned(&state);
             return Err(error);
         }
+        drop(allocation_lock);
         if !self.wait_until_ready(&state) {
             if self.stop_if_owned(&state) {
                 self.remove_state(&server.id)?;
@@ -557,6 +569,36 @@ impl<'a> MountRuntime<'a> {
         Ok(Some(read_json(&path)?))
     }
 
+    fn mountpoint_reserved_by_other(&self, server_id: &str, mountpoint: &Path) -> bool {
+        let Ok(entries) = fs::read_dir(&self.paths.state_dir) else {
+            return false;
+        };
+        let requested = path_key(mountpoint, self.windows);
+        entries.flatten().any(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                return false;
+            }
+            let Ok(state) = read_json::<MountState>(&path) else {
+                return false;
+            };
+            state.server_id != server_id
+                && path_key(&state.mountpoint, self.windows) == requested
+                && self.state_process_may_be_owned(&state)
+        })
+    }
+
+    fn state_process_may_be_owned(&self, state: &MountState) -> bool {
+        let Some(snapshot) = self.processes.snapshot(state.pid) else {
+            return false;
+        };
+        start_time_matches(state, &snapshot)
+            && snapshot
+                .arguments
+                .as_ref()
+                .is_none_or(|arguments| argv_matches_state(arguments, state, self.windows))
+    }
+
     fn save_state(&self, state: &MountState) -> Result<(), RuntimeError> {
         write_private_json(&self.paths.state_file(&state.server_id), state)?;
         Ok(())
@@ -628,6 +670,7 @@ mod tests {
         snapshots: RefCell<VecDeque<Option<ProcessSnapshot>>>,
         last: RefCell<Option<ProcessSnapshot>>,
         signals: RefCell<Vec<&'static str>>,
+        spawn_calls: RefCell<usize>,
     }
 
     impl FakeProcesses {
@@ -636,6 +679,7 @@ mod tests {
                 snapshots: RefCell::new(snapshots.into_iter().collect()),
                 last: RefCell::new(None),
                 signals: RefCell::new(Vec::new()),
+                spawn_calls: RefCell::new(0),
             }
         }
     }
@@ -647,6 +691,7 @@ mod tests {
             _arguments: &[String],
             _log: &Path,
         ) -> Result<u32, String> {
+            *self.spawn_calls.borrow_mut() += 1;
             Ok(42)
         }
 
@@ -1003,5 +1048,36 @@ mod tests {
 
         assert_eq!(log_tail(&log, 2), "three\nfour");
         assert_eq!(log_tail(&log, 0), "");
+    }
+
+    #[test]
+    fn live_state_reserves_mountpoint_before_spawn() {
+        let temp = tempdir().unwrap();
+        let paths = paths(temp.path());
+        let (mut other, snapshot) = state(temp.path(), Some(matching_arguments(temp.path())));
+        other.server_id = "beta".into();
+        write_private_json(&paths.state_file("beta"), &other).unwrap();
+        let processes = FakeProcesses::new([Some(snapshot)]);
+        let rc = FakeRc {
+            pid: Ok(42),
+            quit_calls: RefCell::new(0),
+        };
+        let mountpoint = FakeMountpoint {
+            ready: RefCell::new(false),
+        };
+        let runtime =
+            MountRuntime::new(&paths, &processes, &rc, &mountpoint).with_options(options());
+
+        assert!(matches!(
+            runtime.mount(MountRequest {
+                server: &server(),
+                settings: &Settings::default(),
+                rclone: Path::new("rclone"),
+                mountpoint: &temp.path().join("mnt"),
+                cache_dir: &temp.path().join("cache"),
+            }),
+            Err(RuntimeError::MountpointReserved(_))
+        ));
+        assert_eq!(*processes.spawn_calls.borrow(), 0);
     }
 }
