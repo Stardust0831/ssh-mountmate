@@ -134,9 +134,12 @@ impl Default for ServerConfig {
 
 impl ServerConfig {
     pub fn normalize(&mut self) {
-        if self.id.trim().is_empty() {
-            self.id = sanitize_id(self.display_name());
-        }
+        let id_source = if self.id.trim().is_empty() {
+            self.display_name()
+        } else {
+            &self.id
+        };
+        self.id = sanitize_id(id_source);
         if self.name.trim().is_empty() {
             self.name = self.display_name().to_owned();
         }
@@ -307,6 +310,14 @@ impl Settings {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MountPhase {
+    Starting,
+    #[default]
+    Mounted,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MountState {
     pub pid: u32,
@@ -315,6 +326,12 @@ pub struct MountState {
     pub mountpoint: PathBuf,
     pub log: PathBuf,
     pub rc_addr: String,
+    #[serde(default)]
+    pub phase: MountPhase,
+    #[serde(default)]
+    pub process_started_at: Option<u64>,
+    #[serde(default)]
+    pub rclone: PathBuf,
 }
 
 #[cfg(test)]
@@ -357,5 +374,17 @@ mod tests {
         assert_eq!(normalize_port("0"), None);
         assert_eq!(normalize_port("65536"), None);
         assert_eq!(normalize_port("22x"), None);
+    }
+
+    #[test]
+    fn legacy_mount_state_deserializes_with_runtime_defaults() {
+        let state: MountState = serde_json::from_str(
+            r#"{"pid":42,"server_id":"alpha","remote":"alpha:","mountpoint":"R:","log":"alpha.log","rc_addr":"127.0.0.1:5572"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(state.phase, MountPhase::Mounted);
+        assert_eq!(state.process_started_at, None);
+        assert!(state.rclone.as_os_str().is_empty());
     }
 }

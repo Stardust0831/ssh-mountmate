@@ -77,7 +77,18 @@ impl AppPaths {
     }
 
     pub fn state_file(&self, server_id: &str) -> PathBuf {
-        self.state_dir.join(format!("{server_id}.json"))
+        self.state_dir
+            .join(format!("{}.json", path_component(server_id)))
+    }
+
+    pub fn mount_lock(&self, server_id: &str) -> PathBuf {
+        self.state_dir
+            .join(format!("{}.mount.lock", path_component(server_id)))
+    }
+
+    pub fn mount_log(&self, remote_name: &str) -> PathBuf {
+        self.state_dir
+            .join(format!("{}.log", path_component(remote_name)))
     }
 }
 
@@ -90,4 +101,46 @@ fn home_dir() -> PathBuf {
     directories::BaseDirs::new()
         .map(|dirs| dirs.home_dir().to_owned())
         .unwrap_or_else(|| Path::new(".").to_owned())
+}
+
+fn path_component(value: &str) -> String {
+    let component: String = value
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || matches!(character, '.' | '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let component = component.trim_matches(['.', '_', '-']);
+    if component.is_empty() {
+        "invalid".into()
+    } else {
+        component.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_paths_cannot_escape_the_state_directory() {
+        let paths = AppPaths {
+            config_dir: PathBuf::from("config"),
+            cache_dir: PathBuf::from("cache"),
+            state_dir: PathBuf::from("state"),
+            data_dir: PathBuf::from("data"),
+        };
+        assert_eq!(
+            paths.state_file("../../outside"),
+            PathBuf::from("state/outside.json")
+        );
+        assert_eq!(
+            paths.mount_log("host:22"),
+            PathBuf::from("state/host_22.log")
+        );
+    }
 }

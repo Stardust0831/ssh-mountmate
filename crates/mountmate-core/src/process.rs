@@ -63,6 +63,31 @@ pub fn path_matches_command(command: &str, path: &Path) -> bool {
     command.contains(path.trim_end_matches('/'))
 }
 
+pub fn argv_matches_state(arguments: &[String], state: &MountState, windows: bool) -> bool {
+    let normalize = |value: &str| {
+        let value = value.replace('\\', "/");
+        if windows { value.to_lowercase() } else { value }
+    };
+    let arguments: Vec<_> = arguments.iter().map(|value| normalize(value)).collect();
+    let remote = normalize(&state.remote);
+    let mountpoint = normalize(&state.mountpoint.to_string_lossy());
+    let log = normalize(&state.log.to_string_lossy());
+    let rclone = normalize(&state.rclone.to_string_lossy());
+    let Some(mount_index) = arguments.iter().position(|value| value == "mount") else {
+        return false;
+    };
+    let identity_matches = arguments.get(mount_index + 1) == Some(&remote)
+        && arguments.get(mount_index + 2) == Some(&mountpoint);
+    let log_matches = arguments
+        .windows(2)
+        .any(|pair| pair[0] == "--log-file" && pair[1] == log);
+    let binary_matches = rclone.is_empty()
+        || arguments
+            .first()
+            .is_some_and(|argument| argument == &rclone);
+    identity_matches && log_matches && binary_matches
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -77,6 +102,9 @@ mod tests {
             mountpoint: PathBuf::from("R:"),
             log: PathBuf::from("C:/State/alpha.log"),
             rc_addr: "127.0.0.1:1234".into(),
+            phase: crate::MountPhase::Mounted,
+            process_started_at: Some(100),
+            rclone: PathBuf::from("rclone"),
         }
     }
 
@@ -119,5 +147,35 @@ mod tests {
             status_from_evidence(Some(&state), true, Some(command), true, false),
             MountStatus::Mounted
         );
+    }
+
+    #[test]
+    fn argv_identity_uses_exact_tokens_not_substrings() {
+        let state = state();
+        assert!(argv_matches_state(
+            &[
+                "rclone".into(),
+                "--rc".into(),
+                "mount".into(),
+                "alpha:folder".into(),
+                "R:".into(),
+                "--log-file".into(),
+                "C:/State/alpha.log".into(),
+            ],
+            &state,
+            true
+        ));
+        assert!(!argv_matches_state(
+            &[
+                "rclone".into(),
+                "mount".into(),
+                "alpha:folder-old".into(),
+                "R:".into(),
+                "--log-file".into(),
+                "C:/State/alpha.log".into(),
+            ],
+            &state,
+            true
+        ));
     }
 }

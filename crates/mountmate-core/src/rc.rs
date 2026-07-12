@@ -54,6 +54,14 @@ impl HttpRcClient {
         transfer_snapshot(self)
     }
 
+    pub fn process_id(&self) -> Result<u32, RcError> {
+        process_id(self)
+    }
+
+    pub fn quit(&self) -> Result<(), RcError> {
+        quit(self)
+    }
+
     pub fn refresh_remote(
         &self,
         remote: &str,
@@ -100,6 +108,24 @@ pub fn transfer_snapshot(api: &impl RcApi) -> Result<TransferSnapshot, RcError> 
     let vfs: VfsStatsResponse = decode("vfs/stats", api.call("vfs/stats", json!({}))?)?;
     let core: CoreStatsResponse = decode("core/stats", api.call("core/stats", json!({}))?)?;
     Ok(build_transfer_snapshot(queue, vfs, core))
+}
+
+pub fn process_id(api: &impl RcApi) -> Result<u32, RcError> {
+    let response = api.call("core/pid", json!({}))?;
+    response
+        .get("pid")
+        .and_then(Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| RcError::InvalidResponse {
+            method: "core/pid".into(),
+            message: "missing or invalid pid".into(),
+        })
+}
+
+pub fn quit(api: &impl RcApi) -> Result<(), RcError> {
+    api.call("core/quit", json!({}))?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -215,5 +241,20 @@ mod tests {
         let calls = api.calls.borrow();
         assert_eq!(calls[3].1["remote"], "");
         assert_ne!(calls[3].1["remote"], "\"");
+    }
+
+    #[test]
+    fn process_identity_and_quit_use_rc_contract() {
+        let api = FakeRc::new([json!({"pid": 42}), json!({})]);
+        assert_eq!(process_id(&api).unwrap(), 42);
+        quit(&api).unwrap();
+        assert_eq!(
+            api.calls
+                .borrow()
+                .iter()
+                .map(|(method, _)| method.as_str())
+                .collect::<Vec<_>>(),
+            ["core/pid", "core/quit"]
+        );
     }
 }
