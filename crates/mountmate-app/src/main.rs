@@ -24,6 +24,10 @@ use mountmate_core::{
 };
 use mountmate_platform::Platform;
 
+mod transfer_center;
+
+use transfer_center::{connection_view as transfer_connection_view, totals as transfer_totals};
+
 fn main() -> iced::Result {
     iced::daemon(App::new, App::update, App::view)
         .title(App::title)
@@ -62,6 +66,7 @@ struct App {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Connections,
+    TransferCenter,
     ConnectionEditor,
     Settings,
 }
@@ -255,6 +260,8 @@ enum Message {
     ClosePopup(window::Id),
     WindowClosed(window::Id),
     AddConnection,
+    OpenTransfers,
+    CloseTransfers,
     OpenSettings,
     CancelEditor,
     ConnectionSourceChanged(ConnectionSource),
@@ -444,6 +451,15 @@ impl App {
                 self.ssh_import_actions.clear();
                 self.screen = Screen::ConnectionEditor;
                 self.status = "New connection".into();
+            }
+            Message::OpenTransfers => {
+                self.screen = Screen::TransferCenter;
+                self.status = "Transfer center".into();
+                return self.transfer_task();
+            }
+            Message::CloseTransfers => {
+                self.screen = Screen::Connections;
+                self.status = "Ready".into();
             }
             Message::OpenSettings => {
                 self.settings_draft = Some(SettingsDraft::from_settings(&self.settings));
@@ -1232,6 +1248,7 @@ impl App {
         if window == self.main_window {
             match self.screen {
                 Screen::Connections => self.main_view(),
+                Screen::TransferCenter => self.transfer_center_view(),
                 Screen::ConnectionEditor => self.connection_editor_view(),
                 Screen::Settings => self.settings_view(),
             }
@@ -1241,10 +1258,27 @@ impl App {
     }
 
     fn main_view(&self) -> Element<'_, Message> {
+        let active_transfers = self
+            .servers
+            .iter()
+            .filter(|server| {
+                self.mount_statuses.get(&server.id) == Some(&MountStatus::Mounted)
+                    && self
+                        .transfers
+                        .get(&server.id)
+                        .is_some_and(transfer_is_active)
+            })
+            .count();
+        let transfers_label = if active_transfers == 0 {
+            "Transfers".into()
+        } else {
+            format!("Transfers ({active_transfers})")
+        };
         let toolbar = row![
             text(APP_NAME).size(28),
             Space::new().width(Fill),
             button("Refresh").on_press(Message::Refresh),
+            button(text(transfers_label)).on_press(Message::OpenTransfers),
             button("Add connection").on_press(Message::AddConnection),
             button("Settings").on_press(Message::OpenSettings),
         ]
@@ -1283,6 +1317,126 @@ impl App {
                 row![text(&self.status), Space::new().width(Fill), text(VERSION)],
             ]
             .spacing(14),
+        )
+        .padding(18)
+        .width(Fill)
+        .height(Fill)
+        .into()
+    }
+
+    fn transfer_center_view(&self) -> Element<'_, Message> {
+        let mounted: Vec<_> = self
+            .servers
+            .iter()
+            .filter(|server| self.mount_statuses.get(&server.id) == Some(&MountStatus::Mounted))
+            .collect();
+        let has_mounted_connections = !mounted.is_empty();
+        let unavailable_connections = mounted
+            .iter()
+            .filter(|server| self.transfer_errors.contains_key(&server.id))
+            .count();
+        let totals = transfer_totals(mounted.iter().map(|server| {
+            if self.transfer_errors.contains_key(&server.id) {
+                None
+            } else {
+                self.transfers.get(&server.id)
+            }
+        }));
+        let summary = if mounted.is_empty() {
+            "No mounted connections".into()
+        } else if totals.errors > 0 {
+            format!(
+                "{} upload error(s) across {} mounted connection(s)",
+                totals.errors,
+                mounted.len()
+            )
+        } else if unavailable_connections > 0 && totals.pending_files > 0 {
+            format!(
+                "{} file(s) pending; transfer state unavailable for {} connection(s)",
+                totals.pending_files, unavailable_connections
+            )
+        } else if unavailable_connections > 0 {
+            format!(
+                "Transfer state unavailable for {} mounted connection(s)",
+                unavailable_connections
+            )
+        } else if totals.pending_files > 0 && totals.progress_available {
+            format!(
+                "{} file(s) pending - {} of {} uploaded",
+                totals.pending_files,
+                format_bytes(totals.transferred_bytes),
+                format_bytes(totals.total_bytes)
+            )
+        } else if totals.pending_files > 0 {
+            format!(
+                "{} file(s) pending - exact overall progress unavailable",
+                totals.pending_files
+            )
+        } else if totals.unknown_connections > unavailable_connections {
+            format!(
+                "Checking {} mounted connection(s)",
+                totals.unknown_connections - unavailable_connections
+            )
+        } else {
+            "All mounted connections are cloud synced".into()
+        };
+        let header = row![
+            text("Transfer center").size(28),
+            Space::new().width(Fill),
+            button(if self.transfer_refreshing {
+                "Refreshing..."
+            } else {
+                "Refresh now"
+            })
+            .on_press_maybe((!self.transfer_refreshing).then_some(Message::TransferTick)),
+            button("Back").on_press(Message::CloseTransfers),
+        ]
+        .spacing(10)
+        .align_y(Center);
+
+        let overview = column![
+            text(summary).size(18),
+            progress_bar(0.0..=100.0, totals.percentage as f32),
+            text(if totals.progress_available {
+                format!(
+                    "{} uploading, {} queued, {} error(s)",
+                    totals.uploading, totals.queued, totals.errors
+                )
+            } else {
+                format!(
+                    "{} uploading, {} queued, {} error(s) - overall percentage unavailable",
+                    totals.uploading, totals.queued, totals.errors
+                )
+            })
+            .size(13),
+        ]
+        .spacing(8);
+
+        let mut connections = column![].spacing(10);
+        for server in mounted {
+            connections = connections.push(transfer_connection_view(
+                server,
+                self.transfers.get(&server.id),
+                self.transfer_errors.get(&server.id),
+            ));
+        }
+        if !has_mounted_connections {
+            connections = connections.push(
+                container(text("Mount a connection to inspect its cloud transfer state").size(16))
+                    .padding(28)
+                    .width(Fill)
+                    .center_x(Fill),
+            );
+        }
+
+        container(
+            column![
+                header,
+                overview,
+                scrollable(connections).height(Fill),
+                row![text(&self.status), Space::new().width(Fill), text(VERSION)],
+            ]
+            .spacing(16),
         )
         .padding(18)
         .width(Fill)
