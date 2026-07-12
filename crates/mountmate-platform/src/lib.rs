@@ -184,13 +184,207 @@ impl PlatformIntegration for Platform {
         Err(PlatformError::Unsupported("taskbar or dock progress"))
     }
 
-    fn register_file_manager_menu(&self, _executable: &Path) -> Result<(), PlatformError> {
-        Err(PlatformError::Unsupported("file-manager integration"))
+    fn register_file_manager_menu(&self, executable: &Path) -> Result<(), PlatformError> {
+        register_file_manager_menu(executable)
     }
 
     fn unregister_file_manager_menu(&self) -> Result<(), PlatformError> {
-        Err(PlatformError::Unsupported("file-manager integration"))
+        unregister_file_manager_menu()
     }
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExplorerMenuEntry {
+    key: &'static str,
+    label: &'static str,
+    action: &'static str,
+    placeholder: Option<&'static str>,
+}
+
+#[cfg(any(windows, test))]
+const EXPLORER_MENU_ENTRIES: [ExplorerMenuEntry; 6] = [
+    ExplorerMenuEntry {
+        key: r"Directory\Background\shell\SSHMountMate.Refresh",
+        label: "Refresh with SSH MountMate",
+        action: "--refresh-path",
+        placeholder: Some("%V"),
+    },
+    ExplorerMenuEntry {
+        key: r"Directory\shell\SSHMountMate.Refresh",
+        label: "Refresh with SSH MountMate",
+        action: "--refresh-path",
+        placeholder: Some("%1"),
+    },
+    ExplorerMenuEntry {
+        key: r"Drive\shell\SSHMountMate.Refresh",
+        label: "Refresh with SSH MountMate",
+        action: "--refresh-path",
+        placeholder: Some("%1"),
+    },
+    ExplorerMenuEntry {
+        key: r"Directory\Background\shell\SSHMountMate.Transfers",
+        label: "Open SSH MountMate transfers",
+        action: "--show-transfers",
+        placeholder: None,
+    },
+    ExplorerMenuEntry {
+        key: r"Directory\shell\SSHMountMate.Transfers",
+        label: "Open SSH MountMate transfers",
+        action: "--show-transfers",
+        placeholder: None,
+    },
+    ExplorerMenuEntry {
+        key: r"Drive\shell\SSHMountMate.Transfers",
+        label: "Open SSH MountMate transfers",
+        action: "--show-transfers",
+        placeholder: None,
+    },
+];
+
+#[cfg(any(windows, test))]
+fn explorer_command(executable: &Path, entry: ExplorerMenuEntry) -> String {
+    let executable = executable.to_string_lossy();
+    match entry.placeholder {
+        Some(placeholder) => format!(r#""{executable}" {} "{placeholder}\.""#, entry.action),
+        None => format!(r#""{executable}" {}"#, entry.action),
+    }
+}
+
+#[cfg(windows)]
+fn register_file_manager_menu(executable: &Path) -> Result<(), PlatformError> {
+    use std::mem::size_of;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::{null, null_mut};
+
+    use windows_sys::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
+        RegCreateKeyExW, RegSetValueExW,
+    };
+
+    struct OwnedKey(HKEY);
+    impl Drop for OwnedKey {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    RegCloseKey(self.0);
+                }
+            }
+        }
+    }
+
+    fn wide(value: &std::ffi::OsStr) -> Vec<u16> {
+        value.encode_wide().chain(Some(0)).collect()
+    }
+
+    fn set_string(key: HKEY, name: Option<&str>, value: &str) -> Result<(), PlatformError> {
+        let name = name.map(|name| wide(std::ffi::OsStr::new(name)));
+        let value = wide(std::ffi::OsStr::new(value));
+        let result = unsafe {
+            RegSetValueExW(
+                key,
+                name.as_ref().map_or(null(), |name| name.as_ptr()),
+                0,
+                REG_SZ,
+                value.as_ptr().cast(),
+                (value.len() * size_of::<u16>()) as u32,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(PlatformError::Failed(
+                std::io::Error::from_raw_os_error(result as i32).to_string(),
+            ))
+        }
+    }
+
+    for entry in EXPLORER_MENU_ENTRIES {
+        let path = wide(std::ffi::OsStr::new(&format!(
+            r"Software\Classes\{}",
+            entry.key
+        )));
+        let mut key = null_mut();
+        let result = unsafe {
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                path.as_ptr(),
+                0,
+                null(),
+                REG_OPTION_NON_VOLATILE,
+                KEY_SET_VALUE,
+                null(),
+                &mut key,
+                null_mut(),
+            )
+        };
+        if result != 0 {
+            return Err(PlatformError::Failed(
+                std::io::Error::from_raw_os_error(result as i32).to_string(),
+            ));
+        }
+        let key = OwnedKey(key);
+        set_string(key.0, None, entry.label)?;
+        set_string(key.0, Some("Icon"), &executable.to_string_lossy())?;
+
+        let command_path = wide(std::ffi::OsStr::new(&format!(
+            r"Software\Classes\{}\command",
+            entry.key
+        )));
+        let mut command_key = null_mut();
+        let result = unsafe {
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                command_path.as_ptr(),
+                0,
+                null(),
+                REG_OPTION_NON_VOLATILE,
+                KEY_SET_VALUE,
+                null(),
+                &mut command_key,
+                null_mut(),
+            )
+        };
+        if result != 0 {
+            return Err(PlatformError::Failed(
+                std::io::Error::from_raw_os_error(result as i32).to_string(),
+            ));
+        }
+        let command_key = OwnedKey(command_key);
+        set_string(command_key.0, None, &explorer_command(executable, entry))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn register_file_manager_menu(_executable: &Path) -> Result<(), PlatformError> {
+    Err(PlatformError::Unsupported("file-manager integration"))
+}
+
+#[cfg(windows)]
+fn unregister_file_manager_menu() -> Result<(), PlatformError> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RegDeleteTreeW};
+
+    for entry in EXPLORER_MENU_ENTRIES {
+        let path: Vec<u16> = std::ffi::OsStr::new(&format!(r"Software\Classes\{}", entry.key))
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let result = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, path.as_ptr()) };
+        if result != 0 && result != 2 {
+            return Err(PlatformError::Failed(
+                std::io::Error::from_raw_os_error(result as i32).to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn unregister_file_manager_menu() -> Result<(), PlatformError> {
+    Err(PlatformError::Unsupported("file-manager integration"))
 }
 
 #[cfg(all(test, unix))]
@@ -220,6 +414,49 @@ mod tests {
         assert_eq!(
             std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+    }
+
+    #[test]
+    fn explorer_refresh_commands_protect_drive_root_quotes() {
+        let executable = Path::new(r"C:\Program Files\SSH MountMate\SSHMountMate.exe");
+        let commands: Vec<_> = EXPLORER_MENU_ENTRIES
+            .iter()
+            .copied()
+            .filter(|entry| entry.action == "--refresh-path")
+            .map(|entry| explorer_command(executable, entry))
+            .collect();
+
+        assert_eq!(commands.len(), 3);
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.ends_with(r#""%V\.""#))
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.ends_with(r#""%1\.""#))
+        );
+        assert!(
+            commands.iter().all(|command| command.starts_with(
+                r#""C:\Program Files\SSH MountMate\SSHMountMate.exe" --refresh-path "#
+            ))
+        );
+    }
+
+    #[test]
+    fn explorer_transfer_commands_reuse_the_main_executable() {
+        let executable = Path::new(r"C:\SSHMountMate.exe");
+        let entry = EXPLORER_MENU_ENTRIES
+            .iter()
+            .copied()
+            .find(|entry| entry.action == "--show-transfers")
+            .unwrap();
+
+        assert_eq!(
+            explorer_command(executable, entry),
+            r#""C:\SSHMountMate.exe" --show-transfers"#
         );
     }
 }

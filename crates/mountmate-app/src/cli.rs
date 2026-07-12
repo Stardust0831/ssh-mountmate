@@ -5,6 +5,8 @@ use mountmate_core::{APP_NAME, VERSION};
 pub(crate) enum LaunchAction {
     Gui(AppCommand),
     Headless(AppCommand),
+    RegisterFileManagerMenu,
+    UnregisterFileManagerMenu,
     Help,
     Version,
     Licenses,
@@ -27,6 +29,12 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Launc
             "-h" | "--help" => Some(LaunchAction::Help),
             "-V" | "--version" => Some(LaunchAction::Version),
             "--licenses" => Some(LaunchAction::Licenses),
+            "--register-file-manager-menu" | "--register-shell-menu" => {
+                Some(LaunchAction::RegisterFileManagerMenu)
+            }
+            "--unregister-file-manager-menu" | "--unregister-shell-menu" => {
+                Some(LaunchAction::UnregisterFileManagerMenu)
+            }
             "--show-main" => Some(LaunchAction::Gui(AppCommand::ShowMain)),
             "--show-transfers" => Some(LaunchAction::Gui(AppCommand::ShowTransfers)),
             "--mount-all" | "--mount-startup-all" => {
@@ -102,6 +110,8 @@ Usage: SSHMountMate [COMMAND]
   --refresh-id ID                Refresh one mounted connection
   --relative-dir PATH            Directory used with --refresh-id
   --refresh-path PATH            Refresh the mount containing a local directory
+  --register-file-manager-menu   Register file-manager commands for this executable
+  --unregister-file-manager-menu Remove file-manager commands
   --licenses                     Print bundled third-party notices
   -h, --help                     Print this help
   -V, --version                  Print the version"#
@@ -141,6 +151,10 @@ mod tests {
         assert_eq!(
             parse(args(&["--show-transfers"])).unwrap(),
             LaunchAction::Gui(AppCommand::ShowTransfers)
+        );
+        assert_eq!(
+            parse(args(&["--register-shell-menu"])).unwrap(),
+            LaunchAction::RegisterFileManagerMenu
         );
     }
 

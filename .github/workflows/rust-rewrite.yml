@@ -84,9 +84,32 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          & .\target\release\SSHMountMate.exe --version
-          & .\target\release\SSHMountMate.exe --help | Out-Null
-          & .\target\release\SSHMountMate.exe --licenses | Out-Null
+          $exe = (Resolve-Path .\target\release\SSHMountMate.exe).Path
+          & $exe --version
+          & $exe --help | Out-Null
+          & $exe --licenses | Out-Null
+          try {
+            & $exe --register-file-manager-menu
+            if ($LASTEXITCODE -ne 0) { throw "Explorer command registration failed" }
+
+            $driveRefresh = (Get-Item 'HKCU:\Software\Classes\Drive\shell\SSHMountMate.Refresh\command').GetValue('')
+            $backgroundRefresh = (Get-Item 'HKCU:\Software\Classes\Directory\Background\shell\SSHMountMate.Refresh\command').GetValue('')
+            $driveTransfers = (Get-Item 'HKCU:\Software\Classes\Drive\shell\SSHMountMate.Transfers\command').GetValue('')
+            if ($driveRefresh -ne "`"$exe`" --refresh-path `"%1\.`"") {
+              throw "Unexpected drive refresh command: $driveRefresh"
+            }
+            if ($backgroundRefresh -ne "`"$exe`" --refresh-path `"%V\.`"") {
+              throw "Unexpected background refresh command: $backgroundRefresh"
+            }
+            if ($driveTransfers -ne "`"$exe`" --show-transfers") {
+              throw "Unexpected transfer command: $driveTransfers"
+            }
+          } finally {
+            & $exe --unregister-file-manager-menu
+          }
+          if (Test-Path 'HKCU:\Software\Classes\Drive\shell\SSHMountMate.Refresh') {
+            throw "Explorer refresh command was not removed"
+          }
       - name: Bundle verified rclone
         if: runner.os != 'Windows'
         shell: bash

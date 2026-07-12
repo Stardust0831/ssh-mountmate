@@ -28,7 +28,7 @@ use mountmate_core::transfer::TransferSnapshot;
 use mountmate_core::{
     APP_NAME, AuthMethod, ConnectionMethod, MountState, ServerConfig, Settings, VERSION,
 };
-use mountmate_platform::Platform;
+use mountmate_platform::{Platform, PlatformIntegration};
 
 mod cli;
 mod i18n;
@@ -58,6 +58,25 @@ fn run() -> Result<(), String> {
         }
         LaunchAction::Licenses => {
             println!("{}", cli::licenses());
+            return Ok(());
+        }
+        LaunchAction::RegisterFileManagerMenu => {
+            let executable = std::env::current_exe()
+                .map_err(|error| format!("Could not locate the current executable: {error}"))?;
+            Platform
+                .register_file_manager_menu(&executable)
+                .map_err(|error| error.to_string())?;
+            println!(
+                "File-manager commands registered for {}",
+                executable.display()
+            );
+            return Ok(());
+        }
+        LaunchAction::UnregisterFileManagerMenu => {
+            Platform
+                .unregister_file_manager_menu()
+                .map_err(|error| error.to_string())?;
+            println!("File-manager commands removed");
             return Ok(());
         }
         LaunchAction::Gui(_) | LaunchAction::Headless(_) => {}
@@ -453,6 +472,9 @@ enum Message {
     AutoTransfersChanged(bool),
     AutoUpdatesChanged(bool),
     LanguageChanged(Language),
+    RegisterFileManagerMenu,
+    UnregisterFileManagerMenu,
+    FileManagerMenuFinished(Result<bool, String>),
     SaveSettings,
     SettingsSaved(Result<Settings, String>),
     Mount(String),
@@ -964,6 +986,13 @@ impl App {
                 }
                 self.status = self.locale().text(TextKey::Settings).into();
             }
+            Message::RegisterFileManagerMenu => return self.file_manager_menu_task(true),
+            Message::UnregisterFileManagerMenu => return self.file_manager_menu_task(false),
+            Message::FileManagerMenuFinished(result) => match result {
+                Ok(true) => self.status = locale.text(TextKey::FileManagerMenuRegistered).into(),
+                Ok(false) => self.status = locale.text(TextKey::FileManagerMenuRemoved).into(),
+                Err(error) => self.status = error,
+            },
             Message::SaveSettings => return self.save_settings(),
             Message::SettingsSaved(result) => {
                 self.editor_saving = false;
@@ -1379,6 +1408,40 @@ impl App {
                 .unwrap_or_else(|error| Err(error.to_string()))
             },
             Message::SettingsSaved,
+        )
+    }
+
+    fn file_manager_menu_task(&mut self, register: bool) -> Task<Message> {
+        self.status = self
+            .locale()
+            .text(if register {
+                TextKey::RegisteringFileManagerMenu
+            } else {
+                TextKey::RemovingFileManagerMenu
+            })
+            .into();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    if register {
+                        let executable = std::env::current_exe().map_err(|error| {
+                            format!("Could not locate the current executable: {error}")
+                        })?;
+                        Platform
+                            .register_file_manager_menu(&executable)
+                            .map(|()| true)
+                            .map_err(|error| error.to_string())
+                    } else {
+                        Platform
+                            .unregister_file_manager_menu()
+                            .map(|()| false)
+                            .map_err(|error| error.to_string())
+                    }
+                })
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()))
+            },
+            Message::FileManagerMenuFinished,
         )
     }
 
@@ -2281,9 +2344,31 @@ impl App {
         ]
         .spacing(14)
         .max_width(440);
-        let content = column![cache_profile, cache_limits, cache_timing, behavior]
-            .spacing(18)
-            .max_width(900);
+        let file_manager = if cfg!(windows) {
+            column![
+                text(locale.text(TextKey::FileManagerIntegration)).size(20),
+                text(locale.text(TextKey::FileManagerIntegrationHelp)).size(14),
+                row![
+                    button(locale.text(TextKey::RegisterFileManagerMenu))
+                        .on_press(Message::RegisterFileManagerMenu),
+                    button(locale.text(TextKey::RemoveFileManagerMenu))
+                        .on_press(Message::UnregisterFileManagerMenu),
+                ]
+                .spacing(10),
+            ]
+            .spacing(8)
+        } else {
+            column![]
+        };
+        let content = column![
+            cache_profile,
+            cache_limits,
+            cache_timing,
+            behavior,
+            file_manager
+        ]
+        .spacing(18)
+        .max_width(900);
         editor_shell(header, scrollable(content), &self.status)
     }
 
