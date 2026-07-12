@@ -4132,6 +4132,7 @@ dependencies = [
 name = "ssh-mountmate"
 version = "0.4.0-alpha.1"
 dependencies = [
+ "async-channel",
  "gtk",
  "iced",
  "libloading 0.8.9",

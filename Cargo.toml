@@ -15,6 +15,7 @@ repository = "https://github.com/Stardust0831/ssh-mountmate"
 
 [workspace.dependencies]
 anyhow = "1.0"
+async-channel = "2.5"
 configparser = { version = "3.1", features = ["indexmap"] }
 directories = "6.0"
 fs2 = "0.4"

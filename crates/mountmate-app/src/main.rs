@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc::{Receiver, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use iced::widget::{
@@ -102,10 +102,10 @@ fn run() -> Result<(), String> {
     match action {
         LaunchAction::Headless(command) => run_headless(&paths, command),
         LaunchAction::Gui(initial_command) => {
-            let (command_sender, command_receiver) = std::sync::mpsc::channel();
+            let (command_sender, command_receiver) = async_channel::unbounded();
             let command_server = Arc::new(
                 AppCommandServer::start(paths.app_command_state(), &Platform, move |command| {
-                    let _ = command_sender.send(command);
+                    let _ = command_sender.send_blocking(command);
                 })
                 .map_err(|error| error.to_string())?,
             );
@@ -113,7 +113,7 @@ fn run() -> Result<(), String> {
                 paths,
                 instance_lock,
                 command_server,
-                command_receiver: Arc::new(Mutex::new(command_receiver)),
+                command_receiver: CommandSubscription(command_receiver),
                 initial_command,
             };
             iced::daemon(move || App::new(bootstrap.clone()), App::update, App::view)
@@ -132,8 +132,34 @@ struct Bootstrap {
     paths: AppPaths,
     instance_lock: Arc<InstanceLock>,
     command_server: Arc<AppCommandServer>,
-    command_receiver: Arc<Mutex<Receiver<AppCommand>>>,
+    command_receiver: CommandSubscription,
     initial_command: AppCommand,
+}
+
+#[derive(Clone)]
+struct CommandSubscription(async_channel::Receiver<AppCommand>);
+
+impl Hash for CommandSubscription {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        "ssh-mountmate.app-command-subscription".hash(state);
+    }
+}
+
+fn command_stream(subscription: &CommandSubscription) -> async_channel::Receiver<AppCommand> {
+    subscription.0.clone()
+}
+
+#[derive(Clone)]
+struct TraySubscription(async_channel::Receiver<TrayAction>);
+
+impl Hash for TraySubscription {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        "ssh-mountmate.tray-subscription".hash(state);
+    }
+}
+
+fn tray_stream(subscription: &TraySubscription) -> async_channel::Receiver<TrayAction> {
+    subscription.0.clone()
 }
 
 fn run_headless(paths: &AppPaths, command: AppCommand) -> Result<(), String> {
@@ -246,7 +272,7 @@ struct App {
     paths: AppPaths,
     _instance_lock: Arc<InstanceLock>,
     _command_server: Arc<AppCommandServer>,
-    command_receiver: Arc<Mutex<Receiver<AppCommand>>>,
+    command_receiver: CommandSubscription,
     pending_commands: VecDeque<AppCommand>,
     settings: Settings,
     system_locale: Locale,
@@ -262,6 +288,8 @@ struct App {
     main_window_opening: bool,
     pending_main_activation: bool,
     tray: Option<TrayController>,
+    tray_action_sender: async_channel::Sender<TrayAction>,
+    tray_actions: TraySubscription,
     tray_error: Option<String>,
     exit_confirmation_open: bool,
     popup_windows: HashMap<window::Id, String>,
@@ -434,7 +462,9 @@ impl SettingsDraft {
 
 #[derive(Debug, Clone)]
 enum Message {
-    CommandTick,
+    AppCommand(AppCommand),
+    TrayAction(TrayAction),
+    TrayTick,
     MainWindowOpened(window::Id),
     Refresh,
     RefreshFinished(Result<mountmate_core::rc::RefreshResult, String>),
@@ -530,7 +560,10 @@ impl App {
 
     fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
-            iced::time::every(Duration::from_millis(100)).map(|_| Message::CommandTick),
+            Subscription::run_with(self.command_receiver.clone(), command_stream)
+                .map(Message::AppCommand),
+            Subscription::run_with(self.tray_actions.clone(), tray_stream).map(Message::TrayAction),
+            iced::time::every(Duration::from_millis(100)).map(|_| Message::TrayTick),
             iced::time::every(Duration::from_secs(1)).map(|_| Message::TransferTick),
             window::close_requests().map(Message::CloseRequested),
             window::close_events().map(Message::WindowClosed),
@@ -566,6 +599,7 @@ impl App {
         } else {
             Screen::Connections
         };
+        let (tray_action_sender, tray_actions) = async_channel::unbounded();
         let mut app = Self {
             paths,
             _instance_lock: instance_lock,
@@ -586,6 +620,8 @@ impl App {
             main_window_opening: true,
             pending_main_activation: false,
             tray: None,
+            tray_action_sender,
+            tray_actions: TraySubscription(tray_actions),
             tray_error: None,
             exit_confirmation_open: false,
             popup_windows: HashMap::new(),
@@ -616,10 +652,13 @@ impl App {
     fn update(&mut self, message: Message) -> Task<Message> {
         let locale = self.locale();
         match message {
-            Message::CommandTick => {
-                let command_task = self.drain_app_commands();
-                let tray_task = self.drain_tray_events();
-                return Task::batch([command_task, tray_task]);
+            Message::AppCommand(command) => return self.handle_app_command(command),
+            Message::TrayAction(action) => return self.handle_tray_action(action),
+            Message::TrayTick => {
+                if self.tray.is_some() {
+                    TrayController::desktop_iteration();
+                    self.sync_tray();
+                }
             }
             Message::MainWindowOpened(id) => {
                 if id == self.main_window {
@@ -1050,6 +1089,7 @@ impl App {
                 result,
             } => {
                 self.busy.remove(&id);
+                let mut tasks = Vec::new();
                 match result {
                     Ok(message) => {
                         self.mount_statuses.insert(
@@ -1061,14 +1101,18 @@ impl App {
                         );
                         self.status = message;
                         if matches!(operation, MountOperation::Unmount) {
-                            return self.close_popups_for_server(&id);
+                            tasks.push(self.close_popups_for_server(&id));
                         }
                     }
                     Err(error) => {
                         self.status = error;
-                        return self.status_task();
+                        tasks.push(self.status_task());
                     }
                 }
+                if let Some(command) = self.take_pending_command(&id) {
+                    tasks.push(self.handle_app_command(command));
+                }
+                return Task::batch(tasks);
             }
             Message::Open(id) => return self.open_mountpoint(id),
             Message::OpenFinished(result) => match result {
@@ -1140,39 +1184,11 @@ impl App {
         Task::none()
     }
 
-    fn drain_app_commands(&mut self) -> Task<Message> {
-        let mut commands = std::mem::take(&mut self.pending_commands);
-        {
-            let receiver = match self.command_receiver.lock() {
-                Ok(receiver) => receiver,
-                Err(error) => {
-                    self.status = format!("App command channel failed: {error}");
-                    return Task::none();
-                }
-            };
-            loop {
-                match receiver.try_recv() {
-                    Ok(command) => commands.push_back(command),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        self.status = "App command server stopped unexpectedly".into();
-                        break;
-                    }
-                }
-            }
-        }
-        Task::batch(
-            commands
-                .into_iter()
-                .map(|command| self.handle_app_command(command)),
-        )
-    }
-
     fn initialize_tray(&mut self) {
         if self.tray.is_some() || self.tray_error.is_some() {
             return;
         }
-        match TrayController::new(self.locale()) {
+        match TrayController::new(self.locale(), self.tray_action_sender.clone()) {
             Ok(tray) => {
                 self.tray = Some(tray);
                 self.sync_tray();
@@ -1201,31 +1217,18 @@ impl App {
         }
     }
 
-    fn drain_tray_events(&mut self) -> Task<Message> {
-        if self.tray.is_none() {
-            return Task::none();
-        }
-        self.sync_tray();
-        let mut tasks = Vec::new();
-        for action in TrayController::drain_actions() {
-            match action {
-                TrayAction::ShowMain => tasks.push(self.show_main_window()),
-                TrayAction::ShowTransfers => {
-                    self.screen = Screen::TransferCenter;
-                    self.status = self.locale().text(TextKey::TransferCenter).into();
-                    tasks.push(self.show_main_window());
-                    tasks.push(self.transfer_task());
-                }
-                TrayAction::MountAll => {
-                    tasks.push(self.handle_app_command(AppCommand::MountAll));
-                }
-                TrayAction::UnmountAll => {
-                    tasks.push(self.handle_app_command(AppCommand::UnmountAll));
-                }
-                TrayAction::Exit => return self.request_exit(),
+    fn handle_tray_action(&mut self, action: TrayAction) -> Task<Message> {
+        match action {
+            TrayAction::ShowMain => self.show_main_window(),
+            TrayAction::ShowTransfers => {
+                self.screen = Screen::TransferCenter;
+                self.status = self.locale().text(TextKey::TransferCenter).into();
+                Task::batch([self.show_main_window(), self.transfer_task()])
             }
+            TrayAction::MountAll => self.handle_app_command(AppCommand::MountAll),
+            TrayAction::UnmountAll => self.handle_app_command(AppCommand::UnmountAll),
+            TrayAction::Exit => self.request_exit(),
         }
-        Task::batch(tasks)
     }
 
     fn handle_app_command(&mut self, command: AppCommand) -> Task<Message> {
@@ -1320,6 +1323,17 @@ impl App {
             return Task::none();
         }
         self.start_mount_operation(id, Some(operation))
+    }
+
+    fn take_pending_command(&mut self, id: &str) -> Option<AppCommand> {
+        let position = self.pending_commands.iter().position(|command| {
+            matches!(
+                command,
+                AppCommand::Mount { id: pending_id } | AppCommand::Unmount { id: pending_id }
+                    if pending_id == id
+            )
+        })?;
+        self.pending_commands.remove(position)
     }
 
     fn activate_main_window(&self) -> Task<Message> {

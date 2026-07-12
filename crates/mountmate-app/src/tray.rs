@@ -32,8 +32,16 @@ pub(crate) struct TrayController {
 }
 
 impl TrayController {
-    pub(crate) fn new(locale: Locale) -> Result<Self, String> {
+    pub(crate) fn new(
+        locale: Locale,
+        action_sender: async_channel::Sender<TrayAction>,
+    ) -> Result<Self, String> {
         initialize_desktop_menu_runtime()?;
+        MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+            if let Some(action) = action_for_id(event.id.as_ref()) {
+                let _ = action_sender.send_blocking(action);
+            }
+        }));
 
         let show_main = MenuItem::with_id(
             SHOW_MAIN_ID,
@@ -106,15 +114,8 @@ impl TrayController {
         }
     }
 
-    pub(crate) fn drain_actions() -> Vec<TrayAction> {
+    pub(crate) fn desktop_iteration() {
         desktop_menu_iteration();
-        let mut actions = Vec::new();
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
-            if let Some(action) = action_for_id(event.id.as_ref()) {
-                actions.push(action);
-            }
-        }
-        actions
     }
 }
 
