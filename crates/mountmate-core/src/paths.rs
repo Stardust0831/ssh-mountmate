@@ -99,6 +99,10 @@ impl AppPaths {
         self.data_dir.join("bin")
     }
 
+    pub fn mount_cache_dir(&self, remote_name: &str) -> PathBuf {
+        self.cache_dir.join(path_component(remote_name))
+    }
+
     pub fn legacy_managed_bin_dirs(&self) -> Vec<PathBuf> {
         let Some(parent) = self.data_dir.parent() else {
             return Vec::new();

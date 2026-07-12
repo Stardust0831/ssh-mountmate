@@ -6,6 +6,7 @@ pub mod rc;
 pub mod rclone;
 pub mod rclone_binary;
 pub mod runtime;
+pub mod service;
 pub mod ssh;
 pub mod storage;
 pub mod transfer;

@@ -10,6 +10,7 @@ repository.workspace = true
 iced.workspace = true
 mountmate-core = { path = "../mountmate-core" }
 mountmate-platform = { path = "../mountmate-platform" }
+tokio.workspace = true
 
 [[bin]]
 name = "SSHMountMate"

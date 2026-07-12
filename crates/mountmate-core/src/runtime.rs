@@ -211,6 +211,9 @@ impl MountpointControl for SystemMountpointControl {
             let value = path.as_os_str().to_string_lossy();
             if value.len() == 2 && value.as_bytes()[0].is_ascii_alphabetic() && value.ends_with(':')
             {
+                if system_mountpoint_ready(path) {
+                    return Err("Windows drive is already in use".into());
+                }
                 return Ok(());
             }
             if path.exists() {
@@ -478,9 +481,12 @@ impl<'a> MountRuntime<'a> {
         if command == Some(false) {
             return MountStatus::Stale;
         }
-        let rc_verified = self.rc.process_id(&state.rc_addr) == Ok(state.pid);
         let mountpoint_ready = self.mountpoints.is_ready(&state.mountpoint);
-        if mountpoint_ready && (rc_verified || command == Some(true)) {
+        if mountpoint_ready && command == Some(true) {
+            return MountStatus::Mounted;
+        }
+        let rc_verified = self.rc.process_id(&state.rc_addr) == Ok(state.pid);
+        if mountpoint_ready && rc_verified {
             MountStatus::Mounted
         } else if state.phase == MountPhase::Starting || command != Some(false) {
             MountStatus::Starting
@@ -747,6 +753,18 @@ mod tests {
 
     struct FakeMountpoint {
         ready: RefCell<bool>,
+    }
+
+    struct PanicRc;
+
+    impl RcControl for PanicRc {
+        fn process_id(&self, _address: &str) -> Result<u32, String> {
+            panic!("RC must not be queried when local evidence is conclusive")
+        }
+
+        fn quit(&self, _address: &str) -> Result<(), String> {
+            unreachable!()
+        }
     }
 
     impl MountpointControl for FakeMountpoint {
@@ -1079,5 +1097,20 @@ mod tests {
             Err(RuntimeError::MountpointReserved(_))
         ));
         assert_eq!(*processes.spawn_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn status_skips_rc_when_process_and_mountpoint_are_conclusive() {
+        let temp = tempdir().unwrap();
+        let paths = paths(temp.path());
+        let (state, snapshot) = state(temp.path(), Some(matching_arguments(temp.path())));
+        write_private_json(&paths.state_file("alpha"), &state).unwrap();
+        let processes = FakeProcesses::new([Some(snapshot)]);
+        let mountpoint = FakeMountpoint {
+            ready: RefCell::new(true),
+        };
+        let runtime = MountRuntime::new(&paths, &processes, &PanicRc, &mountpoint);
+
+        assert_eq!(runtime.status("alpha").unwrap(), MountStatus::Mounted);
     }
 }

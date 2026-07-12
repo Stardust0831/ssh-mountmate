@@ -3584,6 +3584,7 @@ dependencies = [
  "iced",
  "mountmate-core",
  "mountmate-platform",
+ "tokio",
 ]
 
 [[package]]
