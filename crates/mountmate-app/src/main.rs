@@ -3,14 +3,20 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use iced::widget::{Space, button, column, container, progress_bar, row, scrollable, text};
-use iced::{Center, Element, Fill, Point, Size, Subscription, Task, Theme, window};
+use iced::widget::{
+    Space, button, checkbox, column, container, pick_list, progress_bar, row, scrollable, text,
+    text_input,
+};
+use iced::{Center, Element, Fill, Length, Point, Size, Subscription, Task, Theme, window};
+use mountmate_core::connection::{ConnectionDraft, ConnectionSource, SecretAction};
 use mountmate_core::paths::AppPaths;
 use mountmate_core::process::MountStatus;
 use mountmate_core::service::MountService;
 use mountmate_core::storage::{self, read_json};
 use mountmate_core::transfer::TransferSnapshot;
-use mountmate_core::{APP_NAME, MountState, ServerConfig, Settings, VERSION};
+use mountmate_core::{
+    APP_NAME, AuthMethod, ConnectionMethod, MountState, ServerConfig, Settings, VERSION,
+};
 
 fn main() -> iced::Result {
     iced::daemon(App::new, App::update, App::view)
@@ -36,7 +42,197 @@ struct App {
     popup_order: Vec<window::Id>,
     dismissed_popups: HashSet<String>,
     synced_polls: HashMap<String, u8>,
+    screen: Screen,
+    connection_draft: Option<ConnectionDraft>,
+    settings_draft: Option<SettingsDraft>,
+    editor_saving: bool,
+    pending_delete: Option<String>,
     status: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    Connections,
+    ConnectionEditor,
+    Settings,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ConnectionField {
+    Name,
+    HostAlias,
+    Host,
+    User,
+    Port,
+    KeyFile,
+    RemotePath,
+    Mountpoint,
+}
+
+#[derive(Clone)]
+struct SecretInput(String);
+
+impl std::fmt::Debug for SecretInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SettingsField {
+    CacheRoot,
+    MaxSize,
+    MaxAge,
+    MinFreeSpace,
+    WriteBack,
+    DirCacheTime,
+    BufferSize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheMode {
+    Off,
+    Minimal,
+    Writes,
+    Full,
+}
+
+impl CacheMode {
+    const ALL: [Self; 4] = [Self::Off, Self::Minimal, Self::Writes, Self::Full];
+
+    fn from_value(value: &str) -> Self {
+        match value {
+            "off" => Self::Off,
+            "minimal" => Self::Minimal,
+            "writes" => Self::Writes,
+            _ => Self::Full,
+        }
+    }
+
+    fn value(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Minimal => "minimal",
+            Self::Writes => "writes",
+            Self::Full => "full",
+        }
+    }
+}
+
+impl std::fmt::Display for CacheMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Off => "Off",
+            Self::Minimal => "Minimal",
+            Self::Writes => "Writes",
+            Self::Full => "Full",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Language {
+    Auto,
+    English,
+    Chinese,
+}
+
+impl Language {
+    const ALL: [Self; 3] = [Self::Auto, Self::English, Self::Chinese];
+
+    fn from_value(value: &str) -> Self {
+        match value {
+            "en" => Self::English,
+            "zh" => Self::Chinese,
+            _ => Self::Auto,
+        }
+    }
+
+    fn value(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::English => "en",
+            Self::Chinese => "zh",
+        }
+    }
+}
+
+impl std::fmt::Display for Language {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Auto => "System default",
+            Self::English => "English",
+            Self::Chinese => "简体中文",
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SettingsDraft {
+    cache_root: String,
+    cache_mode: CacheMode,
+    max_size: String,
+    max_age: String,
+    min_free_space: String,
+    write_back: String,
+    dir_cache_time: String,
+    buffer_size: String,
+    startup_all: bool,
+    auto_show_transfers: bool,
+    auto_check_updates: bool,
+    language: Language,
+}
+
+impl SettingsDraft {
+    fn from_settings(settings: &Settings) -> Self {
+        Self {
+            cache_root: settings.cache_root.display().to_string(),
+            cache_mode: CacheMode::from_value(&settings.vfs_cache_mode),
+            max_size: settings.vfs_cache_max_size.clone(),
+            max_age: settings.vfs_cache_max_age.clone(),
+            min_free_space: settings.vfs_cache_min_free_space.clone(),
+            write_back: settings.vfs_write_back.clone(),
+            dir_cache_time: settings.dir_cache_time.clone(),
+            buffer_size: settings.buffer_size.clone(),
+            startup_all: settings.startup_all,
+            auto_show_transfers: settings.auto_show_transfers,
+            auto_check_updates: settings.auto_check_updates,
+            language: Language::from_value(&settings.language),
+        }
+    }
+
+    fn build(&self, original: &Settings) -> Result<Settings, String> {
+        if self.cache_root.trim().is_empty() {
+            return Err("Cache root is required".into());
+        }
+        if self.cache_root.chars().any(char::is_control) {
+            return Err("Cache root must not contain control characters".into());
+        }
+        for (name, value, required) in [
+            ("Maximum cache age", self.max_age.as_str(), true),
+            ("Write-back delay", self.write_back.as_str(), true),
+            ("Directory cache time", self.dir_cache_time.as_str(), true),
+            ("Maximum cache size", self.max_size.as_str(), false),
+            ("Minimum free space", self.min_free_space.as_str(), false),
+            ("Buffer size", self.buffer_size.as_str(), false),
+        ] {
+            validate_setting_value(name, value, required)?;
+        }
+        let mut settings = original.clone();
+        settings.cache_root = PathBuf::from(self.cache_root.trim());
+        settings.vfs_cache_mode = self.cache_mode.value().into();
+        settings.vfs_cache_max_size = self.max_size.trim().into();
+        settings.vfs_cache_max_age = self.max_age.trim().into();
+        settings.vfs_cache_min_free_space = self.min_free_space.trim().into();
+        settings.vfs_write_back = self.write_back.trim().into();
+        settings.dir_cache_time = self.dir_cache_time.trim().into();
+        settings.buffer_size = self.buffer_size.trim().into();
+        settings.startup_all = self.startup_all;
+        settings.auto_show_transfers = self.auto_show_transfers;
+        settings.auto_check_updates = self.auto_check_updates;
+        settings.language = self.language.value().into();
+        Ok(settings)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +246,23 @@ enum Message {
     WindowClosed(window::Id),
     AddConnection,
     OpenSettings,
+    CancelEditor,
+    ConnectionSourceChanged(ConnectionSource),
+    ConnectionFieldChanged(ConnectionField, String),
+    ConnectionAuthChanged(AuthMethod),
+    ConnectionMethodChanged(ConnectionMethod),
+    PasswordChanged(SecretInput),
+    KeyPassphraseChanged(SecretInput),
+    SaveConnection,
+    ConnectionSaved(Result<Vec<ServerConfig>, String>),
+    SettingsFieldChanged(SettingsField, String),
+    CacheModeChanged(CacheMode),
+    StartupAllChanged(bool),
+    AutoTransfersChanged(bool),
+    AutoUpdatesChanged(bool),
+    LanguageChanged(Language),
+    SaveSettings,
+    SettingsSaved(Result<Settings, String>),
     Mount(String),
     MountFinished {
         id: String,
@@ -60,6 +273,9 @@ enum Message {
     OpenFinished(Result<(), String>),
     Edit(String),
     Remove(String),
+    CancelRemove,
+    ConfirmRemove,
+    RemoveFinished(Result<Vec<ServerConfig>, String>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -115,6 +331,11 @@ impl App {
             popup_order: Vec::new(),
             dismissed_popups: HashSet::new(),
             synced_polls: HashMap::new(),
+            screen: Screen::Connections,
+            connection_draft: None,
+            settings_draft: None,
+            editor_saving: false,
+            pending_delete: None,
             status,
         };
         let task = Task::batch([open_window.discard(), app.status_task()]);
@@ -188,10 +409,133 @@ impl App {
                 self.popup_order.retain(|popup| *popup != id);
             }
             Message::AddConnection => {
-                self.status = "Connection editor is the next implemented surface".into()
+                self.connection_draft = Some(ConnectionDraft::default());
+                self.screen = Screen::ConnectionEditor;
+                self.status = "New connection".into();
             }
             Message::OpenSettings => {
-                self.status = format!("Cache profile: {}", self.settings.vfs_cache_mode)
+                self.settings_draft = Some(SettingsDraft::from_settings(&self.settings));
+                self.screen = Screen::Settings;
+                self.status = "Settings".into();
+            }
+            Message::CancelEditor => {
+                if !self.editor_saving {
+                    self.connection_draft = None;
+                    self.settings_draft = None;
+                    self.screen = Screen::Connections;
+                    self.status = "Ready".into();
+                }
+            }
+            Message::ConnectionSourceChanged(source) => {
+                if let Some(draft) = &mut self.connection_draft {
+                    draft.source = source;
+                    draft.apply_source_defaults();
+                }
+            }
+            Message::ConnectionFieldChanged(field, value) => {
+                if let Some(draft) = &mut self.connection_draft {
+                    match field {
+                        ConnectionField::Name => draft.name = value,
+                        ConnectionField::HostAlias => draft.host_alias = value,
+                        ConnectionField::Host => draft.host = value,
+                        ConnectionField::User => {
+                            draft.user = value;
+                            draft.apply_sai_name();
+                        }
+                        ConnectionField::Port => draft.port = value,
+                        ConnectionField::KeyFile => draft.key_file = value,
+                        ConnectionField::RemotePath => draft.remote_path = value,
+                        ConnectionField::Mountpoint => draft.mountpoint = value,
+                    }
+                }
+            }
+            Message::ConnectionAuthChanged(auth) => {
+                if let Some(draft) = &mut self.connection_draft {
+                    draft.auth = auth;
+                }
+            }
+            Message::ConnectionMethodChanged(method) => {
+                if let Some(draft) = &mut self.connection_draft {
+                    draft.connection_method = method;
+                    if method == ConnectionMethod::Openssh {
+                        draft.auth = AuthMethod::Key;
+                    }
+                }
+            }
+            Message::PasswordChanged(value) => {
+                if let Some(draft) = &mut self.connection_draft {
+                    draft.password = value.0;
+                }
+            }
+            Message::KeyPassphraseChanged(value) => {
+                if let Some(draft) = &mut self.connection_draft {
+                    draft.key_passphrase = value.0;
+                }
+            }
+            Message::SaveConnection => return self.save_connection(),
+            Message::ConnectionSaved(result) => {
+                self.editor_saving = false;
+                match result {
+                    Ok(servers) => {
+                        self.servers = servers;
+                        self.connection_draft = None;
+                        self.screen = Screen::Connections;
+                        self.status = "Connection saved".into();
+                        return self.status_task();
+                    }
+                    Err(error) => self.status = error,
+                }
+            }
+            Message::SettingsFieldChanged(field, value) => {
+                if let Some(draft) = &mut self.settings_draft {
+                    match field {
+                        SettingsField::CacheRoot => draft.cache_root = value,
+                        SettingsField::MaxSize => draft.max_size = value,
+                        SettingsField::MaxAge => draft.max_age = value,
+                        SettingsField::MinFreeSpace => draft.min_free_space = value,
+                        SettingsField::WriteBack => draft.write_back = value,
+                        SettingsField::DirCacheTime => draft.dir_cache_time = value,
+                        SettingsField::BufferSize => draft.buffer_size = value,
+                    }
+                }
+            }
+            Message::CacheModeChanged(mode) => {
+                if let Some(draft) = &mut self.settings_draft {
+                    draft.cache_mode = mode;
+                }
+            }
+            Message::StartupAllChanged(value) => {
+                if let Some(draft) = &mut self.settings_draft {
+                    draft.startup_all = value;
+                }
+            }
+            Message::AutoTransfersChanged(value) => {
+                if let Some(draft) = &mut self.settings_draft {
+                    draft.auto_show_transfers = value;
+                }
+            }
+            Message::AutoUpdatesChanged(value) => {
+                if let Some(draft) = &mut self.settings_draft {
+                    draft.auto_check_updates = value;
+                }
+            }
+            Message::LanguageChanged(language) => {
+                if let Some(draft) = &mut self.settings_draft {
+                    draft.language = language;
+                }
+            }
+            Message::SaveSettings => return self.save_settings(),
+            Message::SettingsSaved(result) => {
+                self.editor_saving = false;
+                match result {
+                    Ok(settings) => {
+                        self.settings = settings;
+                        self.settings_draft = None;
+                        self.screen = Screen::Connections;
+                        self.status = "Settings saved".into();
+                    }
+                    Err(error) => self.status = error,
+                }
             }
             Message::Mount(id) => return self.start_mount_operation(id),
             Message::MountFinished {
@@ -225,10 +569,132 @@ impl App {
                 Ok(()) => self.status = "Opened mountpoint".into(),
                 Err(error) => self.status = error,
             },
-            Message::Edit(id) => self.status = format!("Edit requested for {id}"),
-            Message::Remove(id) => self.status = format!("Remove requested for {id}"),
+            Message::Edit(id) => {
+                if self.can_modify(&id)
+                    && let Some(server) = self.servers.iter().find(|server| server.id == id)
+                {
+                    self.connection_draft = Some(ConnectionDraft::from_server(server));
+                    self.screen = Screen::ConnectionEditor;
+                    self.status = format!("Editing {}", server.display_name());
+                }
+            }
+            Message::Remove(id) => {
+                if self.can_modify(&id) {
+                    self.pending_delete = Some(id);
+                }
+            }
+            Message::CancelRemove => self.pending_delete = None,
+            Message::ConfirmRemove => {
+                let Some(id) = self.pending_delete.take() else {
+                    return Task::none();
+                };
+                if !self.can_modify(&id) {
+                    self.status = "Unmount the connection before removing it".into();
+                    return Task::none();
+                }
+                self.editor_saving = true;
+                self.status = format!("Removing {id}...");
+                let paths = self.paths.clone();
+                return Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            storage::remove_server(&paths, &id).map_err(|error| error.to_string())
+                        })
+                        .await
+                        .unwrap_or_else(|error| Err(error.to_string()))
+                    },
+                    Message::RemoveFinished,
+                );
+            }
+            Message::RemoveFinished(result) => {
+                self.editor_saving = false;
+                match result {
+                    Ok(servers) => {
+                        self.servers = servers;
+                        self.status = "Connection removed".into();
+                    }
+                    Err(error) => self.status = error,
+                }
+            }
         }
         Task::none()
+    }
+
+    fn can_modify(&self, id: &str) -> bool {
+        !self.busy.contains(id)
+            && self
+                .mount_statuses
+                .get(id)
+                .copied()
+                .unwrap_or(MountStatus::Unmounted)
+                == MountStatus::Unmounted
+    }
+
+    fn save_connection(&mut self) -> Task<Message> {
+        if self.editor_saving {
+            return Task::none();
+        }
+        let Some(draft) = &self.connection_draft else {
+            return Task::none();
+        };
+        let validated = match draft.validate(&self.servers) {
+            Ok(validated) => validated,
+            Err(error) => {
+                self.status = error.to_string();
+                return Task::none();
+            }
+        };
+        self.editor_saving = true;
+        self.status = "Saving connection...".into();
+        let service = self.service.clone();
+        let paths = self.paths.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let password = obscure_action(&service, &validated.password)?;
+                    let key_passphrase = obscure_action(&service, &validated.key_passphrase)?;
+                    let server = validated
+                        .apply_secrets(password, key_passphrase)
+                        .map_err(|error| error.to_string())?;
+                    storage::upsert_server(&paths, server).map_err(|error| error.to_string())
+                })
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()))
+            },
+            Message::ConnectionSaved,
+        )
+    }
+
+    fn save_settings(&mut self) -> Task<Message> {
+        if self.editor_saving {
+            return Task::none();
+        }
+        let Some(draft) = &self.settings_draft else {
+            return Task::none();
+        };
+        let settings = match draft.build(&self.settings) {
+            Ok(settings) => settings,
+            Err(error) => {
+                self.status = error;
+                return Task::none();
+            }
+        };
+        self.editor_saving = true;
+        self.status = "Saving settings...".into();
+        let paths = self.paths.clone();
+        let result_settings = settings.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    storage::save_settings(&paths, &settings)
+                        .map(|()| result_settings)
+                        .map_err(|error| error.to_string())
+                })
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()))
+            },
+            Message::SettingsSaved,
+        )
     }
 
     fn status_task(&self) -> Task<Message> {
@@ -456,7 +922,11 @@ impl App {
 
     fn view(&self, window: window::Id) -> Element<'_, Message> {
         if window == self.main_window {
-            self.main_view()
+            match self.screen {
+                Screen::Connections => self.main_view(),
+                Screen::ConnectionEditor => self.connection_editor_view(),
+                Screen::Settings => self.settings_view(),
+            }
         } else {
             self.transfer_popup_view(window)
         }
@@ -492,6 +962,8 @@ impl App {
                     self.busy.contains(&server.id),
                     self.transfers.get(&server.id),
                     self.transfer_errors.contains_key(&server.id),
+                    self.can_modify(&server.id),
+                    self.pending_delete.as_deref() == Some(&server.id),
                 ));
             }
         }
@@ -508,6 +980,219 @@ impl App {
         .width(Fill)
         .height(Fill)
         .into()
+    }
+
+    fn connection_editor_view(&self) -> Element<'_, Message> {
+        let Some(draft) = &self.connection_draft else {
+            return container(text("Connection editor unavailable")).into();
+        };
+        let title = if draft.editing_id.is_some() {
+            "Edit connection"
+        } else {
+            "Add connection"
+        };
+        let header = row![
+            text(title).size(28),
+            Space::new().width(Fill),
+            button("Cancel").on_press_maybe((!self.editor_saving).then_some(Message::CancelEditor)),
+            button(if self.editor_saving {
+                "Saving..."
+            } else {
+                "Save"
+            })
+            .on_press_maybe((!self.editor_saving).then_some(Message::SaveConnection)),
+        ]
+        .spacing(10)
+        .align_y(Center);
+
+        let source = labeled_control(
+            "Source",
+            pick_list(
+                ConnectionSource::ALL,
+                Some(draft.source),
+                Message::ConnectionSourceChanged,
+            )
+            .width(Fill),
+        );
+        let identity = row![
+            connection_input("Name", &draft.name, ConnectionField::Name),
+            connection_input(
+                "SSH Host alias",
+                &draft.host_alias,
+                ConnectionField::HostAlias,
+            ),
+        ]
+        .spacing(12);
+        let target = row![
+            connection_input("IP / Host", &draft.host, ConnectionField::Host),
+            connection_input("User", &draft.user, ConnectionField::User),
+            connection_input("Port", &draft.port, ConnectionField::Port)
+                .width(Length::Fixed(150.0)),
+        ]
+        .spacing(12);
+        let authentication: Element<'_, Message> =
+            if draft.connection_method == ConnectionMethod::Openssh {
+                container(text("Private key (managed by OpenSSH)"))
+                    .padding(10)
+                    .width(Fill)
+                    .into()
+            } else {
+                pick_list(
+                    AuthMethod::ALL,
+                    Some(draft.auth),
+                    Message::ConnectionAuthChanged,
+                )
+                .width(Fill)
+                .into()
+            };
+        let transport = row![
+            labeled_control(
+                "Transport",
+                pick_list(
+                    ConnectionMethod::ALL,
+                    Some(draft.connection_method),
+                    Message::ConnectionMethodChanged,
+                )
+                .width(Fill),
+            ),
+            labeled_control("Authentication", authentication),
+        ]
+        .spacing(12);
+
+        let mut auth_fields = column![].spacing(12);
+        if draft.connection_method == ConnectionMethod::Native {
+            match draft.auth {
+                AuthMethod::Password => {
+                    auth_fields = auth_fields.push(labeled_control(
+                        "Password",
+                        text_input("Required for a new or changed target", &draft.password)
+                            .secure(true)
+                            .on_input(|value| Message::PasswordChanged(SecretInput(value)))
+                            .width(Fill),
+                    ));
+                }
+                AuthMethod::Key => {
+                    auth_fields = auth_fields.push(
+                        row![
+                            connection_input(
+                                "Private key file",
+                                &draft.key_file,
+                                ConnectionField::KeyFile
+                            ),
+                            labeled_control(
+                                "Key passphrase",
+                                text_input("Optional", &draft.key_passphrase)
+                                    .secure(true)
+                                    .on_input(|value| Message::KeyPassphraseChanged(SecretInput(
+                                        value
+                                    )))
+                                    .width(Fill),
+                            ),
+                        ]
+                        .spacing(12),
+                    );
+                }
+            }
+        }
+        let paths = row![
+            connection_input(
+                "Remote path ($HOME by default)",
+                &draft.remote_path,
+                ConnectionField::RemotePath,
+            ),
+            connection_input(
+                "Mountpoint (Auto by default)",
+                &draft.mountpoint,
+                ConnectionField::Mountpoint,
+            ),
+        ]
+        .spacing(12);
+        let content = column![source, identity, target, transport, auth_fields, paths]
+            .spacing(16)
+            .max_width(900);
+        editor_shell(header, scrollable(content), &self.status)
+    }
+
+    fn settings_view(&self) -> Element<'_, Message> {
+        let Some(draft) = &self.settings_draft else {
+            return container(text("Settings unavailable")).into();
+        };
+        let header = row![
+            text("Settings").size(28),
+            Space::new().width(Fill),
+            button("Cancel").on_press_maybe((!self.editor_saving).then_some(Message::CancelEditor)),
+            button(if self.editor_saving {
+                "Saving..."
+            } else {
+                "Save"
+            })
+            .on_press_maybe((!self.editor_saving).then_some(Message::SaveSettings)),
+        ]
+        .spacing(10)
+        .align_y(Center);
+        let cache_profile = row![
+            settings_input("Cache root", &draft.cache_root, SettingsField::CacheRoot),
+            labeled_control(
+                "VFS cache mode",
+                pick_list(
+                    CacheMode::ALL,
+                    Some(draft.cache_mode),
+                    Message::CacheModeChanged
+                )
+                .width(Fill),
+            ),
+        ]
+        .spacing(12);
+        let cache_limits = row![
+            settings_input("Maximum size", &draft.max_size, SettingsField::MaxSize),
+            settings_input("Maximum age", &draft.max_age, SettingsField::MaxAge),
+            settings_input(
+                "Minimum free space",
+                &draft.min_free_space,
+                SettingsField::MinFreeSpace,
+            ),
+        ]
+        .spacing(12);
+        let cache_timing = row![
+            settings_input(
+                "Write-back delay",
+                &draft.write_back,
+                SettingsField::WriteBack
+            ),
+            settings_input(
+                "Directory cache time",
+                &draft.dir_cache_time,
+                SettingsField::DirCacheTime,
+            ),
+            settings_input("Buffer size", &draft.buffer_size, SettingsField::BufferSize),
+        ]
+        .spacing(12);
+        let behavior = column![
+            checkbox(draft.startup_all)
+                .label("Mount all saved connections at login")
+                .on_toggle(Message::StartupAllChanged),
+            checkbox(draft.auto_show_transfers)
+                .label("Show transfer popup automatically")
+                .on_toggle(Message::AutoTransfersChanged),
+            checkbox(draft.auto_check_updates)
+                .label("Check for updates automatically")
+                .on_toggle(Message::AutoUpdatesChanged),
+            labeled_control(
+                "Language",
+                pick_list(
+                    Language::ALL,
+                    Some(draft.language),
+                    Message::LanguageChanged
+                )
+                .width(Fill),
+            ),
+        ]
+        .spacing(14)
+        .max_width(440);
+        let content = column![cache_profile, cache_limits, cache_timing, behavior]
+            .spacing(18)
+            .max_width(900);
+        editor_shell(header, scrollable(content), &self.status)
     }
 
     fn transfer_popup_view(&self, window: window::Id) -> Element<'_, Message> {
@@ -566,6 +1251,8 @@ fn connection_card<'a>(
     busy: bool,
     transfer: Option<&'a TransferSnapshot>,
     transfer_unavailable: bool,
+    can_modify: bool,
+    confirming_remove: bool,
 ) -> Element<'a, Message> {
     let id = server.id.clone();
     let host = format!("{}@{}:{}", server.user, server.host, server.port);
@@ -604,21 +1291,109 @@ fn connection_card<'a>(
                 .push(progress_bar(0.0..=100.0, snapshot.percentage as f32));
         }
     }
-    container(
+    let edit = button("Edit").on_press_maybe(can_modify.then(|| Message::Edit(id.clone())));
+    let actions: Element<'_, Message> = if confirming_remove {
         row![
-            details,
-            operation,
-            open,
-            button("Edit").on_press(Message::Edit(id.clone())),
-            button("Remove").on_press(Message::Remove(id)),
+            button("Cancel").on_press(Message::CancelRemove),
+            button("Confirm remove").on_press(Message::ConfirmRemove),
         ]
         .spacing(8)
-        .align_y(Center),
+        .into()
+    } else {
+        row![
+            edit,
+            button("Remove").on_press_maybe(can_modify.then_some(Message::Remove(id))),
+        ]
+        .spacing(8)
+        .into()
+    };
+    container(
+        row![details, operation, open, actions]
+            .spacing(8)
+            .align_y(Center),
     )
     .padding(16)
     .width(Fill)
     .style(container::rounded_box)
     .into()
+}
+
+fn connection_input<'a>(
+    label: &'a str,
+    value: &'a str,
+    field: ConnectionField,
+) -> iced::widget::Column<'a, Message> {
+    labeled_control(
+        label,
+        text_input(label, value)
+            .on_input(move |value| Message::ConnectionFieldChanged(field, value))
+            .width(Fill),
+    )
+}
+
+fn settings_input<'a>(
+    label: &'a str,
+    value: &'a str,
+    field: SettingsField,
+) -> iced::widget::Column<'a, Message> {
+    labeled_control(
+        label,
+        text_input(label, value)
+            .on_input(move |value| Message::SettingsFieldChanged(field, value))
+            .width(Fill),
+    )
+}
+
+fn labeled_control<'a>(
+    label: &'a str,
+    control: impl Into<Element<'a, Message>>,
+) -> iced::widget::Column<'a, Message> {
+    column![text(label).size(13), control.into()]
+        .spacing(5)
+        .width(Fill)
+}
+
+fn editor_shell<'a>(
+    header: impl Into<Element<'a, Message>>,
+    content: impl Into<Element<'a, Message>>,
+    status: &'a str,
+) -> Element<'a, Message> {
+    container(
+        column![
+            header.into(),
+            container(content.into()).height(Fill).width(Fill),
+            row![text(status), Space::new().width(Fill), text(VERSION)],
+        ]
+        .spacing(16),
+    )
+    .padding(18)
+    .width(Fill)
+    .height(Fill)
+    .into()
+}
+
+fn validate_setting_value(name: &str, value: &str, required: bool) -> Result<(), String> {
+    let value = value.trim();
+    if required && value.is_empty() {
+        return Err(format!("{name} is required"));
+    }
+    if value
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(format!("{name} must not contain whitespace"));
+    }
+    Ok(())
+}
+
+fn obscure_action(service: &MountService, action: &SecretAction) -> Result<Option<String>, String> {
+    match action {
+        SecretAction::Obscure(secret) => service
+            .obscure_secret(secret)
+            .map(Some)
+            .map_err(|error| error.to_string()),
+        SecretAction::Clear | SecretAction::Keep(_) => Ok(None),
+    }
 }
 
 fn display_mountpoint(server: &ServerConfig) -> &str {

@@ -44,7 +44,36 @@ pub fn load_servers(paths: &AppPaths) -> Result<Vec<ServerConfig>, StorageError>
 }
 
 pub fn save_servers(paths: &AppPaths, servers: &[ServerConfig]) -> Result<(), StorageError> {
+    let _lock = FileLock::acquire(&paths.servers_lock(), Duration::from_secs(10))?;
     write_private_json(&paths.servers_file(), servers)
+}
+
+pub fn upsert_server(
+    paths: &AppPaths,
+    server: ServerConfig,
+) -> Result<Vec<ServerConfig>, StorageError> {
+    let _lock = FileLock::acquire(&paths.servers_lock(), Duration::from_secs(10))?;
+    let mut servers = load_servers(paths)?;
+    if let Some(existing) = servers.iter_mut().find(|existing| existing.id == server.id) {
+        *existing = server;
+    } else {
+        servers.push(server);
+    }
+    write_private_json(&paths.servers_file(), &servers)?;
+    Ok(servers)
+}
+
+pub fn remove_server(paths: &AppPaths, server_id: &str) -> Result<Vec<ServerConfig>, StorageError> {
+    let _lock = FileLock::acquire(&paths.servers_lock(), Duration::from_secs(10))?;
+    let mut servers = load_servers(paths)?;
+    servers.retain(|server| server.id != server_id);
+    write_private_json(&paths.servers_file(), &servers)?;
+    Ok(servers)
+}
+
+pub fn save_settings(paths: &AppPaths, settings: &Settings) -> Result<(), StorageError> {
+    let _lock = FileLock::acquire(&paths.settings_lock(), Duration::from_secs(10))?;
+    write_private_json(&paths.settings_file(), settings)
 }
 
 pub fn load_settings(paths: &AppPaths) -> Result<Settings, StorageError> {
@@ -192,5 +221,54 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn transactional_upsert_preserves_other_connections() {
+        let temp = tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: temp.path().join("config"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            data_dir: temp.path().join("data"),
+        };
+        save_servers(
+            &paths,
+            &[ServerConfig {
+                id: "alpha".into(),
+                name: "Alpha".into(),
+                ..ServerConfig::default()
+            }],
+        )
+        .unwrap();
+        let servers = upsert_server(
+            &paths,
+            ServerConfig {
+                id: "beta".into(),
+                name: "Beta".into(),
+                ..ServerConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(servers.len(), 2);
+        assert_eq!(load_servers(&paths).unwrap(), servers);
+        assert_eq!(remove_server(&paths, "alpha").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn settings_save_uses_private_atomic_storage() {
+        let temp = tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: temp.path().join("config"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            data_dir: temp.path().join("data"),
+        };
+        let settings = Settings {
+            cache_root: temp.path().join("cache with spaces"),
+            ..Settings::default()
+        };
+        save_settings(&paths, &settings).unwrap();
+        assert_eq!(load_settings(&paths).unwrap(), settings);
     }
 }

@@ -1,3 +1,4 @@
+use std::fmt;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -45,12 +46,38 @@ pub enum AuthMethod {
     Password,
 }
 
+impl AuthMethod {
+    pub const ALL: [Self; 2] = [Self::Key, Self::Password];
+}
+
+impl fmt::Display for AuthMethod {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Key => "Private key",
+            Self::Password => "Password",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ConnectionMethod {
     #[default]
     Native,
     Openssh,
+}
+
+impl ConnectionMethod {
+    pub const ALL: [Self; 2] = [Self::Native, Self::Openssh];
+}
+
+impl fmt::Display for ConnectionMethod {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Native => "Native SFTP",
+            Self::Openssh => "OpenSSH",
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

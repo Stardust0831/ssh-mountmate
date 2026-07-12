@@ -1,6 +1,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 use thiserror::Error;
 
@@ -38,6 +42,8 @@ pub enum ServiceError {
     Runtime(#[from] RuntimeError),
     #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error("rclone obscure failed: {0}")]
+    Obscure(String),
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +122,40 @@ impl MountService {
     pub fn transfer_snapshot(&self, server_id: &str) -> Result<TransferSnapshot, ServiceError> {
         let state: MountState = read_json(&self.paths.state_file(server_id))?;
         Ok(HttpRcClient::new(&state.rc_addr, Duration::from_millis(750))?.transfer_snapshot()?)
+    }
+
+    pub fn obscure_secret(&self, secret: &str) -> Result<String, ServiceError> {
+        if secret.is_empty() {
+            return Err(ServiceError::Obscure("secret is empty".into()));
+        }
+        let rclone = resolve_rclone(&self.paths, &self.app_root, None)?
+            .ok_or(ServiceError::RcloneMissing)?;
+        let mut command = Command::new(&rclone.path);
+        command.args(["obscure", secret]);
+        #[cfg(windows)]
+        command.creation_flags(0x0800_0000);
+        let output = command
+            .output()
+            .map_err(|error| ServiceError::Obscure(error.to_string()))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            return Err(ServiceError::Obscure(if stderr.is_empty() {
+                format!("process exited with {}", output.status)
+            } else {
+                stderr
+            }));
+        }
+        let obscured = String::from_utf8(output.stdout)
+            .map_err(|error| ServiceError::Obscure(error.to_string()))?
+            .trim()
+            .to_owned();
+        if obscured.is_empty() {
+            Err(ServiceError::Obscure(
+                "rclone returned an empty value".into(),
+            ))
+        } else {
+            Ok(obscured)
+        }
     }
 
     fn ensure_remote(&self, server: &ServerConfig) -> Result<(), ServiceError> {

@@ -1,3 +1,4 @@
+pub mod connection;
 pub mod model;
 pub mod mountpoint;
 pub mod paths;

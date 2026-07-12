@@ -60,6 +60,14 @@ impl AppPaths {
         self.config_dir.join("settings.json")
     }
 
+    pub fn servers_lock(&self) -> PathBuf {
+        self.config_dir.join("servers.json.lock")
+    }
+
+    pub fn settings_lock(&self) -> PathBuf {
+        self.config_dir.join("settings.json.lock")
+    }
+
     pub fn rclone_config(&self) -> PathBuf {
         self.config_dir.join("rclone.conf")
     }

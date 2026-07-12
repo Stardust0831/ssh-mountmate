@@ -1,0 +1,624 @@
+use std::fmt;
+use std::path::{Path, PathBuf};
+
+use thiserror::Error;
+
+use crate::model::{normalize_port, sanitize_id};
+use crate::mountpoint::HOME_MOUNTPOINT_VALUE;
+use crate::{AuthMethod, ConnectionMethod, ServerConfig};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ConnectionSource {
+    #[default]
+    Manual,
+    SshConfig,
+    SaiCluster,
+}
+
+impl ConnectionSource {
+    pub const ALL: [Self; 3] = [Self::Manual, Self::SshConfig, Self::SaiCluster];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::SshConfig => "ssh_config",
+            Self::SaiCluster => "sai_cluster",
+        }
+    }
+
+    fn from_server(server: &ServerConfig) -> Self {
+        match server.source.as_str() {
+            "ssh_config" => Self::SshConfig,
+            "sai_cluster" => Self::SaiCluster,
+            _ => Self::Manual,
+        }
+    }
+}
+
+impl fmt::Display for ConnectionSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Manual => "Manual",
+            Self::SshConfig => "SSH config",
+            Self::SaiCluster => "SAI cluster",
+        })
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ConnectionDraft {
+    pub editing_id: Option<String>,
+    pub source: ConnectionSource,
+    pub name: String,
+    pub host_alias: String,
+    pub host: String,
+    pub user: String,
+    pub port: String,
+    pub auth: AuthMethod,
+    pub key_file: String,
+    pub password: String,
+    pub key_passphrase: String,
+    pub connection_method: ConnectionMethod,
+    pub remote_path: String,
+    pub mountpoint: String,
+    pub ssh_config_managed: bool,
+    pub copy_key_to_ssh_dir: bool,
+    existing: Option<ServerConfig>,
+}
+
+impl fmt::Debug for ConnectionDraft {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConnectionDraft")
+            .field("editing_id", &self.editing_id)
+            .field("source", &self.source)
+            .field("name", &self.name)
+            .field("host", &self.host)
+            .field("user", &self.user)
+            .field(
+                "password",
+                &(!self.password.is_empty()).then_some("<redacted>"),
+            )
+            .field(
+                "key_passphrase",
+                &(!self.key_passphrase.is_empty()).then_some("<redacted>"),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for ConnectionDraft {
+    fn default() -> Self {
+        Self {
+            editing_id: None,
+            source: ConnectionSource::Manual,
+            name: String::new(),
+            host_alias: String::new(),
+            host: String::new(),
+            user: String::new(),
+            port: "22".into(),
+            auth: AuthMethod::Key,
+            key_file: String::new(),
+            password: String::new(),
+            key_passphrase: String::new(),
+            connection_method: ConnectionMethod::Native,
+            remote_path: String::new(),
+            mountpoint: String::new(),
+            ssh_config_managed: false,
+            copy_key_to_ssh_dir: false,
+            existing: None,
+        }
+    }
+}
+
+impl ConnectionDraft {
+    pub fn from_server(server: &ServerConfig) -> Self {
+        Self {
+            editing_id: Some(server.id.clone()),
+            source: ConnectionSource::from_server(server),
+            name: server.name.clone(),
+            host_alias: server.host_alias.clone(),
+            host: server.host.clone(),
+            user: server.user.clone(),
+            port: server.port.clone(),
+            auth: server.auth,
+            key_file: server.key_file.clone(),
+            password: String::new(),
+            key_passphrase: String::new(),
+            connection_method: server.connection_method,
+            remote_path: server.remote_path.clone(),
+            mountpoint: server.mountpoint.clone(),
+            ssh_config_managed: server.ssh_config_managed,
+            copy_key_to_ssh_dir: server.copy_key_to_ssh_dir,
+            existing: Some(server.clone()),
+        }
+    }
+
+    pub fn apply_source_defaults(&mut self) {
+        if self.source == ConnectionSource::SaiCluster {
+            self.host = "c1.sai.ai-4s.com".into();
+            self.port = "12022".into();
+            self.auth = AuthMethod::Key;
+            self.connection_method = ConnectionMethod::Native;
+            self.apply_sai_name();
+        }
+    }
+
+    pub fn apply_sai_name(&mut self) {
+        if self.source != ConnectionSource::SaiCluster || self.user.trim().is_empty() {
+            return;
+        }
+        let name = format!("SAI-{}", self.user.trim());
+        if self.name.trim().is_empty() || self.name == "SAI" || self.name.starts_with("SAI-") {
+            self.name.clone_from(&name);
+        }
+        if self.host_alias.trim().is_empty()
+            || self.host_alias == "SAI"
+            || self.host_alias.starts_with("SAI-")
+        {
+            self.host_alias = name;
+        }
+    }
+
+    pub fn validate(&self, servers: &[ServerConfig]) -> Result<ValidatedConnection, DraftError> {
+        let name = required_scalar(&self.name, "Name")?;
+        let host = required_scalar(&self.host, "IP/Host")?;
+        let user = required_scalar(&self.user, "User")?;
+        let port = normalize_port(&self.port).ok_or(DraftError::InvalidPort)?;
+        let connection_method = self.connection_method;
+        let auth = if connection_method == ConnectionMethod::Openssh {
+            AuthMethod::Key
+        } else {
+            self.auth
+        };
+        let key_file = self.key_file.trim().to_owned();
+        if connection_method == ConnectionMethod::Native && auth == AuthMethod::Key {
+            validate_private_key(&key_file)?;
+        }
+        let mountpoint = normalize_mountpoint(&self.mountpoint)?;
+        let remote_path = normalize_remote_path(&self.remote_path);
+        let mut host_alias = self.host_alias.trim().to_owned();
+        let ssh_config_managed =
+            self.ssh_config_managed && self.source != ConnectionSource::SshConfig;
+        if ssh_config_managed && host_alias.is_empty() {
+            host_alias = sanitize_id(&name);
+        }
+        if self.source == ConnectionSource::SshConfig || ssh_config_managed {
+            validate_host_alias(&host_alias)?;
+        }
+
+        let mut id = self
+            .editing_id
+            .clone()
+            .unwrap_or_else(|| unique_id(&sanitize_id(&name), servers));
+        if id.trim().is_empty() {
+            id = unique_id(&sanitize_id(&name), servers);
+        }
+        let mut server = ServerConfig {
+            id,
+            name,
+            mode: if self.source == ConnectionSource::SshConfig {
+                "ssh_config".into()
+            } else {
+                "manual".into()
+            },
+            source: self.source.as_str().into(),
+            host_alias,
+            host,
+            user,
+            port,
+            auth,
+            key_file,
+            password_obscured: String::new(),
+            key_pass_obscured: String::new(),
+            connection_method,
+            remote_path,
+            mountpoint,
+            cache_mode: self
+                .existing
+                .as_ref()
+                .map_or_else(String::new, |server| server.cache_mode.clone()),
+            network_mode: self
+                .existing
+                .as_ref()
+                .is_some_and(|server| server.network_mode),
+            ssh_config_managed,
+            copy_key_to_ssh_dir: self.copy_key_to_ssh_dir
+                && ssh_config_managed
+                && auth == AuthMethod::Key,
+            managed_ssh_config_path: self
+                .existing
+                .as_ref()
+                .map_or_else(String::new, |server| server.managed_ssh_config_path.clone()),
+        };
+        server.normalize();
+
+        if let Some(duplicate) = servers.iter().find(|candidate| {
+            self.editing_id.as_deref() != Some(candidate.id.as_str())
+                && connection_fingerprint(candidate) == connection_fingerprint(&server)
+        }) {
+            return Err(DraftError::Duplicate(duplicate.display_name().into()));
+        }
+
+        let password = match auth {
+            AuthMethod::Password if !self.password.is_empty() => {
+                SecretAction::Obscure(self.password.clone())
+            }
+            AuthMethod::Password => self
+                .existing
+                .as_ref()
+                .filter(|existing| same_password_target(existing, &server))
+                .map(|existing| SecretAction::Keep(existing.password_obscured.clone()))
+                .filter(|action| !matches!(action, SecretAction::Keep(value) if value.is_empty()))
+                .ok_or(DraftError::PasswordRequired)?,
+            AuthMethod::Key => SecretAction::Clear,
+        };
+        let key_passphrase =
+            if auth == AuthMethod::Key && connection_method == ConnectionMethod::Native {
+                if !self.key_passphrase.is_empty() {
+                    SecretAction::Obscure(self.key_passphrase.clone())
+                } else {
+                    self.existing
+                        .as_ref()
+                        .filter(|existing| same_key_target(existing, &server))
+                        .map_or(SecretAction::Clear, |existing| {
+                            if existing.key_pass_obscured.is_empty() {
+                                SecretAction::Clear
+                            } else {
+                                SecretAction::Keep(existing.key_pass_obscured.clone())
+                            }
+                        })
+                }
+            } else {
+                SecretAction::Clear
+            };
+        Ok(ValidatedConnection {
+            server,
+            password,
+            key_passphrase,
+        })
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum SecretAction {
+    Clear,
+    Keep(String),
+    Obscure(String),
+}
+
+impl fmt::Debug for SecretAction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Clear => "Clear",
+            Self::Keep(_) => "Keep(<redacted>)",
+            Self::Obscure(_) => "Obscure(<redacted>)",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedConnection {
+    pub server: ServerConfig,
+    pub password: SecretAction,
+    pub key_passphrase: SecretAction,
+}
+
+impl ValidatedConnection {
+    pub fn apply_secrets(
+        mut self,
+        password: Option<String>,
+        key_passphrase: Option<String>,
+    ) -> Result<ServerConfig, DraftError> {
+        self.server.password_obscured = resolved_secret(self.password, password)?;
+        self.server.key_pass_obscured = resolved_secret(self.key_passphrase, key_passphrase)?;
+        Ok(self.server)
+    }
+}
+
+fn resolved_secret(action: SecretAction, obscured: Option<String>) -> Result<String, DraftError> {
+    match action {
+        SecretAction::Clear => Ok(String::new()),
+        SecretAction::Keep(value) => Ok(value),
+        SecretAction::Obscure(_) => obscured
+            .filter(|value| !value.is_empty())
+            .ok_or(DraftError::SecretNotObscured),
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum DraftError {
+    #[error("{0} is required")]
+    Required(&'static str),
+    #[error("{0} must not contain whitespace or control characters")]
+    InvalidScalar(&'static str),
+    #[error("Port must be a number from 1 to 65535")]
+    InvalidPort,
+    #[error("Select a private key file")]
+    KeyRequired,
+    #[error("Key file not found: {0}")]
+    KeyMissing(String),
+    #[error("Select the private key file, not the .pub public key file")]
+    PublicKey,
+    #[error("SSH Host is invalid")]
+    InvalidHostAlias,
+    #[error("Custom mountpoint must be an absolute path or start with ~")]
+    InvalidMountpoint,
+    #[error("A connection for the same target already exists: {0}")]
+    Duplicate(String),
+    #[error("Password is required")]
+    PasswordRequired,
+    #[error("A secret could not be safely obscured")]
+    SecretNotObscured,
+}
+
+fn required_scalar(value: &str, field: &'static str) -> Result<String, DraftError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(DraftError::Required(field));
+    }
+    if value
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(DraftError::InvalidScalar(field));
+    }
+    Ok(value.into())
+}
+
+fn validate_private_key(value: &str) -> Result<(), DraftError> {
+    if value.is_empty() {
+        return Err(DraftError::KeyRequired);
+    }
+    let path = expand_home(Path::new(value));
+    if !path.is_file() {
+        return Err(DraftError::KeyMissing(value.into()));
+    }
+    if path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pub"))
+    {
+        return Err(DraftError::PublicKey);
+    }
+    Ok(())
+}
+
+fn validate_host_alias(value: &str) -> Result<(), DraftError> {
+    let valid = !value.is_empty()
+        && !value.starts_with('-')
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | ':')
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(DraftError::InvalidHostAlias)
+    }
+}
+
+fn normalize_remote_path(value: &str) -> String {
+    let value = value.trim().replace('\\', "/");
+    if value == "~" {
+        String::new()
+    } else if value.starts_with('/') {
+        let suffix = value.trim_matches('/');
+        if suffix.is_empty() {
+            "/".into()
+        } else {
+            format!("/{suffix}")
+        }
+    } else {
+        value.trim_matches('/').into()
+    }
+}
+
+fn normalize_mountpoint(value: &str) -> Result<String, DraftError> {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("auto") {
+        return Ok(String::new());
+    }
+    if value == HOME_MOUNTPOINT_VALUE || windows_drive(value).is_some() {
+        return Ok(value.trim_end_matches(['\\', '/']).into());
+    }
+    if value.starts_with("~/") || value.starts_with("~\\") || absolute_path(value) {
+        Ok(value.into())
+    } else {
+        Err(DraftError::InvalidMountpoint)
+    }
+}
+
+fn absolute_path(value: &str) -> bool {
+    Path::new(value).is_absolute()
+        || (value.len() >= 3
+            && value.as_bytes()[0].is_ascii_alphabetic()
+            && value.as_bytes()[1] == b':'
+            && matches!(value.as_bytes()[2], b'\\' | b'/'))
+        || value.starts_with("\\\\")
+        || value.starts_with("//")
+}
+
+fn windows_drive(value: &str) -> Option<char> {
+    let bytes = value.as_bytes();
+    matches!(bytes, [letter, b':'] | [letter, b':', b'\\' | b'/'] if letter.is_ascii_alphabetic())
+        .then(|| char::from(bytes[0]).to_ascii_uppercase())
+}
+
+fn connection_fingerprint(server: &ServerConfig) -> (String, String, String, String, String) {
+    (
+        server.host.trim().into(),
+        server.user.trim().into(),
+        normalize_port(&server.port).unwrap_or_else(|| server.port.trim().into()),
+        normalize_remote_path(&server.remote_path),
+        normalize_mountpoint(&server.mountpoint)
+            .unwrap_or_else(|_| server.mountpoint.trim().into()),
+    )
+}
+
+fn same_password_target(existing: &ServerConfig, candidate: &ServerConfig) -> bool {
+    existing.source == candidate.source
+        && existing.host_alias == candidate.host_alias
+        && existing.host == candidate.host
+        && existing.user == candidate.user
+        && normalize_port(&existing.port) == normalize_port(&candidate.port)
+        && existing.auth == candidate.auth
+        && existing.connection_method == candidate.connection_method
+}
+
+fn same_key_target(existing: &ServerConfig, candidate: &ServerConfig) -> bool {
+    existing.auth == candidate.auth
+        && existing.key_file == candidate.key_file
+        && existing.connection_method == candidate.connection_method
+}
+
+fn unique_id(base: &str, servers: &[ServerConfig]) -> String {
+    if !servers.iter().any(|server| server.id == base) {
+        return base.into();
+    }
+    (2..)
+        .map(|index| format!("{base}-{index}"))
+        .find(|candidate| !servers.iter().any(|server| &server.id == candidate))
+        .expect("an unused numeric connection suffix always exists")
+}
+
+fn expand_home(path: &Path) -> PathBuf {
+    let value = path.as_os_str().to_string_lossy();
+    if (value == "~" || value.starts_with("~/") || value.starts_with("~\\"))
+        && let Some(directories) = directories::BaseDirs::new()
+    {
+        return if value == "~" {
+            directories.home_dir().into()
+        } else {
+            directories.home_dir().join(&value[2..])
+        };
+    }
+    path.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    fn password_server() -> ServerConfig {
+        ServerConfig {
+            id: "alpha".into(),
+            name: "Alpha".into(),
+            host: "host.example".into(),
+            user: "alice".into(),
+            port: "22".into(),
+            auth: AuthMethod::Password,
+            password_obscured: "kept-secret".into(),
+            ..ServerConfig::default()
+        }
+    }
+
+    #[test]
+    fn unchanged_password_target_preserves_obscured_secret() {
+        let existing = password_server();
+        let draft = ConnectionDraft::from_server(&existing);
+        let validated = draft.validate(std::slice::from_ref(&existing)).unwrap();
+        assert_eq!(validated.password, SecretAction::Keep("kept-secret".into()));
+        assert_eq!(
+            validated
+                .apply_secrets(None, None)
+                .unwrap()
+                .password_obscured,
+            "kept-secret"
+        );
+    }
+
+    #[test]
+    fn changed_password_target_requires_a_new_password() {
+        let existing = password_server();
+        let mut draft = ConnectionDraft::from_server(&existing);
+        draft.host = "other.example".into();
+        assert_eq!(
+            draft.validate(&[existing]),
+            Err(DraftError::PasswordRequired)
+        );
+    }
+
+    #[test]
+    fn plaintext_secret_is_only_returned_as_an_obscure_action() {
+        let mut draft = ConnectionDraft::from_server(&password_server());
+        draft.password = "plain-text".into();
+        let validated = draft.validate(&[]).unwrap();
+        assert_eq!(
+            validated.password,
+            SecretAction::Obscure("plain-text".into())
+        );
+        assert!(validated.server.password_obscured.is_empty());
+        assert_eq!(
+            validated.apply_secrets(None, None),
+            Err(DraftError::SecretNotObscured)
+        );
+    }
+
+    #[test]
+    fn exact_duplicate_target_is_rejected() {
+        let existing = password_server();
+        let mut draft = ConnectionDraft::from_server(&existing);
+        draft.editing_id = None;
+        draft.existing = None;
+        draft.password = "new".into();
+        assert_eq!(
+            draft.validate(&[existing]),
+            Err(DraftError::Duplicate("Alpha".into()))
+        );
+    }
+
+    #[test]
+    fn native_key_requires_an_existing_private_key() {
+        let temp = tempdir().unwrap();
+        let public = temp.path().join("id_ed25519.pub");
+        fs::write(&public, "public").unwrap();
+        let mut draft = ConnectionDraft {
+            name: "Alpha".into(),
+            host: "host.example".into(),
+            user: "alice".into(),
+            key_file: public.display().to_string(),
+            ..ConnectionDraft::default()
+        };
+        assert_eq!(draft.validate(&[]), Err(DraftError::PublicKey));
+        draft.key_file = temp.path().join("missing").display().to_string();
+        assert!(matches!(
+            draft.validate(&[]),
+            Err(DraftError::KeyMissing(_))
+        ));
+    }
+
+    #[test]
+    fn openssh_forces_key_auth_without_native_key_validation() {
+        let draft = ConnectionDraft {
+            name: "Alpha".into(),
+            host: "host.example".into(),
+            user: "alice".into(),
+            auth: AuthMethod::Password,
+            connection_method: ConnectionMethod::Openssh,
+            ..ConnectionDraft::default()
+        };
+        assert_eq!(draft.validate(&[]).unwrap().server.auth, AuthMethod::Key);
+    }
+
+    #[test]
+    fn new_ids_never_collide() {
+        let existing = ServerConfig {
+            id: "Alpha".into(),
+            ..ServerConfig::default()
+        };
+        let temp = tempdir().unwrap();
+        let key = temp.path().join("id");
+        fs::write(&key, "private").unwrap();
+        let draft = ConnectionDraft {
+            name: "Alpha".into(),
+            host: "host.example".into(),
+            user: "alice".into(),
+            key_file: key.display().to_string(),
+            ..ConnectionDraft::default()
+        };
+        assert_eq!(draft.validate(&[existing]).unwrap().server.id, "Alpha-2");
+    }
+}
