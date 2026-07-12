@@ -64,8 +64,16 @@ impl AppPaths {
         self.config_dir.join("rclone.conf")
     }
 
+    pub fn rclone_config_lock(&self) -> PathBuf {
+        self.config_dir.join("rclone.conf.lock")
+    }
+
     pub fn known_hosts(&self) -> PathBuf {
         self.config_dir.join("known_hosts")
+    }
+
+    pub fn known_hosts_lock(&self) -> PathBuf {
+        self.config_dir.join("known_hosts.lock")
     }
 
     pub fn state_file(&self, server_id: &str) -> PathBuf {

@@ -1,19 +1,251 @@
+use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use configparser::ini::{Ini, WriteOptions};
+use thiserror::Error;
+
+use crate::model::{AuthMethod, ConnectionMethod};
+use crate::paths::AppPaths;
+use crate::ssh::{ResolvedSshConfig, readable_file, validate_host_alias};
+use crate::storage::{FileLock, StorageError, atomic_write};
 use crate::{ServerConfig, Settings};
 
-pub fn known_hosts_marker(host: &str, port: &str) -> String {
-    if port.trim().is_empty() || port == "22" {
-        host.to_owned()
-    } else {
-        format!("[{host}]:{port}")
+#[derive(Debug, Error)]
+pub enum RcloneConfigError {
+    #[error("invalid rclone remote name: {0}")]
+    InvalidRemoteName(String),
+    #[error("invalid value for {field}")]
+    InvalidValue { field: &'static str },
+    #[error("SSH config resolution is required for an SSH config connection")]
+    MissingResolvedSshConfig,
+    #[error("invalid rclone config at {path}: {message}")]
+    InvalidConfig { path: PathBuf, message: String },
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RcloneRemote {
+    pub name: String,
+    pub options: Vec<(String, String)>,
+}
+
+impl RcloneRemote {
+    pub fn for_server(
+        server: &ServerConfig,
+        resolved: Option<&ResolvedSshConfig>,
+        known_hosts: Option<&Path>,
+        windows: bool,
+    ) -> Result<Self, RcloneConfigError> {
+        let name = server.remote_name().to_owned();
+        validate_remote_name(&name)?;
+        let mut options = vec![
+            ("type".into(), "sftp".into()),
+            ("shell_type".into(), "unix".into()),
+            ("disable_hashcheck".into(), "true".into()),
+        ];
+        if server.connection_method == ConnectionMethod::Openssh {
+            options.push(("ssh".into(), openssh_command(server, windows)?));
+            return Ok(Self { name, options });
+        }
+
+        let ssh_config_connection = server.mode == "ssh_config";
+        let resolved = if ssh_config_connection {
+            Some(resolved.ok_or(RcloneConfigError::MissingResolvedSshConfig)?)
+        } else {
+            None
+        };
+        let host = resolved
+            .map(|config| config.first("hostname", &server.host))
+            .unwrap_or(&server.host);
+        let default_user = default_username();
+        let user = resolved
+            .map(|config| config.first("user", default_user.as_str()))
+            .unwrap_or(&server.user);
+        let port = resolved
+            .map(|config| config.first("port", &server.port))
+            .unwrap_or(&server.port);
+        validate_scalar(host, "host")?;
+        validate_scalar(user, "user")?;
+        validate_port(port)?;
+        options.extend([
+            ("host".into(), host.to_owned()),
+            ("user".into(), user.to_owned()),
+            ("port".into(), port.to_owned()),
+        ]);
+
+        if ssh_config_connection {
+            if let Some(key_file) =
+                resolved.and_then(|config| config.first_existing_path("identityfile"))
+            {
+                options.push(("key_file".into(), key_file.display().to_string()));
+            } else {
+                options.push(("key_use_agent".into(), "true".into()));
+            }
+        } else {
+            match server.auth {
+                AuthMethod::Password => {
+                    validate_scalar(&server.password_obscured, "password")?;
+                    options.push(("pass".into(), server.password_obscured.clone()));
+                }
+                AuthMethod::Key if !server.key_file.is_empty() => {
+                    validate_scalar(&server.key_file, "key file")?;
+                    options.push(("key_file".into(), server.key_file.clone()));
+                    if !server.key_pass_obscured.is_empty() {
+                        validate_scalar(&server.key_pass_obscured, "key passphrase")?;
+                        options.push(("key_file_pass".into(), server.key_pass_obscured.clone()));
+                    }
+                }
+                AuthMethod::Key => {
+                    options.push(("key_use_agent".into(), "true".into()));
+                }
+            }
+        }
+        if let Some(path) = known_hosts.and_then(readable_file) {
+            options.push(("known_hosts_file".into(), path.display().to_string()));
+        }
+        Ok(Self { name, options })
     }
 }
 
-pub fn known_hosts_line_matches(line: &str, marker: &str) -> bool {
-    line.split_whitespace()
-        .next()
-        .is_some_and(|hosts| hosts.split(',').any(|host| host == marker))
+pub fn write_rclone_remote(
+    paths: &AppPaths,
+    remote: &RcloneRemote,
+) -> Result<(), RcloneConfigError> {
+    validate_remote_name(&remote.name)?;
+    let _lock = FileLock::acquire(&paths.rclone_config_lock(), Duration::from_secs(180))?;
+    let path = paths.rclone_config();
+    let mut defaults = Ini::new_cs().defaults();
+    defaults.enable_inline_comments = false;
+    let mut config = Ini::new_from_defaults(defaults);
+    if path.exists() {
+        let content = fs::read_to_string(&path).map_err(|source| StorageError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        config
+            .read(content)
+            .map_err(|message| RcloneConfigError::InvalidConfig {
+                path: path.clone(),
+                message,
+            })?;
+    }
+    config.remove_section(&remote.name);
+    for (key, value) in &remote.options {
+        validate_ini_name(key, "rclone option")?;
+        validate_scalar(value, "rclone option value")?;
+        config.set(&remote.name, key, Some(value.clone()));
+    }
+    let write_options = WriteOptions::new_with_params(true, 4, 1);
+    atomic_write(&path, config.pretty_writes(&write_options).as_bytes())?;
+    Ok(())
+}
+
+fn validate_remote_name(value: &str) -> Result<(), RcloneConfigError> {
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        Ok(())
+    } else {
+        Err(RcloneConfigError::InvalidRemoteName(value.to_owned()))
+    }
+}
+
+fn validate_ini_name(value: &str, field: &'static str) -> Result<(), RcloneConfigError> {
+    if !value.is_empty() && !value.contains(['\r', '\n', '[', ']', '=', ':']) {
+        Ok(())
+    } else {
+        Err(RcloneConfigError::InvalidValue { field })
+    }
+}
+
+fn validate_scalar(value: &str, field: &'static str) -> Result<(), RcloneConfigError> {
+    if !value.is_empty() && !value.contains(['\r', '\n', '\0']) {
+        Ok(())
+    } else {
+        Err(RcloneConfigError::InvalidValue { field })
+    }
+}
+
+fn validate_port(value: &str) -> Result<(), RcloneConfigError> {
+    match value.parse::<u16>() {
+        Ok(port) if port > 0 => Ok(()),
+        _ => Err(RcloneConfigError::InvalidValue { field: "port" }),
+    }
+}
+
+fn default_username() -> String {
+    env::var("USERNAME")
+        .or_else(|_| env::var("USER"))
+        .unwrap_or_default()
+}
+
+fn openssh_command(server: &ServerConfig, windows: bool) -> Result<String, RcloneConfigError> {
+    let mut arguments = vec!["ssh".to_owned(), "-o".into(), "BatchMode=yes".into()];
+    if (server.source == "ssh_config" || server.ssh_config_managed) && !server.host_alias.is_empty()
+    {
+        validate_host_alias(&server.host_alias)
+            .map_err(|_| RcloneConfigError::InvalidValue { field: "SSH host" })?;
+        arguments.push(server.host_alias.clone());
+    } else {
+        validate_scalar(&server.host, "host")?;
+        validate_port(&server.port)?;
+        if !server.user.is_empty() {
+            validate_scalar(&server.user, "user")?;
+            arguments.extend(["-l".into(), server.user.clone()]);
+        }
+        arguments.extend(["-p".into(), server.port.clone()]);
+        if !server.key_file.is_empty() {
+            validate_scalar(&server.key_file, "key file")?;
+            arguments.extend([
+                "-i".into(),
+                server.key_file.clone(),
+                "-o".into(),
+                "IdentitiesOnly=yes".into(),
+            ]);
+        }
+        arguments.push(server.host.clone());
+    }
+    Ok(arguments
+        .iter()
+        .map(|argument| quote_command_argument(argument, windows))
+        .collect::<Vec<_>>()
+        .join(" "))
+}
+
+fn quote_command_argument(value: &str, windows: bool) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || "._-/:=~".contains(ch))
+    {
+        return value.to_owned();
+    }
+    if windows {
+        let mut quoted = String::from("\"");
+        let mut backslashes = 0;
+        for ch in value.chars() {
+            if ch == '\\' {
+                backslashes += 1;
+            } else if ch == '"' {
+                quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            } else {
+                quoted.push_str(&"\\".repeat(backslashes));
+                backslashes = 0;
+                quoted.push(ch);
+            }
+        }
+        quoted.push_str(&"\\".repeat(backslashes * 2));
+        quoted.push('"');
+        quoted
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -132,7 +364,18 @@ pub fn cache_directory(settings: &Settings, server: &ServerConfig) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::tempdir;
+
     use super::*;
+
+    fn app_paths(root: &Path) -> AppPaths {
+        AppPaths {
+            config_dir: root.join("config"),
+            cache_dir: root.join("cache"),
+            state_dir: root.join("state"),
+            data_dir: root.join("data"),
+        }
+    }
 
     fn command(cache_mode: &str) -> Vec<String> {
         let server = ServerConfig {
@@ -189,19 +432,6 @@ mod tests {
     }
 
     #[test]
-    fn host_marker_includes_nonstandard_port() {
-        assert_eq!(known_hosts_marker("example.com", "22"), "example.com");
-        assert_eq!(
-            known_hosts_marker("example.com", "12022"),
-            "[example.com]:12022"
-        );
-        assert!(known_hosts_line_matches(
-            "[example.com]:12022 ssh-ed25519 AAAA",
-            "[example.com]:12022"
-        ));
-    }
-
-    #[test]
     fn explorer_drive_root_repairs_trailing_quote() {
         assert_eq!(normalize_explorer_refresh_path("Y:\"", true), "Y:\\");
         assert_eq!(
@@ -209,5 +439,142 @@ mod tests {
             "C:\\Mount Folder\\"
         );
         assert_eq!(normalize_refresh_relative_path("\""), "");
+    }
+
+    #[test]
+    fn native_remote_keeps_obscured_password_and_readable_known_hosts() {
+        let temp = tempdir().unwrap();
+        let known_hosts = temp.path().join("known_hosts");
+        fs::write(&known_hosts, "host ssh-ed25519 AAAA\n").unwrap();
+        let server = ServerConfig {
+            id: "alpha".into(),
+            host: "alpha.example".into(),
+            user: "researcher".into(),
+            port: "12022".into(),
+            auth: AuthMethod::Password,
+            password_obscured: "obscured-value".into(),
+            ..ServerConfig::default()
+        };
+
+        let remote = RcloneRemote::for_server(&server, None, Some(&known_hosts), false).unwrap();
+
+        assert!(
+            remote
+                .options
+                .contains(&("pass".into(), "obscured-value".into()))
+        );
+        assert!(
+            remote
+                .options
+                .contains(&("known_hosts_file".into(), known_hosts.display().to_string()))
+        );
+        assert!(!remote.options.iter().any(|(key, _)| key == "key_file"));
+    }
+
+    #[test]
+    fn unreadable_known_hosts_is_never_written_to_remote() {
+        let temp = tempdir().unwrap();
+        let not_a_file = temp.path().join("known_hosts");
+        fs::create_dir(&not_a_file).unwrap();
+        let server = ServerConfig {
+            id: "alpha".into(),
+            host: "alpha.example".into(),
+            user: "researcher".into(),
+            ..ServerConfig::default()
+        };
+
+        let remote = RcloneRemote::for_server(&server, None, Some(&not_a_file), false).unwrap();
+
+        assert!(
+            !remote
+                .options
+                .iter()
+                .any(|(key, _)| key == "known_hosts_file")
+        );
+    }
+
+    #[test]
+    fn ssh_config_remote_uses_resolved_values_and_existing_identity() {
+        let temp = tempdir().unwrap();
+        let identity = temp.path().join("id key");
+        fs::write(&identity, "PRIVATE KEY").unwrap();
+        let resolved = ResolvedSshConfig::parse(&format!(
+            "hostname c1.example\nuser researcher\nport 12022\nidentityfile \"{}\"\n",
+            identity.display()
+        ));
+        let server = ServerConfig {
+            id: "internal-id".into(),
+            mode: "ssh_config".into(),
+            host_alias: "cluster".into(),
+            ..ServerConfig::default()
+        };
+
+        let remote = RcloneRemote::for_server(&server, Some(&resolved), None, false).unwrap();
+
+        assert_eq!(remote.name, "cluster");
+        assert!(
+            remote
+                .options
+                .contains(&("host".into(), "c1.example".into()))
+        );
+        assert!(
+            remote
+                .options
+                .contains(&("key_file".into(), identity.display().to_string()))
+        );
+        assert!(!remote.options.iter().any(|(key, _)| key == "key_use_agent"));
+    }
+
+    #[test]
+    fn openssh_remote_uses_quoted_command_without_saved_secrets() {
+        let server = ServerConfig {
+            id: "alpha".into(),
+            host: "alpha.example".into(),
+            user: "researcher".into(),
+            port: "22".into(),
+            key_file: "/home/user/key file".into(),
+            password_obscured: "must-not-appear".into(),
+            connection_method: ConnectionMethod::Openssh,
+            ..ServerConfig::default()
+        };
+
+        let remote = RcloneRemote::for_server(&server, None, None, false).unwrap();
+        let command = remote.options.iter().find(|(key, _)| key == "ssh").unwrap();
+
+        assert!(command.1.contains("'/home/user/key file'"));
+        assert!(!remote.options.iter().any(|(key, _)| key == "pass"));
+        assert!(!command.1.contains("must-not-appear"));
+    }
+
+    #[test]
+    fn config_update_preserves_other_secrets_and_removes_stale_options() {
+        let temp = tempdir().unwrap();
+        let paths = app_paths(temp.path());
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        fs::write(
+            paths.rclone_config(),
+            "[other]\npass = preserved-secret\n\n[alpha]\nknown_hosts_file = stale\npass = stale\n",
+        )
+        .unwrap();
+        let remote = RcloneRemote {
+            name: "alpha".into(),
+            options: vec![
+                ("type".into(), "sftp".into()),
+                ("ssh".into(), "ssh -o BatchMode=yes alpha".into()),
+            ],
+        };
+
+        write_rclone_remote(&paths, &remote).unwrap();
+
+        let content = fs::read_to_string(paths.rclone_config()).unwrap();
+        let mut parsed = Ini::new_cs();
+        parsed.read(content).unwrap();
+        assert_eq!(parsed.get("other", "pass"), Some("preserved-secret".into()));
+        assert_eq!(parsed.get("alpha", "known_hosts_file"), None);
+        assert_eq!(parsed.get("alpha", "pass"), None);
+        assert_eq!(
+            parsed.get("alpha", "ssh"),
+            Some("ssh -o BatchMode=yes alpha".into())
+        );
     }
 }
