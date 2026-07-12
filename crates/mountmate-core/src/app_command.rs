@@ -440,13 +440,27 @@ mod tests {
 
     #[test]
     fn second_instance_lock_is_rejected_until_release() {
+        const CHILD_PATH: &str = "SSH_MOUNTMATE_LOCK_TEST_PATH";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            assert!(matches!(
+                InstanceLock::try_acquire(Path::new(&path)),
+                Err(AppCommandError::AlreadyRunning)
+            ));
+            return;
+        }
+
         let temp = tempdir().unwrap();
         let path = temp.path().join("instance.lock");
         let first = InstanceLock::try_acquire(&path).unwrap();
-        assert!(matches!(
-            InstanceLock::try_acquire(&path),
-            Err(AppCommandError::AlreadyRunning)
-        ));
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "app_command::tests::second_instance_lock_is_rejected_until_release",
+            ])
+            .env(CHILD_PATH, &path)
+            .status()
+            .unwrap();
+        assert!(status.success());
         drop(first);
         InstanceLock::try_acquire(&path).unwrap();
     }

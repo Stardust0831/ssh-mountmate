@@ -7,11 +7,20 @@ test_root="$(mktemp -d "${TMPDIR:-/tmp}/ssh-mountmate-ipc-XXXXXX")"
 app_pid=""
 
 cleanup() {
+  status=$?
   if [[ -n "$app_pid" ]]; then
     kill "$app_pid" 2>/dev/null || true
     wait "$app_pid" 2>/dev/null || true
   fi
+  if [[ "$status" != "0" ]]; then
+    printf '%s\n' '--- SSH MountMate stdout ---' >&2
+    cat "$test_root/gui.stdout" >&2 2>/dev/null || true
+    printf '%s\n' '--- SSH MountMate stderr ---' >&2
+    cat "$test_root/gui.stderr" >&2 2>/dev/null || true
+  fi
   rm -rf "$test_root"
+  trap - EXIT
+  exit "$status"
 }
 trap cleanup EXIT
 
@@ -32,13 +41,14 @@ export XDG_STATE_HOME="$test_root/state"
 export XDG_RUNTIME_DIR="$test_root/runtime"
 export WINIT_UNIX_BACKEND=x11
 export WGPU_BACKEND="${WGPU_BACKEND:-gl}"
+export LIBGL_ALWAYS_SOFTWARE=1
 unset WAYLAND_DISPLAY WAYLAND_SOCKET
 
 "$binary" >"$test_root/gui.stdout" 2>"$test_root/gui.stderr" &
 app_pid=$!
 
 state="$XDG_STATE_HOME/rsshmount/app-command.json"
-for _ in {1..100}; do
+for _ in {1..400}; do
   [[ -s "$state" ]] && break
   sleep 0.05
 done
@@ -59,7 +69,7 @@ done
 [[ "$process_count" == "1" ]]
 
 window_id=""
-for _ in {1..100}; do
+for _ in {1..400}; do
   window_id="$(xdotool search --onlyvisible --name "SSH MountMate" 2>/dev/null | head -n 1 || true)"
   [[ -n "$window_id" ]] && break
   sleep 0.05
