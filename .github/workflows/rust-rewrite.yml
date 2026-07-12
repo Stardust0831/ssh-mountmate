@@ -4,15 +4,6 @@ on:
   push:
     branches:
       - rust-rewrite
-  pull_request:
-    branches:
-      - main
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - "crates/**"
-      - ".github/workflows/rust-rewrite.yml"
   workflow_dispatch:
 
 permissions:
