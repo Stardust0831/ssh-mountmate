@@ -1,4 +1,6 @@
-use std::fs::{self, File, OpenOptions};
+#[cfg(not(windows))]
+use std::fs::File;
+use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -7,11 +9,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[cfg(not(windows))]
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use thiserror::Error;
 use uuid::Uuid;
+
+#[cfg(windows)]
+use sha2::{Digest, Sha256};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::CreateMutexW;
 
 use crate::ssh::SshPermissionControl;
 use crate::storage::read_json;
@@ -53,28 +63,78 @@ pub enum AppCommandError {
 }
 
 pub struct InstanceLock {
+    #[cfg(not(windows))]
     _file: File,
+    #[cfg(windows)]
+    mutex: HANDLE,
 }
+
+#[cfg(windows)]
+// The handle is immutable and is only closed when the owning InstanceLock is dropped.
+unsafe impl Send for InstanceLock {}
+#[cfg(windows)]
+unsafe impl Sync for InstanceLock {}
 
 impl InstanceLock {
     pub fn try_acquire(path: &Path) -> Result<Self, AppCommandError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path)?;
-        match file.try_lock_exclusive() {
-            Ok(()) => Ok(Self { _file: file }),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                Err(AppCommandError::AlreadyRunning)
+        #[cfg(windows)]
+        {
+            let name = windows_mutex_name(path)?;
+            let mutex = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+            if mutex.is_null() {
+                return Err(std::io::Error::last_os_error().into());
             }
-            Err(error) => Err(error.into()),
+            if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+                unsafe {
+                    CloseHandle(mutex);
+                }
+                return Err(AppCommandError::AlreadyRunning);
+            }
+            return Ok(Self { mutex });
+        }
+        #[cfg(not(windows))]
+        {
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(path)?;
+            match file.try_lock_exclusive() {
+                Ok(()) => Ok(Self { _file: file }),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    Err(AppCommandError::AlreadyRunning)
+                }
+                Err(error) => Err(error.into()),
+            }
         }
     }
+}
+
+#[cfg(windows)]
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.mutex);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_mutex_name(path: &Path) -> Result<Vec<u16>, AppCommandError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let canonical_parent = fs::canonicalize(parent)?;
+    let identity = canonical_parent
+        .join(path.file_name().unwrap_or_default())
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_lowercase();
+    let digest = Sha256::digest(identity.as_bytes());
+    let name = format!("Local\\SSHMountMate.Instance.{digest:x}");
+    Ok(name.encode_utf16().chain(std::iter::once(0)).collect())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
