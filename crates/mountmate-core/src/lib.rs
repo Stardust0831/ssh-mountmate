@@ -1,5 +1,7 @@
 pub mod model;
 pub mod paths;
+pub mod process;
+pub mod rc;
 pub mod rclone;
 pub mod storage;
 pub mod transfer;
