@@ -13,6 +13,7 @@ use std::os::windows::process::CommandExt;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System, UpdateKind};
 use thiserror::Error;
 
+use crate::mountpoint::system_mountpoint_ready;
 use crate::paths::AppPaths;
 use crate::process::{MountStatus, argv_matches_state};
 use crate::rc::HttpRcClient;
@@ -226,54 +227,6 @@ impl MountpointControl for SystemMountpointControl {
 
     fn is_ready(&self, path: &Path) -> bool {
         system_mountpoint_ready(path)
-    }
-}
-
-#[cfg(windows)]
-fn system_mountpoint_ready(path: &Path) -> bool {
-    path.exists()
-}
-
-#[cfg(target_os = "linux")]
-fn system_mountpoint_ready(path: &Path) -> bool {
-    let expected = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
-    let Ok(mountinfo) = fs::read_to_string("/proc/self/mountinfo") else {
-        return unix_device_changed(path);
-    };
-    mountinfo.lines().any(|line| {
-        line.split_whitespace()
-            .nth(4)
-            .map(decode_mountinfo_path)
-            .is_some_and(|candidate| candidate == expected || candidate == path)
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn decode_mountinfo_path(value: &str) -> PathBuf {
-    PathBuf::from(
-        value
-            .replace("\\040", " ")
-            .replace("\\011", "\t")
-            .replace("\\012", "\n")
-            .replace("\\134", "\\"),
-    )
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn system_mountpoint_ready(path: &Path) -> bool {
-    unix_device_changed(path)
-}
-
-#[cfg(unix)]
-fn unix_device_changed(path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    let Some(parent) = path.parent() else {
-        return false;
-    };
-    match (path.metadata(), parent.metadata()) {
-        (Ok(path_metadata), Ok(parent_metadata)) => path_metadata.dev() != parent_metadata.dev(),
-        _ => false,
     }
 }
 

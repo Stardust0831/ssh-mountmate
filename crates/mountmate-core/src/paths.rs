@@ -86,6 +86,10 @@ impl AppPaths {
             .join(format!("{}.mount.lock", path_component(server_id)))
     }
 
+    pub fn mount_allocation_lock(&self) -> PathBuf {
+        self.state_dir.join("mountpoint-allocation.lock")
+    }
+
     pub fn mount_log(&self, remote_name: &str) -> PathBuf {
         self.state_dir
             .join(format!("{}.log", path_component(remote_name)))

@@ -1,4 +1,5 @@
 pub mod model;
+pub mod mountpoint;
 pub mod paths;
 pub mod process;
 pub mod rc;
