@@ -81,6 +81,7 @@ impl AppPaths {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn env_path(name: &str, fallback: PathBuf) -> PathBuf {
     env::var_os(name).map(PathBuf::from).unwrap_or(fallback)
 }

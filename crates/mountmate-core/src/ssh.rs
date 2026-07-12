@@ -104,8 +104,7 @@ impl ResolvedSshConfig {
     pub fn first_existing_path(&self, key: &str) -> Option<PathBuf> {
         self.all(key)
             .iter()
-            .flat_map(|value| split_ssh_words(value))
-            .map(|value| expand_home(&value))
+            .map(|value| expand_home(value.trim().trim_matches('"')))
             .find(|path| path.is_file())
     }
 
@@ -263,15 +262,17 @@ fn split_ssh_words(line: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut quote = None;
-    let mut escaped = false;
-    for ch in line.chars() {
-        if escaped {
-            current.push(ch);
-            escaped = false;
-            continue;
-        }
+    let mut characters = line.chars().peekable();
+    while let Some(ch) = characters.next() {
         if ch == '\\' {
-            escaped = true;
+            if characters
+                .peek()
+                .is_some_and(|next| next.is_whitespace() || matches!(next, '\'' | '"' | '#'))
+            {
+                current.push(characters.next().expect("peeked character exists"));
+            } else {
+                current.push(ch);
+            }
             continue;
         }
         if let Some(active_quote) = quote {
@@ -293,9 +294,6 @@ fn split_ssh_words(line: &str) -> Vec<String> {
         } else {
             current.push(ch);
         }
-    }
-    if escaped {
-        current.push('\\');
     }
     if !current.is_empty() {
         words.push(current);
@@ -570,6 +568,14 @@ mod tests {
         assert_eq!(
             choose_transport(RequestedTransport::Auto, &config, true),
             SshTransport::Openssh
+        );
+    }
+
+    #[test]
+    fn ssh_word_parser_preserves_windows_paths() {
+        assert_eq!(
+            split_ssh_words(r#"C:\Users\Agent\.ssh\known_hosts "D:\key files\id""#),
+            [r"C:\Users\Agent\.ssh\known_hosts", r"D:\key files\id"]
         );
     }
 
