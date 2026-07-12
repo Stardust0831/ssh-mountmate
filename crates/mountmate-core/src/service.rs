@@ -12,8 +12,11 @@ use crate::connection::{SshImportPlan, plan_ssh_imports};
 use crate::mountpoint::{HOME_MOUNTPOINT_VALUE, MountpointAllocator, SystemMountpointProbe};
 use crate::paths::AppPaths;
 use crate::process::MountStatus;
-use crate::rc::{HttpRcClient, RcError};
-use crate::rclone::{RcloneConfigError, RcloneRemote, write_rclone_remote};
+use crate::rc::{HttpRcClient, RcError, RefreshResult};
+use crate::rclone::{
+    RcloneConfigError, RcloneRemote, normalize_explorer_refresh_path,
+    normalize_refresh_relative_path, write_rclone_remote,
+};
 use crate::rclone_binary::{RcloneBinaryError, resolve_rclone};
 use crate::runtime::{
     HttpRcControl, MountRequest, MountRuntime, RuntimeError, SystemMountpointControl,
@@ -46,6 +49,8 @@ pub enum ServiceError {
     Storage(#[from] StorageError),
     #[error("rclone obscure failed: {0}")]
     Obscure(String),
+    #[error("the selected path is not inside an active SSH MountMate mount: {0}")]
+    PathOutsideMount(String),
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +129,54 @@ impl MountService {
     pub fn transfer_snapshot(&self, server_id: &str) -> Result<TransferSnapshot, ServiceError> {
         let state: MountState = read_json(&self.paths.state_file(server_id))?;
         Ok(HttpRcClient::new(&state.rc_addr, Duration::from_millis(750))?.transfer_snapshot()?)
+    }
+
+    pub fn refresh(
+        &self,
+        server_id: &str,
+        relative_dir: &str,
+        recursive: bool,
+    ) -> Result<RefreshResult, ServiceError> {
+        let state: MountState = read_json(&self.paths.state_file(server_id))?;
+        Ok(
+            HttpRcClient::new(&state.rc_addr, Duration::from_secs(3))?.refresh_remote(
+                &state.remote,
+                &normalize_refresh_relative_path(relative_dir),
+                recursive,
+            )?,
+        )
+    }
+
+    pub fn refresh_path(
+        &self,
+        servers: &[ServerConfig],
+        local_path: &str,
+    ) -> Result<RefreshResult, ServiceError> {
+        for server in servers {
+            let state_file = self.paths.state_file(&server.id);
+            if !state_file.exists() {
+                continue;
+            }
+            let state: MountState = match read_json(&state_file) {
+                Ok(state) => state,
+                Err(_) => continue,
+            };
+            let Some(relative_dir) = relative_refresh_dir(
+                local_path,
+                &state.mountpoint.to_string_lossy(),
+                cfg!(windows),
+            ) else {
+                continue;
+            };
+            return Ok(
+                HttpRcClient::new(&state.rc_addr, Duration::from_secs(3))?.refresh_remote(
+                    &state.remote,
+                    &relative_dir,
+                    false,
+                )?,
+            );
+        }
+        Err(ServiceError::PathOutsideMount(local_path.into()))
     }
 
     pub fn obscure_secret(&self, secret: &str) -> Result<String, ServiceError> {
@@ -278,6 +331,39 @@ impl MountService {
     }
 }
 
+pub fn relative_refresh_dir(requested: &str, mountpoint: &str, windows: bool) -> Option<String> {
+    let normalize = |value: &str| {
+        normalize_explorer_refresh_path(value, windows)
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_owned()
+    };
+    let requested_normalized = normalize(requested);
+    let mountpoint_normalized = normalize(mountpoint);
+    if requested_normalized.is_empty() || mountpoint_normalized.is_empty() {
+        return None;
+    }
+    let equal = if windows {
+        requested_normalized.eq_ignore_ascii_case(&mountpoint_normalized)
+    } else {
+        requested_normalized == mountpoint_normalized
+    };
+    if equal {
+        return Some(String::new());
+    }
+    let prefix = format!("{mountpoint_normalized}/");
+    let relative = if windows {
+        requested_normalized.get(prefix.len()..).filter(|_| {
+            requested_normalized
+                .get(..prefix.len())
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&prefix))
+        })
+    } else {
+        requested_normalized.strip_prefix(&prefix)
+    }?;
+    Some(normalize_refresh_relative_path(relative))
+}
+
 fn imported_ssh_server(
     host_alias: &str,
     config_path: &Path,
@@ -370,5 +456,34 @@ mod tests {
         );
         let server = imported_ssh_server("cluster", Path::new("config"), &resolved, true).unwrap();
         assert_eq!(server.connection_method, ConnectionMethod::Openssh);
+    }
+
+    #[test]
+    fn refresh_path_resolves_root_and_nested_directories() {
+        assert_eq!(
+            relative_refresh_dir("/mnt/alpha", "/mnt/alpha", false),
+            Some(String::new())
+        );
+        assert_eq!(
+            relative_refresh_dir("/mnt/alpha/folder/child", "/mnt/alpha", false),
+            Some("folder/child".into())
+        );
+        assert_eq!(
+            relative_refresh_dir("/mnt/alphabet", "/mnt/alpha", false),
+            None
+        );
+    }
+
+    #[test]
+    fn windows_refresh_path_repairs_quotes_and_compares_case_insensitively() {
+        assert_eq!(
+            relative_refresh_dir("Y:\"", "Y:", true),
+            Some(String::new())
+        );
+        assert_eq!(
+            relative_refresh_dir("y:\\Folder\\Child", "Y:", true),
+            Some("Folder/Child".into())
+        );
+        assert_eq!(relative_refresh_dir("Z:\\Folder", "Y:", true), None);
     }
 }

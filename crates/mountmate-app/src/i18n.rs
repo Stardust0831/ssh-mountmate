@@ -1,6 +1,7 @@
 use std::fmt;
 
 use mountmate_core::connection::{ConnectionSource, ImportAction, ImportStatus};
+use mountmate_core::rc::RefreshResult;
 use mountmate_core::{AuthMethod, ConnectionMethod};
 
 use super::CacheMode;
@@ -181,6 +182,23 @@ impl Locale {
         match self {
             Self::English => format!("Opening {id}..."),
             Self::Chinese => format!("正在打开 {id}..."),
+        }
+    }
+
+    pub(crate) fn refresh_complete(self, result: &RefreshResult) -> String {
+        match (self, result.pending_uploads) {
+            (Self::English, 0) => {
+                format!("Remote refreshed: {} entries", result.entries.len())
+            }
+            (Self::English, pending) => format!(
+                "Remote refreshed: {} entries; {pending} local file(s) still waiting to upload",
+                result.entries.len()
+            ),
+            (Self::Chinese, 0) => format!("云端已刷新：{} 个条目", result.entries.len()),
+            (Self::Chinese, pending) => format!(
+                "云端已刷新：{} 个条目；仍有 {pending} 个本地文件等待上传",
+                result.entries.len()
+            ),
         }
     }
 }

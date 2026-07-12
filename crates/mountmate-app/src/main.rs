@@ -1,6 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iced::widget::{
@@ -8,6 +10,9 @@ use iced::widget::{
     text_input,
 };
 use iced::{Center, Element, Fill, Length, Point, Size, Subscription, Task, Theme, window};
+use mountmate_core::app_command::{
+    AppCommand, AppCommandError, AppCommandServer, InstanceLock, send_command_retry,
+};
 use mountmate_core::connection::{
     ConnectionDraft, ConnectionSource, DraftError, ImportAction, ImportStatus, SecretAction,
     SshImportPlan,
@@ -25,23 +30,203 @@ use mountmate_core::{
 };
 use mountmate_platform::Platform;
 
+mod cli;
 mod i18n;
 mod transfer_center;
 
+use cli::LaunchAction;
 use i18n::{Choice, LanguagePreference as Language, Locale, TextKey};
 use transfer_center::{connection_view as transfer_connection_view, totals as transfer_totals};
 
-fn main() -> iced::Result {
-    iced::daemon(App::new, App::update, App::view)
-        .title(App::title)
-        .theme(App::theme)
-        .subscription(App::subscription)
-        .run()
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
 }
 
-#[derive(Debug)]
+fn run() -> Result<(), String> {
+    let action = cli::parse(std::env::args().skip(1))?;
+    match action {
+        LaunchAction::Help => {
+            println!("{}", cli::help());
+            return Ok(());
+        }
+        LaunchAction::Version => {
+            println!("{APP_NAME} {VERSION}");
+            return Ok(());
+        }
+        LaunchAction::Licenses => {
+            println!("{}", cli::licenses());
+            return Ok(());
+        }
+        LaunchAction::Gui(_) | LaunchAction::Headless(_) => {}
+    }
+
+    let paths = AppPaths::discover();
+    let instance_lock = match InstanceLock::try_acquire(&paths.app_instance_lock()) {
+        Ok(lock) => Arc::new(lock),
+        Err(AppCommandError::AlreadyRunning) => {
+            let command = match action {
+                LaunchAction::Gui(command) | LaunchAction::Headless(command) => command,
+                _ => unreachable!(),
+            };
+            send_command_retry(&paths.app_command_state(), &command, Duration::from_secs(2))
+                .map_err(|error| format!("Could not contact the running instance: {error}"))?;
+            return Ok(());
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+
+    match action {
+        LaunchAction::Headless(command) => run_headless(&paths, command),
+        LaunchAction::Gui(initial_command) => {
+            let (command_sender, command_receiver) = std::sync::mpsc::channel();
+            let command_server = Arc::new(
+                AppCommandServer::start(paths.app_command_state(), &Platform, move |command| {
+                    let _ = command_sender.send(command);
+                })
+                .map_err(|error| error.to_string())?,
+            );
+            let bootstrap = Bootstrap {
+                paths,
+                instance_lock,
+                command_server,
+                command_receiver: Arc::new(Mutex::new(command_receiver)),
+                initial_command,
+            };
+            iced::daemon(move || App::new(bootstrap.clone()), App::update, App::view)
+                .title(App::title)
+                .theme(App::theme)
+                .subscription(App::subscription)
+                .run()
+                .map_err(|error| error.to_string())
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[derive(Clone)]
+struct Bootstrap {
+    paths: AppPaths,
+    instance_lock: Arc<InstanceLock>,
+    command_server: Arc<AppCommandServer>,
+    command_receiver: Arc<Mutex<Receiver<AppCommand>>>,
+    initial_command: AppCommand,
+}
+
+fn run_headless(paths: &AppPaths, command: AppCommand) -> Result<(), String> {
+    let settings = storage::load_settings(paths).map_err(|error| error.to_string())?;
+    let servers = storage::load_servers(paths).map_err(|error| error.to_string())?;
+    let service = MountService::new(paths.clone(), application_root());
+    match command {
+        AppCommand::Mount { id } => {
+            let server = find_server(&servers, &id)?;
+            let state = service
+                .mount(server, &settings)
+                .map_err(|error| error.to_string())?;
+            println!("Mounted {} at {}", state.remote, state.mountpoint.display());
+        }
+        AppCommand::Unmount { id } => {
+            find_server(&servers, &id)?;
+            service.unmount(&id).map_err(|error| error.to_string())?;
+            println!("Unmounted {id}");
+        }
+        AppCommand::Open { id } => {
+            find_server(&servers, &id)?;
+            let state: MountState =
+                read_json(&paths.state_file(&id)).map_err(|error| error.to_string())?;
+            let locale =
+                Locale::from_preference(Language::from_value(&settings.language), Locale::system());
+            open_path(&state.mountpoint, locale)?;
+        }
+        AppCommand::RefreshPath { path } => {
+            let result = service
+                .refresh_path(&servers, &path)
+                .map_err(|error| error.to_string())?;
+            print_refresh_result(&result);
+        }
+        AppCommand::Refresh { id, relative_dir } => {
+            find_server(&servers, &id)?;
+            let result = service
+                .refresh(&id, &relative_dir, false)
+                .map_err(|error| error.to_string())?;
+            print_refresh_result(&result);
+        }
+        AppCommand::MountAll => run_headless_batch(&service, &servers, |service, server| {
+            service
+                .mount(server, &settings)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })?,
+        AppCommand::UnmountAll => run_headless_batch(&service, &servers, |service, server| {
+            if paths.state_file(&server.id).exists() {
+                service
+                    .unmount(&server.id)
+                    .map_err(|error| error.to_string())
+            } else {
+                Ok(())
+            }
+        })?,
+        AppCommand::ShowMain | AppCommand::ShowTransfers => {
+            return Err("a window command requires the GUI".into());
+        }
+    }
+    Ok(())
+}
+
+fn run_headless_batch(
+    service: &MountService,
+    servers: &[ServerConfig],
+    operation: impl Fn(&MountService, &ServerConfig) -> Result<(), String> + Sync,
+) -> Result<(), String> {
+    let failures = std::thread::scope(|scope| {
+        let tasks: Vec<_> = servers
+            .iter()
+            .map(|server| {
+                let operation = &operation;
+                scope.spawn(move || {
+                    operation(service, server)
+                        .err()
+                        .map(|error| format!("{}: {error}", server.display_name()))
+                })
+            })
+            .collect();
+        tasks
+            .into_iter()
+            .filter_map(|task| task.join().ok().flatten())
+            .collect::<Vec<_>>()
+    });
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("\n"))
+    }
+}
+
+fn find_server<'a>(servers: &'a [ServerConfig], id: &str) -> Result<&'a ServerConfig, String> {
+    servers
+        .iter()
+        .find(|server| server.id == id)
+        .ok_or_else(|| format!("Connection does not exist: {id}"))
+}
+
+fn print_refresh_result(result: &mountmate_core::rc::RefreshResult) {
+    println!("Remote verified: {} entries", result.entries.len());
+    if result.pending_uploads > 0 {
+        println!(
+            "{} local file(s) are still waiting to upload",
+            result.pending_uploads
+        );
+    }
+}
+
 struct App {
     paths: AppPaths,
+    _instance_lock: Arc<InstanceLock>,
+    _command_server: Arc<AppCommandServer>,
+    command_receiver: Arc<Mutex<Receiver<AppCommand>>>,
+    pending_commands: VecDeque<AppCommand>,
     settings: Settings,
     system_locale: Locale,
     servers: Vec<ServerConfig>,
@@ -52,6 +237,8 @@ struct App {
     transfer_errors: HashMap<String, String>,
     transfer_refreshing: bool,
     main_window: window::Id,
+    main_window_ready: bool,
+    pending_main_activation: bool,
     popup_windows: HashMap<window::Id, String>,
     popup_order: Vec<window::Id>,
     dismissed_popups: HashSet<String>,
@@ -222,7 +409,10 @@ impl SettingsDraft {
 
 #[derive(Debug, Clone)]
 enum Message {
+    CommandTick,
+    MainWindowOpened(window::Id),
     Refresh,
+    RefreshFinished(Result<mountmate_core::rc::RefreshResult, String>),
     StatusesLoaded(Vec<(String, Result<MountStatus, String>)>),
     TransferTick,
     TransfersLoaded(Vec<(String, Result<TransferSnapshot, String>)>),
@@ -280,7 +470,7 @@ enum Message {
     RemoveFinished(Result<Vec<ServerConfig>, String>),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MountOperation {
     Mount,
     Unmount,
@@ -310,13 +500,20 @@ impl App {
 
     fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
+            iced::time::every(Duration::from_millis(100)).map(|_| Message::CommandTick),
             iced::time::every(Duration::from_secs(1)).map(|_| Message::TransferTick),
             window::close_events().map(Message::WindowClosed),
         ])
     }
 
-    fn new() -> (Self, Task<Message>) {
-        let paths = AppPaths::discover();
+    fn new(bootstrap: Bootstrap) -> (Self, Task<Message>) {
+        let Bootstrap {
+            paths,
+            instance_lock,
+            command_server,
+            command_receiver,
+            initial_command,
+        } = bootstrap;
         let service = MountService::new(paths.clone(), application_root());
         let settings = storage::load_settings(&paths).unwrap_or_default();
         let system_locale = Locale::system();
@@ -333,8 +530,17 @@ impl App {
             ),
         };
         let (main_window, open_window) = window::open(main_window_settings());
-        let app = Self {
+        let screen = if initial_command == AppCommand::ShowTransfers {
+            Screen::TransferCenter
+        } else {
+            Screen::Connections
+        };
+        let mut app = Self {
             paths,
+            _instance_lock: instance_lock,
+            _command_server: command_server,
+            command_receiver,
+            pending_commands: VecDeque::new(),
             settings,
             system_locale,
             servers,
@@ -345,11 +551,13 @@ impl App {
             transfer_errors: HashMap::new(),
             transfer_refreshing: false,
             main_window,
+            main_window_ready: false,
+            pending_main_activation: false,
             popup_windows: HashMap::new(),
             popup_order: Vec::new(),
             dismissed_popups: HashSet::new(),
             synced_polls: HashMap::new(),
-            screen: Screen::Connections,
+            screen,
             connection_draft: None,
             settings_draft: None,
             editor_saving: false,
@@ -359,13 +567,30 @@ impl App {
             pending_delete: None,
             status,
         };
-        let task = Task::batch([open_window.discard(), app.status_task()]);
+        let mut tasks = vec![
+            open_window.map(Message::MainWindowOpened),
+            app.status_task(),
+        ];
+        if screen == Screen::TransferCenter {
+            tasks.push(app.transfer_task());
+        }
+        let task = Task::batch(tasks);
         (app, task)
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
         let locale = self.locale();
         match message {
+            Message::CommandTick => return self.drain_app_commands(),
+            Message::MainWindowOpened(id) => {
+                if id == self.main_window {
+                    self.main_window_ready = true;
+                    if self.pending_main_activation {
+                        self.pending_main_activation = false;
+                        return self.activate_main_window();
+                    }
+                }
+            }
             Message::Refresh => match storage::load_servers(&self.paths) {
                 Ok(servers) => {
                     self.servers = servers;
@@ -373,6 +598,10 @@ impl App {
                     return self.status_task();
                 }
                 Err(error) => self.status = error.to_string(),
+            },
+            Message::RefreshFinished(result) => match result {
+                Ok(result) => self.status = locale.refresh_complete(&result),
+                Err(error) => self.status = error,
             },
             Message::StatusesLoaded(results) => {
                 let mut errors = Vec::new();
@@ -748,7 +977,7 @@ impl App {
                     Err(error) => self.status = error,
                 }
             }
-            Message::Mount(id) => return self.start_mount_operation(id),
+            Message::Mount(id) => return self.start_mount_operation(id, None),
             Message::MountFinished {
                 id,
                 operation,
@@ -843,6 +1072,141 @@ impl App {
             }
         }
         Task::none()
+    }
+
+    fn drain_app_commands(&mut self) -> Task<Message> {
+        let mut commands = std::mem::take(&mut self.pending_commands);
+        {
+            let receiver = match self.command_receiver.lock() {
+                Ok(receiver) => receiver,
+                Err(error) => {
+                    self.status = format!("App command channel failed: {error}");
+                    return Task::none();
+                }
+            };
+            loop {
+                match receiver.try_recv() {
+                    Ok(command) => commands.push_back(command),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        self.status = "App command server stopped unexpectedly".into();
+                        break;
+                    }
+                }
+            }
+        }
+        Task::batch(
+            commands
+                .into_iter()
+                .map(|command| self.handle_app_command(command)),
+        )
+    }
+
+    fn handle_app_command(&mut self, command: AppCommand) -> Task<Message> {
+        match command {
+            AppCommand::ShowMain => self.show_main_window(),
+            AppCommand::ShowTransfers => {
+                self.screen = Screen::TransferCenter;
+                self.status = self.locale().text(TextKey::TransferCenter).into();
+                Task::batch([self.show_main_window(), self.transfer_task()])
+            }
+            AppCommand::Mount { id } => self.handle_mount_command(id, MountOperation::Mount),
+            AppCommand::Unmount { id } => self.handle_mount_command(id, MountOperation::Unmount),
+            AppCommand::Open { id } => self.open_mountpoint(id),
+            AppCommand::RefreshPath { path } => {
+                self.status = self.locale().text(TextKey::Refreshing).into();
+                let service = self.service.clone();
+                let servers = self.servers.clone();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            service
+                                .refresh_path(&servers, &path)
+                                .map_err(|error| error.to_string())
+                        })
+                        .await
+                        .unwrap_or_else(|error| Err(error.to_string()))
+                    },
+                    Message::RefreshFinished,
+                )
+            }
+            AppCommand::Refresh { id, relative_dir } => {
+                if !self.servers.iter().any(|server| server.id == id) {
+                    self.status = self.locale().text(TextKey::ConnectionGone).into();
+                    return Task::none();
+                }
+                self.status = self.locale().text(TextKey::Refreshing).into();
+                let service = self.service.clone();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            service
+                                .refresh(&id, &relative_dir, false)
+                                .map_err(|error| error.to_string())
+                        })
+                        .await
+                        .unwrap_or_else(|error| Err(error.to_string()))
+                    },
+                    Message::RefreshFinished,
+                )
+            }
+            AppCommand::MountAll => {
+                let ids = self
+                    .servers
+                    .iter()
+                    .map(|server| server.id.clone())
+                    .collect::<Vec<_>>();
+                Task::batch(
+                    ids.into_iter()
+                        .map(|id| self.handle_mount_command(id, MountOperation::Mount)),
+                )
+            }
+            AppCommand::UnmountAll => {
+                let ids = self
+                    .servers
+                    .iter()
+                    .filter(|server| self.paths.state_file(&server.id).exists())
+                    .map(|server| server.id.clone())
+                    .collect::<Vec<_>>();
+                Task::batch(
+                    ids.into_iter()
+                        .map(|id| self.handle_mount_command(id, MountOperation::Unmount)),
+                )
+            }
+        }
+    }
+
+    fn handle_mount_command(&mut self, id: String, operation: MountOperation) -> Task<Message> {
+        if self.busy.contains(&id) {
+            self.pending_commands.retain(|command| {
+                !matches!(
+                    command,
+                    AppCommand::Mount { id: pending_id }
+                        | AppCommand::Unmount { id: pending_id }
+                        if pending_id.as_str() == id.as_str()
+                )
+            });
+            let command = match operation {
+                MountOperation::Mount => AppCommand::Mount { id },
+                MountOperation::Unmount => AppCommand::Unmount { id },
+            };
+            self.pending_commands.push_back(command);
+            return Task::none();
+        }
+        self.start_mount_operation(id, Some(operation))
+    }
+
+    fn activate_main_window(&self) -> Task<Message> {
+        window::minimize(self.main_window, false).chain(window::gain_focus(self.main_window))
+    }
+
+    fn show_main_window(&mut self) -> Task<Message> {
+        if self.main_window_ready {
+            self.activate_main_window()
+        } else {
+            self.pending_main_activation = true;
+            Task::none()
+        }
     }
 
     fn can_modify(&self, id: &str) -> bool {
@@ -1168,19 +1532,31 @@ impl App {
         Task::batch(tasks)
     }
 
-    fn start_mount_operation(&mut self, id: String) -> Task<Message> {
+    fn start_mount_operation(
+        &mut self,
+        id: String,
+        requested: Option<MountOperation>,
+    ) -> Task<Message> {
         if !self.busy.insert(id.clone()) {
             return Task::none();
         }
+        let current_status = self.mount_statuses.get(&id).copied();
         let mounted = matches!(
-            self.mount_statuses.get(&id),
+            current_status,
             Some(MountStatus::Mounted | MountStatus::Starting)
         );
-        let operation = if mounted {
+        let operation = requested.unwrap_or(if mounted {
             MountOperation::Unmount
         } else {
             MountOperation::Mount
-        };
+        });
+        if (operation == MountOperation::Mount && mounted)
+            || (operation == MountOperation::Unmount
+                && current_status == Some(MountStatus::Unmounted))
+        {
+            self.busy.remove(&id);
+            return Task::none();
+        }
         self.mount_statuses
             .insert(id.clone(), MountStatus::Starting);
         self.status = match operation {

@@ -19,10 +19,13 @@ jobs:
           toolchain: 1.97.0
           components: rustfmt, clippy
       - name: Linux GUI dependencies
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev xvfb xdotool
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
+      - run: cargo build --package ssh-mountmate
+      - name: Single-instance GUI smoke test
+        run: xvfb-run -a bash tests/rust_single_instance_smoke.sh target/debug/SSHMountMate
 
   build:
     strategy:
@@ -70,6 +73,20 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
       - run: cargo test --workspace --all-features
       - run: cargo build --release --package ssh-mountmate
+      - name: Smoke-test command-line entry points
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          target/release/SSHMountMate --version
+          target/release/SSHMountMate --help >/dev/null
+          target/release/SSHMountMate --licenses >/dev/null
+      - name: Smoke-test command-line entry points
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & .\target\release\SSHMountMate.exe --version
+          & .\target\release\SSHMountMate.exe --help | Out-Null
+          & .\target\release\SSHMountMate.exe --licenses | Out-Null
       - name: Bundle verified rclone
         if: runner.os != 'Windows'
         shell: bash
