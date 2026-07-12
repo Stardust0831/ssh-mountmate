@@ -12,6 +12,9 @@ pub enum GlobalProgressState {
     Error { completed: u64, total: u64 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeWindowHandle(pub isize);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notification {
     pub id: String,
@@ -30,7 +33,11 @@ pub enum PlatformError {
 
 pub trait PlatformIntegration: Send + Sync {
     fn show_notification(&self, notification: &Notification) -> Result<(), PlatformError>;
-    fn set_global_progress(&self, state: GlobalProgressState) -> Result<(), PlatformError>;
+    fn set_global_progress(
+        &self,
+        window: Option<NativeWindowHandle>,
+        state: GlobalProgressState,
+    ) -> Result<(), PlatformError>;
     fn register_file_manager_menu(&self, executable: &Path) -> Result<(), PlatformError>;
     fn unregister_file_manager_menu(&self) -> Result<(), PlatformError>;
 }
@@ -180,8 +187,12 @@ impl PlatformIntegration for Platform {
         Err(PlatformError::Unsupported("native notifications"))
     }
 
-    fn set_global_progress(&self, _state: GlobalProgressState) -> Result<(), PlatformError> {
-        Err(PlatformError::Unsupported("taskbar or dock progress"))
+    fn set_global_progress(
+        &self,
+        window: Option<NativeWindowHandle>,
+        state: GlobalProgressState,
+    ) -> Result<(), PlatformError> {
+        set_global_progress(window, state)
     }
 
     fn register_file_manager_menu(&self, executable: &Path) -> Result<(), PlatformError> {
@@ -191,6 +202,83 @@ impl PlatformIntegration for Platform {
     fn unregister_file_manager_menu(&self) -> Result<(), PlatformError> {
         unregister_file_manager_menu()
     }
+}
+
+#[cfg(windows)]
+fn set_global_progress(
+    window: Option<NativeWindowHandle>,
+    state: GlobalProgressState,
+) -> Result<(), PlatformError> {
+    use std::cell::RefCell;
+    use std::ffi::c_void;
+
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+    use windows::Win32::UI::Shell::{
+        ITaskbarList3, TBPF_ERROR, TBPF_INDETERMINATE, TBPF_NOPROGRESS, TBPF_NORMAL, TBPF_PAUSED,
+        TaskbarList,
+    };
+
+    let Some(NativeWindowHandle(window)) = window else {
+        return Err(PlatformError::Failed(
+            "Windows taskbar progress requires a window handle".into(),
+        ));
+    };
+    if window == 0 {
+        return Err(PlatformError::Failed(
+            "Windows taskbar progress received an invalid window handle".into(),
+        ));
+    }
+
+    let window = HWND(window as *mut c_void);
+    let (flag, progress) = match state {
+        GlobalProgressState::Hidden => (TBPF_NOPROGRESS, None),
+        GlobalProgressState::Indeterminate => (TBPF_INDETERMINATE, None),
+        GlobalProgressState::Normal { completed, total } => (TBPF_NORMAL, Some((completed, total))),
+        GlobalProgressState::Paused { completed, total } => (TBPF_PAUSED, Some((completed, total))),
+        GlobalProgressState::Error { completed, total } => (TBPF_ERROR, Some((completed, total))),
+    };
+    thread_local! {
+        static TASKBAR: RefCell<Option<ITaskbarList3>> = const { RefCell::new(None) };
+    }
+    TASKBAR.with(|taskbar| {
+        let mut taskbar = taskbar.borrow_mut();
+        if taskbar.is_none() {
+            let created: ITaskbarList3 = unsafe {
+                CoCreateInstance(&TaskbarList, None, CLSCTX_INPROC_SERVER)
+                    .map_err(|error| PlatformError::Failed(error.to_string()))?
+            };
+            unsafe {
+                created
+                    .HrInit()
+                    .map_err(|error| PlatformError::Failed(error.to_string()))?;
+            }
+            *taskbar = Some(created);
+        }
+        let result = unsafe {
+            let taskbar = taskbar.as_ref().expect("taskbar object was initialized");
+            taskbar.SetProgressState(window, flag).and_then(|_| {
+                if let Some((completed, total)) = progress {
+                    taskbar.SetProgressValue(window, completed.min(total), total.max(1))
+                } else {
+                    Ok(())
+                }
+            })
+        };
+        if let Err(error) = result {
+            *taskbar = None;
+            return Err(PlatformError::Failed(error.to_string()));
+        }
+        Ok(())
+    })
+}
+
+#[cfg(not(windows))]
+fn set_global_progress(
+    _window: Option<NativeWindowHandle>,
+    _state: GlobalProgressState,
+) -> Result<(), PlatformError> {
+    Err(PlatformError::Unsupported("taskbar or dock progress"))
 }
 
 #[cfg(any(windows, test))]

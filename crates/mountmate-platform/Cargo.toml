@@ -11,6 +11,11 @@ mountmate-core = { path = "../mountmate-core" }
 thiserror.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+] }
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",

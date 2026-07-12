@@ -2484,6 +2484,7 @@ dependencies = [
  "mountmate-core",
  "tempfile",
  "thiserror 2.0.18",
+ "windows 0.61.3",
  "windows-sys 0.61.2",
 ]
 

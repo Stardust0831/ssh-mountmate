@@ -28,7 +28,9 @@ use mountmate_core::transfer::TransferSnapshot;
 use mountmate_core::{
     APP_NAME, AuthMethod, ConnectionMethod, MountState, ServerConfig, Settings, VERSION,
 };
-use mountmate_platform::{Platform, PlatformIntegration};
+#[cfg(windows)]
+use mountmate_platform::NativeWindowHandle;
+use mountmate_platform::{GlobalProgressState, Platform, PlatformIntegration};
 
 mod cli;
 mod i18n;
@@ -37,7 +39,9 @@ mod tray;
 
 use cli::LaunchAction;
 use i18n::{Choice, LanguagePreference as Language, Locale, TextKey};
-use transfer_center::{connection_view as transfer_connection_view, totals as transfer_totals};
+use transfer_center::{
+    TransferTotals, connection_view as transfer_connection_view, totals as transfer_totals,
+};
 use tray::{TrayAction, TrayController};
 
 fn main() {
@@ -670,10 +674,15 @@ impl App {
                     self.main_window_ready = true;
                     self.main_window_opening = false;
                     self.initialize_tray();
+                    let progress = self.global_progress_state();
                     if self.pending_main_activation {
                         self.pending_main_activation = false;
-                        return self.activate_main_window();
+                        return Task::batch([
+                            self.activate_main_window(),
+                            set_native_global_progress(id, progress),
+                        ]);
                     }
+                    return set_native_global_progress(id, progress);
                 }
             }
             Message::Refresh => match storage::load_servers(&self.paths) {
@@ -702,6 +711,10 @@ impl App {
                     .first()
                     .cloned()
                     .unwrap_or_else(|| locale.text(TextKey::Ready).into());
+                return set_native_global_progress(
+                    self.main_window,
+                    self.global_progress_state(),
+                );
             }
             Message::TransferTick => return self.transfer_task(),
             Message::TransfersLoaded(results) => {
@@ -723,7 +736,10 @@ impl App {
                         }
                     }
                 }
-                return self.reconcile_transfer_popups();
+                return Task::batch([
+                    self.reconcile_transfer_popups(),
+                    set_native_global_progress(self.main_window, self.global_progress_state()),
+                ]);
             }
             Message::PopupOpened(id) => {
                 let index = self
@@ -1118,6 +1134,10 @@ impl App {
                 if let Some(command) = self.take_pending_command(&id) {
                     tasks.push(self.handle_app_command(command));
                 }
+                tasks.push(set_native_global_progress(
+                    self.main_window,
+                    self.global_progress_state(),
+                ));
                 return Task::batch(tasks);
             }
             Message::Open(id) => return self.open_mountpoint(id),
@@ -1658,7 +1678,7 @@ impl App {
             .map(|server| server.id.clone())
             .collect();
         if ids.is_empty() {
-            return Task::none();
+            return set_native_global_progress(self.main_window, self.global_progress_state());
         }
         self.transfer_refreshing = true;
         let service = self.service.clone();
@@ -1748,6 +1768,25 @@ impl App {
         }
 
         Task::batch(tasks)
+    }
+
+    fn global_progress_state(&self) -> GlobalProgressState {
+        let mounted = self
+            .servers
+            .iter()
+            .filter(|server| self.mount_statuses.get(&server.id) == Some(&MountStatus::Mounted));
+        let totals = transfer_totals(mounted.map(|server| {
+            if self.transfer_errors.contains_key(&server.id) {
+                None
+            } else {
+                self.transfers.get(&server.id)
+            }
+        }));
+        let out_of_space = self.transfers.iter().any(|(id, snapshot)| {
+            self.mount_statuses.get(id) == Some(&MountStatus::Mounted) && snapshot.out_of_space
+        });
+
+        global_progress_state(&totals, out_of_space)
     }
 
     fn close_popups_for_server(&mut self, server_id: &str) -> Task<Message> {
@@ -2964,6 +3003,29 @@ fn transfer_is_active(snapshot: &TransferSnapshot) -> bool {
     snapshot.queued > 0 || snapshot.uploading > 0 || snapshot.errors > 0
 }
 
+fn global_progress_state(totals: &TransferTotals, out_of_space: bool) -> GlobalProgressState {
+    if totals.errors > 0 || out_of_space {
+        return GlobalProgressState::Error {
+            completed: totals.transferred_bytes,
+            total: totals.total_bytes.max(1),
+        };
+    }
+    if totals.pending_files == 0 {
+        return if totals.unknown_connections > 0 {
+            GlobalProgressState::Indeterminate
+        } else {
+            GlobalProgressState::Hidden
+        };
+    }
+    if !totals.progress_available {
+        return GlobalProgressState::Indeterminate;
+    }
+    GlobalProgressState::Normal {
+        completed: totals.transferred_bytes,
+        total: totals.total_bytes.max(1),
+    }
+}
+
 fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
@@ -3055,6 +3117,31 @@ fn configure_popup_window(id: window::Id, index: usize) -> Task<Message> {
             window::move_to(id, position)
         }
     })
+}
+
+#[cfg(windows)]
+fn set_native_global_progress(id: window::Id, state: GlobalProgressState) -> Task<Message> {
+    use window::raw_window_handle::RawWindowHandle;
+
+    window::run(id, move |window| {
+        let Ok(handle) = window.window_handle() else {
+            return;
+        };
+        let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+            return;
+        };
+        if let Err(error) =
+            Platform.set_global_progress(Some(NativeWindowHandle(handle.hwnd.get())), state)
+        {
+            diagnostic_trace(&format!("taskbar progress failed: {error}"));
+        }
+    })
+    .discard()
+}
+
+#[cfg(not(windows))]
+fn set_native_global_progress(_id: window::Id, _state: GlobalProgressState) -> Task<Message> {
+    Task::none()
 }
 
 #[cfg(windows)]
@@ -3167,6 +3254,50 @@ mod localization_tests {
         assert_eq!(
             localized_import_reason(Locale::Chinese, ImportStatus::Same, true, "ignored"),
             "匹配的连接正在挂载或执行任务"
+        );
+    }
+
+    #[test]
+    fn taskbar_progress_uses_truthful_transfer_totals() {
+        let normal = TransferTotals {
+            pending_files: 2,
+            total_bytes: 400,
+            transferred_bytes: 100,
+            progress_available: true,
+            ..TransferTotals::default()
+        };
+        assert_eq!(
+            global_progress_state(&normal, false),
+            GlobalProgressState::Normal {
+                completed: 100,
+                total: 400,
+            }
+        );
+
+        let unknown = TransferTotals {
+            pending_files: 1,
+            progress_available: false,
+            ..TransferTotals::default()
+        };
+        assert_eq!(
+            global_progress_state(&unknown, false),
+            GlobalProgressState::Indeterminate
+        );
+
+        let error = TransferTotals {
+            errors: 1,
+            ..TransferTotals::default()
+        };
+        assert_eq!(
+            global_progress_state(&error, false),
+            GlobalProgressState::Error {
+                completed: 0,
+                total: 1,
+            }
+        );
+        assert_eq!(
+            global_progress_state(&TransferTotals::default(), false),
+            GlobalProgressState::Hidden
         );
     }
 }

@@ -42,3 +42,12 @@ The Rust application links `sys-locale` to select the interface language from th
 The Rust application links `tray-icon` and its `muda` menu library to provide native Windows
 system-tray, macOS menu-bar, and Linux AppIndicator controls. Both projects use the same Tauri
 Programme MIT license notice included above.
+
+## windows
+
+- Project: https://github.com/microsoft/windows-rs
+- License: MIT OR Apache-2.0 (distributed under the MIT option)
+- License text: `licenses/windows-LICENSE-MIT.txt`
+
+The Rust application links Microsoft's `windows` crate to expose native Windows shell APIs,
+including truthful taskbar transfer progress.

@@ -36,6 +36,7 @@ url = "2.5"
 uuid = { version = "1.17", features = ["v4", "serde"] }
 wait-timeout = "0.2"
 windows-sys = "0.61"
+windows = "0.61.3"
 
 [profile.release]
 lto = "thin"
