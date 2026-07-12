@@ -105,6 +105,7 @@ fn run() -> Result<(), String> {
             let (command_sender, command_receiver) = async_channel::unbounded();
             let command_server = Arc::new(
                 AppCommandServer::start(paths.app_command_state(), &Platform, move |command| {
+                    diagnostic_trace(&format!("ipc-server received {command:?}"));
                     let _ = command_sender.send_blocking(command);
                 })
                 .map_err(|error| error.to_string())?,
@@ -652,7 +653,10 @@ impl App {
     fn update(&mut self, message: Message) -> Task<Message> {
         let locale = self.locale();
         match message {
-            Message::AppCommand(command) => return self.handle_app_command(command),
+            Message::AppCommand(command) => {
+                diagnostic_trace(&format!("app received {command:?}"));
+                return self.handle_app_command(command);
+            }
             Message::TrayAction(action) => return self.handle_tray_action(action),
             Message::TrayTick => {
                 if self.tray.is_some() {
@@ -662,6 +666,7 @@ impl App {
             }
             Message::MainWindowOpened(id) => {
                 if id == self.main_window {
+                    diagnostic_trace(&format!("main window opened {id:?}"));
                     self.main_window_ready = true;
                     self.main_window_opening = false;
                     self.initialize_tray();
@@ -746,6 +751,7 @@ impl App {
                 }
             }
             Message::WindowClosed(id) if id == self.main_window => {
+                diagnostic_trace(&format!("main window closed {id:?}"));
                 self.main_window_ready = false;
                 self.main_window_opening = false;
                 if self.tray.is_none() {
@@ -1342,12 +1348,15 @@ impl App {
 
     fn show_main_window(&mut self) -> Task<Message> {
         if self.main_window_ready {
+            diagnostic_trace("activating existing main window");
             self.activate_main_window()
         } else if self.main_window_opening {
+            diagnostic_trace("main window already opening; activation queued");
             self.pending_main_activation = true;
             Task::none()
         } else {
             let (main_window, open_window) = window::open(main_window_settings());
+            diagnostic_trace(&format!("opening replacement main window {main_window:?}"));
             self.main_window = main_window;
             self.main_window_opening = true;
             self.pending_main_activation = true;
@@ -1361,6 +1370,7 @@ impl App {
         }
         self.status = self.locale().text(TextKey::RunningInBackground).into();
         let main_window = self.main_window;
+        diagnostic_trace(&format!("closing main window to tray {main_window:?}"));
         self.main_window_ready = false;
         self.main_window_opening = false;
         window::close(main_window)
@@ -2974,6 +2984,21 @@ fn application_root() -> PathBuf {
         .ok()
         .and_then(|path| path.parent().map(Path::to_owned))
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn diagnostic_trace(message: &str) {
+    use std::io::Write;
+
+    let Some(path) = std::env::var_os("SSH_MOUNTMATE_TRACE_FILE") else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{message}");
+    }
 }
 
 fn main_window_settings() -> window::Settings {

@@ -22,6 +22,10 @@ cleanup() {
     cat "$test_root/gui.stdout" >&2 2>/dev/null || true
     printf '%s\n' '--- SSH MountMate stderr ---' >&2
     cat "$test_root/gui.stderr" >&2 2>/dev/null || true
+    printf '%s\n' '--- SSH MountMate event trace ---' >&2
+    cat "$test_root/gui.trace" >&2 2>/dev/null || true
+    printf '%s\n' '--- Matching X11 windows ---' >&2
+    xdotool search --name "SSH MountMate" getwindowname %@ getwindowpid %@ >&2 2>/dev/null || true
   fi
   rm -rf "$test_root"
   trap - EXIT
@@ -48,6 +52,7 @@ export WINIT_UNIX_BACKEND=x11
 export WGPU_BACKEND="${WGPU_BACKEND:-gl}"
 export LIBGL_ALWAYS_SOFTWARE=1
 export NO_AT_BRIDGE=1
+export SSH_MOUNTMATE_TRACE_FILE="$test_root/gui.trace"
 unset WAYLAND_DISPLAY WAYLAND_SOCKET
 
 openbox >"$test_root/openbox.stdout" 2>"$test_root/openbox.stderr" &
