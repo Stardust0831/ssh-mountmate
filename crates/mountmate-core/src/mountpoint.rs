@@ -253,7 +253,7 @@ fn windows_parent(path: &Path) -> PathBuf {
 
 fn path_is_absolute(path: &Path, windows: bool) -> bool {
     if !windows {
-        return path.is_absolute();
+        return path.as_os_str().to_string_lossy().starts_with('/');
     }
     let value = path.to_string_lossy();
     let bytes = value.as_bytes();
