@@ -259,6 +259,7 @@ struct App {
     transfer_refreshing: bool,
     main_window: window::Id,
     main_window_ready: bool,
+    main_window_opening: bool,
     pending_main_activation: bool,
     tray: Option<TrayController>,
     tray_error: Option<String>,
@@ -582,6 +583,7 @@ impl App {
             transfer_refreshing: false,
             main_window,
             main_window_ready: false,
+            main_window_opening: true,
             pending_main_activation: false,
             tray: None,
             tray_error: None,
@@ -622,6 +624,7 @@ impl App {
             Message::MainWindowOpened(id) => {
                 if id == self.main_window {
                     self.main_window_ready = true;
+                    self.main_window_opening = false;
                     self.initialize_tray();
                     if self.pending_main_activation {
                         self.pending_main_activation = false;
@@ -703,7 +706,13 @@ impl App {
                     return iced::exit();
                 }
             }
-            Message::WindowClosed(id) if id == self.main_window => return iced::exit(),
+            Message::WindowClosed(id) if id == self.main_window => {
+                self.main_window_ready = false;
+                self.main_window_opening = false;
+                if self.tray.is_none() {
+                    return iced::exit();
+                }
+            }
             Message::WindowClosed(id) => {
                 if let Some(server_id) = self.popup_windows.remove(&id) {
                     self.dismissed_popups.insert(server_id);
@@ -1314,17 +1323,21 @@ impl App {
     }
 
     fn activate_main_window(&self) -> Task<Message> {
-        window::set_mode(self.main_window, window::Mode::Windowed)
-            .chain(window::minimize(self.main_window, false))
-            .chain(window::gain_focus(self.main_window))
+        window::minimize(self.main_window, false).chain(window::gain_focus(self.main_window))
     }
 
     fn show_main_window(&mut self) -> Task<Message> {
         if self.main_window_ready {
             self.activate_main_window()
-        } else {
+        } else if self.main_window_opening {
             self.pending_main_activation = true;
             Task::none()
+        } else {
+            let (main_window, open_window) = window::open(main_window_settings());
+            self.main_window = main_window;
+            self.main_window_opening = true;
+            self.pending_main_activation = true;
+            open_window.map(Message::MainWindowOpened)
         }
     }
 
@@ -1333,7 +1346,10 @@ impl App {
             return self.request_exit();
         }
         self.status = self.locale().text(TextKey::RunningInBackground).into();
-        window::set_mode(self.main_window, window::Mode::Hidden)
+        let main_window = self.main_window;
+        self.main_window_ready = false;
+        self.main_window_opening = false;
+        window::close(main_window)
     }
 
     fn request_exit(&mut self) -> Task<Message> {
