@@ -167,8 +167,10 @@ pub fn build_transfer_snapshot(
         uploading,
         queued_bytes,
         transferred_bytes,
-        percentage: if queued_bytes == 0 {
+        percentage: if queued_bytes == 0 && queued == 0 && uploading == 0 && errors == 0 {
             100.0
+        } else if queued_bytes == 0 {
+            0.0
         } else {
             (transferred_bytes as f64 * 100.0 / queued_bytes as f64).clamp(0.0, 100.0)
         },
@@ -234,5 +236,23 @@ mod tests {
         );
         assert!(!snapshot.synced);
         assert_eq!(snapshot.queued, 1);
+    }
+
+    #[test]
+    fn upload_without_known_size_never_reports_false_completion() {
+        let snapshot = build_transfer_snapshot(
+            QueueResponse::default(),
+            VfsStatsResponse {
+                disk_cache: DiskCacheStats {
+                    uploads_in_progress: 1,
+                    ..DiskCacheStats::default()
+                },
+            },
+            CoreStatsResponse::default(),
+        );
+
+        assert_eq!(snapshot.uploading, 1);
+        assert_eq!(snapshot.percentage, 0.0);
+        assert!(!snapshot.synced);
     }
 }

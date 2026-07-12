@@ -7,6 +7,7 @@ use thiserror::Error;
 use crate::mountpoint::{HOME_MOUNTPOINT_VALUE, MountpointAllocator, SystemMountpointProbe};
 use crate::paths::AppPaths;
 use crate::process::MountStatus;
+use crate::rc::{HttpRcClient, RcError};
 use crate::rclone::{RcloneConfigError, RcloneRemote, write_rclone_remote};
 use crate::rclone_binary::{RcloneBinaryError, resolve_rclone};
 use crate::runtime::{
@@ -18,6 +19,7 @@ use crate::ssh::{
     select_readable_known_hosts,
 };
 use crate::storage::{StorageError, read_json};
+use crate::transfer::TransferSnapshot;
 use crate::{ConnectionMethod, MountState, ServerConfig, Settings};
 
 #[derive(Debug, Error)]
@@ -28,6 +30,8 @@ pub enum ServiceError {
     RcloneBinary(#[from] RcloneBinaryError),
     #[error(transparent)]
     RcloneConfig(#[from] RcloneConfigError),
+    #[error(transparent)]
+    Rc(#[from] RcError),
     #[error(transparent)]
     Ssh(#[from] SshError),
     #[error(transparent)]
@@ -107,6 +111,11 @@ impl MountService {
 
     pub fn status(&self, server_id: &str) -> Result<MountStatus, ServiceError> {
         self.with_runtime(|runtime| runtime.status(server_id).map_err(ServiceError::from))
+    }
+
+    pub fn transfer_snapshot(&self, server_id: &str) -> Result<TransferSnapshot, ServiceError> {
+        let state: MountState = read_json(&self.paths.state_file(server_id))?;
+        Ok(HttpRcClient::new(&state.rc_addr, Duration::from_millis(750))?.transfer_snapshot()?)
     }
 
     fn ensure_remote(&self, server: &ServerConfig) -> Result<(), ServiceError> {

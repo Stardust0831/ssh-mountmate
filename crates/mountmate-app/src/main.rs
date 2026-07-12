@@ -1,19 +1,22 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
-use iced::widget::{Space, button, column, container, row, scrollable, text};
-use iced::{Center, Element, Fill, Task, Theme};
+use iced::widget::{Space, button, column, container, progress_bar, row, scrollable, text};
+use iced::{Center, Element, Fill, Subscription, Task, Theme};
 use mountmate_core::paths::AppPaths;
 use mountmate_core::process::MountStatus;
 use mountmate_core::service::MountService;
 use mountmate_core::storage::{self, read_json};
+use mountmate_core::transfer::TransferSnapshot;
 use mountmate_core::{APP_NAME, MountState, ServerConfig, Settings, VERSION};
 
 fn main() -> iced::Result {
     iced::application(App::new, App::update, App::view)
         .title(App::title)
         .theme(App::theme)
+        .subscription(App::subscription)
         .window_size((980.0, 720.0))
         .run()
 }
@@ -26,6 +29,9 @@ struct App {
     service: MountService,
     mount_statuses: HashMap<String, MountStatus>,
     busy: HashSet<String>,
+    transfers: HashMap<String, TransferSnapshot>,
+    transfer_errors: HashMap<String, String>,
+    transfer_refreshing: bool,
     status: String,
 }
 
@@ -33,6 +39,8 @@ struct App {
 enum Message {
     Refresh,
     StatusesLoaded(Vec<(String, Result<MountStatus, String>)>),
+    TransferTick,
+    TransfersLoaded(Vec<(String, Result<TransferSnapshot, String>)>),
     AddConnection,
     OpenSettings,
     Mount(String),
@@ -62,6 +70,10 @@ impl App {
         Theme::Dark
     }
 
+    fn subscription(&self) -> Subscription<Message> {
+        iced::time::every(Duration::from_secs(1)).map(|_| Message::TransferTick)
+    }
+
     fn new() -> (Self, Task<Message>) {
         let paths = AppPaths::discover();
         let service = MountService::new(paths.clone(), application_root());
@@ -80,6 +92,9 @@ impl App {
             service,
             mount_statuses: HashMap::new(),
             busy: HashSet::new(),
+            transfers: HashMap::new(),
+            transfer_errors: HashMap::new(),
+            transfer_refreshing: false,
             status,
         };
         let task = app.status_task();
@@ -107,6 +122,21 @@ impl App {
                     }
                 }
                 self.status = errors.first().cloned().unwrap_or_else(|| "Ready".into());
+            }
+            Message::TransferTick => return self.transfer_task(),
+            Message::TransfersLoaded(results) => {
+                self.transfer_refreshing = false;
+                for (id, result) in results {
+                    match result {
+                        Ok(snapshot) => {
+                            self.transfers.insert(id.clone(), snapshot);
+                            self.transfer_errors.remove(&id);
+                        }
+                        Err(error) => {
+                            self.transfer_errors.insert(id, error);
+                        }
+                    }
+                }
             }
             Message::AddConnection => {
                 self.status = "Connection editor is the next implemented surface".into()
@@ -170,6 +200,53 @@ impl App {
                 .unwrap_or_else(|error| vec![(String::new(), Err(error.to_string()))])
             },
             Message::StatusesLoaded,
+        )
+    }
+
+    fn transfer_task(&mut self) -> Task<Message> {
+        if self.transfer_refreshing {
+            return Task::none();
+        }
+        let ids: Vec<_> = self
+            .servers
+            .iter()
+            .filter(|server| {
+                self.mount_statuses.get(&server.id) == Some(&MountStatus::Mounted)
+                    && !self.busy.contains(&server.id)
+            })
+            .map(|server| server.id.clone())
+            .collect();
+        if ids.is_empty() {
+            return Task::none();
+        }
+        self.transfer_refreshing = true;
+        let service = self.service.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    std::thread::scope(|scope| {
+                        let tasks: Vec<_> = ids
+                            .into_iter()
+                            .map(|id| {
+                                let service = service.clone();
+                                scope.spawn(move || {
+                                    let result = service
+                                        .transfer_snapshot(&id)
+                                        .map_err(|error| error.to_string());
+                                    (id, result)
+                                })
+                            })
+                            .collect();
+                        tasks
+                            .into_iter()
+                            .filter_map(|task| task.join().ok())
+                            .collect()
+                    })
+                })
+                .await
+                .unwrap_or_default()
+            },
+            Message::TransfersLoaded,
         )
     }
 
@@ -274,6 +351,8 @@ impl App {
                         .copied()
                         .unwrap_or(MountStatus::Unmounted),
                     self.busy.contains(&server.id),
+                    self.transfers.get(&server.id),
+                    self.transfer_errors.contains_key(&server.id),
                 ));
             }
         }
@@ -293,7 +372,13 @@ impl App {
     }
 }
 
-fn connection_card(server: &ServerConfig, status: MountStatus, busy: bool) -> Element<'_, Message> {
+fn connection_card<'a>(
+    server: &'a ServerConfig,
+    status: MountStatus,
+    busy: bool,
+    transfer: Option<&'a TransferSnapshot>,
+    transfer_unavailable: bool,
+) -> Element<'a, Message> {
     let id = server.id.clone();
     let host = format!("{}@{}:{}", server.user, server.host, server.port);
     let remote = if server.remote_path.is_empty() {
@@ -314,16 +399,26 @@ fn connection_card(server: &ServerConfig, status: MountStatus, busy: bool) -> El
     if status == MountStatus::Mounted && !busy {
         open = open.on_press(Message::Open(id.clone()));
     }
+    let mut details = column![
+        text(server.display_name()).size(22),
+        text(host).size(15),
+        text(format!("{}  ->  {}", remote, display_mountpoint(server))).size(14),
+        text(status_label(status)).size(13),
+    ]
+    .spacing(4)
+    .width(Fill);
+    if status == MountStatus::Mounted {
+        if transfer_unavailable {
+            details = details.push(text("Transfer state unavailable").size(13));
+        } else if let Some(snapshot) = transfer {
+            details = details
+                .push(text(transfer_label(snapshot)).size(13))
+                .push(progress_bar(0.0..=100.0, snapshot.percentage as f32));
+        }
+    }
     container(
         row![
-            column![
-                text(server.display_name()).size(22),
-                text(host).size(15),
-                text(format!("{}  ->  {}", remote, display_mountpoint(server))).size(14),
-                text(status_label(status)).size(13),
-            ]
-            .spacing(4)
-            .width(Fill),
+            details,
             operation,
             open,
             button("Edit").on_press(Message::Edit(id.clone())),
@@ -352,6 +447,49 @@ fn status_label(status: MountStatus) -> &'static str {
         MountStatus::Unmounted => "Unmounted",
         MountStatus::Starting => "Starting",
         MountStatus::Stale => "Stale state",
+    }
+}
+
+fn transfer_label(snapshot: &TransferSnapshot) -> String {
+    if snapshot.errors > 0 {
+        format!("{} upload error(s)", snapshot.errors)
+    } else if snapshot.uploading > 0 {
+        if snapshot.files.is_empty() {
+            format!(
+                "Uploading {} file(s) - progress unavailable",
+                snapshot.uploading
+            )
+        } else {
+            format!(
+                "Uploading {} file(s) - {:.0}%",
+                snapshot.uploading, snapshot.percentage
+            )
+        }
+    } else if snapshot.queued > 0 {
+        format!(
+            "{} file(s) queued - {}",
+            snapshot.queued,
+            format_bytes(snapshot.queued_bytes)
+        )
+    } else if snapshot.synced {
+        "Cloud synced".into()
+    } else {
+        "Checking cloud state".into()
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
