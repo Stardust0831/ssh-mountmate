@@ -3678,6 +3678,7 @@ dependencies = [
  "mountmate-core",
  "mountmate-platform",
  "rfd",
+ "sys-locale",
  "tokio",
 ]
 

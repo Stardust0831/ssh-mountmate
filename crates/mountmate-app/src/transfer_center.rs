@@ -3,6 +3,7 @@ use iced::{Center, Element, Fill};
 use mountmate_core::ServerConfig;
 use mountmate_core::transfer::{TransferFile, TransferSnapshot};
 
+use super::i18n::{Locale, TextKey};
 use super::{Message, format_bytes, transfer_is_active, transfer_label};
 
 #[derive(Debug, Default, PartialEq)]
@@ -61,29 +62,42 @@ pub(crate) fn connection_view<'a>(
     server: &'a ServerConfig,
     snapshot: Option<&'a TransferSnapshot>,
     error: Option<&'a String>,
+    locale: Locale,
 ) -> Element<'a, Message> {
     let mut content = column![text(server.display_name()).size(21)].spacing(7);
     if let Some(error) = error {
         content = content
-            .push(text("Transfer state unavailable").size(14))
+            .push(text(locale.text(TextKey::TransferStateUnavailable)).size(14))
             .push(text(error).size(12));
     } else if let Some(snapshot) = snapshot {
         content = content
-            .push(text(transfer_label(snapshot)).size(14))
+            .push(text(transfer_label(locale, snapshot)).size(14))
             .push(progress_bar(0.0..=100.0, snapshot.percentage as f32));
         if snapshot.out_of_space {
-            content = content.push(text("The local VFS cache is out of space").size(13));
+            content = content.push(
+                text(match locale {
+                    Locale::English => "The local VFS cache is out of space",
+                    Locale::Chinese => "本地 VFS 缓存空间不足",
+                })
+                .size(13),
+            );
         }
         if snapshot.files.is_empty() && transfer_is_active(snapshot) {
             content = content.push(
-                text("rclone reports pending work but has not exposed per-file details").size(12),
+                text(match locale {
+                    Locale::English => {
+                        "rclone reports pending work but has not exposed per-file details"
+                    }
+                    Locale::Chinese => "rclone 报告仍有待处理任务，但尚未提供逐文件详情",
+                })
+                .size(12),
             );
         }
         for file in &snapshot.files {
-            content = content.push(file_view(file));
+            content = content.push(file_view(file, locale));
         }
     } else {
-        content = content.push(text("Checking transfer state...").size(14));
+        content = content.push(text(locale.text(TextKey::CheckingTransferState)).size(14));
     }
     container(content)
         .padding(14)
@@ -92,34 +106,59 @@ pub(crate) fn connection_view<'a>(
         .into()
 }
 
-fn file_view(file: &TransferFile) -> Element<'_, Message> {
+fn file_view(file: &TransferFile, locale: Locale) -> Element<'_, Message> {
     let state = if file.uploading {
-        "Uploading"
+        match locale {
+            Locale::English => "Uploading",
+            Locale::Chinese => "上传中",
+        }
     } else if file.tries > 0 {
-        "Queued for retry"
+        match locale {
+            Locale::English => "Queued for retry",
+            Locale::Chinese => "等待重试",
+        }
     } else {
-        "Queued"
+        match locale {
+            Locale::English => "Queued",
+            Locale::Chinese => "排队中",
+        }
     };
     let amount = if file.size == 0 {
-        format!("{} uploaded, total size unknown", format_bytes(file.bytes))
+        match locale {
+            Locale::English => {
+                format!("{} uploaded, total size unknown", format_bytes(file.bytes))
+            }
+            Locale::Chinese => format!("已上传 {}，总大小未知", format_bytes(file.bytes)),
+        }
     } else {
-        format!(
-            "{} of {}",
-            format_bytes(file.bytes),
-            format_bytes(file.size)
-        )
+        match locale {
+            Locale::English => format!(
+                "{} of {}",
+                format_bytes(file.bytes),
+                format_bytes(file.size)
+            ),
+            Locale::Chinese => {
+                format!("{} / {}", format_bytes(file.bytes), format_bytes(file.size))
+            }
+        }
     };
     let activity = if file.uploading {
         let eta = file
             .eta
-            .map(format_eta)
-            .unwrap_or_else(|| "ETA unknown".into());
+            .map(|eta| format_eta(locale, eta))
+            .unwrap_or_else(|| format_eta(locale, f64::NAN));
         format!("{}/s - {eta}", format_bytes(file.speed.max(0.0) as u64))
     } else {
-        "Waiting for upload slot".into()
+        match locale {
+            Locale::English => "Waiting for upload slot".into(),
+            Locale::Chinese => "等待上传队列".into(),
+        }
     };
     let retries = if file.tries > 0 {
-        format!(" - {} attempt(s)", file.tries)
+        match locale {
+            Locale::English => format!(" - {} attempt(s)", file.tries),
+            Locale::Chinese => format!(" - 已尝试 {} 次", file.tries),
+        }
     } else {
         String::new()
     };
@@ -144,20 +183,32 @@ fn file_view(file: &TransferFile) -> Element<'_, Message> {
     .into()
 }
 
-fn format_eta(seconds: f64) -> String {
+fn format_eta(locale: Locale, seconds: f64) -> String {
     if !seconds.is_finite() || seconds < 0.0 {
-        return "ETA unknown".into();
+        return match locale {
+            Locale::English => "ETA unknown".into(),
+            Locale::Chinese => "剩余时间未知".into(),
+        };
     }
     let seconds = seconds.round() as u64;
     let hours = seconds / 3600;
     let minutes = seconds % 3600 / 60;
     let seconds = seconds % 60;
     if hours > 0 {
-        format!("ETA {hours}h {minutes}m")
+        match locale {
+            Locale::English => format!("ETA {hours}h {minutes}m"),
+            Locale::Chinese => format!("预计剩余 {hours} 小时 {minutes} 分钟"),
+        }
     } else if minutes > 0 {
-        format!("ETA {minutes}m {seconds}s")
+        match locale {
+            Locale::English => format!("ETA {minutes}m {seconds}s"),
+            Locale::Chinese => format!("预计剩余 {minutes} 分 {seconds} 秒"),
+        }
     } else {
-        format!("ETA {seconds}s")
+        match locale {
+            Locale::English => format!("ETA {seconds}s"),
+            Locale::Chinese => format!("预计剩余 {seconds} 秒"),
+        }
     }
 }
 
@@ -245,9 +296,10 @@ mod tests {
 
     #[test]
     fn eta_format_is_compact_and_stable() {
-        assert_eq!(format_eta(42.0), "ETA 42s");
-        assert_eq!(format_eta(125.0), "ETA 2m 5s");
-        assert_eq!(format_eta(3_661.0), "ETA 1h 1m");
-        assert_eq!(format_eta(f64::NAN), "ETA unknown");
+        assert_eq!(format_eta(Locale::English, 42.0), "ETA 42s");
+        assert_eq!(format_eta(Locale::English, 125.0), "ETA 2m 5s");
+        assert_eq!(format_eta(Locale::English, 3_661.0), "ETA 1h 1m");
+        assert_eq!(format_eta(Locale::English, f64::NAN), "ETA unknown");
+        assert_eq!(format_eta(Locale::Chinese, 42.0), "预计剩余 42 秒");
     }
 }

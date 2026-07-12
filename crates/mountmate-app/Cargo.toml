@@ -11,6 +11,7 @@ iced.workspace = true
 mountmate-core = { path = "../mountmate-core" }
 mountmate-platform = { path = "../mountmate-platform" }
 rfd.workspace = true
+sys-locale.workspace = true
 tokio.workspace = true
 
 [[bin]]
