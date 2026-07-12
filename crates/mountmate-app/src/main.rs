@@ -711,10 +711,7 @@ impl App {
                     .first()
                     .cloned()
                     .unwrap_or_else(|| locale.text(TextKey::Ready).into());
-                return set_native_global_progress(
-                    self.main_window,
-                    self.global_progress_state(),
-                );
+                return set_native_global_progress(self.main_window, self.global_progress_state());
             }
             Message::TransferTick => return self.transfer_task(),
             Message::TransfersLoaded(results) => {
