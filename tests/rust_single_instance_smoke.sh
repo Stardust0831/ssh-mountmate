@@ -47,14 +47,13 @@ export XDG_RUNTIME_DIR="$test_root/runtime"
 export WINIT_UNIX_BACKEND=x11
 export WGPU_BACKEND="${WGPU_BACKEND:-gl}"
 export LIBGL_ALWAYS_SOFTWARE=1
+export NO_AT_BRIDGE=1
 unset WAYLAND_DISPLAY WAYLAND_SOCKET
 
 openbox >"$test_root/openbox.stdout" 2>"$test_root/openbox.stderr" &
 wm_pid=$!
-for _ in {1..100}; do
-  xdotool getactivewindow >/dev/null 2>&1 && break
-  sleep 0.05
-done
+sleep 0.3
+kill -0 "$wm_pid" || { echo "Openbox did not stay running" >&2; exit 1; }
 
 "$binary" >"$test_root/gui.stdout" 2>"$test_root/gui.stderr" &
 app_pid=$!
@@ -64,12 +63,12 @@ for _ in {1..400}; do
   [[ -s "$state" ]] && break
   sleep 0.05
 done
-[[ -s "$state" ]]
-[[ "$(stat -c %a "$state")" == "600" ]]
+[[ -s "$state" ]] || { echo "App command state was not created" >&2; exit 1; }
+[[ "$(stat -c %a "$state")" == "600" ]] || { echo "App command state is not mode 600" >&2; exit 1; }
 
 "$binary" --show-transfers
 "$binary" --mount-id missing
-[[ -d "/proc/$app_pid" ]]
+[[ -d "/proc/$app_pid" ]] || { echo "GUI exited while handling forwarded commands" >&2; exit 1; }
 
 process_count=0
 for process in /proc/[0-9]*; do
@@ -78,7 +77,7 @@ for process in /proc/[0-9]*; do
     process_count=$((process_count + 1))
   fi
 done
-[[ "$process_count" == "1" ]]
+[[ "$process_count" == "1" ]] || { echo "Expected one GUI process, found $process_count" >&2; exit 1; }
 
 window_id=""
 for _ in {1..400}; do
@@ -86,8 +85,8 @@ for _ in {1..400}; do
   [[ -n "$window_id" ]] && break
   sleep 0.05
 done
-[[ -n "$window_id" ]]
-[[ "$(xdotool getwindowpid "$window_id")" == "$app_pid" ]]
+[[ -n "$window_id" ]] || { echo "Main window did not become visible" >&2; exit 1; }
+[[ "$(xdotool getwindowpid "$window_id")" == "$app_pid" ]] || { echo "Main window belongs to another process" >&2; exit 1; }
 
 xdotool windowclose "$window_id"
 for _ in {1..200}; do
@@ -95,8 +94,8 @@ for _ in {1..200}; do
   [[ -z "$visible" ]] && break
   sleep 0.05
 done
-[[ -z "${visible:-}" ]]
-[[ -d "/proc/$app_pid" ]]
+[[ -z "${visible:-}" ]] || { echo "Main window did not hide after close request" >&2; exit 1; }
+[[ -d "/proc/$app_pid" ]] || { echo "GUI exited instead of remaining in the tray" >&2; exit 1; }
 
 "$binary" --show-main
 restored_window=""
@@ -105,9 +104,9 @@ for _ in {1..200}; do
   [[ -n "$restored_window" ]] && break
   sleep 0.05
 done
-[[ -n "$restored_window" ]]
-[[ "$(xdotool getwindowpid "$restored_window")" == "$app_pid" ]]
-[[ ! -s "$test_root/gui.stdout" ]]
+[[ -n "$restored_window" ]] || { echo "IPC did not restore the hidden main window" >&2; exit 1; }
+[[ "$(xdotool getwindowpid "$restored_window")" == "$app_pid" ]] || { echo "Restored window belongs to another process" >&2; exit 1; }
+[[ ! -s "$test_root/gui.stdout" ]] || { echo "GUI unexpectedly wrote to stdout" >&2; exit 1; }
 if grep -Eq "panicked|ERROR_OUT_OF_HOST_MEMORY" "$test_root/gui.stderr"; then
   cat "$test_root/gui.stderr" >&2
   exit 1
