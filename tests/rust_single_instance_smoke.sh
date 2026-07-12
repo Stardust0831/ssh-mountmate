@@ -5,12 +5,17 @@ binary="${1:-target/debug/SSHMountMate}"
 binary="$(realpath "$binary")"
 test_root="$(mktemp -d "${TMPDIR:-/tmp}/ssh-mountmate-ipc-XXXXXX")"
 app_pid=""
+wm_pid=""
 
 cleanup() {
   status=$?
   if [[ -n "$app_pid" ]]; then
     kill "$app_pid" 2>/dev/null || true
     wait "$app_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$wm_pid" ]]; then
+    kill "$wm_pid" 2>/dev/null || true
+    wait "$wm_pid" 2>/dev/null || true
   fi
   if [[ "$status" != "0" ]]; then
     printf '%s\n' '--- SSH MountMate stdout ---' >&2
@@ -44,6 +49,13 @@ export WGPU_BACKEND="${WGPU_BACKEND:-gl}"
 export LIBGL_ALWAYS_SOFTWARE=1
 unset WAYLAND_DISPLAY WAYLAND_SOCKET
 
+openbox >"$test_root/openbox.stdout" 2>"$test_root/openbox.stderr" &
+wm_pid=$!
+for _ in {1..100}; do
+  xdotool getactivewindow >/dev/null 2>&1 && break
+  sleep 0.05
+done
+
 "$binary" >"$test_root/gui.stdout" 2>"$test_root/gui.stderr" &
 app_pid=$!
 
@@ -76,10 +88,30 @@ for _ in {1..400}; do
 done
 [[ -n "$window_id" ]]
 [[ "$(xdotool getwindowpid "$window_id")" == "$app_pid" ]]
+
+xdotool windowclose "$window_id"
+for _ in {1..200}; do
+  visible="$(xdotool search --onlyvisible --name "SSH MountMate" 2>/dev/null | head -n 1 || true)"
+  [[ -z "$visible" ]] && break
+  sleep 0.05
+done
+[[ -z "${visible:-}" ]]
+[[ -d "/proc/$app_pid" ]]
+
+"$binary" --show-main
+restored_window=""
+for _ in {1..200}; do
+  restored_window="$(xdotool search --onlyvisible --name "SSH MountMate" 2>/dev/null | head -n 1 || true)"
+  [[ -n "$restored_window" ]] && break
+  sleep 0.05
+done
+[[ -n "$restored_window" ]]
+[[ "$(xdotool getwindowpid "$restored_window")" == "$app_pid" ]]
 [[ ! -s "$test_root/gui.stdout" ]]
 if grep -Eq "panicked|ERROR_OUT_OF_HOST_MEMORY" "$test_root/gui.stderr"; then
   cat "$test_root/gui.stderr" >&2
   exit 1
 fi
 
-printf 'single-instance smoke passed: pid=%s window=%s mode=600\n' "$app_pid" "$window_id"
+printf 'single-instance background smoke passed: pid=%s window=%s restored=%s mode=600\n' \
+  "$app_pid" "$window_id" "$restored_window"

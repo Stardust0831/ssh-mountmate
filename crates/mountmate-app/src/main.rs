@@ -33,10 +33,12 @@ use mountmate_platform::{Platform, PlatformIntegration};
 mod cli;
 mod i18n;
 mod transfer_center;
+mod tray;
 
 use cli::LaunchAction;
 use i18n::{Choice, LanguagePreference as Language, Locale, TextKey};
 use transfer_center::{connection_view as transfer_connection_view, totals as transfer_totals};
+use tray::{TrayAction, TrayController};
 
 fn main() {
     if let Err(error) = run() {
@@ -258,6 +260,9 @@ struct App {
     main_window: window::Id,
     main_window_ready: bool,
     pending_main_activation: bool,
+    tray: Option<TrayController>,
+    tray_error: Option<String>,
+    exit_confirmation_open: bool,
     popup_windows: HashMap<window::Id, String>,
     popup_order: Vec<window::Id>,
     dismissed_popups: HashSet<String>,
@@ -437,6 +442,8 @@ enum Message {
     TransfersLoaded(Vec<(String, Result<TransferSnapshot, String>)>),
     PopupOpened(window::Id),
     ClosePopup(window::Id),
+    CloseRequested(window::Id),
+    ExitDecision(bool),
     WindowClosed(window::Id),
     AddConnection,
     OpenTransfers,
@@ -524,6 +531,7 @@ impl App {
         Subscription::batch([
             iced::time::every(Duration::from_millis(100)).map(|_| Message::CommandTick),
             iced::time::every(Duration::from_secs(1)).map(|_| Message::TransferTick),
+            window::close_requests().map(Message::CloseRequested),
             window::close_events().map(Message::WindowClosed),
         ])
     }
@@ -575,6 +583,9 @@ impl App {
             main_window,
             main_window_ready: false,
             pending_main_activation: false,
+            tray: None,
+            tray_error: None,
+            exit_confirmation_open: false,
             popup_windows: HashMap::new(),
             popup_order: Vec::new(),
             dismissed_popups: HashSet::new(),
@@ -603,10 +614,15 @@ impl App {
     fn update(&mut self, message: Message) -> Task<Message> {
         let locale = self.locale();
         match message {
-            Message::CommandTick => return self.drain_app_commands(),
+            Message::CommandTick => {
+                let command_task = self.drain_app_commands();
+                let tray_task = self.drain_tray_events();
+                return Task::batch([command_task, tray_task]);
+            }
             Message::MainWindowOpened(id) => {
                 if id == self.main_window {
                     self.main_window_ready = true;
+                    self.initialize_tray();
                     if self.pending_main_activation {
                         self.pending_main_activation = false;
                         return self.activate_main_window();
@@ -677,6 +693,16 @@ impl App {
                 self.popup_order.retain(|popup| *popup != id);
                 return window::close(id);
             }
+            Message::CloseRequested(id) if id == self.main_window => {
+                return self.hide_main_window();
+            }
+            Message::CloseRequested(_) => {}
+            Message::ExitDecision(confirmed) => {
+                self.exit_confirmation_open = false;
+                if confirmed {
+                    return iced::exit();
+                }
+            }
             Message::WindowClosed(id) if id == self.main_window => return iced::exit(),
             Message::WindowClosed(id) => {
                 if let Some(server_id) = self.popup_windows.remove(&id) {
@@ -714,7 +740,8 @@ impl App {
                     self.ssh_import_plan = None;
                     self.ssh_import_actions.clear();
                     self.screen = Screen::Connections;
-                    self.status = locale.text(TextKey::Ready).into();
+                    self.status = self.locale().text(TextKey::Ready).into();
+                    self.sync_tray();
                 }
             }
             Message::ConnectionSourceChanged(source) => {
@@ -985,6 +1012,7 @@ impl App {
                     draft.language = language;
                 }
                 self.status = self.locale().text(TextKey::Settings).into();
+                self.sync_tray();
             }
             Message::RegisterFileManagerMenu => return self.file_manager_menu_task(true),
             Message::UnregisterFileManagerMenu => return self.file_manager_menu_task(false),
@@ -1131,6 +1159,66 @@ impl App {
         )
     }
 
+    fn initialize_tray(&mut self) {
+        if self.tray.is_some() || self.tray_error.is_some() {
+            return;
+        }
+        match TrayController::new(self.locale()) {
+            Ok(tray) => {
+                self.tray = Some(tray);
+                self.sync_tray();
+            }
+            Err(error) => {
+                self.tray_error = Some(error.clone());
+                self.status = self.locale().tray_unavailable(&error);
+            }
+        }
+    }
+
+    fn sync_tray(&mut self) {
+        let locale = self.locale();
+        let can_mount = self.servers.iter().any(|server| {
+            !self.busy.contains(&server.id)
+                && !matches!(
+                    self.mount_statuses.get(&server.id),
+                    Some(MountStatus::Mounted | MountStatus::Starting)
+                )
+        });
+        let can_unmount = self.servers.iter().any(|server| {
+            !self.busy.contains(&server.id) && self.paths.state_file(&server.id).exists()
+        });
+        if let Some(tray) = &mut self.tray {
+            tray.sync(locale, can_mount, can_unmount);
+        }
+    }
+
+    fn drain_tray_events(&mut self) -> Task<Message> {
+        if self.tray.is_none() {
+            return Task::none();
+        }
+        self.sync_tray();
+        let mut tasks = Vec::new();
+        for action in TrayController::drain_actions() {
+            match action {
+                TrayAction::ShowMain => tasks.push(self.show_main_window()),
+                TrayAction::ShowTransfers => {
+                    self.screen = Screen::TransferCenter;
+                    self.status = self.locale().text(TextKey::TransferCenter).into();
+                    tasks.push(self.show_main_window());
+                    tasks.push(self.transfer_task());
+                }
+                TrayAction::MountAll => {
+                    tasks.push(self.handle_app_command(AppCommand::MountAll));
+                }
+                TrayAction::UnmountAll => {
+                    tasks.push(self.handle_app_command(AppCommand::UnmountAll));
+                }
+                TrayAction::Exit => return self.request_exit(),
+            }
+        }
+        Task::batch(tasks)
+    }
+
     fn handle_app_command(&mut self, command: AppCommand) -> Task<Message> {
         match command {
             AppCommand::ShowMain => self.show_main_window(),
@@ -1226,7 +1314,9 @@ impl App {
     }
 
     fn activate_main_window(&self) -> Task<Message> {
-        window::minimize(self.main_window, false).chain(window::gain_focus(self.main_window))
+        window::set_mode(self.main_window, window::Mode::Windowed)
+            .chain(window::minimize(self.main_window, false))
+            .chain(window::gain_focus(self.main_window))
     }
 
     fn show_main_window(&mut self) -> Task<Message> {
@@ -1236,6 +1326,51 @@ impl App {
             self.pending_main_activation = true;
             Task::none()
         }
+    }
+
+    fn hide_main_window(&mut self) -> Task<Message> {
+        if self.tray.is_none() {
+            return self.request_exit();
+        }
+        self.status = self.locale().text(TextKey::RunningInBackground).into();
+        window::set_mode(self.main_window, window::Mode::Hidden)
+    }
+
+    fn request_exit(&mut self) -> Task<Message> {
+        if self.exit_confirmation_open {
+            return Task::none();
+        }
+        let active = self
+            .transfers
+            .values()
+            .filter(|snapshot| transfer_is_active(snapshot))
+            .count();
+        let unknown = self
+            .servers
+            .iter()
+            .filter(|server| self.mount_statuses.get(&server.id) == Some(&MountStatus::Mounted))
+            .filter(|server| {
+                self.transfer_errors.contains_key(&server.id)
+                    || !self.transfers.contains_key(&server.id)
+            })
+            .count();
+        if active == 0 && unknown == 0 {
+            return iced::exit();
+        }
+        self.exit_confirmation_open = true;
+        let description = self.locale().exit_warning(active, unknown);
+        Task::perform(
+            async move {
+                rfd::AsyncMessageDialog::new()
+                    .set_title(APP_NAME)
+                    .set_description(description)
+                    .set_level(rfd::MessageLevel::Warning)
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show()
+                    .await
+            },
+            |result| Message::ExitDecision(result == rfd::MessageDialogResult::Yes),
+        )
     }
 
     fn can_modify(&self, id: &str) -> bool {
@@ -2344,6 +2479,10 @@ impl App {
         ]
         .spacing(14)
         .max_width(440);
+        let tray_capability = self
+            .tray_error
+            .as_ref()
+            .map(|error| text(locale.tray_unavailable(error)).size(14));
         let file_manager = if cfg!(windows) {
             column![
                 text(locale.text(TextKey::FileManagerIntegration)).size(20),
@@ -2365,6 +2504,7 @@ impl App {
             cache_limits,
             cache_timing,
             behavior,
+            tray_capability,
             file_manager
         ]
         .spacing(18)
@@ -2810,6 +2950,7 @@ fn main_window_settings() -> window::Settings {
     window::Settings {
         size: Size::new(980.0, 720.0),
         position: window::Position::Centered,
+        exit_on_close_request: false,
         ..window::Settings::default()
     }
 }

@@ -13,6 +13,12 @@ mountmate-platform = { path = "../mountmate-platform" }
 rfd.workspace = true
 sys-locale.workspace = true
 tokio.workspace = true
+tray-icon.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+libloading = "0.8"
+tray-icon = { workspace = true, features = ["gtk"] }
 
 [[bin]]
 name = "SSHMountMate"

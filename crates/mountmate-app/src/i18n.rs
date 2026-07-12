@@ -201,6 +201,24 @@ impl Locale {
             ),
         }
     }
+
+    pub(crate) fn tray_unavailable(self, error: &str) -> String {
+        match self {
+            Self::English => format!("System tray unavailable: {error}"),
+            Self::Chinese => format!("系统托盘不可用：{error}"),
+        }
+    }
+
+    pub(crate) fn exit_warning(self, active: usize, unknown: usize) -> String {
+        match self {
+            Self::English => format!(
+                "{active} mounted connection(s) still have queued or active uploads, and {unknown} mounted connection(s) have an unknown cloud state. Exiting the interface leaves rclone mounts running, but you will no longer see transfer status. Exit anyway?"
+            ),
+            Self::Chinese => format!(
+                "仍有 {active} 个挂载连接存在排队或正在进行的上传，另有 {unknown} 个挂载连接的云端状态未知。退出界面不会停止 rclone 挂载，但你将无法继续查看传输状态。仍要退出吗？"
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,6 +284,7 @@ pub(crate) enum TextKey {
     DirectoryCacheTime,
     Edit,
     EditConnection,
+    Exit,
     FileManagerIntegration,
     FileManagerIntegrationHelp,
     FileManagerMenuRegistered,
@@ -285,6 +304,7 @@ pub(crate) enum TextKey {
     MaximumSize,
     MinimumFreeSpace,
     Mount,
+    MountAll,
     MountAllAtLogin,
     MountConnectionForTransfers,
     Mountpoint,
@@ -310,6 +330,7 @@ pub(crate) enum TextKey {
     Remove,
     RemoveFileManagerMenu,
     RemovingFileManagerMenu,
+    RunningInBackground,
     Save,
     Saving,
     SavingConnection,
@@ -322,6 +343,7 @@ pub(crate) enum TextKey {
     SettingsSaved,
     SettingsUnavailable,
     ShowTransferPopup,
+    ShowMainWindow,
     Source,
     SshConfigFile,
     SshConfigPathRequired,
@@ -333,6 +355,7 @@ pub(crate) enum TextKey {
     Transfers,
     Transport,
     Unmount,
+    UnmountAll,
     UnmountBeforeRemove,
     User,
     VfsCacheMode,
@@ -365,6 +388,7 @@ fn english(key: TextKey) -> &'static str {
         TextKey::DirectoryCacheTime => "Directory cache time",
         TextKey::Edit => "Edit",
         TextKey::EditConnection => "Edit connection",
+        TextKey::Exit => "Exit",
         TextKey::FileManagerIntegration => "Explorer integration",
         TextKey::FileManagerIntegrationHelp => {
             "Adds Refresh and Transfers to folder and drive context menus for the current user."
@@ -386,6 +410,7 @@ fn english(key: TextKey) -> &'static str {
         TextKey::MaximumSize => "Maximum size",
         TextKey::MinimumFreeSpace => "Minimum free space",
         TextKey::Mount => "Mount",
+        TextKey::MountAll => "Mount all",
         TextKey::MountAllAtLogin => "Mount all saved connections at login",
         TextKey::MountConnectionForTransfers => {
             "Mount a connection to inspect its cloud transfer state"
@@ -413,6 +438,7 @@ fn english(key: TextKey) -> &'static str {
         TextKey::Remove => "Remove",
         TextKey::RemoveFileManagerMenu => "Remove Explorer commands",
         TextKey::RemovingFileManagerMenu => "Removing Explorer commands...",
+        TextKey::RunningInBackground => "Running in the system tray",
         TextKey::Save => "Save",
         TextKey::Saving => "Saving...",
         TextKey::SavingConnection => "Saving connection...",
@@ -425,6 +451,7 @@ fn english(key: TextKey) -> &'static str {
         TextKey::SettingsSaved => "Settings saved",
         TextKey::SettingsUnavailable => "Settings unavailable",
         TextKey::ShowTransferPopup => "Show transfer popup automatically",
+        TextKey::ShowMainWindow => "Show SSH MountMate",
         TextKey::Source => "Source",
         TextKey::SshConfigFile => "SSH config file",
         TextKey::SshConfigPathRequired => "SSH config path is required",
@@ -436,6 +463,7 @@ fn english(key: TextKey) -> &'static str {
         TextKey::Transfers => "Transfers",
         TextKey::Transport => "Transport",
         TextKey::Unmount => "Unmount",
+        TextKey::UnmountAll => "Unmount all",
         TextKey::UnmountBeforeRemove => "Unmount the connection before removing it",
         TextKey::User => "User",
         TextKey::VfsCacheMode => "VFS cache mode",
@@ -469,6 +497,7 @@ fn chinese(key: TextKey) -> &'static str {
         TextKey::DirectoryCacheTime => "目录缓存时间",
         TextKey::Edit => "编辑",
         TextKey::EditConnection => "编辑连接",
+        TextKey::Exit => "退出",
         TextKey::FileManagerIntegration => "资源管理器集成",
         TextKey::FileManagerIntegrationHelp => {
             "为当前用户的文件夹和驱动器右键菜单添加刷新与传输中心命令。"
@@ -490,6 +519,7 @@ fn chinese(key: TextKey) -> &'static str {
         TextKey::MaximumSize => "最大大小",
         TextKey::MinimumFreeSpace => "最小剩余空间",
         TextKey::Mount => "挂载",
+        TextKey::MountAll => "全部挂载",
         TextKey::MountAllAtLogin => "登录时挂载所有已保存连接",
         TextKey::MountConnectionForTransfers => "挂载连接后可查看其云端传输状态",
         TextKey::Mountpoint => "挂载点（默认自动选择）",
@@ -515,6 +545,7 @@ fn chinese(key: TextKey) -> &'static str {
         TextKey::Remove => "删除",
         TextKey::RemoveFileManagerMenu => "移除资源管理器命令",
         TextKey::RemovingFileManagerMenu => "正在移除资源管理器命令...",
+        TextKey::RunningInBackground => "正在系统托盘中运行",
         TextKey::Save => "保存",
         TextKey::Saving => "正在保存...",
         TextKey::SavingConnection => "正在保存连接...",
@@ -527,6 +558,7 @@ fn chinese(key: TextKey) -> &'static str {
         TextKey::SettingsSaved => "设置已保存",
         TextKey::SettingsUnavailable => "设置不可用",
         TextKey::ShowTransferPopup => "自动显示传输进度弹窗",
+        TextKey::ShowMainWindow => "显示 SSH MountMate",
         TextKey::Source => "来源",
         TextKey::SshConfigFile => "SSH 配置文件",
         TextKey::SshConfigPathRequired => "必须填写 SSH 配置路径",
@@ -538,6 +570,7 @@ fn chinese(key: TextKey) -> &'static str {
         TextKey::Transfers => "传输",
         TextKey::Transport => "传输方式",
         TextKey::Unmount => "卸载",
+        TextKey::UnmountAll => "全部卸载",
         TextKey::UnmountBeforeRemove => "请先卸载连接再删除",
         TextKey::User => "用户",
         TextKey::VfsCacheMode => "VFS 缓存模式",

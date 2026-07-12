@@ -273,6 +273,8 @@ Refresh clears the VFS directory cache, actively reloads the requested directory
 
 Right-click a connection card for Open, Refresh, Transfers, and Log actions. On Windows, Settings can register the same Refresh and Transfers commands in Explorer. The registration points back to the same `SSHMountMate.exe`; no helper executable is installed. A short-lived right-click process forwards its request to the running app over authenticated loopback IPC and exits.
 
+The Rust application keeps a native system-tray icon on Windows, a menu-bar item on macOS, and an AppIndicator on supported Linux desktops. Closing the main window hides it without stopping mounts or transfer monitoring. The tray menu can restore the main window, open Transfers, mount or unmount all connections, and explicitly exit the interface. Exit asks for confirmation when uploads are active or cloud state is unknown; rclone mount processes remain independent of the GUI.
+
 ## Capacity Display
 
 For mounted connections, SSH MountMate shows used and total capacity on each card. On Lustre paths, it first tries to read the remote directory's project ID with `lfs project -d` and then reads project quota with `lfs quota -p`. If the path is not on Lustre, `lfs` is unavailable, or the project has no nonzero hard block limit, the app falls back to `rclone about`.

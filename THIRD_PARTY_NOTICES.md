@@ -32,3 +32,13 @@ The Rust application links `rfd` to provide native file and folder selection dia
 - License text: `licenses/sys-locale-LICENSE-MIT.txt`
 
 The Rust application links `sys-locale` to select the interface language from the active operating-system locale.
+
+## tray-icon and muda
+
+- Projects: https://github.com/tauri-apps/tray-icon and https://github.com/tauri-apps/muda
+- License: MIT OR Apache-2.0 (distributed under the MIT option)
+- License text: `licenses/tray-icon-LICENSE-MIT.txt`
+
+The Rust application links `tray-icon` and its `muda` menu library to provide native Windows
+system-tray, macOS menu-bar, and Linux AppIndicator controls. Both projects use the same Tauri
+Programme MIT license notice included above.
