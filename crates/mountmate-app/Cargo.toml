@@ -1,0 +1,16 @@
+[package]
+name = "ssh-mountmate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+iced.workspace = true
+mountmate-core = { path = "../mountmate-core" }
+mountmate-platform = { path = "../mountmate-platform" }
+
+[[bin]]
+name = "SSHMountMate"
+path = "src/main.rs"

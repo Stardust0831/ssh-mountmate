@@ -1,0 +1,70 @@
+name: Rust rewrite
+
+on:
+  push:
+    branches:
+      - rust-rewrite
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "crates/**"
+      - ".github/workflows/rust-rewrite.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.0
+          components: rustfmt, clippy
+      - name: Linux GUI dependencies
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-features
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: SSHMountMate-rust-windows-x64
+          - os: windows-11-arm
+            artifact: SSHMountMate-rust-windows-arm64
+          - os: macos-15-intel
+            artifact: SSHMountMate-rust-macos-x64
+          - os: macos-14
+            artifact: SSHMountMate-rust-macos-arm64
+          - os: ubuntu-latest
+            artifact: SSHMountMate-rust-linux-x64
+          - os: ubuntu-24.04-arm
+            artifact: SSHMountMate-rust-linux-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.0
+      - name: Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
+      - run: cargo test --workspace --all-features
+      - run: cargo build --release --package ssh-mountmate
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            target/release/SSHMountMate
+            target/release/SSHMountMate.exe
+          if-no-files-found: error

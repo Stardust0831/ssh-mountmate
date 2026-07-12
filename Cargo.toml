@@ -1,0 +1,33 @@
+[workspace]
+members = [
+    "crates/mountmate-app",
+    "crates/mountmate-core",
+    "crates/mountmate-platform",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.4.0-alpha.1"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/Stardust0831/ssh-mountmate"
+
+[workspace.dependencies]
+anyhow = "1.0"
+directories = "6.0"
+fs2 = "0.4"
+iced = { version = "0.14.0", features = ["tokio", "svg"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.20"
+thiserror = "2.0"
+url = "2.5"
+uuid = { version = "1.17", features = ["v4", "serde"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
