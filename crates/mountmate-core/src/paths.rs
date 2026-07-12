@@ -90,6 +90,26 @@ impl AppPaths {
         self.state_dir
             .join(format!("{}.log", path_component(remote_name)))
     }
+
+    pub fn managed_bin_dir(&self) -> PathBuf {
+        self.data_dir.join("bin")
+    }
+
+    pub fn legacy_managed_bin_dirs(&self) -> Vec<PathBuf> {
+        let Some(parent) = self.data_dir.parent() else {
+            return Vec::new();
+        };
+        let legacy_name = if cfg!(target_os = "windows") || cfg!(target_os = "macos") {
+            "SSHMountMate"
+        } else {
+            LEGACY_APP_ID
+        };
+        let legacy = parent.join(legacy_name).join("bin");
+        (legacy != self.managed_bin_dir())
+            .then_some(legacy)
+            .into_iter()
+            .collect()
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -142,5 +162,6 @@ mod tests {
             paths.mount_log("host:22"),
             PathBuf::from("state/host_22.log")
         );
+        assert_eq!(paths.managed_bin_dir(), PathBuf::from("data/bin"));
     }
 }

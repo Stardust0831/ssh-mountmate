@@ -3,6 +3,7 @@ pub mod paths;
 pub mod process;
 pub mod rc;
 pub mod rclone;
+pub mod rclone_binary;
 pub mod runtime;
 pub mod ssh;
 pub mod storage;
