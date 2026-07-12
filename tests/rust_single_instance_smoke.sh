@@ -93,7 +93,8 @@ done
 [[ -n "$window_id" ]] || { echo "Main window did not become visible" >&2; exit 1; }
 [[ "$(xdotool getwindowpid "$window_id")" == "$app_pid" ]] || { echo "Main window belongs to another process" >&2; exit 1; }
 
-xdotool windowclose "$window_id"
+xdotool windowactivate --sync "$window_id"
+xdotool key --clearmodifiers alt+F4
 for _ in {1..200}; do
   visible="$(xdotool search --onlyvisible --name "SSH MountMate" 2>/dev/null | head -n 1 || true)"
   [[ -z "$visible" ]] && break
