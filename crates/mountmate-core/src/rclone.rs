@@ -188,6 +188,10 @@ fn openssh_command(server: &ServerConfig, windows: bool) -> Result<String, Rclon
     let mut arguments = vec!["ssh".to_owned(), "-o".into(), "BatchMode=yes".into()];
     if (server.source == "ssh_config" || server.ssh_config_managed) && !server.host_alias.is_empty()
     {
+        if server.source == "ssh_config" && !server.ssh_config_path.trim().is_empty() {
+            validate_scalar(&server.ssh_config_path, "SSH config path")?;
+            arguments.extend(["-F".into(), server.ssh_config_path.clone()]);
+        }
         validate_host_alias(&server.host_alias)
             .map_err(|_| RcloneConfigError::InvalidValue { field: "SSH host" })?;
         arguments.push(server.host_alias.clone());
@@ -544,6 +548,28 @@ mod tests {
         assert!(command.1.contains("'/home/user/key file'"));
         assert!(!remote.options.iter().any(|(key, _)| key == "pass"));
         assert!(!command.1.contains("must-not-appear"));
+    }
+
+    #[test]
+    fn imported_openssh_profile_keeps_its_custom_config_file() {
+        let server = ServerConfig {
+            id: "cluster".into(),
+            source: "ssh_config".into(),
+            host_alias: "cluster".into(),
+            connection_method: ConnectionMethod::Openssh,
+            ssh_config_path: "/home/user/ssh configs/research".into(),
+            ..ServerConfig::default()
+        };
+
+        let remote = RcloneRemote::for_server(&server, None, None, false).unwrap();
+        let command = &remote
+            .options
+            .iter()
+            .find(|(key, _)| key == "ssh")
+            .unwrap()
+            .1;
+        assert!(command.contains("-F '/home/user/ssh configs/research'"));
+        assert!(command.ends_with("cluster"));
     }
 
     #[test]

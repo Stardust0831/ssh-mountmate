@@ -8,15 +8,21 @@ use iced::widget::{
     text_input,
 };
 use iced::{Center, Element, Fill, Length, Point, Size, Subscription, Task, Theme, window};
-use mountmate_core::connection::{ConnectionDraft, ConnectionSource, SecretAction};
+use mountmate_core::connection::{
+    ConnectionDraft, ConnectionSource, ImportAction, ImportStatus, SecretAction, SshImportPlan,
+};
 use mountmate_core::paths::AppPaths;
 use mountmate_core::process::MountStatus;
 use mountmate_core::service::MountService;
+use mountmate_core::ssh::{
+    default_ssh_config_path, prepare_managed_ssh_server, remove_managed_ssh_server,
+};
 use mountmate_core::storage::{self, read_json};
 use mountmate_core::transfer::TransferSnapshot;
 use mountmate_core::{
     APP_NAME, AuthMethod, ConnectionMethod, MountState, ServerConfig, Settings, VERSION,
 };
+use mountmate_platform::Platform;
 
 fn main() -> iced::Result {
     iced::daemon(App::new, App::update, App::view)
@@ -46,6 +52,9 @@ struct App {
     connection_draft: Option<ConnectionDraft>,
     settings_draft: Option<SettingsDraft>,
     editor_saving: bool,
+    ssh_import_loading: bool,
+    ssh_import_plan: Option<SshImportPlan>,
+    ssh_import_actions: Vec<ImportAction>,
     pending_delete: Option<String>,
     status: String,
 }
@@ -67,6 +76,7 @@ enum ConnectionField {
     KeyFile,
     RemotePath,
     Mountpoint,
+    SshConfigPath,
 }
 
 #[derive(Clone)]
@@ -253,9 +263,24 @@ enum Message {
     ConnectionMethodChanged(ConnectionMethod),
     PasswordChanged(SecretInput),
     KeyPassphraseChanged(SecretInput),
+    ManagedSshChanged(bool),
+    CopyKeyChanged(bool),
+    LoadSshConfig,
+    BrowseSshConfig,
+    SshConfigPicked(Option<PathBuf>),
+    BrowsePrivateKey,
+    PrivateKeyPicked(Option<PathBuf>),
+    SshImportLoaded {
+        config_path: PathBuf,
+        result: Result<SshImportPlan, String>,
+    },
+    SshHostSelected(String),
+    SshImportActionChanged(usize, ImportAction),
     SaveConnection,
     ConnectionSaved(Result<Vec<ServerConfig>, String>),
     SettingsFieldChanged(SettingsField, String),
+    BrowseCacheRoot,
+    CacheRootPicked(Option<PathBuf>),
     CacheModeChanged(CacheMode),
     StartupAllChanged(bool),
     AutoTransfersChanged(bool),
@@ -335,6 +360,9 @@ impl App {
             connection_draft: None,
             settings_draft: None,
             editor_saving: false,
+            ssh_import_loading: false,
+            ssh_import_plan: None,
+            ssh_import_actions: Vec::new(),
             pending_delete: None,
             status,
         };
@@ -409,7 +437,11 @@ impl App {
                 self.popup_order.retain(|popup| *popup != id);
             }
             Message::AddConnection => {
-                self.connection_draft = Some(ConnectionDraft::default());
+                let mut draft = ConnectionDraft::default();
+                draft.ssh_config_path = default_ssh_config_path().display().to_string();
+                self.connection_draft = Some(draft);
+                self.ssh_import_plan = None;
+                self.ssh_import_actions.clear();
                 self.screen = Screen::ConnectionEditor;
                 self.status = "New connection".into();
             }
@@ -422,6 +454,8 @@ impl App {
                 if !self.editor_saving {
                     self.connection_draft = None;
                     self.settings_draft = None;
+                    self.ssh_import_plan = None;
+                    self.ssh_import_actions.clear();
                     self.screen = Screen::Connections;
                     self.status = "Ready".into();
                 }
@@ -430,6 +464,17 @@ impl App {
                 if let Some(draft) = &mut self.connection_draft {
                     draft.source = source;
                     draft.apply_source_defaults();
+                    if matches!(
+                        source,
+                        ConnectionSource::SshConfig | ConnectionSource::SshConfigBatch
+                    ) {
+                        if draft.ssh_config_path.trim().is_empty() {
+                            draft.ssh_config_path = default_ssh_config_path().display().to_string();
+                        }
+                        return self.load_ssh_config();
+                    }
+                    self.ssh_import_plan = None;
+                    self.ssh_import_actions.clear();
                 }
             }
             Message::ConnectionFieldChanged(field, value) => {
@@ -446,6 +491,11 @@ impl App {
                         ConnectionField::KeyFile => draft.key_file = value,
                         ConnectionField::RemotePath => draft.remote_path = value,
                         ConnectionField::Mountpoint => draft.mountpoint = value,
+                        ConnectionField::SshConfigPath => {
+                            draft.ssh_config_path = value;
+                            self.ssh_import_plan = None;
+                            self.ssh_import_actions.clear();
+                        }
                     }
                 }
             }
@@ -470,6 +520,139 @@ impl App {
             Message::KeyPassphraseChanged(value) => {
                 if let Some(draft) = &mut self.connection_draft {
                     draft.key_passphrase = value.0;
+                }
+            }
+            Message::ManagedSshChanged(value) => {
+                if let Some(draft) = &mut self.connection_draft {
+                    draft.ssh_config_managed = value;
+                    if !value {
+                        draft.copy_key_to_ssh_dir = false;
+                    }
+                }
+            }
+            Message::CopyKeyChanged(value) => {
+                if let Some(draft) = &mut self.connection_draft {
+                    draft.copy_key_to_ssh_dir = value;
+                }
+            }
+            Message::LoadSshConfig => return self.load_ssh_config(),
+            Message::BrowseSshConfig => {
+                return Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Select SSH config")
+                            .pick_file()
+                            .await
+                            .map(|file| file.path().to_owned())
+                    },
+                    Message::SshConfigPicked,
+                );
+            }
+            Message::SshConfigPicked(Some(path)) => {
+                if let Some(draft) = &mut self.connection_draft {
+                    draft.ssh_config_path = path.display().to_string();
+                    self.ssh_import_plan = None;
+                    self.ssh_import_actions.clear();
+                    return self.load_ssh_config();
+                }
+            }
+            Message::SshConfigPicked(None) => {}
+            Message::BrowsePrivateKey => {
+                return Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Select private key")
+                            .pick_file()
+                            .await
+                            .map(|file| file.path().to_owned())
+                    },
+                    Message::PrivateKeyPicked,
+                );
+            }
+            Message::PrivateKeyPicked(Some(path)) => {
+                if let Some(draft) = &mut self.connection_draft {
+                    draft.key_file = path.display().to_string();
+                }
+            }
+            Message::PrivateKeyPicked(None) => {}
+            Message::SshImportLoaded {
+                config_path,
+                result,
+            } => {
+                self.ssh_import_loading = false;
+                let request_is_current = self.connection_draft.as_ref().is_some_and(|draft| {
+                    matches!(
+                        draft.source,
+                        ConnectionSource::SshConfig | ConnectionSource::SshConfigBatch
+                    ) && Path::new(draft.ssh_config_path.trim()) == config_path
+                });
+                if !request_is_current {
+                    return Task::none();
+                }
+                match result {
+                    Ok(plan) => {
+                        self.ssh_import_actions = plan
+                            .items
+                            .iter()
+                            .map(|item| item.default_action())
+                            .collect();
+                        if self
+                            .connection_draft
+                            .as_ref()
+                            .is_some_and(|draft| draft.source == ConnectionSource::SshConfig)
+                        {
+                            let selected = self
+                                .connection_draft
+                                .as_ref()
+                                .map(|draft| draft.host_alias.as_str())
+                                .unwrap_or_default();
+                            let server = plan
+                                .items
+                                .iter()
+                                .filter_map(|item| item.server.as_ref())
+                                .find(|server| server.host_alias == selected)
+                                .or_else(|| plan.items.iter().find_map(|item| item.server.as_ref()))
+                                .cloned();
+                            if let (Some(draft), Some(server)) =
+                                (&mut self.connection_draft, server)
+                            {
+                                draft.apply_imported_server(&server);
+                            }
+                        }
+                        let valid = plan
+                            .items
+                            .iter()
+                            .filter(|item| item.status != ImportStatus::Invalid)
+                            .count();
+                        self.status = format!("Loaded {valid} SSH Host entries");
+                        self.ssh_import_plan = Some(plan);
+                    }
+                    Err(error) => {
+                        self.ssh_import_plan = None;
+                        self.ssh_import_actions.clear();
+                        self.status = error;
+                    }
+                }
+            }
+            Message::SshHostSelected(host_alias) => {
+                let server = self
+                    .ssh_import_plan
+                    .as_ref()
+                    .and_then(|plan| {
+                        plan.items.iter().find_map(|item| {
+                            item.server
+                                .as_ref()
+                                .filter(|server| server.host_alias == host_alias)
+                        })
+                    })
+                    .cloned();
+                if let (Some(draft), Some(server)) = (&mut self.connection_draft, server) {
+                    draft.apply_imported_server(&server);
+                }
+            }
+            Message::SshImportActionChanged(index, action) => {
+                if let Some(selected) = self.ssh_import_actions.get_mut(index) {
+                    *selected = action;
                 }
             }
             Message::SaveConnection => return self.save_connection(),
@@ -499,6 +682,24 @@ impl App {
                     }
                 }
             }
+            Message::BrowseCacheRoot => {
+                return Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Select cache directory")
+                            .pick_folder()
+                            .await
+                            .map(|folder| folder.path().to_owned())
+                    },
+                    Message::CacheRootPicked,
+                );
+            }
+            Message::CacheRootPicked(Some(path)) => {
+                if let Some(draft) = &mut self.settings_draft {
+                    draft.cache_root = path.display().to_string();
+                }
+            }
+            Message::CacheRootPicked(None) => {}
             Message::CacheModeChanged(mode) => {
                 if let Some(draft) = &mut self.settings_draft {
                     draft.cache_mode = mode;
@@ -574,6 +775,13 @@ impl App {
                     && let Some(server) = self.servers.iter().find(|server| server.id == id)
                 {
                     self.connection_draft = Some(ConnectionDraft::from_server(server));
+                    if let Some(draft) = &mut self.connection_draft
+                        && draft.ssh_config_path.trim().is_empty()
+                    {
+                        draft.ssh_config_path = default_ssh_config_path().display().to_string();
+                    }
+                    self.ssh_import_plan = None;
+                    self.ssh_import_actions.clear();
                     self.screen = Screen::ConnectionEditor;
                     self.status = format!("Editing {}", server.display_name());
                 }
@@ -595,9 +803,16 @@ impl App {
                 self.editor_saving = true;
                 self.status = format!("Removing {id}...");
                 let paths = self.paths.clone();
+                let server = self.servers.iter().find(|server| server.id == id).cloned();
                 return Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
+                            if let Some(server) = server
+                                && server.ssh_config_managed
+                            {
+                                remove_managed_ssh_server(&server)
+                                    .map_err(|error| error.to_string())?;
+                            }
                             storage::remove_server(&paths, &id).map_err(|error| error.to_string())
                         })
                         .await
@@ -634,6 +849,13 @@ impl App {
         if self.editor_saving {
             return Task::none();
         }
+        if self
+            .connection_draft
+            .as_ref()
+            .is_some_and(|draft| draft.source == ConnectionSource::SshConfigBatch)
+        {
+            return self.save_ssh_batch();
+        }
         let Some(draft) = &self.connection_draft else {
             return Task::none();
         };
@@ -648,15 +870,101 @@ impl App {
         self.status = "Saving connection...".into();
         let service = self.service.clone();
         let paths = self.paths.clone();
+        let previous = draft
+            .editing_id
+            .as_deref()
+            .and_then(|id| self.servers.iter().find(|server| server.id == id))
+            .cloned();
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
                     let password = obscure_action(&service, &validated.password)?;
                     let key_passphrase = obscure_action(&service, &validated.key_passphrase)?;
-                    let server = validated
+                    let mut server = validated
                         .apply_secrets(password, key_passphrase)
                         .map_err(|error| error.to_string())?;
-                    storage::upsert_server(&paths, server).map_err(|error| error.to_string())
+                    prepare_managed_ssh_server(&mut server, &Platform)
+                        .map_err(|error| error.to_string())?;
+                    let servers = storage::upsert_server(&paths, server.clone())
+                        .map_err(|error| error.to_string())?;
+                    if let Some(previous) = previous
+                        && previous.ssh_config_managed
+                        && (!server.ssh_config_managed
+                            || previous.managed_ssh_config_path != server.managed_ssh_config_path)
+                    {
+                        remove_managed_ssh_server(&previous).map_err(|error| error.to_string())?;
+                    }
+                    Ok(servers)
+                })
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()))
+            },
+            Message::ConnectionSaved,
+        )
+    }
+
+    fn load_ssh_config(&mut self) -> Task<Message> {
+        if self.ssh_import_loading {
+            return Task::none();
+        }
+        let Some(draft) = &self.connection_draft else {
+            return Task::none();
+        };
+        let config_path = PathBuf::from(draft.ssh_config_path.trim());
+        if config_path.as_os_str().is_empty() {
+            self.status = "SSH config path is required".into();
+            return Task::none();
+        }
+        let existing = self.servers.clone();
+        let protected: HashSet<_> = existing
+            .iter()
+            .filter(|server| !self.can_modify(&server.id))
+            .map(|server| server.id.clone())
+            .collect();
+        let service = self.service.clone();
+        let result_path = config_path.clone();
+        self.ssh_import_loading = true;
+        self.status = format!("Loading {}...", config_path.display());
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    service
+                        .ssh_import_plan(&config_path, &existing, &protected)
+                        .map_err(|error| error.to_string())
+                })
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()))
+            },
+            move |result| Message::SshImportLoaded {
+                config_path: result_path.clone(),
+                result,
+            },
+        )
+    }
+
+    fn save_ssh_batch(&mut self) -> Task<Message> {
+        let Some(plan) = &self.ssh_import_plan else {
+            self.status = "Load an SSH config before importing".into();
+            return Task::none();
+        };
+        let updates = match plan.apply(&self.ssh_import_actions, &self.servers) {
+            Ok(updates) if !updates.is_empty() => updates,
+            Ok(_) => {
+                self.status = "Select at least one SSH Host to import or overwrite".into();
+                return Task::none();
+            }
+            Err(error) => {
+                self.status = error.to_string();
+                return Task::none();
+            }
+        };
+        self.editor_saving = true;
+        self.status = format!("Saving {} SSH connections...", updates.len());
+        let paths = self.paths.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    storage::upsert_servers(&paths, updates).map_err(|error| error.to_string())
                 })
                 .await
                 .unwrap_or_else(|error| Err(error.to_string()))
@@ -986,7 +1294,9 @@ impl App {
         let Some(draft) = &self.connection_draft else {
             return container(text("Connection editor unavailable")).into();
         };
-        let title = if draft.editing_id.is_some() {
+        let title = if draft.source == ConnectionSource::SshConfigBatch {
+            "Import SSH config"
+        } else if draft.editing_id.is_some() {
             "Edit connection"
         } else {
             "Add connection"
@@ -997,6 +1307,8 @@ impl App {
             button("Cancel").on_press_maybe((!self.editor_saving).then_some(Message::CancelEditor)),
             button(if self.editor_saving {
                 "Saving..."
+            } else if draft.source == ConnectionSource::SshConfigBatch {
+                "Import"
             } else {
                 "Save"
             })
@@ -1005,15 +1317,123 @@ impl App {
         .spacing(10)
         .align_y(Center);
 
+        let source_options: Vec<_> = ConnectionSource::ALL
+            .into_iter()
+            .filter(|source| {
+                draft.editing_id.is_none() || *source != ConnectionSource::SshConfigBatch
+            })
+            .collect();
         let source = labeled_control(
             "Source",
             pick_list(
-                ConnectionSource::ALL,
+                source_options,
                 Some(draft.source),
                 Message::ConnectionSourceChanged,
             )
             .width(Fill),
         );
+        let mut ssh_config_controls = column![].spacing(12);
+        if matches!(
+            draft.source,
+            ConnectionSource::SshConfig | ConnectionSource::SshConfigBatch
+        ) {
+            ssh_config_controls = ssh_config_controls.push(
+                row![
+                    connection_input(
+                        "SSH config file",
+                        &draft.ssh_config_path,
+                        ConnectionField::SshConfigPath,
+                    ),
+                    button("Browse").on_press(Message::BrowseSshConfig),
+                    button(if self.ssh_import_loading {
+                        "Loading..."
+                    } else {
+                        "Load"
+                    })
+                    .on_press_maybe(
+                        (!self.ssh_import_loading && !self.editor_saving)
+                            .then_some(Message::LoadSshConfig),
+                    ),
+                ]
+                .spacing(12)
+                .align_y(Center),
+            );
+        }
+        if draft.source == ConnectionSource::SshConfigBatch {
+            let mut items = column![].spacing(8);
+            if let Some(plan) = &self.ssh_import_plan {
+                for (index, item) in plan.items.iter().enumerate() {
+                    let allowed = if item.status == ImportStatus::New {
+                        vec![ImportAction::Import, ImportAction::Ignore]
+                    } else if item.can_overwrite {
+                        vec![ImportAction::Ignore, ImportAction::Overwrite]
+                    } else {
+                        vec![ImportAction::Ignore]
+                    };
+                    let action = self
+                        .ssh_import_actions
+                        .get(index)
+                        .copied()
+                        .unwrap_or(ImportAction::Ignore);
+                    let target = item
+                        .server
+                        .as_ref()
+                        .map(|server| format!("{}@{}:{}", server.user, server.host, server.port))
+                        .unwrap_or_else(|| item.reason.clone());
+                    let mut details = column![
+                        text(&item.host_alias).size(17),
+                        text(target).size(13),
+                        text(item.status.to_string()).size(12),
+                    ]
+                    .spacing(3)
+                    .width(Fill);
+                    if !item.reason.is_empty() {
+                        details = details.push(text(&item.reason).size(12));
+                    }
+                    items = items.push(
+                        container(
+                            row![
+                                details,
+                                pick_list(allowed, Some(action), move |action| {
+                                    Message::SshImportActionChanged(index, action)
+                                })
+                                .width(Length::Fixed(150.0)),
+                            ]
+                            .spacing(12)
+                            .align_y(Center),
+                        )
+                        .padding(12)
+                        .width(Fill)
+                        .style(container::rounded_box),
+                    );
+                }
+            }
+            let content = column![source, ssh_config_controls, items]
+                .spacing(16)
+                .max_width(900);
+            return editor_shell(header, scrollable(content), &self.status);
+        }
+        if draft.source == ConnectionSource::SshConfig {
+            let hosts: Vec<_> = self
+                .ssh_import_plan
+                .as_ref()
+                .into_iter()
+                .flat_map(|plan| &plan.items)
+                .filter_map(|item| item.server.as_ref())
+                .map(|server| server.host_alias.clone())
+                .collect();
+            if !hosts.is_empty() {
+                ssh_config_controls = ssh_config_controls.push(labeled_control(
+                    "SSH Host",
+                    pick_list(
+                        hosts,
+                        Some(draft.host_alias.clone()),
+                        Message::SshHostSelected,
+                    )
+                    .width(Fill),
+                ));
+            }
+        }
         let identity = row![
             connection_input("Name", &draft.name, ConnectionField::Name),
             connection_input(
@@ -1074,10 +1494,11 @@ impl App {
                 AuthMethod::Key => {
                     auth_fields = auth_fields.push(
                         row![
-                            connection_input(
+                            connection_file_input(
                                 "Private key file",
                                 &draft.key_file,
-                                ConnectionField::KeyFile
+                                ConnectionField::KeyFile,
+                                Message::BrowsePrivateKey,
                             ),
                             labeled_control(
                                 "Key passphrase",
@@ -1094,6 +1515,24 @@ impl App {
                 }
             }
         }
+        let mut managed_fields = column![].spacing(10);
+        if matches!(
+            draft.source,
+            ConnectionSource::Manual | ConnectionSource::SaiCluster
+        ) {
+            managed_fields = managed_fields.push(
+                checkbox(draft.ssh_config_managed)
+                    .label("Write a managed OpenSSH profile")
+                    .on_toggle(Message::ManagedSshChanged),
+            );
+            if draft.ssh_config_managed && draft.auth == AuthMethod::Key {
+                managed_fields = managed_fields.push(
+                    checkbox(draft.copy_key_to_ssh_dir)
+                        .label("Copy the private key into ~/.ssh")
+                        .on_toggle(Message::CopyKeyChanged),
+                );
+            }
+        }
         let paths = row![
             connection_input(
                 "Remote path ($HOME by default)",
@@ -1107,9 +1546,18 @@ impl App {
             ),
         ]
         .spacing(12);
-        let content = column![source, identity, target, transport, auth_fields, paths]
-            .spacing(16)
-            .max_width(900);
+        let content = column![
+            source,
+            ssh_config_controls,
+            identity,
+            target,
+            transport,
+            auth_fields,
+            managed_fields,
+            paths
+        ]
+        .spacing(16)
+        .max_width(900);
         editor_shell(header, scrollable(content), &self.status)
     }
 
@@ -1131,7 +1579,12 @@ impl App {
         .spacing(10)
         .align_y(Center);
         let cache_profile = row![
-            settings_input("Cache root", &draft.cache_root, SettingsField::CacheRoot),
+            settings_folder_input(
+                "Cache root",
+                &draft.cache_root,
+                SettingsField::CacheRoot,
+                Message::BrowseCacheRoot,
+            ),
             labeled_control(
                 "VFS cache mode",
                 pick_list(
@@ -1331,6 +1784,24 @@ fn connection_input<'a>(
     )
 }
 
+fn connection_file_input<'a>(
+    label: &'a str,
+    value: &'a str,
+    field: ConnectionField,
+    browse: Message,
+) -> iced::widget::Column<'a, Message> {
+    labeled_control(
+        label,
+        row![
+            text_input(label, value)
+                .on_input(move |value| Message::ConnectionFieldChanged(field, value))
+                .width(Fill),
+            button("Browse").on_press(browse),
+        ]
+        .spacing(8),
+    )
+}
+
 fn settings_input<'a>(
     label: &'a str,
     value: &'a str,
@@ -1341,6 +1812,24 @@ fn settings_input<'a>(
         text_input(label, value)
             .on_input(move |value| Message::SettingsFieldChanged(field, value))
             .width(Fill),
+    )
+}
+
+fn settings_folder_input<'a>(
+    label: &'a str,
+    value: &'a str,
+    field: SettingsField,
+    browse: Message,
+) -> iced::widget::Column<'a, Message> {
+    labeled_control(
+        label,
+        row![
+            text_input(label, value)
+                .on_input(move |value| Message::SettingsFieldChanged(field, value))
+                .width(Fill),
+            button("Browse").on_press(browse),
+        ]
+        .spacing(8),
     )
 }
 

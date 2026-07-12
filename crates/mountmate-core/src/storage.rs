@@ -30,6 +30,8 @@ pub enum StorageError {
     },
     #[error("timed out waiting for lock: {0}")]
     LockTimeout(PathBuf),
+    #[error("a connection for the same target already exists: {0}")]
+    DuplicateConnection(String),
 }
 
 pub fn load_servers(paths: &AppPaths) -> Result<Vec<ServerConfig>, StorageError> {
@@ -54,6 +56,7 @@ pub fn upsert_server(
 ) -> Result<Vec<ServerConfig>, StorageError> {
     let _lock = FileLock::acquire(&paths.servers_lock(), Duration::from_secs(10))?;
     let mut servers = load_servers(paths)?;
+    reject_duplicate_target(&servers, &server)?;
     if let Some(existing) = servers.iter_mut().find(|existing| existing.id == server.id) {
         *existing = server;
     } else {
@@ -61,6 +64,39 @@ pub fn upsert_server(
     }
     write_private_json(&paths.servers_file(), &servers)?;
     Ok(servers)
+}
+
+pub fn upsert_servers(
+    paths: &AppPaths,
+    updates: Vec<ServerConfig>,
+) -> Result<Vec<ServerConfig>, StorageError> {
+    let _lock = FileLock::acquire(&paths.servers_lock(), Duration::from_secs(10))?;
+    let mut servers = load_servers(paths)?;
+    for server in updates {
+        reject_duplicate_target(&servers, &server)?;
+        if let Some(existing) = servers.iter_mut().find(|existing| existing.id == server.id) {
+            *existing = server;
+        } else {
+            servers.push(server);
+        }
+    }
+    write_private_json(&paths.servers_file(), &servers)?;
+    Ok(servers)
+}
+
+fn reject_duplicate_target(
+    servers: &[ServerConfig],
+    candidate: &ServerConfig,
+) -> Result<(), StorageError> {
+    if let Some(duplicate) = servers.iter().find(|server| {
+        server.id != candidate.id && crate::connection::same_connection_target(server, candidate)
+    }) {
+        Err(StorageError::DuplicateConnection(
+            duplicate.display_name().into(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 pub fn remove_server(paths: &AppPaths, server_id: &str) -> Result<Vec<ServerConfig>, StorageError> {
@@ -237,6 +273,8 @@ mod tests {
             &[ServerConfig {
                 id: "alpha".into(),
                 name: "Alpha".into(),
+                host: "alpha.example".into(),
+                user: "alice".into(),
                 ..ServerConfig::default()
             }],
         )
@@ -246,6 +284,8 @@ mod tests {
             ServerConfig {
                 id: "beta".into(),
                 name: "Beta".into(),
+                host: "beta.example".into(),
+                user: "alice".into(),
                 ..ServerConfig::default()
             },
         )
@@ -253,6 +293,35 @@ mod tests {
         assert_eq!(servers.len(), 2);
         assert_eq!(load_servers(&paths).unwrap(), servers);
         assert_eq!(remove_server(&paths, "alpha").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn transactional_upsert_rechecks_duplicate_targets_under_lock() {
+        let temp = tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: temp.path().join("config"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            data_dir: temp.path().join("data"),
+        };
+        let alpha = ServerConfig {
+            id: "alpha".into(),
+            name: "Alpha".into(),
+            host: "host.example".into(),
+            user: "alice".into(),
+            port: "22".into(),
+            ..ServerConfig::default()
+        };
+        save_servers(&paths, std::slice::from_ref(&alpha)).unwrap();
+        let duplicate = ServerConfig {
+            id: "beta".into(),
+            name: "Beta".into(),
+            ..alpha
+        };
+        assert!(matches!(
+            upsert_server(&paths, duplicate),
+            Err(StorageError::DuplicateConnection(name)) if name == "Alpha"
+        ));
     }
 
     #[test]

@@ -12,16 +12,23 @@ pub enum ConnectionSource {
     #[default]
     Manual,
     SshConfig,
+    SshConfigBatch,
     SaiCluster,
 }
 
 impl ConnectionSource {
-    pub const ALL: [Self; 3] = [Self::Manual, Self::SshConfig, Self::SaiCluster];
+    pub const ALL: [Self; 4] = [
+        Self::Manual,
+        Self::SshConfig,
+        Self::SshConfigBatch,
+        Self::SaiCluster,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Manual => "manual",
             Self::SshConfig => "ssh_config",
+            Self::SshConfigBatch => "ssh_config_batch",
             Self::SaiCluster => "sai_cluster",
         }
     }
@@ -29,6 +36,7 @@ impl ConnectionSource {
     fn from_server(server: &ServerConfig) -> Self {
         match server.source.as_str() {
             "ssh_config" => Self::SshConfig,
+            "ssh_config_batch" => Self::SshConfigBatch,
             "sai_cluster" => Self::SaiCluster,
             _ => Self::Manual,
         }
@@ -40,6 +48,7 @@ impl fmt::Display for ConnectionSource {
         formatter.write_str(match self {
             Self::Manual => "Manual",
             Self::SshConfig => "SSH config",
+            Self::SshConfigBatch => "SSH config (batch)",
             Self::SaiCluster => "SAI cluster",
         })
     }
@@ -63,6 +72,7 @@ pub struct ConnectionDraft {
     pub mountpoint: String,
     pub ssh_config_managed: bool,
     pub copy_key_to_ssh_dir: bool,
+    pub ssh_config_path: String,
     existing: Option<ServerConfig>,
 }
 
@@ -106,6 +116,7 @@ impl Default for ConnectionDraft {
             mountpoint: String::new(),
             ssh_config_managed: false,
             copy_key_to_ssh_dir: false,
+            ssh_config_path: String::new(),
             existing: None,
         }
     }
@@ -130,6 +141,7 @@ impl ConnectionDraft {
             mountpoint: server.mountpoint.clone(),
             ssh_config_managed: server.ssh_config_managed,
             copy_key_to_ssh_dir: server.copy_key_to_ssh_dir,
+            ssh_config_path: server.ssh_config_path.clone(),
             existing: Some(server.clone()),
         }
     }
@@ -140,6 +152,8 @@ impl ConnectionDraft {
             self.port = "12022".into();
             self.auth = AuthMethod::Key;
             self.connection_method = ConnectionMethod::Native;
+            self.ssh_config_managed = true;
+            self.copy_key_to_ssh_dir = true;
             self.apply_sai_name();
         }
     }
@@ -160,6 +174,19 @@ impl ConnectionDraft {
         }
     }
 
+    pub fn apply_imported_server(&mut self, server: &ServerConfig) {
+        self.source = ConnectionSource::SshConfig;
+        self.name = server.name.clone();
+        self.host_alias = server.host_alias.clone();
+        self.host = server.host.clone();
+        self.user = server.user.clone();
+        self.port = server.port.clone();
+        self.auth = server.auth;
+        self.key_file = server.key_file.clone();
+        self.connection_method = server.connection_method;
+        self.ssh_config_path = server.ssh_config_path.clone();
+    }
+
     pub fn validate(&self, servers: &[ServerConfig]) -> Result<ValidatedConnection, DraftError> {
         let name = required_scalar(&self.name, "Name")?;
         let host = required_scalar(&self.host, "IP/Host")?;
@@ -172,18 +199,28 @@ impl ConnectionDraft {
             self.auth
         };
         let key_file = self.key_file.trim().to_owned();
-        if connection_method == ConnectionMethod::Native && auth == AuthMethod::Key {
+        if connection_method == ConnectionMethod::Native
+            && auth == AuthMethod::Key
+            && self.source != ConnectionSource::SshConfig
+        {
             validate_private_key(&key_file)?;
         }
         let mountpoint = normalize_mountpoint(&self.mountpoint)?;
         let remote_path = normalize_remote_path(&self.remote_path);
         let mut host_alias = self.host_alias.trim().to_owned();
-        let ssh_config_managed =
-            self.ssh_config_managed && self.source != ConnectionSource::SshConfig;
+        let ssh_config_managed = self.ssh_config_managed
+            && !matches!(
+                self.source,
+                ConnectionSource::SshConfig | ConnectionSource::SshConfigBatch
+            );
         if ssh_config_managed && host_alias.is_empty() {
             host_alias = sanitize_id(&name);
         }
-        if self.source == ConnectionSource::SshConfig || ssh_config_managed {
+        if matches!(
+            self.source,
+            ConnectionSource::SshConfig | ConnectionSource::SshConfigBatch
+        ) || ssh_config_managed
+        {
             validate_host_alias(&host_alias)?;
         }
 
@@ -197,7 +234,10 @@ impl ConnectionDraft {
         let mut server = ServerConfig {
             id,
             name,
-            mode: if self.source == ConnectionSource::SshConfig {
+            mode: if matches!(
+                self.source,
+                ConnectionSource::SshConfig | ConnectionSource::SshConfigBatch
+            ) {
                 "ssh_config".into()
             } else {
                 "manual".into()
@@ -230,6 +270,14 @@ impl ConnectionDraft {
                 .existing
                 .as_ref()
                 .map_or_else(String::new, |server| server.managed_ssh_config_path.clone()),
+            ssh_config_path: if matches!(
+                self.source,
+                ConnectionSource::SshConfig | ConnectionSource::SshConfigBatch
+            ) {
+                self.ssh_config_path.trim().into()
+            } else {
+                String::new()
+            },
         };
         server.normalize();
 
@@ -350,6 +398,10 @@ pub enum DraftError {
     PasswordRequired,
     #[error("A secret could not be safely obscured")]
     SecretNotObscured,
+    #[error("The SSH import plan is inconsistent")]
+    InvalidImportPlan,
+    #[error("The selected import action is not allowed for SSH Host {0}")]
+    InvalidImportAction(String),
 }
 
 fn required_scalar(value: &str, field: &'static str) -> Result<String, DraftError> {
@@ -454,6 +506,10 @@ fn connection_fingerprint(server: &ServerConfig) -> (String, String, String, Str
     )
 }
 
+pub fn same_connection_target(left: &ServerConfig, right: &ServerConfig) -> bool {
+    connection_fingerprint(left) == connection_fingerprint(right)
+}
+
 fn same_password_target(existing: &ServerConfig, candidate: &ServerConfig) -> bool {
     existing.source == candidate.source
         && existing.host_alias == candidate.host_alias
@@ -478,6 +534,231 @@ fn unique_id(base: &str, servers: &[ServerConfig]) -> String {
         .map(|index| format!("{base}-{index}"))
         .find(|candidate| !servers.iter().any(|server| &server.id == candidate))
         .expect("an unused numeric connection suffix always exists")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportStatus {
+    New,
+    Same,
+    SameHost,
+    SameTarget,
+    Invalid,
+}
+
+impl fmt::Display for ImportStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::New => "New",
+            Self::Same => "Same configuration",
+            Self::SameHost => "Same SSH Host",
+            Self::SameTarget => "Same target",
+            Self::Invalid => "Invalid",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportAction {
+    Ignore,
+    Import,
+    Overwrite,
+}
+
+impl ImportAction {
+    pub const ALL: [Self; 3] = [Self::Ignore, Self::Import, Self::Overwrite];
+}
+
+impl fmt::Display for ImportAction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Ignore => "Ignore",
+            Self::Import => "Import",
+            Self::Overwrite => "Overwrite",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshImportItem {
+    pub host_alias: String,
+    pub status: ImportStatus,
+    pub reason: String,
+    pub server: Option<ServerConfig>,
+    pub matched_id: Option<String>,
+    pub matched_name: Option<String>,
+    pub can_overwrite: bool,
+    pub overwrite_protected: bool,
+}
+
+impl SshImportItem {
+    pub fn default_action(&self) -> ImportAction {
+        if self.status == ImportStatus::New {
+            ImportAction::Import
+        } else {
+            ImportAction::Ignore
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SshImportPlan {
+    pub items: Vec<SshImportItem>,
+}
+
+impl SshImportPlan {
+    pub fn apply(
+        &self,
+        actions: &[ImportAction],
+        existing: &[ServerConfig],
+    ) -> Result<Vec<ServerConfig>, DraftError> {
+        if actions.len() != self.items.len() {
+            return Err(DraftError::InvalidImportPlan);
+        }
+        let mut selected = Vec::new();
+        for (item, action) in self.items.iter().zip(actions) {
+            match action {
+                ImportAction::Ignore => {}
+                ImportAction::Import if item.status == ImportStatus::New => {
+                    if let Some(server) = &item.server {
+                        selected.push(server.clone());
+                    }
+                }
+                ImportAction::Overwrite if item.can_overwrite => {
+                    let Some(server) = &item.server else {
+                        return Err(DraftError::InvalidImportPlan);
+                    };
+                    let Some(existing) = item
+                        .matched_id
+                        .as_deref()
+                        .and_then(|id| existing.iter().find(|server| server.id == id))
+                    else {
+                        return Err(DraftError::InvalidImportPlan);
+                    };
+                    selected.push(merge_imported_connection(existing, server));
+                }
+                _ => return Err(DraftError::InvalidImportAction(item.host_alias.clone())),
+            }
+        }
+        Ok(selected)
+    }
+}
+
+pub fn plan_ssh_imports(
+    imports: Vec<(String, Result<ServerConfig, String>)>,
+    existing: &[ServerConfig],
+    protected_ids: &std::collections::HashSet<String>,
+) -> SshImportPlan {
+    let mut known = existing.to_vec();
+    let mut items = Vec::with_capacity(imports.len());
+    for (host_alias, result) in imports {
+        let mut server = match result {
+            Ok(server) => server,
+            Err(reason) => {
+                items.push(SshImportItem {
+                    host_alias,
+                    status: ImportStatus::Invalid,
+                    reason,
+                    server: None,
+                    matched_id: None,
+                    matched_name: None,
+                    can_overwrite: false,
+                    overwrite_protected: false,
+                });
+                continue;
+            }
+        };
+        server.id = unique_id(&sanitize_id(server.display_name()), &known);
+        let duplicate = import_duplicate(&server, &known);
+        let (status, matched) = duplicate.map_or((ImportStatus::New, None), |(status, server)| {
+            (status, Some(server))
+        });
+        let existing_match =
+            matched.filter(|matched| existing.iter().any(|item| item.id == matched.id));
+        let overwrite_protected =
+            existing_match.is_some_and(|matched| protected_ids.contains(&matched.id));
+        let can_overwrite = existing_match.is_some() && !overwrite_protected;
+        items.push(SshImportItem {
+            host_alias,
+            status,
+            reason: import_reason(status, overwrite_protected).into(),
+            server: Some(server.clone()),
+            matched_id: existing_match.map(|matched| matched.id.clone()),
+            matched_name: existing_match.map(|matched| matched.display_name().into()),
+            can_overwrite,
+            overwrite_protected,
+        });
+        if status == ImportStatus::New {
+            known.push(server);
+        }
+    }
+    SshImportPlan { items }
+}
+
+fn import_duplicate<'a>(
+    candidate: &ServerConfig,
+    known: &'a [ServerConfig],
+) -> Option<(ImportStatus, &'a ServerConfig)> {
+    let alias = candidate.host_alias.trim().to_ascii_lowercase();
+    let target = import_target(candidate);
+    known
+        .iter()
+        .find(|server| {
+            server.host_alias.trim().eq_ignore_ascii_case(&alias) && import_target(server) == target
+        })
+        .map(|server| (ImportStatus::Same, server))
+        .or_else(|| {
+            (!alias.is_empty()).then(|| {
+                known
+                    .iter()
+                    .find(|server| server.host_alias.trim().eq_ignore_ascii_case(&alias))
+                    .map(|server| (ImportStatus::SameHost, server))
+            })?
+        })
+        .or_else(|| {
+            known
+                .iter()
+                .find(|server| import_target(server) == target)
+                .map(|server| (ImportStatus::SameTarget, server))
+        })
+}
+
+fn import_target(server: &ServerConfig) -> (String, String, String) {
+    (
+        server.host.trim().to_ascii_lowercase(),
+        server.user.trim().into(),
+        normalize_port(&server.port).unwrap_or_else(|| server.port.trim().into()),
+    )
+}
+
+fn import_reason(status: ImportStatus, protected: bool) -> &'static str {
+    if protected {
+        return "The matching connection is mounted or busy";
+    }
+    match status {
+        ImportStatus::New => "",
+        ImportStatus::Same => "The same configuration already exists",
+        ImportStatus::SameHost => "The same SSH Host already exists",
+        ImportStatus::SameTarget => "The same HostName, user, and port already exist",
+        ImportStatus::Invalid => "The SSH Host could not be resolved",
+    }
+}
+
+fn merge_imported_connection(existing: &ServerConfig, imported: &ServerConfig) -> ServerConfig {
+    ServerConfig {
+        id: existing.id.clone(),
+        name: imported.name.clone(),
+        mode: imported.mode.clone(),
+        source: imported.source.clone(),
+        host_alias: imported.host_alias.clone(),
+        host: imported.host.clone(),
+        user: imported.user.clone(),
+        port: imported.port.clone(),
+        auth: imported.auth,
+        key_file: imported.key_file.clone(),
+        connection_method: imported.connection_method,
+        ssh_config_path: imported.ssh_config_path.clone(),
+        ..existing.clone()
+    }
 }
 
 fn expand_home(path: &Path) -> PathBuf {
@@ -620,5 +901,85 @@ mod tests {
             ..ConnectionDraft::default()
         };
         assert_eq!(draft.validate(&[existing]).unwrap().server.id, "Alpha-2");
+    }
+
+    #[test]
+    fn ssh_import_plan_marks_duplicates_and_protects_mounted_overwrites() {
+        let existing = ServerConfig {
+            id: "alpha".into(),
+            name: "Existing Alpha".into(),
+            mode: "ssh_config".into(),
+            source: "ssh_config".into(),
+            host_alias: "alpha".into(),
+            host: "alpha.example".into(),
+            user: "alice".into(),
+            port: "22".into(),
+            ..ServerConfig::default()
+        };
+        let imported = ServerConfig {
+            name: "alpha".into(),
+            mode: "ssh_config".into(),
+            source: "ssh_config".into(),
+            host_alias: "alpha".into(),
+            host: "alpha.example".into(),
+            user: "alice".into(),
+            port: "22".into(),
+            ..ServerConfig::default()
+        };
+        let protected = std::collections::HashSet::from(["alpha".into()]);
+        let plan = plan_ssh_imports(
+            vec![("alpha".into(), Ok(imported))],
+            std::slice::from_ref(&existing),
+            &protected,
+        );
+        assert_eq!(plan.items[0].status, ImportStatus::Same);
+        assert!(plan.items[0].overwrite_protected);
+        assert!(!plan.items[0].can_overwrite);
+        assert_eq!(
+            plan.apply(&[ImportAction::Overwrite], &[existing]),
+            Err(DraftError::InvalidImportAction("alpha".into()))
+        );
+    }
+
+    #[test]
+    fn ssh_import_overwrite_preserves_profile_specific_settings() {
+        let existing = ServerConfig {
+            id: "alpha".into(),
+            name: "Old".into(),
+            host_alias: "alpha".into(),
+            host: "old.example".into(),
+            user: "alice".into(),
+            port: "22".into(),
+            remote_path: "/project".into(),
+            mountpoint: "Z:".into(),
+            cache_mode: "writes".into(),
+            ..ServerConfig::default()
+        };
+        let imported = ServerConfig {
+            name: "Alpha".into(),
+            mode: "ssh_config".into(),
+            source: "ssh_config".into(),
+            host_alias: "alpha".into(),
+            host: "new.example".into(),
+            user: "alice".into(),
+            port: "22".into(),
+            ssh_config_path: "/tmp/custom-config".into(),
+            ..ServerConfig::default()
+        };
+        let plan = plan_ssh_imports(
+            vec![("alpha".into(), Ok(imported))],
+            std::slice::from_ref(&existing),
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(plan.items[0].status, ImportStatus::SameHost);
+        let merged = plan
+            .apply(&[ImportAction::Overwrite], &[existing])
+            .unwrap()
+            .remove(0);
+        assert_eq!(merged.host, "new.example");
+        assert_eq!(merged.remote_path, "/project");
+        assert_eq!(merged.mountpoint, "Z:");
+        assert_eq!(merged.cache_mode, "writes");
+        assert_eq!(merged.ssh_config_path, "/tmp/custom-config");
     }
 }

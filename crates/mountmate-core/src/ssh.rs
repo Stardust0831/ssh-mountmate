@@ -55,6 +55,10 @@ pub enum SshError {
     InvalidPort(String),
     #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error("SSH permission update failed for {path}: {message}")]
+    Permissions { path: PathBuf, message: String },
+    #[error("invalid private key file: {0}")]
+    InvalidPrivateKey(PathBuf),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,6 +200,252 @@ pub fn list_ssh_config_hosts(config_path: &Path) -> Result<Vec<SshHostEntry>, Ss
     let mut seen = HashSet::new();
     visit_ssh_config(config_path, &mut seen, &mut entries)?;
     Ok(entries)
+}
+
+pub fn default_ssh_config_path() -> PathBuf {
+    directories::BaseDirs::new()
+        .map(|directories| directories.home_dir().join(".ssh/config"))
+        .unwrap_or_else(|| PathBuf::from(".ssh/config"))
+}
+
+pub trait SshPermissionControl {
+    fn restrict_private_path(&self, path: &Path, directory: bool) -> Result<(), String>;
+}
+
+pub fn prepare_managed_ssh_server(
+    server: &mut crate::ServerConfig,
+    permissions: &dyn SshPermissionControl,
+) -> Result<(), SshError> {
+    let ssh_dir = default_ssh_config_path()
+        .parent()
+        .unwrap_or_else(|| Path::new(".ssh"))
+        .to_owned();
+    prepare_managed_ssh_server_at(server, permissions, &ssh_dir)
+}
+
+fn prepare_managed_ssh_server_at(
+    server: &mut crate::ServerConfig,
+    permissions: &dyn SshPermissionControl,
+    ssh_dir: &Path,
+) -> Result<(), SshError> {
+    if !server.ssh_config_managed {
+        return Ok(());
+    }
+    validate_host_alias(&server.host_alias)?;
+    validate_config_scalar(&server.host, "HostName")?;
+    validate_config_scalar(&server.user, "User")?;
+    validate_port(&server.port)?;
+
+    let managed_dir = ssh_dir.join("ssh-mountmate.d");
+    let lock_path = ssh_dir.join("ssh-mountmate.lock");
+    fs::create_dir_all(&managed_dir).map_err(|source| SshError::Io {
+        path: managed_dir.clone(),
+        source,
+    })?;
+    restrict_path(permissions, ssh_dir, true)?;
+    restrict_path(permissions, &managed_dir, true)?;
+    let _lock = FileLock::acquire(&lock_path, Duration::from_secs(30))?;
+
+    if server.copy_key_to_ssh_dir {
+        server.key_file = copy_private_key(
+            Path::new(&server.key_file),
+            ssh_dir,
+            &server.host_alias,
+            permissions,
+        )?
+        .display()
+        .to_string();
+    } else if !server.key_file.trim().is_empty() && !expand_home(&server.key_file).is_file() {
+        return Err(SshError::InvalidPrivateKey(expand_home(&server.key_file)));
+    }
+
+    ensure_managed_include(ssh_dir, permissions)?;
+    let target = managed_dir.join(format!("{}.conf", safe_ssh_filename(&server.host_alias)));
+    let mut content = format!(
+        "# Managed by SSH MountMate.\n# Prefer editing this Host from the SSH MountMate app.\nHost {}\n    HostName {}\n    User {}\n    Port {}\n",
+        quote_ssh_value(&server.host_alias),
+        quote_ssh_value(&server.host),
+        quote_ssh_value(&server.user),
+        server.port,
+    );
+    if !server.key_file.trim().is_empty() {
+        content.push_str(&format!(
+            "    IdentityFile {}\n    IdentitiesOnly yes\n",
+            quote_ssh_value(&home_relative_ssh_path(Path::new(&server.key_file)))
+        ));
+    }
+    atomic_write(&target, content.as_bytes())?;
+    restrict_path(permissions, &target, false)?;
+    server.managed_ssh_config_path = target.display().to_string();
+    Ok(())
+}
+
+pub fn remove_managed_ssh_server(server: &crate::ServerConfig) -> Result<(), SshError> {
+    let managed_dir = default_ssh_config_path()
+        .parent()
+        .unwrap_or_else(|| Path::new(".ssh"))
+        .join("ssh-mountmate.d");
+    let candidates = [
+        (!server.managed_ssh_config_path.trim().is_empty())
+            .then(|| expand_home(&server.managed_ssh_config_path)),
+        (!server.host_alias.trim().is_empty())
+            .then(|| managed_dir.join(format!("{}.conf", safe_ssh_filename(&server.host_alias)))),
+    ];
+    let managed_identity = fs::canonicalize(&managed_dir).unwrap_or(managed_dir);
+    for candidate in candidates.into_iter().flatten() {
+        let identity = fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+        if identity.parent() == Some(managed_identity.as_path()) {
+            match fs::remove_file(&candidate) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(SshError::Io {
+                        path: candidate,
+                        source,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn restrict_path(
+    permissions: &dyn SshPermissionControl,
+    path: &Path,
+    directory: bool,
+) -> Result<(), SshError> {
+    permissions
+        .restrict_private_path(path, directory)
+        .map_err(|message| SshError::Permissions {
+            path: path.to_owned(),
+            message,
+        })
+}
+
+fn ensure_managed_include(
+    ssh_dir: &Path,
+    permissions: &dyn SshPermissionControl,
+) -> Result<(), SshError> {
+    let config = ssh_dir.join("config");
+    let include = "Include ~/.ssh/ssh-mountmate.d/*.conf";
+    let mut content = match fs::read_to_string(&config) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(source) => {
+            return Err(SshError::Io {
+                path: config,
+                source,
+            });
+        }
+    };
+    if !content
+        .lines()
+        .any(|line| line.trim().eq_ignore_ascii_case(include))
+    {
+        if !content.is_empty() && !content.ends_with(['\n', '\r']) {
+            content.push('\n');
+        }
+        content.push_str(include);
+        content.push('\n');
+        atomic_write(&config, content.as_bytes())?;
+    }
+    restrict_path(permissions, &config, false)
+}
+
+fn copy_private_key(
+    source: &Path,
+    ssh_dir: &Path,
+    host_alias: &str,
+    permissions: &dyn SshPermissionControl,
+) -> Result<PathBuf, SshError> {
+    let source = expand_home(&source.to_string_lossy());
+    if !source.is_file()
+        || source
+            .extension()
+            .is_some_and(|value| value.eq_ignore_ascii_case("pub"))
+    {
+        return Err(SshError::InvalidPrivateKey(source));
+    }
+    let stem = safe_ssh_filename(host_alias);
+    let suffix = source
+        .extension()
+        .map(|extension| format!(".{}", extension.to_string_lossy()))
+        .unwrap_or_default();
+    let mut target = ssh_dir.join(format!("{stem}{suffix}"));
+    if fs::canonicalize(&source).ok() != fs::canonicalize(&target).ok() && target.exists() {
+        target = (2..1000)
+            .map(|index| ssh_dir.join(format!("{stem}-{index}{suffix}")))
+            .find(|candidate| !candidate.exists())
+            .unwrap_or_else(|| {
+                ssh_dir.join(format!("{stem}-{}{suffix}", uuid::Uuid::new_v4().simple()))
+            });
+    }
+    if fs::canonicalize(&source).ok() != fs::canonicalize(&target).ok() {
+        let content = fs::read(&source).map_err(|source_error| SshError::Io {
+            path: source.clone(),
+            source: source_error,
+        })?;
+        atomic_write(&target, &content)?;
+    }
+    restrict_path(permissions, &target, false)?;
+    Ok(target)
+}
+
+fn validate_config_scalar(value: &str, field: &str) -> Result<(), SshError> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.starts_with('-')
+        || value
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+    {
+        Err(SshError::Command(format!("invalid {field}")))
+    } else {
+        Ok(())
+    }
+}
+
+fn safe_ssh_filename(value: &str) -> String {
+    let value: String = value
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let value = value.trim_matches(['.', '_', '-']);
+    if value.is_empty() {
+        format!("host-{}", &uuid::Uuid::new_v4().simple().to_string()[..8])
+    } else {
+        value.into()
+    }
+}
+
+fn quote_ssh_value(value: &str) -> String {
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|character| character.is_whitespace() || matches!(character, '"' | '\\'))
+    {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        value.into()
+    }
+}
+
+fn home_relative_ssh_path(path: &Path) -> String {
+    let path = expand_home(&path.to_string_lossy());
+    if let Some(home) = directories::BaseDirs::new()
+        && let Ok(relative) = path.strip_prefix(home.home_dir())
+    {
+        return format!("~/{}", relative.to_string_lossy().replace('\\', "/"));
+    }
+    path.to_string_lossy().replace('\\', "/")
 }
 
 fn visit_ssh_config(
@@ -518,11 +768,23 @@ pub fn readable_file(path: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
 
     use tempfile::tempdir;
 
     use super::*;
+
+    #[derive(Default)]
+    struct FakePermissions {
+        paths: RefCell<Vec<(PathBuf, bool)>>,
+    }
+
+    impl SshPermissionControl for FakePermissions {
+        fn restrict_private_path(&self, path: &Path, directory: bool) -> Result<(), String> {
+            self.paths.borrow_mut().push((path.to_owned(), directory));
+            Ok(())
+        }
+    }
 
     fn paths(root: &Path) -> AppPaths {
         AppPaths {
@@ -668,6 +930,54 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn managed_ssh_profile_is_idempotent_and_copies_private_key() {
+        let temp = tempdir().unwrap();
+        let ssh_dir = temp.path().join(".ssh");
+        let source = temp.path().join("source key");
+        fs::write(&source, "PRIVATE KEY").unwrap();
+        let permissions = FakePermissions::default();
+        let mut server = crate::ServerConfig {
+            id: "alpha".into(),
+            name: "Alpha".into(),
+            host_alias: "alpha".into(),
+            host: "alpha.example".into(),
+            user: "alice".into(),
+            port: "2202".into(),
+            key_file: source.display().to_string(),
+            ssh_config_managed: true,
+            copy_key_to_ssh_dir: true,
+            ..crate::ServerConfig::default()
+        };
+
+        prepare_managed_ssh_server_at(&mut server, &permissions, &ssh_dir).unwrap();
+        prepare_managed_ssh_server_at(&mut server, &permissions, &ssh_dir).unwrap();
+
+        let config = fs::read_to_string(ssh_dir.join("config")).unwrap();
+        assert_eq!(
+            config
+                .lines()
+                .filter(|line| line.starts_with("Include "))
+                .count(),
+            1
+        );
+        let managed = PathBuf::from(&server.managed_ssh_config_path);
+        let content = fs::read_to_string(&managed).unwrap();
+        assert!(content.contains("Host alpha"));
+        assert!(content.contains("HostName alpha.example"));
+        assert!(content.contains("Port 2202"));
+        assert!(content.contains("IdentitiesOnly yes"));
+        assert!(Path::new(&server.key_file).starts_with(&ssh_dir));
+        assert_eq!(fs::read(&server.key_file).unwrap(), b"PRIVATE KEY");
+        assert!(
+            permissions
+                .paths
+                .borrow()
+                .iter()
+                .any(|(path, directory)| { path == &managed && !directory })
+        );
     }
 
     #[test]

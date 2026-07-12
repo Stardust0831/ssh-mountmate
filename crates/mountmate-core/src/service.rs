@@ -8,6 +8,7 @@ use std::os::windows::process::CommandExt;
 
 use thiserror::Error;
 
+use crate::connection::{SshImportPlan, plan_ssh_imports};
 use crate::mountpoint::{HOME_MOUNTPOINT_VALUE, MountpointAllocator, SystemMountpointProbe};
 use crate::paths::AppPaths;
 use crate::process::MountStatus;
@@ -19,7 +20,8 @@ use crate::runtime::{
     SystemProcessControl,
 };
 use crate::ssh::{
-    KnownHostsManager, ResolvedSshConfig, SshError, readable_file, resolve_ssh_config,
+    KnownHostsManager, RequestedTransport, ResolvedSshConfig, SshError, SshTransport,
+    choose_transport, list_ssh_config_hosts, readable_file, resolve_ssh_config,
     select_readable_known_hosts,
 };
 use crate::storage::{StorageError, read_json};
@@ -158,12 +160,41 @@ impl MountService {
         }
     }
 
+    pub fn ssh_import_plan(
+        &self,
+        config_path: &Path,
+        existing: &[ServerConfig],
+        protected_ids: &std::collections::HashSet<String>,
+    ) -> Result<SshImportPlan, ServiceError> {
+        let entries = list_ssh_config_hosts(config_path)?;
+        let mut seen = std::collections::HashSet::new();
+        let imports = entries
+            .into_iter()
+            .filter(|entry| seen.insert(entry.host.to_ascii_lowercase()))
+            .map(|entry| {
+                let host_alias = entry.host;
+                let server = resolve_ssh_config(Path::new("ssh"), &host_alias, Some(config_path))
+                    .map_err(|error| error.to_string())
+                    .and_then(|resolved| {
+                        imported_ssh_server(&host_alias, config_path, &resolved, cfg!(windows))
+                    });
+                (host_alias, server)
+            })
+            .collect();
+        Ok(plan_ssh_imports(imports, existing, protected_ids))
+    }
+
     fn ensure_remote(&self, server: &ServerConfig) -> Result<(), ServiceError> {
         let resolved = if server.mode == "ssh_config"
             && server.connection_method != ConnectionMethod::Openssh
         {
-            let config = (!server.managed_ssh_config_path.trim().is_empty())
-                .then(|| expand_home_path(Path::new(&server.managed_ssh_config_path)));
+            let config_value = if !server.ssh_config_path.trim().is_empty() {
+                &server.ssh_config_path
+            } else {
+                &server.managed_ssh_config_path
+            };
+            let config = (!config_value.trim().is_empty())
+                .then(|| expand_home_path(Path::new(config_value)));
             Some(resolve_ssh_config(
                 Path::new("ssh"),
                 &server.host_alias,
@@ -247,6 +278,41 @@ impl MountService {
     }
 }
 
+fn imported_ssh_server(
+    host_alias: &str,
+    config_path: &Path,
+    resolved: &ResolvedSshConfig,
+    windows: bool,
+) -> Result<ServerConfig, String> {
+    let host = resolved.first("hostname", host_alias).trim();
+    let user = resolved.first("user", "").trim();
+    let port = crate::model::normalize_port(resolved.first("port", "22"))
+        .ok_or_else(|| "invalid SSH port".to_owned())?;
+    if host.is_empty() || user.is_empty() {
+        return Err("missing HostName or User".into());
+    }
+    let connection_method = match choose_transport(RequestedTransport::Auto, resolved, windows) {
+        SshTransport::Native => ConnectionMethod::Native,
+        SshTransport::Openssh => ConnectionMethod::Openssh,
+    };
+    Ok(ServerConfig {
+        name: host_alias.into(),
+        mode: "ssh_config".into(),
+        source: "ssh_config".into(),
+        host_alias: host_alias.into(),
+        host: host.into(),
+        user: user.into(),
+        port,
+        auth: crate::AuthMethod::Key,
+        key_file: resolved
+            .first_existing_path("identityfile")
+            .map_or_else(String::new, |path| path.display().to_string()),
+        connection_method,
+        ssh_config_path: config_path.display().to_string(),
+        ..ServerConfig::default()
+    })
+}
+
 fn fallback_known_hosts(
     paths: &AppPaths,
     resolved: Option<&ResolvedSshConfig>,
@@ -270,4 +336,39 @@ fn expand_home_path(path: &Path) -> PathBuf {
         };
     }
     path.to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolved_ssh_host_becomes_a_self_contained_import_profile() {
+        let resolved = ResolvedSshConfig::parse(
+            "hostname login.example\nuser alice\nport 2202\nidentityfile /missing/key\n",
+        );
+        let server = imported_ssh_server(
+            "cluster",
+            Path::new("/tmp/custom ssh config"),
+            &resolved,
+            true,
+        )
+        .unwrap();
+        assert_eq!(server.mode, "ssh_config");
+        assert_eq!(server.host, "login.example");
+        assert_eq!(server.user, "alice");
+        assert_eq!(server.port, "2202");
+        assert_eq!(server.connection_method, ConnectionMethod::Native);
+        assert_eq!(server.ssh_config_path, "/tmp/custom ssh config");
+        assert!(server.key_file.is_empty());
+    }
+
+    #[test]
+    fn proxy_configuration_selects_openssh_transport() {
+        let resolved = ResolvedSshConfig::parse(
+            "hostname login.example\nuser alice\nport 22\nproxyjump gateway\n",
+        );
+        let server = imported_ssh_server("cluster", Path::new("config"), &resolved, true).unwrap();
+        assert_eq!(server.connection_method, ConnectionMethod::Openssh);
+    }
 }

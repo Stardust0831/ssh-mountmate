@@ -122,6 +122,8 @@ pub struct ServerConfig {
     pub copy_key_to_ssh_dir: bool,
     #[serde(default)]
     pub managed_ssh_config_path: String,
+    #[serde(default)]
+    pub ssh_config_path: String,
 }
 
 fn default_mode() -> String {
@@ -155,6 +157,7 @@ impl Default for ServerConfig {
             ssh_config_managed: false,
             copy_key_to_ssh_dir: false,
             managed_ssh_config_path: String::new(),
+            ssh_config_path: String::new(),
         }
     }
 }
