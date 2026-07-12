@@ -302,6 +302,9 @@ fn handle_connection(
             return Err("non-loopback client".into());
         }
         stream
+            .set_nonblocking(false)
+            .map_err(|error| error.to_string())?;
+        stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .map_err(|error| error.to_string())?;
         stream
