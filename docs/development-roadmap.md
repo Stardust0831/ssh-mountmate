@@ -116,6 +116,18 @@ Planned design constraints:
   records the completed upload and final remote rename. Per the prerelease decision, this timing
   race is deferred and explicitly non-blocking only for the macOS ARM64 release job; it remains
   visible as a warning and macOS x64 remains blocking.
+- Final rewrite run
+  [29266212614](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29266212614) passed quality
+  and all six strict native jobs on commit `ca66e5c`; macOS ARM64 passed on this run.
+- Final non-publishing release run
+  [29266223640](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29266223640) passed quality,
+  all six native build/lifecycle jobs, exact twelve-ZIP aggregation, and SHA-256 verification.
+- Tag release run
+  [29267800919](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29267800919) rebuilt and
+  passed the same gates, then published
+  [`v0.4.0-alpha.1`](https://github.com/Stardust0831/ssh-mountmate/releases/tag/v0.4.0-alpha.1)
+  as a non-draft prerelease with twelve ZIP assets plus `SHA256SUMS.txt`. The annotated tag resolves
+  to commit `ca66e5c`. PR #11 remains Draft and macOS NFS is not included.
 
 ## Release decisions
 
