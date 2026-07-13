@@ -115,11 +115,11 @@ fn complete_python_layout_migrates_without_losing_user_data() {
     assert_eq!(load_servers(&paths).unwrap(), servers);
     assert_eq!(load_settings(&paths).unwrap(), settings);
     assert_eq!(
-        fs::read_to_string(cache_sentinel).unwrap(),
-        "legacy cached bytes remain in place\n"
+        fs::read(cache_sentinel).unwrap(),
+        fs::read(fixture("cache-sentinel.txt")).unwrap()
     );
     assert_eq!(
-        fs::read_to_string(log_sentinel).unwrap(),
-        "legacy mount log remains readable\n"
+        fs::read(log_sentinel).unwrap(),
+        fs::read(fixture("log-sentinel.txt")).unwrap()
     );
 }
