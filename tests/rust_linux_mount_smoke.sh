@@ -64,7 +64,8 @@ test -n "${port}"
 "${rclone}" --cache-dir "${test_root}/server-cache" \
   --log-file "${test_root}/sftp-server.log" -vv \
   serve sftp "${remote_root}" --addr "127.0.0.1:${port}" \
-  --user "${server_user}" --pass "${server_password}" &
+  --user "${server_user}" --pass "${server_password}" \
+  --dir-cache-time 0s --poll-interval 0 &
 server_pid=$!
 server_ready=false
 for _ in $(seq 1 50); do
@@ -126,6 +127,12 @@ find "${mountpoint}" -maxdepth 1 -mindepth 1 -printf '%f\n' | sort >"${test_root
 printf '%s\n' 'created outside the mount' >"${remote_root}/remote-new.txt"
 refresh_output="$("${binary}" --refresh-path "${mountpoint}")"
 grep -F 'Remote verified:' <<<"${refresh_output}"
+for _ in $(seq 1 50); do
+  if [[ -f "${mountpoint}/remote-new.txt" ]]; then
+    break
+  fi
+  sleep 0.1
+done
 test "$(cat "${mountpoint}/remote-new.txt")" = 'created outside the mount'
 
 dd if=/dev/zero of="${mountpoint}/upload.bin" bs=1M count=8 conv=fsync status=none
