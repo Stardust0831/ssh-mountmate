@@ -48,7 +48,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "Add-WindowsCapability -O
 macOS：
 
 - 内置 rclone，或源码构建使用的配置/系统 rclone
-- macFUSE
+- macFUSE 或 FUSE-T
 - OpenSSH Client
 
 macOS 重要提示：SSH MountMate Release 构建会使用内置的官方 rclone，通常不需要用户安装 Homebrew rclone。如果你手动覆盖 rclone 或从源码运行，不要使用 Homebrew 安装的 `rclone` 做挂载。Homebrew 版 rclone 在 macOS 上不能执行 `rclone mount`，请改用 rclone 官方二进制：
@@ -57,13 +57,21 @@ macOS 重要提示：SSH MountMate Release 构建会使用内置的官方 rclone
 curl https://rclone.org/install.sh | sudo bash
 ```
 
-macOS 挂载仍然需要 macFUSE，macFUSE 可以直接用 Homebrew Cask 安装：
+SSH MountMate 支持 rclone 文档中列出的两种 macOS 挂载层。macFUSE 使用系统扩展，可以直接用 Homebrew Cask 安装：
 
 ```bash
 brew install --cask macfuse
 ```
 
 安装 macFUSE 后，macOS 可能要求在 `System Settings -> Privacy & Security` 中允许系统扩展。如果出现提示，允许后再重新尝试挂载。
+
+FUSE-T 是不使用内核扩展的替代方案，它会通过本机 NFSv4 挂载暴露 rclone FUSE 文件系统：
+
+```bash
+brew install --cask fuse-t
+```
+
+FUSE-T 可能需要在 `System Settings -> Privacy & Security -> Files and Folders` 中允许 `Network Volumes` 访问。由于它使用 NFS 语义，访问时间和修改时间等行为存在已知差异，请先阅读 [rclone 的 FUSE-T 注意事项](https://rclone.org/commands/rclone_mount/#fuse-t-limitations-caveats-and-notes)。SSH MountMate 不会内置 FUSE-T；FUSE-T 公布的二进制许可还要求商业使用或随商业软件捆绑时另行取得商业许可。
 
 如果 macOS 因为程序未公证而阻止打开，解压后可以移除 quarantine 属性：
 
@@ -103,7 +111,7 @@ sudo zypper install -y fuse3 openssh
 
 </details>
 
-Settings 页面里的 `检查依赖` 会报告 rclone、OpenSSH 和当前平台的挂载层依赖：`WinFsp`、`macFUSE` 或 `FUSE`。SSH MountMate 不会静默修改系统软件包。
+Settings 页面里的 `检查依赖` 会报告 rclone、OpenSSH 和当前平台的挂载层依赖：`WinFsp`、`macFUSE / FUSE-T` 或 `FUSE`。SSH MountMate 不会静默修改系统软件包。
 
 ## 内置和托管 rclone
 

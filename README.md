@@ -48,7 +48,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "Add-WindowsCapability -O
 macOS:
 
 - bundled rclone, or a source-build configured/system rclone
-- macFUSE
+- macFUSE or FUSE-T
 - OpenSSH Client
 
 Important macOS note: SSH MountMate release builds use the bundled official rclone binary, so users normally do not need Homebrew rclone. If you override rclone or run from source, do not use the Homebrew `rclone` package for mounting. Homebrew's rclone package cannot run `rclone mount` on macOS. Use the official rclone binary instead:
@@ -57,13 +57,21 @@ Important macOS note: SSH MountMate release builds use the bundled official rclo
 curl https://rclone.org/install.sh | sudo bash
 ```
 
-macFUSE is still required for mounting on macOS, and it can be installed with Homebrew Cask:
+SSH MountMate supports both mount layers documented by rclone on macOS. macFUSE uses a system extension and can be installed with Homebrew Cask:
 
 ```bash
 brew install --cask macfuse
 ```
 
 After installing macFUSE, macOS may ask you to allow the system extension in `System Settings -> Privacy & Security`. Approve it if prompted, then retry the mount.
+
+FUSE-T is a kernel-extension-free alternative that exposes the rclone FUSE filesystem through a local NFSv4 mount:
+
+```bash
+brew install --cask fuse-t
+```
+
+FUSE-T may require `Network Volumes` access under `System Settings -> Privacy & Security -> Files and Folders`. Its NFS-backed semantics also have documented differences, including access/modification-time behavior; review the [rclone FUSE-T caveats](https://rclone.org/commands/rclone_mount/#fuse-t-limitations-caveats-and-notes). FUSE-T is not bundled with SSH MountMate, and its published binary license requires a separate commercial license for commercial use or bundling.
 
 If macOS blocks the downloaded app because it is not notarized, remove the quarantine attribute after unzipping:
 
@@ -103,7 +111,7 @@ sudo zypper install -y fuse3 openssh
 
 </details>
 
-In the Settings window, `Check dependencies` reports rclone, OpenSSH, and the current mount-layer dependency (`WinFsp`, `macFUSE`, or `FUSE`). SSH MountMate does not silently modify system packages.
+In the Settings window, `Check dependencies` reports rclone, OpenSSH, and the current mount-layer dependency (`WinFsp`, `macFUSE / FUSE-T`, or `FUSE`). SSH MountMate does not silently modify system packages.
 
 ## Bundled And Managed rclone
 

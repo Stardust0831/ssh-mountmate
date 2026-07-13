@@ -47,7 +47,7 @@ pub fn mount_dependency_name() -> &'static str {
     if cfg!(windows) {
         "WinFsp"
     } else if cfg!(target_os = "macos") {
-        "macFUSE"
+        "macFUSE / FUSE-T"
     } else {
         "FUSE"
     }
@@ -68,8 +68,14 @@ fn mount_dependency_installed() -> bool {
     [
         "/Library/Filesystems/macfuse.fs",
         "/Library/Filesystems/osxfuse.fs",
+        "/Library/Frameworks/fuse_t.framework",
+        "/Library/Application Support/fuse-t/lib/libfuse-t.dylib",
         "/usr/local/lib/libfuse.dylib",
+        "/usr/local/lib/libfuse-t.dylib",
+        "/usr/local/lib/libfuse3.dylib",
         "/opt/homebrew/lib/libfuse.dylib",
+        "/opt/homebrew/lib/libfuse-t.dylib",
+        "/opt/homebrew/lib/libfuse3.dylib",
     ]
     .into_iter()
     .any(|candidate| Path::new(candidate).exists())
