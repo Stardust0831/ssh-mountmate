@@ -112,7 +112,7 @@ try {
   New-Item -ItemType Directory -Force $configDir | Out-Null
   $passwordObscured = (& $rclone obscure 'test-only-password').Trim()
   if ($LASTEXITCODE -ne 0 -or -not $passwordObscured) { throw 'rclone obscure failed' }
-  @(
+  $servers = @(
     [ordered]@{
       id = 'local-sftp'
       name = 'Local SFTP'
@@ -128,7 +128,9 @@ try {
       mountpoint = $mountpoint
       cache_mode = 'full'
     }
-  ) | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $configDir 'servers.json')
+  )
+  ConvertTo-Json -InputObject $servers -Depth 4 |
+    Set-Content (Join-Path $configDir 'servers.json')
   [ordered]@{
     settings_schema_version = 8
     vfs_cache_mode = 'full'
