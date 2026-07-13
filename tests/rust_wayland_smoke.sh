@@ -22,8 +22,8 @@ cleanup() {
     cat "$test_root/gui.stderr" >&2 2>/dev/null || true
     printf '%s\n' '--- Weston log ---' >&2
     cat "$test_root/weston.log" >&2 2>/dev/null || true
-    printf '%s\n' '--- Mako stderr ---' >&2
-    cat "$test_root/mako.stderr" >&2 2>/dev/null || true
+    printf '%s\n' '--- Notification daemon stderr ---' >&2
+    cat "$test_root/notification-daemon.stderr" >&2 2>/dev/null || true
   fi
   rm -rf "$test_root"
   trap - EXIT
@@ -72,7 +72,9 @@ done
   exit 1
 }
 
-mako >"$test_root/mako.stdout" 2>"$test_root/mako.stderr" &
+/usr/lib/notification-daemon/notification-daemon \
+  >"$test_root/notification-daemon.stdout" \
+  2>"$test_root/notification-daemon.stderr" &
 notification_pid=$!
 notification_ready=false
 for _ in {1..100}; do
@@ -86,7 +88,7 @@ for _ in {1..100}; do
   fi
   sleep 0.05
 done
-[[ "$notification_ready" == true ]] || { echo "Mako notification daemon did not start" >&2; exit 1; }
+[[ "$notification_ready" == true ]] || { echo "Wayland notification daemon did not start" >&2; exit 1; }
 
 "$binary" >"$test_root/gui.stdout" 2>"$test_root/gui.stderr" &
 app_pid=$!
