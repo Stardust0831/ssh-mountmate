@@ -9,10 +9,10 @@ SSH MountMate release builds bundle the official rclone binary for the target pl
 - License: MIT
 - License text: `licenses/rclone-COPYING.txt`
 
-The bundled rclone binary is downloaded from the official rclone download host during the SSH MountMate build:
+The bundled rclone binary is downloaded from the official rclone download host during the SSH MountMate build. Release workflows currently pin rclone v1.74.4:
 
 ```text
-https://downloads.rclone.org/rclone-current-<platform>-<arch>.zip
+https://downloads.rclone.org/v1.74.4/rclone-v1.74.4-<platform>-<arch>.zip
 ```
 
 Platform is `windows`, `osx`, or `linux`; architecture is selected from the build machine, usually `amd64` or `arm64`.
@@ -103,5 +103,5 @@ overwriting an existing backup on Linux and macOS.
 - License texts: `licenses/plist-LICENSE-MIT.txt`, `licenses/quick-xml-LICENSE-MIT.txt`,
   and `licenses/time-LICENSE-MIT.txt`
 
-The macOS login-startup integration uses `plist`, with its XML and time dependencies, to write
-a structured per-user LaunchAgent without invoking shell utilities.
+The macOS integration uses `plist`, with its XML and time dependencies, to write structured
+per-user LaunchAgent and Finder Quick Action documents without ad hoc XML manipulation.

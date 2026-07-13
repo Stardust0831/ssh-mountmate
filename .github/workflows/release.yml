@@ -60,6 +60,12 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
+          test -z "$(git ls-files '*.py' '*.spec' pyproject.toml launcher.py)"
+          python_action='actions/setup''-python'
+          if git grep -n "${python_action}" -- .github; then
+            echo 'Python setup actions are not allowed in the Rust release tree' >&2
+            exit 1
+          fi
           version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
           test "${RELEASE_TAG}" = "v${version}"
       - uses: dtolnay/rust-toolchain@master

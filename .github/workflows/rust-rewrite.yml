@@ -18,6 +18,16 @@ jobs:
         with:
           toolchain: 1.97.0
           components: rustfmt, clippy
+      - name: Enforce Rust-only product tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git ls-files '*.py' '*.spec' pyproject.toml launcher.py)"
+          python_action='actions/setup''-python'
+          if git grep -n "${python_action}" -- .github; then
+            echo 'Python setup actions are not allowed in the Rust product tree' >&2
+            exit 1
+          fi
       - name: Linux GUI dependencies
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dri libgtk-3-dev libayatana-appindicator3-dev xvfb xdotool openbox dbus-x11
       - run: cargo fmt --all --check
