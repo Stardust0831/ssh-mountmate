@@ -15,6 +15,7 @@ use iced::{Center, Element, Fill, Length, Point, Size, Subscription, Task, Theme
 use mountmate_core::app_command::{
     AppCommand, AppCommandError, AppCommandServer, InstanceLock, send_command_retry,
 };
+use mountmate_core::capacity::CapacityInfo;
 use mountmate_core::connection::{
     ConnectionDraft, ConnectionSource, DraftError, ImportAction, ImportStatus, SecretAction,
     SshImportPlan,
@@ -359,6 +360,9 @@ struct App {
     prepared_update: Option<PreparedUpdateLaunch>,
     dependency_status: Option<DependencyStatus>,
     dependency_checking: bool,
+    capacities: HashMap<String, CapacityInfo>,
+    capacity_errors: HashSet<String>,
+    capacity_refreshing: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -630,6 +634,8 @@ enum Message {
     InstallUpdateDecision(bool),
     CheckDependencies,
     DependenciesChecked(Result<DependencyStatus, String>),
+    CapacityTick,
+    CapacitiesLoaded(Vec<(String, Result<Option<CapacityInfo>, String>)>),
     LanguageChanged(Language),
     RegisterFileManagerMenu,
     UnregisterFileManagerMenu,
@@ -687,6 +693,7 @@ impl App {
             Subscription::run_with(self.tray_actions.clone(), tray_stream).map(Message::TrayAction),
             iced::time::every(Duration::from_millis(100)).map(|_| Message::TrayTick),
             iced::time::every(Duration::from_secs(1)).map(|_| Message::TransferTick),
+            iced::time::every(Duration::from_secs(30)).map(|_| Message::CapacityTick),
             window::close_requests().map(Message::CloseRequested),
             window::close_events().map(Message::WindowClosed),
         ])
@@ -770,6 +777,9 @@ impl App {
             prepared_update: None,
             dependency_status: None,
             dependency_checking: false,
+            capacities: HashMap::new(),
+            capacity_errors: HashSet::new(),
+            capacity_refreshing: false,
         };
         let mut tasks = vec![
             open_window.map(Message::MainWindowOpened),
@@ -862,6 +872,11 @@ impl App {
                     .iter()
                     .map(|id| self.close_popups_for_server(id))
                     .collect();
+                for id in &unmounted {
+                    self.capacities.remove(id);
+                    self.capacity_errors.remove(id);
+                }
+                tasks.push(self.capacity_task());
                 tasks.push(set_native_global_progress(
                     self.main_window,
                     self.global_progress_state(),
@@ -869,6 +884,25 @@ impl App {
                 return Task::batch(tasks);
             }
             Message::TransferTick => return self.transfer_task(),
+            Message::CapacityTick => return self.capacity_task(),
+            Message::CapacitiesLoaded(results) => {
+                self.capacity_refreshing = false;
+                for (id, result) in results {
+                    match result {
+                        Ok(Some(capacity)) => {
+                            self.capacities.insert(id.clone(), capacity);
+                            self.capacity_errors.remove(&id);
+                        }
+                        Ok(None) => {
+                            self.capacities.remove(&id);
+                            self.capacity_errors.remove(&id);
+                        }
+                        Err(_) => {
+                            self.capacity_errors.insert(id);
+                        }
+                    }
+                }
+            }
             Message::TransfersLoaded(results) => {
                 self.transfer_refreshing = false;
                 let mut notifications = Vec::new();
@@ -2125,6 +2159,54 @@ impl App {
         )
     }
 
+    fn capacity_task(&mut self) -> Task<Message> {
+        if self.capacity_refreshing {
+            return Task::none();
+        }
+        let servers: Vec<_> = self
+            .servers
+            .iter()
+            .filter(|server| {
+                self.mount_statuses.get(&server.id) == Some(&MountStatus::Mounted)
+                    && !self.busy.contains(&server.id)
+            })
+            .cloned()
+            .collect();
+        if servers.is_empty() {
+            return Task::none();
+        }
+        self.capacity_refreshing = true;
+        let service = self.service.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    std::thread::scope(|scope| {
+                        let tasks: Vec<_> = servers
+                            .into_iter()
+                            .map(|server| {
+                                let service = service.clone();
+                                scope.spawn(move || {
+                                    let id = server.id.clone();
+                                    let result = service
+                                        .capacity(&server)
+                                        .map_err(|error| error.to_string());
+                                    (id, result)
+                                })
+                            })
+                            .collect();
+                        tasks
+                            .into_iter()
+                            .filter_map(|task| task.join().ok())
+                            .collect()
+                    })
+                })
+                .await
+                .unwrap_or_else(|error| vec![(String::new(), Err(error.to_string()))])
+            },
+            Message::CapacitiesLoaded,
+        )
+    }
+
     fn transfer_task(&mut self) -> Task<Message> {
         if self.transfer_refreshing {
             return Task::none();
@@ -2429,6 +2511,8 @@ impl App {
                         busy: self.busy.contains(&server.id),
                         transfer: self.transfers.get(&server.id),
                         transfer_unavailable: self.transfer_errors.contains_key(&server.id),
+                        capacity: self.capacities.get(&server.id),
+                        capacity_unavailable: self.capacity_errors.contains(&server.id),
                         can_modify: self.can_modify(&server.id),
                         confirming_remove: self.pending_delete.as_deref() == Some(&server.id),
                     },
@@ -3239,6 +3323,8 @@ struct ConnectionCardState<'a> {
     busy: bool,
     transfer: Option<&'a TransferSnapshot>,
     transfer_unavailable: bool,
+    capacity: Option<&'a CapacityInfo>,
+    capacity_unavailable: bool,
     can_modify: bool,
     confirming_remove: bool,
 }
@@ -3253,6 +3339,8 @@ fn connection_card<'a>(
         busy,
         transfer,
         transfer_unavailable,
+        capacity,
+        capacity_unavailable,
         can_modify,
         confirming_remove,
     } = state;
@@ -3290,6 +3378,35 @@ fn connection_card<'a>(
     .spacing(4)
     .width(Fill);
     if status == MountStatus::Mounted {
+        if let Some(capacity) = capacity {
+            details = details
+                .push(
+                    text(match locale {
+                        Locale::English => format!(
+                            "{} / {} used ({}%)",
+                            format_bytes(capacity.used),
+                            format_bytes(capacity.total),
+                            capacity.percent
+                        ),
+                        Locale::Chinese => format!(
+                            "已用 {} / {}（{}%）",
+                            format_bytes(capacity.used),
+                            format_bytes(capacity.total),
+                            capacity.percent
+                        ),
+                    })
+                    .size(13),
+                )
+                .push(progress_bar(0.0..=100.0, capacity.percent as f32));
+        } else if capacity_unavailable {
+            details = details.push(
+                text(match locale {
+                    Locale::English => "Capacity unavailable",
+                    Locale::Chinese => "容量信息不可用",
+                })
+                .size(13),
+            );
+        }
         if transfer_unavailable {
             details = details.push(text(locale.text(TextKey::TransferStateUnavailable)).size(13));
         } else if let Some(snapshot) = transfer {

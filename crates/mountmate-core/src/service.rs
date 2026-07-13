@@ -8,6 +8,7 @@ use std::os::windows::process::CommandExt;
 
 use thiserror::Error;
 
+use crate::capacity::{CapacityError, CapacityInfo, mounted_capacity};
 use crate::connection::{SshImportPlan, plan_ssh_imports};
 use crate::mountpoint::{HOME_MOUNTPOINT_VALUE, MountpointAllocator, SystemMountpointProbe};
 use crate::paths::AppPaths;
@@ -47,6 +48,8 @@ pub enum ServiceError {
     Runtime(#[from] RuntimeError),
     #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error(transparent)]
+    Capacity(#[from] CapacityError),
     #[error("rclone obscure failed: {0}")]
     Obscure(String),
     #[error("the selected path is not inside an active SSH MountMate mount: {0}")]
@@ -129,6 +132,14 @@ impl MountService {
     pub fn transfer_snapshot(&self, server_id: &str) -> Result<TransferSnapshot, ServiceError> {
         let state: MountState = read_json(&self.paths.state_file(server_id))?;
         Ok(HttpRcClient::new(&state.rc_addr, Duration::from_millis(750))?.transfer_snapshot()?)
+    }
+
+    pub fn capacity(&self, server: &ServerConfig) -> Result<Option<CapacityInfo>, ServiceError> {
+        if self.status(&server.id)? != MountStatus::Mounted {
+            return Ok(None);
+        }
+        let state: MountState = read_json(&self.paths.state_file(&server.id))?;
+        mounted_capacity(server, &state, &self.paths.rclone_config()).map_err(ServiceError::from)
     }
 
     pub fn refresh(

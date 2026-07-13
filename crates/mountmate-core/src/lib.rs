@@ -1,4 +1,5 @@
 pub mod app_command;
+pub mod capacity;
 pub mod connection;
 pub mod dependency;
 pub mod model;
