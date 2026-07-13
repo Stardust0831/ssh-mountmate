@@ -23,6 +23,7 @@ use mountmate_core::connection::{
 use mountmate_core::dependency::{DependencyStatus, check_dependencies};
 use mountmate_core::paths::AppPaths;
 use mountmate_core::process::MountStatus;
+use mountmate_core::rclone_binary::resolve_rclone;
 use mountmate_core::service::MountService;
 use mountmate_core::ssh::{
     default_ssh_config_path, prepare_managed_ssh_server, remove_managed_ssh_server,
@@ -92,6 +93,14 @@ fn run() -> Result<(), String> {
             } else {
                 println!("SSH MountMate {VERSION} is up to date");
             }
+            return Ok(());
+        }
+        LaunchAction::RclonePath => {
+            let paths = AppPaths::discover();
+            let resolved = resolve_rclone(&paths, &application_root(), None)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "rclone is not available".to_owned())?;
+            println!("{}", resolved.path.display());
             return Ok(());
         }
         LaunchAction::RegisterFileManagerMenu => {

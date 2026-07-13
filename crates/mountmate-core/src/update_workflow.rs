@@ -14,7 +14,7 @@ use crate::update_helper::{
 };
 use crate::update_install::{
     InstallLayoutError, PayloadError, PreparePayloadError, PreparedPayload, TransactionPaths,
-    TransactionPlanError, detect_install_layout, locate_directory_payload, plan_transaction_paths,
+    TransactionPlanError, detect_install_layout, locate_update_payload, plan_transaction_paths,
     prepare_directory_payload,
 };
 
@@ -87,7 +87,7 @@ pub fn prepare_update_install(
     let extracted = cache.join(format!("payload-{}", &digest[..16]));
     download_verified_asset(asset, &archive, progress)?;
     safe_extract_zip(&archive, &extracted)?;
-    let payload = locate_directory_payload(&extracted, std::env::consts::OS)?;
+    let payload = locate_update_payload(&extracted, layout.kind, std::env::consts::OS)?;
     let transaction = plan_transaction_paths(&layout)?;
     let prepared =
         prepare_directory_payload(&layout, &payload, &transaction, std::env::consts::OS)?;
@@ -174,15 +174,15 @@ mod tests {
             digest: String::new(),
             size: 0,
         };
+        let executable = temp.path().join(if cfg!(windows) {
+            "SSHMountMate.exe"
+        } else {
+            "SSHMountMate"
+        });
+        fs::write(&executable, b"application").unwrap();
 
         assert!(matches!(
-            prepare_update_install(
-                &paths,
-                &asset,
-                Path::new("missing-executable"),
-                Vec::new(),
-                None,
-            ),
+            prepare_update_install(&paths, &asset, &executable, Vec::new(), None,),
             Err(UpdateWorkflowError::WrongAsset { .. })
         ));
         assert!(!paths.update_cache_dir().exists());

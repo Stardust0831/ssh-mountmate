@@ -160,7 +160,9 @@ $env:PROCESSOR_ARCHITECTURE
 uname -m
 ```
 
-Use `x64` packages for `AMD64` / `x86_64`, and `arm64` packages for `ARM64` / `arm64` / `aarch64`. On macOS, use `SSHMountMate-macos-x64.zip` for Intel Macs and `SSHMountMate-macos-arm64.zip` for Apple Silicon Macs.
+Use `x64` packages for `AMD64` / `x86_64`, and `arm64` packages for `ARM64` / `arm64` / `aarch64`. The plain `.zip` contains one executable with the verified official rclone embedded; it materializes rclone as a content-addressed managed copy on first use. The `-onedir.zip` contains the application and rclone as a normal directory bundle (or a native `.app` on macOS) and is recommended for desktop integration. Self-update preserves the installed package type.
+
+On macOS, choose the `x64` assets for Intel Macs and `arm64` for Apple Silicon. Use the `-onedir.zip` variant for the native application bundle.
 
 ## Quick Start
 

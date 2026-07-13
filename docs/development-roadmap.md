@@ -1,0 +1,95 @@
+# SSH MountMate development roadmap and work log
+
+This document is the persistent execution log for the Rust rewrite. It records planned work,
+authoritative evidence, release decisions, and unresolved risks. A task is not marked complete
+until its stated evidence exists.
+
+## Current sequence
+
+1. Finish the Rust onefile/onedir distribution work without changing mount behavior.
+2. Re-run the six-platform rewrite workflow and the non-publishing release workflow.
+3. Publish `v0.4.0-alpha.1` as a prerelease only after the required checks and packages pass.
+4. Implement optional macOS `rclone nfsmount` as an explicit Experimental backend.
+5. Keep macOS FUSE as the migration and UI default; keep Windows WinFsp and Linux FUSE3 unchanged.
+6. Do not promote NFS to the default or publish another release until real macOS x64 and ARM64
+   FUSE/NFS lifecycle evidence has been reviewed.
+
+## Prerelease scope: `v0.4.0-alpha.1`
+
+Included work:
+
+- Pure Rust application and packaging; no Python runtime, fallback, source, or active Python CI.
+- Portable onefile and onedir packages on Windows, macOS, and Linux for x64 and ARM64.
+- Verified official rclone, external in onedir and SHA-256-verified/embedded in onefile.
+- Package-type-preserving self-update, authenticated health confirmation, rollback, and active-mount
+  survival checks.
+- Legacy migration, changed-host-key handling, OpenSSH transport, concurrent login mounts,
+  transfer popups/center, native notifications, tray/menu-bar integration, and file-manager refresh.
+
+Explicitly excluded:
+
+- macOS NFS mount backend.
+- Any change to the default macOS FUSE backend.
+- Cloud/server changes.
+- Merge of the draft Rust rewrite PR.
+
+Required evidence before publishing:
+
+- `cargo fmt --all --check`.
+- Workspace Clippy with warnings denied.
+- Complete workspace tests.
+- Native Windows, macOS, and Linux x64/ARM64 builds.
+- Both onefile and onedir package smoke tests on all six targets.
+- Real mount/refresh/queued-upload/unmount lifecycle checks.
+- Packaged update commit/rollback and update during a real queued upload.
+- A non-publishing `release.yml` run that validates exactly twelve ZIP assets plus checksums.
+
+## Next implementation: optional macOS NFS backend
+
+Planned design constraints:
+
+- Add a strongly typed mount-backend enum to settings and mount state.
+- Missing legacy fields deserialize to FUSE; existing users never switch silently.
+- Show the selector and Experimental explanation only on macOS.
+- Generate `rclone nfsmount` only for macOS users who explicitly select NFS.
+- Bind the NFS service to loopback only; never listen on `0.0.0.0` or a LAN interface.
+- Do not automatically fall back to FUSE after an NFS failure.
+- Keep RC, VFS cache, write-back, refresh, transfer state, ownership validation, and cleanup truthful.
+- Run the same real lifecycle suite for macOS FUSE and NFS on x64 and ARM64, including non-blocking
+  performance records.
+
+## Work log
+
+### 2026-07-13
+
+- Preserved user-owned untracked files (`issue-1-reply.md` and five screenshots); none are staged.
+- Pushed `3e12c79` (`Record verified Rust rewrite integration gates`).
+- Pushed `293144f` (`Verify updates preserve active mounts`).
+- Workflow run [29253550458](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29253550458)
+  proved the active-update path on Windows x64/ARM64, macOS x64, and Linux x64. macOS ARM64 and
+  Linux ARM64 did not execute because GitHub Actions could not download actions (`Service
+  Unavailable`), so the run is not accepted as a six-platform gate.
+- Identified a distribution regression: the Rust workflow produced only an onedir payload under
+  the historical onefile asset name. Began restoring true onefile plus `-onedir` assets.
+- Added build-time SHA-256 validation and runtime content-addressed materialization for embedded
+  rclone; core tests reached 144 passing tests before the additional conditional embedded-payload
+  test was added.
+- Added standalone update-payload discovery and package-type-aware asset naming.
+- Added a `--rclone-path` diagnostic command for package smoke tests and user diagnostics.
+- Updated both release workflows to build and verify onefile packages; this work must pass
+  native review/CI before the prerelease is published.
+- Local Rust 1.97 verification after the distribution changes: format and core Clippy passed,
+  all 145 `mountmate-core` unit tests passed, legacy migration passed, and the conditional
+  embedded-rclone test passed with a separately hashed controlled executable payload.
+- Workflow YAML parsing, macOS/Linux shell syntax, and `git diff --check` passed locally. Full GUI
+  compilation is delegated to native CI because this workspace does not provide the GTK/pkg-config
+  development environment used by the Linux runner.
+- Accepted macOS Experimental NFS as the next implementation task, explicitly after the prerelease.
+
+## Release decisions
+
+- The Rust rewrite PR remains Draft.
+- No merge is authorized by this document.
+- `v0.4.0-alpha.1` must be a prerelease, not a stable release.
+- A failed or incomplete architecture gate blocks publication unless the failure is rerun and
+  replaced by successful authoritative evidence.

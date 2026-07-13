@@ -13,6 +13,7 @@ pub(crate) enum LaunchAction {
     Headless(AppCommand),
     RunUpdateHelper(UpdateHelperAuthorization),
     CheckUpdate,
+    RclonePath,
     RegisterFileManagerMenu,
     UnregisterFileManagerMenu,
     RegisterLoginStartup,
@@ -46,6 +47,7 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Launc
             "-V" | "--version" => Some(LaunchAction::Version),
             "--licenses" => Some(LaunchAction::Licenses),
             "--check-update" => Some(LaunchAction::CheckUpdate),
+            "--rclone-path" => Some(LaunchAction::RclonePath),
             "--register-file-manager-menu" | "--register-shell-menu" => {
                 Some(LaunchAction::RegisterFileManagerMenu)
             }
@@ -212,6 +214,7 @@ Usage: SSHMountMate [COMMAND]
   --register-login-startup       Start and mount saved connections at user login
   --unregister-login-startup     Remove the user login startup command
   --check-update                 Check GitHub for a verified platform update
+  --rclone-path                  Print the verified rclone executable path
   --licenses                     Print bundled third-party notices
   -h, --help                     Print this help
   -V, --version                  Print the version"#
@@ -286,6 +289,10 @@ mod tests {
             LaunchAction::CheckUpdate
         );
         assert_eq!(
+            parse(args(&["--rclone-path"])).unwrap(),
+            LaunchAction::RclonePath
+        );
+        assert_eq!(
             parse(args(&["--register-login-startup"])).unwrap(),
             LaunchAction::RegisterLoginStartup
         );
@@ -320,6 +327,7 @@ mod tests {
     fn help_keeps_command_columns_readable() {
         assert!(help().contains("\n  --show-main"));
         assert!(help().contains("\n  --check-update"));
+        assert!(help().contains("\n  --rclone-path"));
         assert!(help().contains("\n  -V, --version"));
         assert!(!help().contains("update-helper"));
         assert!(!help().contains("update-health"));

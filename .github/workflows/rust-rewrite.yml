@@ -366,6 +366,56 @@ jobs:
           if ($rclone.ExitCode -ne 0) { throw "packaged rclone smoke test failed" }
           $python = Get-ChildItem $extracted -Recurse -File | Where-Object { $_.Name -match '^(python|libpython)' -or $_.Extension -eq '.py' }
           if ($python) { throw "packaged archive contains Python runtime files" }
+      - name: Build and verify embedded-rclone onefile
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export SSH_MOUNTMATE_EMBED_RCLONE_PATH="$(pwd)/target/release/bin/rclone"
+          export SSH_MOUNTMATE_EMBED_RCLONE_SHA256="$(tr -d '[:space:]' < target/release/bin/rclone.sha256)"
+          cargo build --release --package ssh-mountmate
+          mkdir -p target/onefile
+          cp target/release/SSHMountMate target/onefile/SSHMountMate
+          chmod 755 target/onefile/SSHMountMate
+          home="${RUNNER_TEMP}/onefile-home"
+          mkdir -p "${home}"
+          rclone_path="$(
+            HOME="${home}" \
+            XDG_CONFIG_HOME="${home}/config" \
+            XDG_CACHE_HOME="${home}/cache" \
+            XDG_STATE_HOME="${home}/state" \
+            XDG_DATA_HOME="${home}/data" \
+            target/onefile/SSHMountMate --rclone-path
+          )"
+          test -x "${rclone_path}"
+          test "$(shasum -a 256 "${rclone_path}" | awk '{print $1}')" = \
+            "${SSH_MOUNTMATE_EMBED_RCLONE_SHA256}"
+          "${rclone_path}" version
+      - name: Build and verify embedded-rclone onefile
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:SSH_MOUNTMATE_EMBED_RCLONE_PATH = (Resolve-Path 'target/release/bin/rclone.exe').Path
+          $env:SSH_MOUNTMATE_EMBED_RCLONE_SHA256 = (Get-Content 'target/release/bin/rclone.exe.sha256' -Raw).Trim()
+          cargo build --release --package ssh-mountmate
+          if ($LASTEXITCODE -ne 0) { throw "onefile build failed" }
+          New-Item -ItemType Directory -Force target/onefile | Out-Null
+          Copy-Item target/release/SSHMountMate.exe target/onefile/SSHMountMate.exe
+          $home = Join-Path $env:RUNNER_TEMP 'onefile-home'
+          $env:HOME = $home
+          $env:USERPROFILE = $home
+          $env:APPDATA = Join-Path $home 'roaming'
+          $env:LOCALAPPDATA = Join-Path $home 'local'
+          $rclonePath = (& .\target\onefile\SSHMountMate.exe --rclone-path).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $rclonePath -PathType Leaf)) {
+            throw "onefile did not materialize embedded rclone"
+          }
+          $actual = (Get-FileHash -Algorithm SHA256 $rclonePath).Hash.ToLowerInvariant()
+          if ($actual -ne $env:SSH_MOUNTMATE_EMBED_RCLONE_SHA256) {
+            throw "materialized onefile rclone digest mismatch: $actual"
+          }
+          $rclone = Start-Process -FilePath $rclonePath -ArgumentList 'version' -Wait -PassThru
+          if ($rclone.ExitCode -ne 0) { throw "materialized onefile rclone failed" }
       - name: Exercise packaged update and rollback
         if: runner.os == 'Linux'
         shell: bash
@@ -432,6 +482,8 @@ jobs:
             target/release/zip-LICENSE-MIT.txt
             target/release/rustix-LICENSE-MIT.txt
             target/release/SSHMountMate.install-layout
+            target/onefile/SSHMountMate
+            target/onefile/SSHMountMate.exe
             target/package/SSH MountMate.app
             target/package-smoke/${{ matrix.artifact }}.zip
           if-no-files-found: error

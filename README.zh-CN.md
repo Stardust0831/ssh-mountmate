@@ -160,7 +160,9 @@ $env:PROCESSOR_ARCHITECTURE
 uname -m
 ```
 
-`AMD64` / `x86_64` 选择 `x64` 包，`ARM64` / `arm64` / `aarch64` 选择 `arm64` 包。Intel Mac 请下载 `SSHMountMate-macos-x64.zip`，Apple Silicon Mac 请下载 `SSHMountMate-macos-arm64.zip`。
+`AMD64` / `x86_64` 选择 `x64` 包，`ARM64` / `arm64` / `aarch64` 选择 `arm64` 包。普通 `.zip` 内只有一个可执行文件，其中嵌入了经过校验的官方 rclone；首次使用时会把 rclone 物化为按内容摘要命名的受管副本。`-onedir.zip` 是普通目录包（macOS 上为原生 `.app`），更适合完整桌面集成。自更新会保持当前安装的包型。
+
+Intel Mac 选择 `x64`，Apple Silicon 选择 `arm64`；需要原生应用包时请选择 `-onedir.zip`。
 
 ## 快速开始
 

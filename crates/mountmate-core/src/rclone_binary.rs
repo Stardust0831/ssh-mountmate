@@ -16,11 +16,14 @@ use crate::paths::AppPaths;
 use crate::storage::{FileLock, StorageError};
 
 const HASH_PREFIX_LENGTH: usize = 16;
+const EMBEDDED_RCLONE: &[u8] = include_bytes!(env!("SSH_MOUNTMATE_EMBEDDED_RCLONE_PATH"));
+const EMBEDDED_RCLONE_SHA256: &str = env!("SSH_MOUNTMATE_EMBEDDED_RCLONE_SHA256");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RcloneSource {
     Configured,
     Bundled,
+    Embedded,
     Managed,
     SystemPath,
 }
@@ -82,6 +85,15 @@ pub fn resolve_rclone(
                 sha256: Some(digest),
             }));
         }
+    }
+
+    if !EMBEDDED_RCLONE.is_empty() {
+        let path = materialize_embedded(paths, windows)?;
+        return Ok(Some(ResolvedRclone {
+            path,
+            source: RcloneSource::Embedded,
+            sha256: Some(EMBEDDED_RCLONE_SHA256.into()),
+        }));
     }
 
     let mut managed_dirs = vec![paths.managed_bin_dir()];
@@ -186,6 +198,29 @@ fn materialize_bundled(
     digest: &str,
     windows: bool,
 ) -> Result<PathBuf, RcloneBinaryError> {
+    materialize_verified(paths, digest, windows, |target| {
+        copy_executable(source, target, windows)
+    })
+}
+
+fn materialize_embedded(paths: &AppPaths, windows: bool) -> Result<PathBuf, RcloneBinaryError> {
+    let digest = EMBEDDED_RCLONE_SHA256;
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(RcloneBinaryError::InvalidManifest(PathBuf::from(
+            "embedded:rclone",
+        )));
+    }
+    materialize_verified(paths, digest, windows, |target| {
+        write_executable_bytes(target, EMBEDDED_RCLONE, windows)
+    })
+}
+
+fn materialize_verified(
+    paths: &AppPaths,
+    digest: &str,
+    windows: bool,
+    write: impl FnOnce(&Path) -> Result<(), RcloneBinaryError>,
+) -> Result<PathBuf, RcloneBinaryError> {
     let directory = paths.managed_bin_dir();
     let suffix = if windows { ".exe" } else { "" };
     let target = directory.join(format!(
@@ -211,7 +246,7 @@ fn materialize_bundled(
         source,
     })?;
     let temporary = directory.join(format!(".rclone.{}.tmp", Uuid::new_v4()));
-    let result = copy_executable(source, &temporary, windows)
+    let result = write(&temporary)
         .and_then(|()| verify_exact_digest(&temporary, digest))
         .and_then(|()| {
             fs::rename(&temporary, &target).map_err(|source| RcloneBinaryError::Io {
@@ -251,6 +286,45 @@ fn copy_executable(source: &Path, target: &Path, _windows: bool) -> Result<(), R
         path: target.to_owned(),
         source,
     })?;
+    #[cfg(unix)]
+    if !_windows {
+        let mut permissions = output
+            .metadata()
+            .map_err(|source| RcloneBinaryError::Io {
+                path: target.to_owned(),
+                source,
+            })?
+            .permissions();
+        permissions.set_mode(permissions.mode() | 0o755);
+        fs::set_permissions(target, permissions).map_err(|source| RcloneBinaryError::Io {
+            path: target.to_owned(),
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+fn write_executable_bytes(
+    target: &Path,
+    payload: &[u8],
+    _windows: bool,
+) -> Result<(), RcloneBinaryError> {
+    let mut output = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(target)
+        .map_err(|source| RcloneBinaryError::Io {
+            path: target.to_owned(),
+            source,
+        })?;
+    output
+        .write_all(payload)
+        .and_then(|()| output.flush())
+        .and_then(|()| output.sync_all())
+        .map_err(|source| RcloneBinaryError::Io {
+            path: target.to_owned(),
+            source,
+        })?;
     #[cfg(unix)]
     if !_windows {
         let mut permissions = output
@@ -488,6 +562,44 @@ mod tests {
             newest_valid_materialized(&paths.managed_bin_dir(), cfg!(windows)).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn verified_bytes_are_materialized_once_by_content_digest() {
+        let temp = tempdir().unwrap();
+        let paths = paths(temp.path());
+        let payload = b"embedded-rclone-test";
+        let digest = format!("{:x}", Sha256::digest(payload));
+        let first = materialize_verified(&paths, &digest, cfg!(windows), |target| {
+            write_executable_bytes(target, payload, cfg!(windows))
+        })
+        .unwrap();
+        let second = materialize_verified(&paths, &digest, cfg!(windows), |_| {
+            panic!("an existing verified content-addressed binary must be reused")
+        })
+        .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(fs::read(first).unwrap(), payload);
+    }
+
+    #[test]
+    fn compiled_embedded_payload_resolves_without_an_application_bundle() {
+        if EMBEDDED_RCLONE.is_empty() {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let resolved = resolve_rclone(
+            &paths(temp.path()),
+            &temp.path().join("standalone-application"),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(resolved.source, RcloneSource::Embedded);
+        assert_eq!(resolved.sha256.as_deref(), Some(EMBEDDED_RCLONE_SHA256));
+        assert_eq!(file_sha256(&resolved.path).unwrap(), EMBEDDED_RCLONE_SHA256);
     }
 
     #[test]

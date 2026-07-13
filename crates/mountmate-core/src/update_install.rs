@@ -97,6 +97,10 @@ pub enum PayloadError {
     MissingDirectoryBundle,
     #[error("the extracted update contained more than one SSH MountMate directory bundle")]
     AmbiguousDirectoryBundle,
+    #[error("the extracted update did not contain a standalone SSH MountMate executable")]
+    MissingStandaloneExecutable,
+    #[error("the extracted update contained more than one standalone SSH MountMate executable")]
+    AmbiguousStandaloneExecutable,
     #[error("the update bundle does not contain the expected executable: {0}")]
     MissingExecutable(PathBuf),
     #[error("the macOS update bundle is incomplete: {0}")]
@@ -246,6 +250,102 @@ pub fn locate_directory_payload(
         1 => Ok(candidates.remove(0)),
         _ => Err(PayloadError::AmbiguousDirectoryBundle),
     }
+}
+
+pub fn locate_update_payload(
+    extracted_root: &Path,
+    kind: InstallKind,
+    os: &str,
+) -> Result<DirectoryPayload, PayloadError> {
+    match kind {
+        InstallKind::StandaloneExecutable => locate_standalone_payload(extracted_root, os),
+        InstallKind::DirectoryBundle | InstallKind::MacApplicationBundle => {
+            locate_directory_payload(extracted_root, os)
+        }
+    }
+}
+
+fn locate_standalone_payload(
+    extracted_root: &Path,
+    os: &str,
+) -> Result<DirectoryPayload, PayloadError> {
+    let metadata =
+        fs::symlink_metadata(extracted_root).map_err(|source| PayloadError::Inspect {
+            path: extracted_root.to_owned(),
+            source,
+        })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(PayloadError::NotDirectory(extracted_root.to_owned()));
+    }
+    let extracted_root = extracted_root
+        .canonicalize()
+        .map_err(|source| PayloadError::Inspect {
+            path: extracted_root.to_owned(),
+            source,
+        })?;
+    let executable_name = if os == "windows" {
+        "SSHMountMate.exe"
+    } else {
+        "SSHMountMate"
+    };
+    let mut candidates = Vec::new();
+    collect_standalone_candidate(&extracted_root, executable_name, &mut candidates)?;
+    for entry in fs::read_dir(&extracted_root).map_err(|source| PayloadError::Inspect {
+        path: extracted_root.clone(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| PayloadError::Inspect {
+            path: extracted_root.clone(),
+            source,
+        })?;
+        let file_type = entry.file_type().map_err(|source| PayloadError::Inspect {
+            path: entry.path(),
+            source,
+        })?;
+        if file_type.is_dir() && !file_type.is_symlink() {
+            collect_standalone_candidate(&entry.path(), executable_name, &mut candidates)?;
+        }
+    }
+    match candidates.len() {
+        0 => Err(PayloadError::MissingStandaloneExecutable),
+        1 => Ok(candidates.remove(0)),
+        _ => Err(PayloadError::AmbiguousStandaloneExecutable),
+    }
+}
+
+fn collect_standalone_candidate(
+    root: &Path,
+    executable_name: &str,
+    candidates: &mut Vec<DirectoryPayload>,
+) -> Result<(), PayloadError> {
+    let executable = root.join(executable_name);
+    let metadata = match fs::symlink_metadata(&executable) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(PayloadError::Inspect {
+                path: executable,
+                source,
+            });
+        }
+    };
+    if metadata.is_file() && !metadata.file_type().is_symlink() {
+        candidates.push(DirectoryPayload {
+            root: root
+                .canonicalize()
+                .map_err(|source| PayloadError::Inspect {
+                    path: root.to_owned(),
+                    source,
+                })?,
+            executable: executable
+                .canonicalize()
+                .map_err(|source| PayloadError::Inspect {
+                    path: executable,
+                    source,
+                })?,
+        });
+    }
+    Ok(())
 }
 
 pub fn plan_transaction_paths(
@@ -1136,6 +1236,45 @@ mod tests {
 
         assert_eq!(layout.kind, InstallKind::StandaloneExecutable);
         assert_eq!(layout.replace_path, executable.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn standalone_update_payload_accepts_root_or_one_wrapper() {
+        for wrapped in [false, true] {
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("extracted");
+            let payload_root = if wrapped {
+                root.join("SSHMountMate-windows-x64")
+            } else {
+                root.clone()
+            };
+            let executable = payload_root.join("SSHMountMate.exe");
+            create_file(&executable);
+
+            let payload =
+                locate_update_payload(&root, InstallKind::StandaloneExecutable, "windows").unwrap();
+
+            assert_eq!(payload.root, payload_root.canonicalize().unwrap());
+            assert_eq!(payload.executable, executable.canonicalize().unwrap());
+        }
+    }
+
+    #[test]
+    fn standalone_update_payload_rejects_missing_and_ambiguous_executables() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("extracted");
+        fs::create_dir(&root).unwrap();
+        assert!(matches!(
+            locate_update_payload(&root, InstallKind::StandaloneExecutable, "linux"),
+            Err(PayloadError::MissingStandaloneExecutable)
+        ));
+
+        create_file(&root.join("first/SSHMountMate"));
+        create_file(&root.join("second/SSHMountMate"));
+        assert!(matches!(
+            locate_update_payload(&root, InstallKind::StandaloneExecutable, "linux"),
+            Err(PayloadError::AmbiguousStandaloneExecutable)
+        ));
     }
 
     #[test]
