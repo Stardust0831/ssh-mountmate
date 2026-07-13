@@ -97,6 +97,27 @@ jobs:
           test ! -e "${XDG_DATA_HOME}/nautilus/scripts/SSH MountMate - Refresh"
           test ! -e "${XDG_DATA_HOME}/nemo/actions/ssh-mountmate-refresh.nemo_action"
           test ! -e "${XDG_DATA_HOME}/kio/servicemenus/ssh-mountmate.desktop"
+          export XDG_CONFIG_HOME="${HOME}/.config"
+          target/release/SSHMountMate --register-login-startup
+          startup="${XDG_CONFIG_HOME}/autostart/ssh-mountmate.desktop"
+          test -f "${startup}"
+          rg --fixed-strings -- '--mount-startup-all' "${startup}"
+          target/release/SSHMountMate --unregister-login-startup
+          test ! -e "${startup}"
+      - name: Smoke-test macOS login startup
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export HOME="${RUNNER_TEMP}/login-startup-home"
+          executable="$(pwd)/target/release/SSHMountMate"
+          target/release/SSHMountMate --register-login-startup
+          startup="${HOME}/Library/LaunchAgents/io.github.stardust0831.ssh-mountmate.plist"
+          plutil -lint "${startup}"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "${startup}")" = "${executable}"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:1' "${startup}")" = '--mount-startup-all'
+          target/release/SSHMountMate --unregister-login-startup
+          test ! -e "${startup}"
       - name: Smoke-test command-line entry points
         if: runner.os == 'Windows'
         shell: pwsh
@@ -128,11 +149,20 @@ jobs:
             if ($notificationName -ne 'SSH MountMate') {
               throw "Unexpected notification identity: $notificationName"
             }
+            Invoke-SSHMountMate '--register-login-startup'
+            $startup = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run').SSHMountMate
+            if ($startup -ne "`"$exe`" --mount-startup-all") {
+              throw "Unexpected login startup command: $startup"
+            }
           } finally {
             Invoke-SSHMountMate '--unregister-file-manager-menu'
+            Invoke-SSHMountMate '--unregister-login-startup'
           }
           if (Test-Path 'HKCU:\Software\Classes\Drive\shell\SSHMountMate.Refresh') {
             throw "Explorer refresh command was not removed"
+          }
+          if ((Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run').PSObject.Properties.Name -contains 'SSHMountMate') {
+            throw "Login startup command was not removed"
           }
       - name: Bundle verified rclone
         if: runner.os != 'Windows'

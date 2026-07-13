@@ -15,6 +15,8 @@ pub(crate) enum LaunchAction {
     CheckUpdate,
     RegisterFileManagerMenu,
     UnregisterFileManagerMenu,
+    RegisterLoginStartup,
+    UnregisterLoginStartup,
     Help,
     Version,
     Licenses,
@@ -50,6 +52,8 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Launc
             "--unregister-file-manager-menu" | "--unregister-shell-menu" => {
                 Some(LaunchAction::UnregisterFileManagerMenu)
             }
+            "--register-login-startup" => Some(LaunchAction::RegisterLoginStartup),
+            "--unregister-login-startup" => Some(LaunchAction::UnregisterLoginStartup),
             "--show-main" => Some(LaunchAction::Gui {
                 command: AppCommand::ShowMain,
                 update_health: None,
@@ -205,6 +209,8 @@ Usage: SSHMountMate [COMMAND]
   --refresh-path PATH            Refresh the mount containing a local directory
   --register-file-manager-menu   Register file-manager commands for this executable
   --unregister-file-manager-menu Remove file-manager commands
+  --register-login-startup       Start and mount saved connections at user login
+  --unregister-login-startup     Remove the user login startup command
   --check-update                 Check GitHub for a verified platform update
   --licenses                     Print bundled third-party notices
   -h, --help                     Print this help
@@ -276,6 +282,10 @@ mod tests {
         assert_eq!(
             parse(args(&["--check-update"])).unwrap(),
             LaunchAction::CheckUpdate
+        );
+        assert_eq!(
+            parse(args(&["--register-login-startup"])).unwrap(),
+            LaunchAction::RegisterLoginStartup
         );
     }
 

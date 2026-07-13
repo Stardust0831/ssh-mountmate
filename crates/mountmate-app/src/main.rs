@@ -113,6 +113,19 @@ fn run() -> Result<(), String> {
             println!("File-manager commands removed");
             return Ok(());
         }
+        action @ (LaunchAction::RegisterLoginStartup | LaunchAction::UnregisterLoginStartup) => {
+            let enabled = matches!(action, LaunchAction::RegisterLoginStartup);
+            let executable = std::env::current_exe()
+                .map_err(|error| format!("Could not locate the current executable: {error}"))?;
+            Platform
+                .set_login_startup(&executable, enabled)
+                .map_err(|error| error.to_string())?;
+            println!(
+                "Login startup {}",
+                if enabled { "registered" } else { "removed" }
+            );
+            return Ok(());
+        }
         LaunchAction::RunUpdateHelper(authorization) => {
             let executable = std::env::current_exe()
                 .map_err(|error| format!("Could not locate the update helper: {error}"))?;
