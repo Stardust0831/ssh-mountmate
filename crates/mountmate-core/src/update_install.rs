@@ -3,6 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -13,14 +14,15 @@ const DIRECTORY_BUNDLE_MARKER: &[u8] = b"ssh-mountmate-directory-bundle-v1\n";
 const MAX_PREPARED_ENTRIES: usize = 20_000;
 const MAX_PREPARED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum InstallKind {
     StandaloneExecutable,
     DirectoryBundle,
     MacApplicationBundle,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstallLayout {
     pub kind: InstallKind,
     pub executable: PathBuf,
@@ -34,13 +36,13 @@ pub struct DirectoryPayload {
     pub executable: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransactionPaths {
     pub prepared: PathBuf,
     pub backup: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreparedPayload {
     pub replace_path: PathBuf,
     pub executable: PathBuf,
@@ -621,7 +623,21 @@ fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
 
 #[cfg(windows)]
 fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
-    fs::rename(source, destination)
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Storage::FileSystem::MoveFileW;
+
+    let source: Vec<_> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<_> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    if unsafe { MoveFileW(source.as_ptr(), destination.as_ptr()) } == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn valid_prepared_name(candidate: &str, target_name: &str, kind: InstallKind) -> bool {
