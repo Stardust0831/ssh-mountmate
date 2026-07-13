@@ -134,7 +134,7 @@ pub fn bundled_candidates(app_root: &Path, windows: bool) -> [PathBuf; 2] {
     ]
 }
 
-fn verify_bundled(path: &Path) -> Result<String, RcloneBinaryError> {
+pub(crate) fn verify_bundled(path: &Path) -> Result<String, RcloneBinaryError> {
     let manifest = path.with_file_name(format!(
         "{}.sha256",
         path.file_name().unwrap_or_default().to_string_lossy()
