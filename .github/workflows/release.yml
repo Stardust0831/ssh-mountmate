@@ -246,6 +246,7 @@ jobs:
 
       - name: Exercise real SFTP mount, refresh, upload, and unmount
         if: runner.os == 'Windows'
+        timeout-minutes: 5
         shell: pwsh
         run: ./tests/rust_windows_mount_smoke.ps1 -PackageRoot target/package/SSHMountMate
 

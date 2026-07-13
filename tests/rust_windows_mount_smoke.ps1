@@ -25,9 +25,16 @@ function Invoke-SSHMountMate([string[]] $Arguments) {
   $process = [System.Diagnostics.Process]::Start($processInfo)
   $stdout = $process.StandardOutput.ReadToEndAsync()
   $stderr = $process.StandardError.ReadToEndAsync()
-  $process.WaitForExit()
+  $exited = $process.WaitForExit(60000)
+  if (-not $exited) {
+    $process.Kill($true)
+    $process.WaitForExit()
+  }
   $output = $stdout.GetAwaiter().GetResult()
   $errorOutput = $stderr.GetAwaiter().GetResult()
+  if (-not $exited) {
+    throw "SSH MountMate $($Arguments -join ' ') timed out`n$output$errorOutput"
+  }
   if ($process.ExitCode -ne 0) {
     throw "SSH MountMate $($Arguments -join ' ') failed with $($process.ExitCode)`n$output$errorOutput"
   }
@@ -48,6 +55,7 @@ try {
   New-Item -ItemType Directory -Force $remoteRoot | Out-Null
   Set-Content -Path (Join-Path $remoteRoot 'initial.txt') -Value 'initial remote content' -NoNewline
 
+  Write-Host '[windows-mount-e2e] installing WinFsp'
   $winFspUrl = 'https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi'
   $winFspSha256 = '073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a'
   $winFspMsi = Join-Path $testRoot 'winfsp-2.1.25156.msi'
@@ -65,6 +73,7 @@ try {
   }
   Get-Service 'WinFsp.Launcher' -ErrorAction Stop | Out-Null
 
+  Write-Host '[windows-mount-e2e] starting local SFTP server'
   $listener = [System.Net.Sockets.TcpListener]::new(
     [System.Net.IPAddress]::Loopback,
     0
@@ -142,6 +151,7 @@ try {
     language = 'en'
   } | ConvertTo-Json | Set-Content (Join-Path $configDir 'settings.json')
 
+  Write-Host '[windows-mount-e2e] mounting drive'
   Invoke-SSHMountMate @('--mount-id', 'local-sftp') | Out-Null
   $mounted = $true
   Wait-Until { Test-Path "${mountpoint}\initial.txt" }
@@ -152,6 +162,7 @@ try {
   Get-ChildItem "${mountpoint}\" | Out-Null
   Set-Content -Path (Join-Path $remoteRoot 'remote-new.txt') `
     -Value 'created outside the mount' -NoNewline
+  Write-Host '[windows-mount-e2e] refreshing quoted drive root'
   $refreshOutput = Invoke-SSHMountMate @('--refresh-path', "$mountpoint`"")
   if ($refreshOutput -notmatch 'Remote verified:') { throw 'Refresh was not remotely verified' }
   Wait-Until { Test-Path "${mountpoint}\remote-new.txt" } 50
@@ -159,6 +170,7 @@ try {
     throw 'Refreshed file content did not match the SFTP source'
   }
 
+  Write-Host '[windows-mount-e2e] verifying queued write-back and remote upload'
   $upload = [byte[]]::new(8MB)
   [System.IO.File]::WriteAllBytes("${mountpoint}\upload.bin", $upload)
   $queuedOutput = Invoke-SSHMountMate @('--refresh-id', 'local-sftp')
@@ -179,11 +191,13 @@ try {
     return $completedOutput -notmatch 'still waiting to upload'
   } 50
 
+  Write-Host '[windows-mount-e2e] unmounting drive'
   Invoke-SSHMountMate @('--unmount-id', 'local-sftp') | Out-Null
   $mounted = $false
   Wait-Until { -not (Test-Path "${mountpoint}\") }
   $state = Join-Path $env:LOCALAPPDATA 'rsshmount/State/local-sftp.json'
   if (Test-Path $state) { throw 'Mount state remained after unmount' }
+  Write-Host '[windows-mount-e2e] lifecycle passed'
   $succeeded = $true
 } finally {
   if ($mounted) {
