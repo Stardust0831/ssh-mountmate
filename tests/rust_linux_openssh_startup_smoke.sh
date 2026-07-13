@@ -65,8 +65,8 @@ host_key="${test_root}/host-key"
 authorized_keys="${test_root}/authorized_keys"
 known_hosts="${test_root}/known_hosts"
 ssh_config="${test_root}/ssh-config"
-ssh-keygen -q -t ed25519 -N '' -f "${client_key}"
-ssh-keygen -q -t ed25519 -N '' -f "${host_key}"
+ssh-keygen -q -t rsa -b 3072 -N '' -f "${client_key}"
+ssh-keygen -q -t ecdsa -b 256 -N '' -f "${host_key}"
 cp "${client_key}.pub" "${authorized_keys}"
 chmod 600 "${client_key}" "${host_key}" "${authorized_keys}"
 
@@ -98,7 +98,7 @@ for _ in $(seq 1 50); do
 done
 test "${server_ready}" == true
 
-ssh-keyscan -T 5 -p "${port}" 127.0.0.1 >"${known_hosts}" 2>/dev/null
+ssh-keyscan -T 5 -t ecdsa -p "${port}" 127.0.0.1 >"${known_hosts}" 2>/dev/null
 test -s "${known_hosts}"
 chmod 600 "${known_hosts}"
 cat >"${ssh_config}" <<EOF
