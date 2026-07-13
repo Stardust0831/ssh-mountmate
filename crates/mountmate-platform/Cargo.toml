@@ -12,6 +12,15 @@ notify-rust.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-app-kit = { workspace = true, features = [
+    "NSApplication",
+    "NSDockTile",
+    "NSProgressIndicator",
+    "NSResponder",
+    "NSView",
+] }
+objc2-foundation = { workspace = true, features = ["NSGeometry", "NSString"] }
 plist.workspace = true
 
 [target.'cfg(windows)'.dependencies]

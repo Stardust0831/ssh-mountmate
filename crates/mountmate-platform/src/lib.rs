@@ -299,7 +299,7 @@ fn ensure_macos_notification_identity() -> Result<(), PlatformError> {
     static RESULT: OnceLock<Result<(), String>> = OnceLock::new();
     RESULT
         .get_or_init(|| {
-            notify_rust::set_application("com.stardust.sshmountmate")
+            notify_rust::set_application("io.github.stardust0831.ssh-mountmate")
                 .map_err(|error| error.to_string())
         })
         .clone()
@@ -375,7 +375,95 @@ fn set_global_progress(
     })
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn set_global_progress(
+    _window: Option<NativeWindowHandle>,
+    state: GlobalProgressState,
+) -> Result<(), PlatformError> {
+    use std::cell::RefCell;
+
+    use objc2::rc::Retained;
+    use objc2::{MainThreadMarker, MainThreadOnly};
+    use objc2_app_kit::{NSApplication, NSProgressIndicator, NSProgressIndicatorStyle};
+    use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+
+    thread_local! {
+        static DOCK_PROGRESS: RefCell<Option<Retained<NSProgressIndicator>>> = const {
+            RefCell::new(None)
+        };
+    }
+
+    let mtm = MainThreadMarker::new().ok_or_else(|| {
+        PlatformError::Failed("macOS Dock progress must be updated on the main thread".into())
+    })?;
+    let dock_tile = NSApplication::sharedApplication(mtm).dockTile();
+    DOCK_PROGRESS.with(|stored| {
+        let mut stored = stored.borrow_mut();
+        if state == GlobalProgressState::Hidden {
+            if let Some(indicator) = stored.take() {
+                indicator.removeFromSuperview();
+            }
+            dock_tile.setBadgeLabel(None);
+            dock_tile.display();
+            return Ok(());
+        }
+
+        if stored.is_none() {
+            let content = dock_tile.contentView(mtm).ok_or_else(|| {
+                PlatformError::Failed("macOS Dock tile did not provide a content view".into())
+            })?;
+            let size = dock_tile.size();
+            let margin = (size.width * 0.08).max(4.0);
+            let height = (size.height * 0.13).clamp(8.0, 18.0);
+            let frame = NSRect::new(
+                NSPoint::new(margin, margin),
+                NSSize::new((size.width - margin * 2.0).max(1.0), height),
+            );
+            let indicator =
+                NSProgressIndicator::initWithFrame(NSProgressIndicator::alloc(mtm), frame);
+            indicator.setStyle(NSProgressIndicatorStyle::Bar);
+            indicator.setMinValue(0.0);
+            indicator.setMaxValue(1.0);
+            indicator.setDisplayedWhenStopped(true);
+            content.addSubview(&indicator);
+            *stored = Some(indicator);
+        }
+
+        let indicator = stored
+            .as_ref()
+            .expect("Dock progress indicator was initialized");
+        match state {
+            GlobalProgressState::Indeterminate => {
+                indicator.setIndeterminate(true);
+                unsafe {
+                    indicator.setUsesThreadedAnimation(true);
+                    indicator.startAnimation(None);
+                }
+            }
+            GlobalProgressState::Normal { completed, total }
+            | GlobalProgressState::Paused { completed, total }
+            | GlobalProgressState::Error { completed, total } => {
+                unsafe {
+                    indicator.stopAnimation(None);
+                }
+                indicator.setIndeterminate(false);
+                indicator.setDoubleValue(completed.min(total) as f64 / total.max(1) as f64);
+            }
+            GlobalProgressState::Hidden => unreachable!("hidden progress returned above"),
+        }
+
+        let badge = match state {
+            GlobalProgressState::Paused { .. } => Some(NSString::from_str("Ⅱ")),
+            GlobalProgressState::Error { .. } => Some(NSString::from_str("!")),
+            _ => None,
+        };
+        dock_tile.setBadgeLabel(badge.as_deref());
+        dock_tile.display();
+        Ok(())
+    })
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn set_global_progress(
     _window: Option<NativeWindowHandle>,
     _state: GlobalProgressState,

@@ -294,6 +294,11 @@ jobs:
           codesign --force --deep --sign - "${app}"
           codesign --verify --deep --strict --verbose=2 "${app}"
           "${contents}/MacOS/SSHMountMate" --version
+      - name: Exercise macOS notification, menu bar, and Dock integration
+        if: runner.os == 'macOS'
+        timeout-minutes: 3
+        shell: bash
+        run: bash tests/rust_macos_gui_smoke.sh "target/package/SSH MountMate.app"
       - name: Smoke-test packaged archive
         if: runner.os == 'Linux'
         shell: bash

@@ -3960,7 +3960,16 @@ fn show_native_notification(notification: NativeNotification) -> Task<Message> {
     )
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn set_native_global_progress(_id: window::Id, state: GlobalProgressState) -> Task<Message> {
+    match Platform.set_global_progress(None, state) {
+        Ok(()) => diagnostic_trace(&format!("dock progress updated: {state:?}")),
+        Err(error) => diagnostic_trace(&format!("dock progress failed: {error}")),
+    }
+    Task::none()
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn set_native_global_progress(_id: window::Id, _state: GlobalProgressState) -> Task<Message> {
     Task::none()
 }
