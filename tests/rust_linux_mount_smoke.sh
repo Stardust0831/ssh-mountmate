@@ -56,6 +56,7 @@ chmod 755 "${test_root}"
 sudo useradd --create-home --home-dir "${server_home}" --shell /bin/bash "${test_user}"
 user_created=true
 sudo passwd --delete "${test_user}" >/dev/null
+sudo chmod 755 "${server_home}"
 sudo install -d -o "${test_user}" -g "${test_user}" -m 700 "${server_home}/.ssh"
 sudo install -d -o "${test_user}" -g "${test_user}" -m 777 "${remote_root}"
 mkdir -p "${mountpoint}" "${test_root}/home"
