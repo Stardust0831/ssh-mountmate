@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use iced::widget::{
     Space, button, checkbox, column, container, pick_list, progress_bar, row, scrollable, text,
-    text_input,
+    text_input, toggler,
 };
 use iced::{Center, Element, Fill, Length, Point, Size, Subscription, Task, Theme, window};
 use mountmate_core::app_command::{
@@ -3094,17 +3094,20 @@ impl App {
             settings_input(
                 locale.text(TextKey::MaximumSize),
                 &draft.max_size,
-                SettingsField::MaxSize
+                SettingsField::MaxSize,
+                locale,
             ),
             settings_input(
                 locale.text(TextKey::MaximumAge),
                 &draft.max_age,
-                SettingsField::MaxAge
+                SettingsField::MaxAge,
+                locale,
             ),
             settings_input(
                 locale.text(TextKey::MinimumFreeSpace),
                 &draft.min_free_space,
                 SettingsField::MinFreeSpace,
+                locale,
             ),
         ]
         .spacing(12);
@@ -3112,28 +3115,31 @@ impl App {
             settings_input(
                 locale.text(TextKey::WriteBackDelay),
                 &draft.write_back,
-                SettingsField::WriteBack
+                SettingsField::WriteBack,
+                locale,
             ),
             settings_input(
                 locale.text(TextKey::DirectoryCacheTime),
                 &draft.dir_cache_time,
                 SettingsField::DirCacheTime,
+                locale,
             ),
             settings_input(
                 locale.text(TextKey::BufferSize),
                 &draft.buffer_size,
-                SettingsField::BufferSize
+                SettingsField::BufferSize,
+                locale,
             ),
         ]
         .spacing(12);
         let behavior = column![
-            checkbox(draft.startup_all)
+            toggler(draft.startup_all)
                 .label(locale.text(TextKey::MountAllAtLogin))
                 .on_toggle(Message::StartupAllChanged),
-            checkbox(draft.auto_show_transfers)
+            toggler(draft.auto_show_transfers)
                 .label(locale.text(TextKey::ShowTransferPopup))
                 .on_toggle(Message::AutoTransfersChanged),
-            checkbox(draft.auto_check_updates)
+            toggler(draft.auto_check_updates)
                 .label(locale.text(TextKey::CheckUpdatesAutomatically))
                 .on_toggle(Message::AutoUpdatesChanged),
             labeled_control(
@@ -3152,7 +3158,7 @@ impl App {
             .tray_error
             .as_ref()
             .map(|error| text(locale.tray_unavailable(error)).size(14));
-        let file_manager = if cfg!(any(windows, target_os = "linux", target_os = "macos")) {
+        let file_manager = if file_manager_settings_visible(std::env::consts::OS) {
             column![
                 text(locale.text(TextKey::FileManagerIntegration)).size(20),
                 text(locale.text(TextKey::FileManagerIntegrationHelp)).size(14),
@@ -3524,13 +3530,53 @@ fn settings_input<'a>(
     label: &'a str,
     value: &'a str,
     field: SettingsField,
+    locale: Locale,
 ) -> iced::widget::Column<'a, Message> {
-    labeled_control(
-        label,
+    column![
+        text(label).size(13),
         text_input(label, value)
             .on_input(move |value| Message::SettingsFieldChanged(field, value))
             .width(Fill),
-    )
+        text(settings_value_hint(field, locale)).size(12),
+    ]
+    .spacing(5)
+    .width(Fill)
+}
+
+fn settings_value_hint(field: SettingsField, locale: Locale) -> &'static str {
+    match (field, locale) {
+        (SettingsField::MaxSize, Locale::English) => {
+            "Size units: K, M, G, T (for example 10G); blank means no limit"
+        }
+        (SettingsField::MaxSize, Locale::Chinese) => {
+            "大小单位：K、M、G、T（例如 10G）；留空表示不限制"
+        }
+        (SettingsField::MaxAge, Locale::English) => "Duration units: s, m, h, d (for example 30m)",
+        (SettingsField::MaxAge, Locale::Chinese) => "时间单位：s、m、h、d（例如 30m）",
+        (SettingsField::MinFreeSpace, Locale::English) => {
+            "Size units: K, M, G, T (for example 1G); blank disables the reserve"
+        }
+        (SettingsField::MinFreeSpace, Locale::Chinese) => {
+            "大小单位：K、M、G、T（例如 1G）；留空表示不保留空间"
+        }
+        (SettingsField::WriteBack, Locale::English) => "Duration units: s, m, h (for example 5s)",
+        (SettingsField::WriteBack, Locale::Chinese) => "时间单位：s、m、h（例如 5s）",
+        (SettingsField::DirCacheTime, Locale::English) => {
+            "Duration units: s, m, h (for example 5m)"
+        }
+        (SettingsField::DirCacheTime, Locale::Chinese) => "时间单位：s、m、h（例如 5m）",
+        (SettingsField::BufferSize, Locale::English) => {
+            "Size units: K, M, G (for example 16M); blank uses the rclone default"
+        }
+        (SettingsField::BufferSize, Locale::Chinese) => {
+            "大小单位：K、M、G（例如 16M）；留空使用 rclone 默认值"
+        }
+        (SettingsField::CacheRoot, _) => "",
+    }
+}
+
+fn file_manager_settings_visible(os: &str) -> bool {
+    matches!(os, "windows" | "linux" | "macos")
 }
 
 fn settings_folder_input<'a>(
@@ -4102,6 +4148,33 @@ mod localization_tests {
             localized_import_reason(Locale::Chinese, ImportStatus::Same, true, "ignored"),
             "匹配的连接正在挂载或执行任务"
         );
+    }
+
+    #[test]
+    fn settings_value_hints_expose_units_in_both_languages() {
+        for field in [
+            SettingsField::MaxSize,
+            SettingsField::MaxAge,
+            SettingsField::MinFreeSpace,
+            SettingsField::WriteBack,
+            SettingsField::DirCacheTime,
+            SettingsField::BufferSize,
+        ] {
+            assert!(!settings_value_hint(field, Locale::English).is_empty());
+            assert!(!settings_value_hint(field, Locale::Chinese).is_empty());
+        }
+        assert!(settings_value_hint(SettingsField::MaxSize, Locale::English).contains("G"));
+        assert!(settings_value_hint(SettingsField::MaxAge, Locale::English).contains("m"));
+        assert!(settings_value_hint(SettingsField::WriteBack, Locale::Chinese).contains("s"));
+    }
+
+    #[test]
+    fn platform_settings_are_hidden_outside_supported_desktop_targets() {
+        assert!(file_manager_settings_visible("windows"));
+        assert!(file_manager_settings_visible("linux"));
+        assert!(file_manager_settings_visible("macos"));
+        assert!(!file_manager_settings_visible("freebsd"));
+        assert!(!file_manager_settings_visible("android"));
     }
 
     #[test]
