@@ -85,3 +85,12 @@ The Rust update engine uses `semver` for release and prerelease ordering.
 
 The Rust update engine uses `zip` with only the Deflate backend enabled to inspect and safely
 extract verified release archives.
+
+## rustix
+
+- Project: https://github.com/bytecodealliance/rustix
+- License: Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT (distributed under the MIT option)
+- License text: `licenses/rustix-LICENSE-MIT.txt`
+
+The Rust update installer uses `rustix` to atomically rename files and directories without
+overwriting an existing backup on Linux and macOS.

@@ -139,6 +139,8 @@ pub(crate) fn licenses() -> &'static str {
         include_str!("../../../licenses/semver-LICENSE-MIT.txt"),
         "\n\n--- zip license ---\n\n",
         include_str!("../../../licenses/zip-LICENSE-MIT.txt"),
+        "\n\n--- rustix license ---\n\n",
+        include_str!("../../../licenses/rustix-LICENSE-MIT.txt"),
     )
 }
 

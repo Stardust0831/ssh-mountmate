@@ -44,6 +44,15 @@ pub struct TransactionPaths {
 pub struct PreparedPayload {
     pub replace_path: PathBuf,
     pub executable: PathBuf,
+    pub executable_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedUpdate {
+    pub executable: PathBuf,
+    pub target: PathBuf,
+    pub failed_payload: PathBuf,
+    pub backup: PathBuf,
 }
 
 #[derive(Debug, Error)]
@@ -142,6 +151,50 @@ pub enum PreparePayloadError {
     Transaction(#[from] TransactionPlanError),
 }
 
+#[derive(Debug, Error)]
+pub enum ApplyUpdateError {
+    #[error("update transaction paths or prepared payload are inconsistent")]
+    InvalidTransaction,
+    #[error("the installation changed after the update was prepared")]
+    InstallationChanged,
+    #[error("prepared update payload is missing or has the wrong file type: {0}")]
+    InvalidPreparedPayload(PathBuf),
+    #[error("prepared update payload verification failed: {0}")]
+    Verification(String),
+    #[error("update swap failed at {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "update swap failed ({replace_error}) and the previous installation could not be restored ({restore_error}); backup remains at {backup}"
+    )]
+    RestoreFailed {
+        replace_error: String,
+        restore_error: String,
+        backup: PathBuf,
+    },
+    #[error(
+        "rollback could not restore the previous installation ({restore_error}); the new installation remains active and the old backup remains at {backup}"
+    )]
+    RollbackRestoreFailed {
+        restore_error: String,
+        backup: PathBuf,
+    },
+    #[error(
+        "rollback could neither restore the previous installation ({restore_error}) nor return the new installation to its target ({recovery_error}); old backup: {backup}, new payload: {failed_payload}"
+    )]
+    RollbackRecoveryFailed {
+        restore_error: String,
+        recovery_error: String,
+        backup: PathBuf,
+        failed_payload: PathBuf,
+    },
+    #[error(transparent)]
+    Layout(#[from] InstallLayoutError),
+}
+
 pub fn detect_install_layout(executable: &Path) -> Result<InstallLayout, InstallLayoutError> {
     detect_install_layout_for(executable, env::consts::OS, &env::temp_dir())
 }
@@ -233,10 +286,11 @@ pub fn prepare_directory_payload(
             Err(PreparePayloadError::MacApplicationRequiresAppPayload)
         }
         InstallKind::StandaloneExecutable => {
-            copy_standalone_payload(payload, &transaction.prepared)?;
+            let executable_sha256 = copy_standalone_payload(payload, &transaction.prepared)?;
             Ok(PreparedPayload {
                 replace_path: transaction.prepared.clone(),
                 executable: transaction.prepared.clone(),
+                executable_sha256,
             })
         }
         InstallKind::DirectoryBundle => {
@@ -260,10 +314,12 @@ pub fn prepare_directory_payload(
                 if verified.root != transaction.prepared {
                     return Err(PreparePayloadError::InvalidTransactionPaths);
                 }
-                verify_copied_executable(&payload.executable, &verified.executable)?;
+                let executable_sha256 =
+                    verify_copied_executable(&payload.executable, &verified.executable)?;
                 Ok(PreparedPayload {
                     replace_path: transaction.prepared.clone(),
                     executable: verified.executable,
+                    executable_sha256,
                 })
             })();
             if result.is_err() {
@@ -272,6 +328,111 @@ pub fn prepare_directory_payload(
             result
         }
     }
+}
+
+pub fn apply_prepared_update(
+    layout: &InstallLayout,
+    prepared: &PreparedPayload,
+    transaction: &TransactionPaths,
+) -> Result<AppliedUpdate, ApplyUpdateError> {
+    apply_prepared_update_for(
+        layout,
+        prepared,
+        transaction,
+        env::consts::OS,
+        &env::temp_dir(),
+    )
+}
+
+fn apply_prepared_update_for(
+    layout: &InstallLayout,
+    prepared: &PreparedPayload,
+    transaction: &TransactionPaths,
+    os: &str,
+    temporary_directory: &Path,
+) -> Result<AppliedUpdate, ApplyUpdateError> {
+    validate_transaction_shape(layout, transaction)
+        .map_err(|_| ApplyUpdateError::InvalidTransaction)?;
+    if prepared.replace_path != transaction.prepared
+        || !prepared.executable.starts_with(&prepared.replace_path)
+    {
+        return Err(ApplyUpdateError::InvalidTransaction);
+    }
+    validate_prepared_payload(layout.kind, prepared, os)?;
+
+    let current = detect_install_layout_for(&layout.executable, os, temporary_directory)?;
+    if current != *layout {
+        return Err(ApplyUpdateError::InstallationChanged);
+    }
+    let current_executable_sha256 = file_sha256(&layout.executable)
+        .map_err(|error| ApplyUpdateError::Verification(error.to_string()))?;
+    let current_executable_relative = layout
+        .executable
+        .strip_prefix(&layout.replace_path)
+        .map_err(|_| ApplyUpdateError::InvalidTransaction)?;
+    let executable_relative = prepared
+        .executable
+        .strip_prefix(&prepared.replace_path)
+        .map_err(|_| ApplyUpdateError::InvalidTransaction)?;
+    let installed_executable = rebase_path(&layout.replace_path, executable_relative);
+
+    swap_paths(
+        &layout.replace_path,
+        &prepared.replace_path,
+        &transaction.backup,
+        || rename_no_replace(&prepared.replace_path, &layout.replace_path),
+    )?;
+    let applied = AppliedUpdate {
+        executable: installed_executable,
+        target: layout.replace_path.clone(),
+        failed_payload: transaction.prepared.clone(),
+        backup: transaction.backup.clone(),
+    };
+    let backup_executable = rebase_path(&applied.backup, current_executable_relative);
+    let backup_sha256 = match file_sha256(&backup_executable) {
+        Ok(digest) => digest,
+        Err(error) => {
+            let verification_error = ApplyUpdateError::Verification(error.to_string());
+            rollback_applied_update(&applied)?;
+            return Err(verification_error);
+        }
+    };
+    if backup_sha256 != current_executable_sha256 {
+        rollback_applied_update(&applied)?;
+        return Err(ApplyUpdateError::InstallationChanged);
+    }
+    Ok(applied)
+}
+
+pub fn rollback_applied_update(applied: &AppliedUpdate) -> Result<(), ApplyUpdateError> {
+    rename_no_replace(&applied.target, &applied.failed_payload).map_err(|source| {
+        ApplyUpdateError::Io {
+            path: applied.failed_payload.clone(),
+            source,
+        }
+    })?;
+    match rename_no_replace(&applied.backup, &applied.target) {
+        Ok(()) => Ok(()),
+        Err(restore_error) => match rename_no_replace(&applied.failed_payload, &applied.target) {
+            Ok(()) => Err(ApplyUpdateError::RollbackRestoreFailed {
+                restore_error: restore_error.to_string(),
+                backup: applied.backup.clone(),
+            }),
+            Err(recovery_error) => Err(ApplyUpdateError::RollbackRecoveryFailed {
+                restore_error: restore_error.to_string(),
+                recovery_error: recovery_error.to_string(),
+                backup: applied.backup.clone(),
+                failed_payload: applied.failed_payload.clone(),
+            }),
+        },
+    }
+}
+
+pub fn commit_applied_update(applied: &AppliedUpdate) -> Result<(), ApplyUpdateError> {
+    remove_path_entry(&applied.backup).map_err(|source| ApplyUpdateError::Io {
+        path: applied.backup.clone(),
+        source,
+    })
 }
 
 fn transaction_file_name(
@@ -284,6 +445,14 @@ fn transaction_file_name(
     match token {
         Some(token) => format!("{prefix}-{token}{suffix}"),
         None => format!("{prefix}{suffix}"),
+    }
+}
+
+fn rebase_path(root: &Path, relative: &Path) -> PathBuf {
+    if relative.as_os_str().is_empty() {
+        root.to_owned()
+    } else {
+        root.join(relative)
     }
 }
 
@@ -304,6 +473,24 @@ fn transaction_name_parts(name: &str, kind: InstallKind, phase: &str) -> (String
 }
 
 fn validate_transaction_paths(
+    layout: &InstallLayout,
+    transaction: &TransactionPaths,
+) -> Result<(), PreparePayloadError> {
+    validate_transaction_shape(layout, transaction)?;
+    if path_entry_exists(&transaction.prepared)? {
+        return Err(PreparePayloadError::PreparedExists(
+            transaction.prepared.clone(),
+        ));
+    }
+    if path_entry_exists(&transaction.backup)? {
+        return Err(PreparePayloadError::BackupExists(
+            transaction.backup.clone(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_transaction_shape(
     layout: &InstallLayout,
     transaction: &TransactionPaths,
 ) -> Result<(), PreparePayloadError> {
@@ -338,17 +525,103 @@ fn validate_transaction_paths(
     {
         return Err(PreparePayloadError::InvalidTransactionPaths);
     }
-    if path_entry_exists(&transaction.prepared)? {
-        return Err(PreparePayloadError::PreparedExists(
-            transaction.prepared.clone(),
+    Ok(())
+}
+
+fn validate_prepared_payload(
+    kind: InstallKind,
+    prepared: &PreparedPayload,
+    os: &str,
+) -> Result<(), ApplyUpdateError> {
+    let metadata =
+        fs::symlink_metadata(&prepared.replace_path).map_err(|source| ApplyUpdateError::Io {
+            path: prepared.replace_path.clone(),
+            source,
+        })?;
+    let expected_type = match kind {
+        InstallKind::StandaloneExecutable => metadata.is_file(),
+        InstallKind::DirectoryBundle => metadata.is_dir(),
+        InstallKind::MacApplicationBundle => return Err(ApplyUpdateError::InvalidTransaction),
+    };
+    if metadata.file_type().is_symlink() || !expected_type {
+        return Err(ApplyUpdateError::InvalidPreparedPayload(
+            prepared.replace_path.clone(),
         ));
     }
-    if path_entry_exists(&transaction.backup)? {
-        return Err(PreparePayloadError::BackupExists(
-            transaction.backup.clone(),
+    let executable_metadata =
+        fs::symlink_metadata(&prepared.executable).map_err(|source| ApplyUpdateError::Io {
+            path: prepared.executable.clone(),
+            source,
+        })?;
+    if executable_metadata.file_type().is_symlink() || !executable_metadata.is_file() {
+        return Err(ApplyUpdateError::InvalidPreparedPayload(
+            prepared.executable.clone(),
         ));
+    }
+    let actual = file_sha256(&prepared.executable)
+        .map_err(|error| ApplyUpdateError::Verification(error.to_string()))?;
+    if actual != prepared.executable_sha256 {
+        return Err(ApplyUpdateError::InvalidPreparedPayload(
+            prepared.executable.clone(),
+        ));
+    }
+    if kind == InstallKind::DirectoryBundle {
+        let verified = locate_directory_payload(&prepared.replace_path, os)
+            .map_err(|_| ApplyUpdateError::InvalidPreparedPayload(prepared.replace_path.clone()))?;
+        if verified.root != prepared.replace_path || verified.executable != prepared.executable {
+            return Err(ApplyUpdateError::InvalidPreparedPayload(
+                prepared.replace_path.clone(),
+            ));
+        }
     }
     Ok(())
+}
+
+fn swap_paths(
+    target: &Path,
+    prepared: &Path,
+    backup: &Path,
+    install_prepared: impl FnOnce() -> io::Result<()>,
+) -> Result<(), ApplyUpdateError> {
+    rename_no_replace(target, backup).map_err(|source| ApplyUpdateError::Io {
+        path: backup.to_owned(),
+        source,
+    })?;
+    match install_prepared() {
+        Ok(()) => Ok(()),
+        Err(replace_error) => match rename_no_replace(backup, target) {
+            Ok(()) => Err(ApplyUpdateError::Io {
+                path: prepared.to_owned(),
+                source: replace_error,
+            }),
+            Err(restore_error) => Err(ApplyUpdateError::RestoreFailed {
+                replace_error: replace_error.to_string(),
+                restore_error: restore_error.to_string(),
+                backup: backup.to_owned(),
+            }),
+        },
+    }
+}
+
+fn remove_path_entry(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+#[cfg(unix)]
+fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+
+    renameat_with(CWD, source, CWD, destination, RenameFlags::NOREPLACE).map_err(io::Error::from)
+}
+
+#[cfg(windows)]
+fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
 }
 
 fn valid_prepared_name(candidate: &str, target_name: &str, kind: InstallKind) -> bool {
@@ -376,7 +649,7 @@ struct CopyTotals {
 fn copy_standalone_payload(
     payload: &DirectoryPayload,
     destination: &Path,
-) -> Result<(), PreparePayloadError> {
+) -> Result<String, PreparePayloadError> {
     let metadata = safe_source_metadata(&payload.executable)?;
     if !metadata.is_file() {
         return Err(PreparePayloadError::UnsafeEntry(payload.executable.clone()));
@@ -517,13 +790,13 @@ fn copy_regular_file(
     result
 }
 
-fn verify_copied_executable(source: &Path, copied: &Path) -> Result<(), PreparePayloadError> {
+fn verify_copied_executable(source: &Path, copied: &Path) -> Result<String, PreparePayloadError> {
     let expected = file_sha256(source)
         .map_err(|error| PreparePayloadError::Verification(error.to_string()))?;
     let actual = file_sha256(copied)
         .map_err(|error| PreparePayloadError::Verification(error.to_string()))?;
     if actual == expected {
-        Ok(())
+        Ok(actual)
     } else {
         Err(PreparePayloadError::ExecutableDigestMismatch)
     }
@@ -1028,6 +1301,141 @@ mod tests {
             fs::read(&transaction.prepared).unwrap(),
             b"not owned by updater"
         );
+    }
+
+    #[test]
+    fn standalone_swap_and_rollback_restore_the_previous_executable() {
+        let temp = tempdir().unwrap();
+        let executable = temp.path().join("SSHMountMate");
+        fs::write(&executable, b"old executable").unwrap();
+        let layout = detect_install_layout_for(&executable, "linux", temp.path()).unwrap();
+        let payload_root = temp.path().join("extracted");
+        let payload_executable = create_directory_bundle(&payload_root, "linux");
+        fs::write(&payload_executable, b"new executable").unwrap();
+        let payload = locate_directory_payload(&payload_root, "linux").unwrap();
+        let transaction = plan_transaction_paths(&layout).unwrap();
+        let prepared = prepare_directory_payload(&layout, &payload, &transaction, "linux").unwrap();
+
+        let applied = apply_prepared_update_for(
+            &layout,
+            &prepared,
+            &transaction,
+            "linux",
+            &temp.path().join("unrelated-temp"),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&executable).unwrap(), b"new executable");
+        assert_eq!(fs::read(&transaction.backup).unwrap(), b"old executable");
+        assert!(!transaction.prepared.exists());
+
+        rollback_applied_update(&applied).unwrap();
+        assert_eq!(fs::read(&executable).unwrap(), b"old executable");
+        assert_eq!(fs::read(&transaction.prepared).unwrap(), b"new executable");
+        assert!(!transaction.backup.exists());
+    }
+
+    #[test]
+    fn directory_swap_is_committed_only_after_backup_cleanup() {
+        let temp = tempdir().unwrap();
+        let installed = temp.path().join("installed");
+        let executable = create_directory_bundle(&installed, "linux");
+        fs::write(&executable, b"old executable").unwrap();
+        let layout = detect_install_layout_for(&executable, "linux", temp.path()).unwrap();
+        let payload_root = temp.path().join("extracted");
+        let payload_executable = create_directory_bundle(&payload_root, "linux");
+        fs::write(&payload_executable, b"new executable").unwrap();
+        let payload = locate_directory_payload(&payload_root, "linux").unwrap();
+        let transaction = plan_transaction_paths(&layout).unwrap();
+        let prepared = prepare_directory_payload(&layout, &payload, &transaction, "linux").unwrap();
+
+        let applied = apply_prepared_update_for(
+            &layout,
+            &prepared,
+            &transaction,
+            "linux",
+            &temp.path().join("unrelated-temp"),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&applied.executable).unwrap(), b"new executable");
+        assert_eq!(
+            fs::read(transaction.backup.join("SSHMountMate")).unwrap(),
+            b"old executable"
+        );
+        commit_applied_update(&applied).unwrap();
+        assert!(!transaction.backup.exists());
+        assert_eq!(fs::read(&applied.executable).unwrap(), b"new executable");
+    }
+
+    #[test]
+    fn failed_second_swap_step_restores_the_original_target() {
+        let temp = tempdir().unwrap();
+        let target = temp.path().join("target");
+        let prepared = temp.path().join("prepared");
+        let backup = temp.path().join("backup");
+        fs::write(&target, b"old").unwrap();
+        fs::write(&prepared, b"new").unwrap();
+
+        assert!(matches!(
+            swap_paths(&target, &prepared, &backup, || {
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected"))
+            }),
+            Err(ApplyUpdateError::Io { .. })
+        ));
+
+        assert_eq!(fs::read(target).unwrap(), b"old");
+        assert_eq!(fs::read(prepared).unwrap(), b"new");
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn swap_never_overwrites_an_existing_backup() {
+        let temp = tempdir().unwrap();
+        let target = temp.path().join("target");
+        let prepared = temp.path().join("prepared");
+        let backup = temp.path().join("backup");
+        fs::write(&target, b"old").unwrap();
+        fs::write(&prepared, b"new").unwrap();
+        fs::write(&backup, b"previous backup").unwrap();
+
+        assert!(matches!(
+            swap_paths(&target, &prepared, &backup, || {
+                panic!("the install step must not run when backup reservation fails")
+            }),
+            Err(ApplyUpdateError::Io { .. })
+        ));
+
+        assert_eq!(fs::read(target).unwrap(), b"old");
+        assert_eq!(fs::read(prepared).unwrap(), b"new");
+        assert_eq!(fs::read(backup).unwrap(), b"previous backup");
+    }
+
+    #[test]
+    fn prepared_executable_tampering_is_rejected_before_swap() {
+        let temp = tempdir().unwrap();
+        let executable = temp.path().join("SSHMountMate");
+        fs::write(&executable, b"old executable").unwrap();
+        let layout = detect_install_layout_for(&executable, "linux", temp.path()).unwrap();
+        let payload_root = temp.path().join("extracted");
+        create_directory_bundle(&payload_root, "linux");
+        let payload = locate_directory_payload(&payload_root, "linux").unwrap();
+        let transaction = plan_transaction_paths(&layout).unwrap();
+        let prepared = prepare_directory_payload(&layout, &payload, &transaction, "linux").unwrap();
+        fs::write(&prepared.executable, b"tampered").unwrap();
+
+        assert!(matches!(
+            apply_prepared_update_for(
+                &layout,
+                &prepared,
+                &transaction,
+                "linux",
+                &temp.path().join("unrelated-temp"),
+            ),
+            Err(ApplyUpdateError::InvalidPreparedPayload(_))
+        ));
+        assert_eq!(fs::read(executable).unwrap(), b"old executable");
+        assert!(!transaction.backup.exists());
     }
 
     #[cfg(unix)]

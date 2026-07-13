@@ -2486,6 +2486,7 @@ dependencies = [
  "fs2",
  "glob",
  "reqwest",
+ "rustix 1.1.4",
  "semver",
  "serde",
  "serde_json",
