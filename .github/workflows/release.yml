@@ -137,8 +137,8 @@ jobs:
           Copy-Item target/release/SSHMountMate.exe "$root/SSHMountMate.exe"
           Copy-Item target/release/bin/rclone.exe, target/release/bin/rclone.exe.sha256 "$root/bin/"
           Copy-Item THIRD_PARTY_NOTICES.md, licenses/*.txt, distribution/SSHMountMate.install-layout $root
-          & "$root/SSHMountMate.exe" --version
-          if ($LASTEXITCODE -ne 0) { throw "release executable smoke test failed" }
+          $process = Start-Process -FilePath "$root/SSHMountMate.exe" -ArgumentList '--version' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "release executable smoke test failed" }
 
       - name: Assemble macOS application bundle
         if: runner.os == 'macOS'

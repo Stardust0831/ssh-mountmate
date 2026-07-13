@@ -85,12 +85,15 @@ jobs:
         shell: pwsh
         run: |
           $exe = (Resolve-Path .\target\release\SSHMountMate.exe).Path
-          & $exe --version
-          & $exe --help | Out-Null
-          & $exe --licenses | Out-Null
+          function Invoke-SSHMountMate([string] $argument) {
+            $process = Start-Process -FilePath $exe -ArgumentList $argument -Wait -PassThru
+            if ($process.ExitCode -ne 0) { throw "SSH MountMate $argument failed" }
+          }
+          Invoke-SSHMountMate '--version'
+          Invoke-SSHMountMate '--help'
+          Invoke-SSHMountMate '--licenses'
           try {
-            & $exe --register-file-manager-menu
-            if ($LASTEXITCODE -ne 0) { throw "Explorer command registration failed" }
+            Invoke-SSHMountMate '--register-file-manager-menu'
 
             $driveRefresh = (Get-Item 'HKCU:\Software\Classes\Drive\shell\SSHMountMate.Refresh\command').GetValue('')
             $backgroundRefresh = (Get-Item 'HKCU:\Software\Classes\Directory\Background\shell\SSHMountMate.Refresh\command').GetValue('')
@@ -109,7 +112,7 @@ jobs:
               throw "Unexpected notification identity: $notificationName"
             }
           } finally {
-            & $exe --unregister-file-manager-menu
+            Invoke-SSHMountMate '--unregister-file-manager-menu'
           }
           if (Test-Path 'HKCU:\Software\Classes\Drive\shell\SSHMountMate.Refresh') {
             throw "Explorer refresh command was not removed"
