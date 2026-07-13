@@ -3,21 +3,20 @@ set -euo pipefail
 
 package_root="$(realpath "${1:?packaged SSH MountMate root is required}")"
 binary="${package_root}/SSHMountMate"
+rclone="${package_root}/bin/rclone"
 test_root="$(mktemp -d "${RUNNER_TEMP:-/tmp}/ssh-mountmate-mount-e2e-XXXXXX")"
-test_user="mountmatee2e"
-server_home="${test_root}/server-home"
-remote_name="remote"
-remote_root="${server_home}/${remote_name}"
+server_user="mountmate"
+server_password="test-only-password"
+remote_root="${test_root}/remote"
 mountpoint="${test_root}/mount"
-sshd_pid=""
-user_created=false
+server_pid=""
 
 cleanup() {
   status=$?
   if [[ "${status}" -ne 0 ]]; then
-    if [[ -f "${test_root}/sshd.log" ]]; then
-      printf '%s\n' '--- sshd log ---' >&2
-      tail -100 "${test_root}/sshd.log" >&2 || true
+    if [[ -f "${test_root}/sftp-server.log" ]]; then
+      printf '%s\n' '--- SFTP server log ---' >&2
+      tail -100 "${test_root}/sftp-server.log" >&2 || true
     fi
     if [[ -n "${XDG_STATE_HOME:-}" && -d "${XDG_STATE_HOME}/rsshmount" ]]; then
       printf '%s\n' '--- SSH MountMate logs ---' >&2
@@ -31,18 +30,16 @@ cleanup() {
   if mountpoint -q "${mountpoint}"; then
     fusermount3 -u "${mountpoint}" 2>/dev/null || sudo umount "${mountpoint}" 2>/dev/null || true
   fi
-  if [[ -n "${sshd_pid}" ]]; then
-    sudo kill "${sshd_pid}" 2>/dev/null || true
+  if [[ -n "${server_pid}" ]]; then
+    kill "${server_pid}" 2>/dev/null || true
+    wait "${server_pid}" 2>/dev/null || true
   fi
-  if [[ "${user_created}" == true ]]; then
-    sudo userdel --remove "${test_user}" >/dev/null 2>&1 || true
-  fi
-  sudo rm -rf "${test_root}"
+  rm -rf "${test_root}"
 }
 trap cleanup EXIT
 
 test -x "${binary}"
-test -x "${package_root}/bin/rclone"
+test -x "${rclone}"
 if [[ ! -c /dev/fuse ]]; then
   sudo modprobe fuse || true
 fi
@@ -52,21 +49,8 @@ fi
 test -c /dev/fuse
 sudo chmod a+rw /dev/fuse
 
-chmod 755 "${test_root}"
-sudo useradd --create-home --home-dir "${server_home}" --shell /bin/bash "${test_user}"
-user_created=true
-sudo passwd --delete "${test_user}" >/dev/null
-sudo chmod 755 "${server_home}"
-sudo install -d -o "${test_user}" -g "${test_user}" -m 700 "${server_home}/.ssh"
-sudo install -d -o "${test_user}" -g "${test_user}" -m 777 "${remote_root}"
-mkdir -p "${mountpoint}" "${test_root}/home"
+mkdir -p "${remote_root}" "${mountpoint}" "${test_root}/home"
 printf '%s\n' 'initial remote content' >"${remote_root}/initial.txt"
-ssh-keygen -q -t ed25519 -N '' -f "${test_root}/client-key"
-ssh-keygen -q -t ed25519 -N '' -f "${test_root}/host-key"
-sudo install -o "${test_user}" -g "${test_user}" -m 600 \
-  "${test_root}/client-key.pub" "${server_home}/.ssh/authorized_keys"
-chmod 600 "${test_root}/client-key" "${test_root}/host-key"
-sudo chown root:root "${test_root}/host-key"
 
 port=""
 for candidate in $(seq 42000 42100); do
@@ -77,35 +61,23 @@ for candidate in $(seq 42000 42100); do
 done
 test -n "${port}"
 
-cat >"${test_root}/sshd_config" <<EOF
-Port ${port}
-ListenAddress 127.0.0.1
-HostKey ${test_root}/host-key
-PidFile ${test_root}/sshd.pid
-AuthorizedKeysFile .ssh/authorized_keys
-PasswordAuthentication no
-KbdInteractiveAuthentication no
-UsePAM no
-StrictModes no
-AllowUsers ${test_user}
-Subsystem sftp internal-sftp
-LogLevel VERBOSE
-EOF
-sudo mkdir -p /run/sshd
-sudo /usr/sbin/sshd -f "${test_root}/sshd_config" -E "${test_root}/sshd.log"
-sshd_pid="$(cat "${test_root}/sshd.pid")"
-
+"${rclone}" --cache-dir "${test_root}/server-cache" \
+  --log-file "${test_root}/sftp-server.log" -vv \
+  serve sftp "${remote_root}" --addr "127.0.0.1:${port}" \
+  --user "${server_user}" --pass "${server_password}" &
+server_pid=$!
+server_ready=false
 for _ in $(seq 1 50); do
-  if ssh -i "${test_root}/client-key" -p "${port}" \
-    -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
-    -o UserKnownHostsFile=/dev/null "${test_user}@127.0.0.1" true 2>/dev/null; then
+  if ! kill -0 "${server_pid}" 2>/dev/null; then
+    break
+  fi
+  if ss -H -ltn "sport = :${port}" | grep -q .; then
+    server_ready=true
     break
   fi
   sleep 0.1
 done
-ssh -i "${test_root}/client-key" -p "${port}" \
-  -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
-  -o UserKnownHostsFile=/dev/null "${test_user}@127.0.0.1" true
+test "${server_ready}" == true
 
 export HOME="${test_root}/home"
 export XDG_CONFIG_HOME="${test_root}/config"
@@ -114,11 +86,11 @@ export XDG_STATE_HOME="${test_root}/state"
 export XDG_DATA_HOME="${test_root}/data"
 config_dir="${XDG_CONFIG_HOME}/rsshmount"
 mkdir -p "${config_dir}"
+password_obscured="$("${rclone}" obscure "${server_password}")"
 jq -n \
-  --arg user "${test_user}" \
+  --arg user "${server_user}" \
   --arg port "${port}" \
-  --arg key "${test_root}/client-key" \
-  --arg remote "${remote_name}" \
+  --arg password "${password_obscured}" \
   --arg mountpoint "${mountpoint}" \
   '[{
     id: "local-sftp",
@@ -128,10 +100,10 @@ jq -n \
     host: "127.0.0.1",
     user: $user,
     port: $port,
-    auth: "key",
-    key_file: $key,
+    auth: "password",
+    password_obscured: $password,
     connection_method: "native",
-    remote_path: $remote,
+    remote_path: "",
     mountpoint: $mountpoint,
     cache_mode: "full"
   }]' >"${config_dir}/servers.json"
