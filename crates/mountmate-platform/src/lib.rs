@@ -909,3 +909,135 @@ mod tests {
         }));
     }
 }
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use std::ffi::c_void;
+    use std::mem::{size_of, zeroed};
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::null_mut;
+
+    use tempfile::tempdir;
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACCESS_ALLOWED_ACE_TYPE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
+        CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
+        GetLengthSid, GetSecurityDescriptorControl, PSID, SE_DACL_PROTECTED, SECURITY_MAX_SID_SIZE,
+        TOKEN_QUERY, TOKEN_USER, TokenUser, WinLocalSystemSid,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetTokenInformation, OpenProcessToken,
+    };
+
+    use super::restrict_private_path;
+
+    fn aligned_buffer(bytes: usize) -> Vec<usize> {
+        vec![0; bytes.div_ceil(size_of::<usize>())]
+    }
+
+    #[test]
+    fn private_windows_acl_is_protected_and_only_allows_user_and_system() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("managed-key");
+        std::fs::write(&path, b"private key").unwrap();
+        restrict_private_path(&path, false).unwrap();
+
+        let mut token = null_mut();
+        assert_ne!(
+            unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) },
+            0
+        );
+        let mut token_bytes = 0;
+        unsafe {
+            GetTokenInformation(token, TokenUser, null_mut(), 0, &mut token_bytes);
+        }
+        let mut token_buffer = aligned_buffer(token_bytes as usize);
+        assert_ne!(
+            unsafe {
+                GetTokenInformation(
+                    token,
+                    TokenUser,
+                    token_buffer.as_mut_ptr().cast(),
+                    token_bytes,
+                    &mut token_bytes,
+                )
+            },
+            0
+        );
+        unsafe { CloseHandle(token) };
+        let user_sid = unsafe { (*(token_buffer.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+        assert_ne!(unsafe { GetLengthSid(user_sid) }, 0);
+
+        let mut system_buffer = aligned_buffer(SECURITY_MAX_SID_SIZE as usize);
+        let system_sid: PSID = system_buffer.as_mut_ptr().cast::<c_void>();
+        let mut system_bytes = SECURITY_MAX_SID_SIZE;
+        assert_ne!(
+            unsafe {
+                CreateWellKnownSid(WinLocalSystemSid, null_mut(), system_sid, &mut system_bytes)
+            },
+            0
+        );
+
+        let wide: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut dacl: *mut ACL = null_mut();
+        let mut descriptor = null_mut();
+        assert_eq!(
+            unsafe {
+                GetNamedSecurityInfoW(
+                    wide.as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    null_mut(),
+                    null_mut(),
+                    &mut dacl,
+                    null_mut(),
+                    &mut descriptor,
+                )
+            },
+            0
+        );
+        assert!(!dacl.is_null());
+        assert!(!descriptor.is_null());
+
+        let mut control = 0;
+        let mut revision = 0;
+        assert_ne!(
+            unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) },
+            0
+        );
+        assert_ne!(control & SE_DACL_PROTECTED, 0);
+
+        let mut information: ACL_SIZE_INFORMATION = unsafe { zeroed() };
+        assert_ne!(
+            unsafe {
+                GetAclInformation(
+                    dacl,
+                    (&mut information as *mut ACL_SIZE_INFORMATION).cast(),
+                    size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                )
+            },
+            0
+        );
+        assert_eq!(information.AceCount, 2);
+        let mut found_user = false;
+        let mut found_system = false;
+        for index in 0..information.AceCount {
+            let mut raw_ace = null_mut();
+            assert_ne!(unsafe { GetAce(dacl, index, &mut raw_ace) }, 0);
+            let ace = unsafe { &*(raw_ace.cast::<ACCESS_ALLOWED_ACE>()) };
+            assert_eq!(ace.Header.AceType, ACCESS_ALLOWED_ACE_TYPE);
+            assert_eq!(ace.Mask, FILE_ALL_ACCESS);
+            let sid = (&ace.SidStart as *const u32).cast_mut().cast::<c_void>();
+            found_user |= unsafe { EqualSid(sid, user_sid) } != 0;
+            found_system |= unsafe { EqualSid(sid, system_sid) } != 0;
+        }
+        assert!(found_user);
+        assert!(found_system);
+        unsafe {
+            LocalFree(descriptor);
+        }
+    }
+}
