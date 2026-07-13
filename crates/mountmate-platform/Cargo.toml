@@ -15,7 +15,11 @@ thiserror.workspace = true
 objc2.workspace = true
 objc2-app-kit = { workspace = true, features = [
     "NSApplication",
+    "NSCell",
+    "NSControl",
     "NSDockTile",
+    "NSImage",
+    "NSImageView",
     "NSProgressIndicator",
     "NSResponder",
     "NSView",

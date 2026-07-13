@@ -384,7 +384,10 @@ fn set_global_progress(
 
     use objc2::rc::Retained;
     use objc2::{MainThreadMarker, MainThreadOnly};
-    use objc2_app_kit::{NSApplication, NSProgressIndicator, NSProgressIndicatorStyle};
+    use objc2_app_kit::{
+        NSApplication, NSImageScaling, NSImageView, NSProgressIndicator, NSProgressIndicatorStyle,
+        NSView,
+    };
     use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
     thread_local! {
@@ -396,7 +399,8 @@ fn set_global_progress(
     let mtm = MainThreadMarker::new().ok_or_else(|| {
         PlatformError::Failed("macOS Dock progress must be updated on the main thread".into())
     })?;
-    let dock_tile = NSApplication::sharedApplication(mtm).dockTile();
+    let application = NSApplication::sharedApplication(mtm);
+    let dock_tile = application.dockTile();
     DOCK_PROGRESS.with(|stored| {
         let mut stored = stored.borrow_mut();
         if state == GlobalProgressState::Hidden {
@@ -409,10 +413,20 @@ fn set_global_progress(
         }
 
         if stored.is_none() {
-            let content = dock_tile.contentView(mtm).ok_or_else(|| {
-                PlatformError::Failed("macOS Dock tile did not provide a content view".into())
-            })?;
             let size = dock_tile.size();
+            let content: Retained<NSView> = if let Some(content) = dock_tile.contentView(mtm) {
+                content
+            } else {
+                let frame = NSRect::new(NSPoint::new(0.0, 0.0), size);
+                let image_view = NSImageView::initWithFrame(NSImageView::alloc(mtm), frame);
+                if let Some(icon) = application.applicationIconImage() {
+                    image_view.setImage(Some(&icon));
+                }
+                image_view.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
+                let content = image_view.into_super().into_super();
+                dock_tile.setContentView(Some(&content));
+                content
+            };
             let margin = (size.width * 0.08).max(4.0);
             let height = (size.height * 0.13).clamp(8.0, 18.0);
             let frame = NSRect::new(
