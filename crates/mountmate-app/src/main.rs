@@ -31,6 +31,9 @@ use mountmate_core::{
 #[cfg(windows)]
 use mountmate_platform::NativeWindowHandle;
 use mountmate_platform::{GlobalProgressState, Platform, PlatformIntegration};
+use mountmate_platform::{
+    Notification as NativeNotification, NotificationLevel as NativeNotificationLevel,
+};
 
 mod cli;
 mod i18n;
@@ -301,6 +304,7 @@ struct App {
     popup_order: Vec<window::Id>,
     dismissed_popups: HashSet<String>,
     synced_polls: HashMap<String, u8>,
+    notification_tracker: TransferNotificationTracker,
     screen: Screen,
     connection_draft: Option<ConnectionDraft>,
     settings_draft: Option<SettingsDraft>,
@@ -310,6 +314,56 @@ struct App {
     ssh_import_actions: Vec<ImportAction>,
     pending_delete: Option<String>,
     status: String,
+}
+
+#[derive(Default)]
+struct TransferNotificationTracker {
+    observed_active: HashSet<String>,
+    notified_errors: HashSet<String>,
+}
+
+impl TransferNotificationTracker {
+    fn observe(
+        &mut self,
+        server_id: &str,
+        display_name: &str,
+        snapshot: &TransferSnapshot,
+        synced_polls: u8,
+        locale: Locale,
+    ) -> Vec<NativeNotification> {
+        let mut notifications = Vec::new();
+        if transfer_is_active(snapshot) {
+            self.observed_active.insert(server_id.into());
+        }
+
+        let failed = snapshot.errors > 0 || snapshot.out_of_space;
+        if failed {
+            if self.notified_errors.insert(server_id.into()) {
+                notifications.push(transfer_error_notification(
+                    locale,
+                    server_id,
+                    display_name,
+                    snapshot,
+                ));
+            }
+        } else {
+            self.notified_errors.remove(server_id);
+        }
+
+        if snapshot.synced && synced_polls >= 2 && self.observed_active.remove(server_id) {
+            notifications.push(transfer_complete_notification(
+                locale,
+                server_id,
+                display_name,
+            ));
+        }
+        notifications
+    }
+
+    fn forget(&mut self, server_id: &str) {
+        self.observed_active.remove(server_id);
+        self.notified_errors.remove(server_id);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -476,6 +530,7 @@ enum Message {
     StatusesLoaded(Vec<(String, Result<MountStatus, String>)>),
     TransferTick,
     TransfersLoaded(Vec<(String, Result<TransferSnapshot, String>)>),
+    NotificationFinished(Result<(), String>),
     PopupOpened(window::Id),
     ClosePopup(window::Id),
     CloseRequested(window::Id),
@@ -633,6 +688,7 @@ impl App {
             popup_order: Vec::new(),
             dismissed_popups: HashSet::new(),
             synced_polls: HashMap::new(),
+            notification_tracker: TransferNotificationTracker::default(),
             screen,
             connection_draft: None,
             settings_draft: None,
@@ -699,10 +755,14 @@ impl App {
             },
             Message::StatusesLoaded(results) => {
                 let mut errors = Vec::new();
+                let mut unmounted = Vec::new();
                 for (id, result) in results {
                     match result {
                         Ok(status) => {
-                            self.mount_statuses.insert(id, status);
+                            self.mount_statuses.insert(id.clone(), status);
+                            if status == MountStatus::Unmounted {
+                                unmounted.push(id);
+                            }
                         }
                         Err(error) => errors.push(error),
                     }
@@ -711,20 +771,44 @@ impl App {
                     .first()
                     .cloned()
                     .unwrap_or_else(|| locale.text(TextKey::Ready).into());
-                return set_native_global_progress(self.main_window, self.global_progress_state());
+                let mut tasks: Vec<_> = unmounted
+                    .iter()
+                    .map(|id| self.close_popups_for_server(id))
+                    .collect();
+                tasks.push(set_native_global_progress(
+                    self.main_window,
+                    self.global_progress_state(),
+                ));
+                return Task::batch(tasks);
             }
             Message::TransferTick => return self.transfer_task(),
             Message::TransfersLoaded(results) => {
                 self.transfer_refreshing = false;
+                let mut notifications = Vec::new();
                 for (id, result) in results {
                     match result {
                         Ok(snapshot) => {
-                            if snapshot.synced {
+                            let synced_polls = if snapshot.synced {
                                 let polls = self.synced_polls.entry(id.clone()).or_default();
                                 *polls = polls.saturating_add(1);
+                                *polls
                             } else {
                                 self.synced_polls.remove(&id);
-                            }
+                                0
+                            };
+                            let display_name = self
+                                .servers
+                                .iter()
+                                .find(|server| server.id == id)
+                                .map(|server| server.display_name().to_owned())
+                                .unwrap_or_else(|| id.clone());
+                            notifications.extend(self.notification_tracker.observe(
+                                &id,
+                                &display_name,
+                                &snapshot,
+                                synced_polls,
+                                locale,
+                            ));
                             self.transfers.insert(id.clone(), snapshot);
                             self.transfer_errors.remove(&id);
                         }
@@ -733,10 +817,17 @@ impl App {
                         }
                     }
                 }
-                return Task::batch([
+                let mut tasks = vec![
                     self.reconcile_transfer_popups(),
                     set_native_global_progress(self.main_window, self.global_progress_state()),
-                ]);
+                ];
+                tasks.extend(notifications.into_iter().map(show_native_notification));
+                return Task::batch(tasks);
+            }
+            Message::NotificationFinished(result) => {
+                if let Err(error) = result {
+                    diagnostic_trace(&format!("native notification failed: {error}"));
+                }
             }
             Message::PopupOpened(id) => {
                 let index = self
@@ -1803,6 +1894,7 @@ impl App {
         self.transfers.remove(server_id);
         self.transfer_errors.remove(server_id);
         self.synced_polls.remove(server_id);
+        self.notification_tracker.forget(server_id);
         Task::batch(tasks)
     }
 
@@ -3000,6 +3092,63 @@ fn transfer_is_active(snapshot: &TransferSnapshot) -> bool {
     snapshot.queued > 0 || snapshot.uploading > 0 || snapshot.errors > 0
 }
 
+fn transfer_complete_notification(
+    locale: Locale,
+    server_id: &str,
+    display_name: &str,
+) -> NativeNotification {
+    NativeNotification {
+        id: format!("transfer-complete-{server_id}"),
+        title: match locale {
+            Locale::English => "Upload complete".into(),
+            Locale::Chinese => "上传完成".into(),
+        },
+        body: match locale {
+            Locale::English => {
+                format!("{display_name} is synchronized with the remote server.")
+            }
+            Locale::Chinese => format!("{display_name} 已与远端服务器同步。"),
+        },
+        progress: None,
+        level: NativeNotificationLevel::Info,
+    }
+}
+
+fn transfer_error_notification(
+    locale: Locale,
+    server_id: &str,
+    display_name: &str,
+    snapshot: &TransferSnapshot,
+) -> NativeNotification {
+    let body = if snapshot.out_of_space {
+        match locale {
+            Locale::English => format!("The local VFS cache for {display_name} is out of space."),
+            Locale::Chinese => format!("{display_name} 的本地 VFS 缓存空间不足。"),
+        }
+    } else {
+        match locale {
+            Locale::English => format!(
+                "{display_name} reports {} upload error(s). Open the transfer center for details.",
+                snapshot.errors
+            ),
+            Locale::Chinese => format!(
+                "{display_name} 报告 {} 个上传错误，请打开传输中心查看详情。",
+                snapshot.errors
+            ),
+        }
+    };
+    NativeNotification {
+        id: format!("transfer-error-{server_id}"),
+        title: match locale {
+            Locale::English => "Upload needs attention".into(),
+            Locale::Chinese => "上传需要处理".into(),
+        },
+        body,
+        progress: None,
+        level: NativeNotificationLevel::Error,
+    }
+}
+
 fn global_progress_state(totals: &TransferTotals, out_of_space: bool) -> GlobalProgressState {
     if totals.errors > 0 || out_of_space {
         return GlobalProgressState::Error {
@@ -3134,6 +3283,21 @@ fn set_native_global_progress(id: window::Id, state: GlobalProgressState) -> Tas
         }
     })
     .discard()
+}
+
+fn show_native_notification(notification: NativeNotification) -> Task<Message> {
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(move || {
+                Platform
+                    .show_notification(&notification)
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(|error| error.to_string())?
+        },
+        Message::NotificationFinished,
+    )
 }
 
 #[cfg(not(windows))]
@@ -3295,6 +3459,70 @@ mod localization_tests {
         assert_eq!(
             global_progress_state(&TransferTotals::default(), false),
             GlobalProgressState::Hidden
+        );
+    }
+
+    #[test]
+    fn native_notifications_require_real_state_transitions() {
+        let mut tracker = TransferNotificationTracker::default();
+        let active = TransferSnapshot {
+            files: Vec::new(),
+            queued: 1,
+            uploading: 1,
+            queued_bytes: 100,
+            transferred_bytes: 40,
+            percentage: 40.0,
+            errors: 0,
+            out_of_space: false,
+            synced: false,
+        };
+        assert!(
+            tracker
+                .observe("alpha", "Alpha", &active, 0, Locale::English)
+                .is_empty()
+        );
+
+        let synced = TransferSnapshot {
+            files: Vec::new(),
+            queued: 0,
+            uploading: 0,
+            queued_bytes: 0,
+            transferred_bytes: 0,
+            percentage: 100.0,
+            errors: 0,
+            out_of_space: false,
+            synced: true,
+        };
+        assert!(
+            tracker
+                .observe("alpha", "Alpha", &synced, 1, Locale::English)
+                .is_empty()
+        );
+        let completed = tracker.observe("alpha", "Alpha", &synced, 2, Locale::English);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].level, NativeNotificationLevel::Info);
+        assert!(
+            tracker
+                .observe("alpha", "Alpha", &synced, 3, Locale::English)
+                .is_empty()
+        );
+
+        let mut failed = active.clone();
+        failed.errors = 1;
+        let first_error = tracker.observe("alpha", "Alpha", &failed, 0, Locale::English);
+        assert_eq!(first_error.len(), 1);
+        assert_eq!(first_error[0].level, NativeNotificationLevel::Error);
+        assert!(
+            tracker
+                .observe("alpha", "Alpha", &failed, 0, Locale::English)
+                .is_empty()
+        );
+        tracker.observe("alpha", "Alpha", &active, 0, Locale::English);
+        assert_eq!(
+            tracker
+                .observe("alpha", "Alpha", &failed, 0, Locale::English)
+                .len(),
+            1
         );
     }
 }

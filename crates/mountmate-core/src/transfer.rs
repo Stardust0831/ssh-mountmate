@@ -176,7 +176,7 @@ pub fn build_transfer_snapshot(
         },
         errors,
         out_of_space: vfs.disk_cache.out_of_space,
-        synced: queued == 0 && uploading == 0 && errors == 0,
+        synced: queued == 0 && uploading == 0 && errors == 0 && !vfs.disk_cache.out_of_space,
     }
 }
 
@@ -253,6 +253,23 @@ mod tests {
 
         assert_eq!(snapshot.uploading, 1);
         assert_eq!(snapshot.percentage, 0.0);
+        assert!(!snapshot.synced);
+    }
+
+    #[test]
+    fn exhausted_cache_never_reports_cloud_sync() {
+        let snapshot = build_transfer_snapshot(
+            QueueResponse::default(),
+            VfsStatsResponse {
+                disk_cache: DiskCacheStats {
+                    out_of_space: true,
+                    ..DiskCacheStats::default()
+                },
+            },
+            CoreStatsResponse::default(),
+        );
+
+        assert!(snapshot.out_of_space);
         assert!(!snapshot.synced);
     }
 }

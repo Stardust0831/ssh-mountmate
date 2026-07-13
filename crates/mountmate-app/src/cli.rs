@@ -129,6 +129,12 @@ pub(crate) fn licenses() -> &'static str {
         include_str!("../../../licenses/sys-locale-LICENSE-MIT.txt"),
         "\n\n--- tray-icon and muda license ---\n\n",
         include_str!("../../../licenses/tray-icon-LICENSE-MIT.txt"),
+        "\n\n--- windows-rs license ---\n\n",
+        include_str!("../../../licenses/windows-LICENSE-MIT.txt"),
+        "\n\n--- notify-rust license ---\n\n",
+        include_str!("../../../licenses/notify-rust-LICENSE-MIT.txt"),
+        "\n\n--- tauri-winrt-notification license ---\n\n",
+        include_str!("../../../licenses/tauri-winrt-notification-LICENSE-MIT.txt"),
     )
 }
 

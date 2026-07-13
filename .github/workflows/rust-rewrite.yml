@@ -95,6 +95,7 @@ jobs:
             $driveRefresh = (Get-Item 'HKCU:\Software\Classes\Drive\shell\SSHMountMate.Refresh\command').GetValue('')
             $backgroundRefresh = (Get-Item 'HKCU:\Software\Classes\Directory\Background\shell\SSHMountMate.Refresh\command').GetValue('')
             $driveTransfers = (Get-Item 'HKCU:\Software\Classes\Drive\shell\SSHMountMate.Transfers\command').GetValue('')
+            $notificationName = (Get-Item 'HKCU:\Software\Classes\AppUserModelId\Stardust.SSHMountMate').GetValue('DisplayName')
             if ($driveRefresh -ne "`"$exe`" --refresh-path `"%1\.`"") {
               throw "Unexpected drive refresh command: $driveRefresh"
             }
@@ -103,6 +104,9 @@ jobs:
             }
             if ($driveTransfers -ne "`"$exe`" --show-transfers") {
               throw "Unexpected transfer command: $driveTransfers"
+            }
+            if ($notificationName -ne 'SSH MountMate') {
+              throw "Unexpected notification identity: $notificationName"
             }
           } finally {
             & $exe --unregister-file-manager-menu
@@ -132,7 +136,8 @@ jobs:
           shasum -a 256 target/release/bin/rclone | awk '{print $1}' > target/release/bin/rclone.sha256
           cp THIRD_PARTY_NOTICES.md licenses/rclone-COPYING.txt licenses/rfd-LICENSE.txt \
             licenses/sys-locale-LICENSE-MIT.txt licenses/tray-icon-LICENSE-MIT.txt \
-            licenses/windows-LICENSE-MIT.txt target/release/
+            licenses/windows-LICENSE-MIT.txt licenses/notify-rust-LICENSE-MIT.txt \
+            licenses/tauri-winrt-notification-LICENSE-MIT.txt target/release/
       - name: Bundle verified rclone
         if: runner.os == 'Windows'
         shell: pwsh
@@ -155,7 +160,7 @@ jobs:
           Copy-Item $binary.FullName target/release/bin/rclone.exe
           (Get-FileHash -Algorithm SHA256 target/release/bin/rclone.exe).Hash.ToLowerInvariant() |
             Set-Content -NoNewline target/release/bin/rclone.exe.sha256
-          Copy-Item THIRD_PARTY_NOTICES.md, licenses/rclone-COPYING.txt, licenses/rfd-LICENSE.txt, licenses/sys-locale-LICENSE-MIT.txt, licenses/tray-icon-LICENSE-MIT.txt, licenses/windows-LICENSE-MIT.txt target/release/
+          Copy-Item THIRD_PARTY_NOTICES.md, licenses/rclone-COPYING.txt, licenses/rfd-LICENSE.txt, licenses/sys-locale-LICENSE-MIT.txt, licenses/tray-icon-LICENSE-MIT.txt, licenses/windows-LICENSE-MIT.txt, licenses/notify-rust-LICENSE-MIT.txt, licenses/tauri-winrt-notification-LICENSE-MIT.txt target/release/
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
@@ -172,4 +177,6 @@ jobs:
             target/release/sys-locale-LICENSE-MIT.txt
             target/release/tray-icon-LICENSE-MIT.txt
             target/release/windows-LICENSE-MIT.txt
+            target/release/notify-rust-LICENSE-MIT.txt
+            target/release/tauri-winrt-notification-LICENSE-MIT.txt
           if-no-files-found: error

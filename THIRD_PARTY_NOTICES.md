@@ -51,3 +51,20 @@ Programme MIT license notice included above.
 
 The Rust application links Microsoft's `windows` crate to expose native Windows shell APIs,
 including truthful taskbar transfer progress.
+
+## notify-rust
+
+- Project: https://github.com/hoodie/notify-rust
+- License: MIT OR Apache-2.0 (distributed under the MIT option)
+- License text: `licenses/notify-rust-LICENSE-MIT.txt`
+
+The Rust application links `notify-rust` to deliver Windows Toast, macOS Notification Center,
+and Linux freedesktop desktop notifications.
+
+## tauri-winrt-notification
+
+- Project: https://github.com/tauri-apps/winrt-notification
+- License: MIT OR Apache-2.0 (distributed under the MIT option)
+- License text: `licenses/tauri-winrt-notification-LICENSE-MIT.txt`
+
+`notify-rust` uses this Tauri library as its Windows Toast backend.

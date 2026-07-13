@@ -21,6 +21,13 @@ pub struct Notification {
     pub title: String,
     pub body: String,
     pub progress: Option<(u64, u64)>,
+    pub level: NotificationLevel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationLevel {
+    Info,
+    Error,
 }
 
 #[derive(Debug, Error)]
@@ -183,8 +190,8 @@ fn restrict_private_path(_path: &Path, _directory: bool) -> Result<(), String> {
 }
 
 impl PlatformIntegration for Platform {
-    fn show_notification(&self, _notification: &Notification) -> Result<(), PlatformError> {
-        Err(PlatformError::Unsupported("native notifications"))
+    fn show_notification(&self, notification: &Notification) -> Result<(), PlatformError> {
+        show_notification(notification)
     }
 
     fn set_global_progress(
@@ -202,6 +209,96 @@ impl PlatformIntegration for Platform {
     fn unregister_file_manager_menu(&self) -> Result<(), PlatformError> {
         unregister_file_manager_menu()
     }
+}
+
+#[cfg(windows)]
+const NOTIFICATION_APP_ID: &str = "Stardust.SSHMountMate";
+
+fn show_notification(notification: &Notification) -> Result<(), PlatformError> {
+    let mut native = notify_rust::Notification::new();
+    native
+        .appname(mountmate_core::APP_NAME)
+        .summary(&notification.title)
+        .body(&notification.body);
+
+    #[cfg(windows)]
+    {
+        ensure_windows_notification_identity()?;
+        let _apartment = WindowsRuntimeApartment::initialize()?;
+        native.app_id(NOTIFICATION_APP_ID);
+    }
+    #[cfg(target_os = "macos")]
+    ensure_macos_notification_identity()?;
+    #[cfg(not(target_os = "macos"))]
+    if notification.level == NotificationLevel::Error {
+        native.urgency(notify_rust::Urgency::Critical);
+    }
+
+    native
+        .show()
+        .map(|_| ())
+        .map_err(|error| PlatformError::Failed(error.to_string()))
+}
+
+#[cfg(windows)]
+struct WindowsRuntimeApartment;
+
+#[cfg(windows)]
+impl WindowsRuntimeApartment {
+    fn initialize() -> Result<Self, PlatformError> {
+        use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
+
+        unsafe { RoInitialize(RO_INIT_MULTITHREADED) }
+            .map_err(|error| PlatformError::Failed(error.to_string()))?;
+        Ok(Self)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsRuntimeApartment {
+    fn drop(&mut self) {
+        use windows::Win32::System::WinRT::RoUninitialize;
+
+        unsafe {
+            RoUninitialize();
+        }
+    }
+}
+
+#[cfg(windows)]
+fn ensure_windows_notification_identity() -> Result<(), PlatformError> {
+    use std::sync::OnceLock;
+
+    static RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+    RESULT
+        .get_or_init(|| {
+            let key = windows_registry::CURRENT_USER
+                .create(format!(
+                    r"Software\Classes\AppUserModelId\{NOTIFICATION_APP_ID}"
+                ))
+                .map_err(|error| error.to_string())?;
+            key.set_string("DisplayName", mountmate_core::APP_NAME)
+                .map_err(|error| error.to_string())?;
+            key.set_string("IconBackgroundColor", "0")
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        })
+        .clone()
+        .map_err(PlatformError::Failed)
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_macos_notification_identity() -> Result<(), PlatformError> {
+    use std::sync::OnceLock;
+
+    static RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+    RESULT
+        .get_or_init(|| {
+            notify_rust::set_application("com.stardust.sshmountmate")
+                .map_err(|error| error.to_string())
+        })
+        .clone()
+        .map_err(PlatformError::Failed)
 }
 
 #[cfg(windows)]
@@ -349,6 +446,8 @@ fn register_file_manager_menu(executable: &Path) -> Result<(), PlatformError> {
         HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
         RegCreateKeyExW, RegSetValueExW,
     };
+
+    ensure_windows_notification_identity()?;
 
     struct OwnedKey(HKEY);
     impl Drop for OwnedKey {
