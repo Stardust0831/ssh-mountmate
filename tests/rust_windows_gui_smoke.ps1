@@ -101,6 +101,7 @@ try {
   $env:APPDATA = Join-Path $testRoot 'roaming'
   $env:LOCALAPPDATA = Join-Path $testRoot 'local'
   $env:SSH_MOUNTMATE_TRACE_FILE = $trace
+  $env:SSH_MOUNTMATE_E2E_NATIVE_SMOKE = '1'
   New-Item -ItemType Directory -Force $env:HOME, $env:APPDATA, $env:LOCALAPPDATA | Out-Null
 
   $gui = Start-Process -FilePath $binary -PassThru `
@@ -110,7 +111,8 @@ try {
   Wait-Until { [SSHMountMateWindowTest]::FindMainWindow($gui.Id) -ne [IntPtr]::Zero }
   $initialWindow = [SSHMountMateWindowTest]::FindMainWindow($gui.Id)
   Wait-Until { Trace-Contains 'tray initialized' }
-  Wait-Until { Trace-Contains 'taskbar progress updated: Hidden' }
+  Wait-Until { Trace-Contains 'taskbar progress updated: Normal { completed: 1, total: 2 }' }
+  Wait-Until { Trace-Contains 'native notification submitted' }
 
   Invoke-SecondInstance @('--show-transfers')
   Wait-Until { Trace-Contains 'ipc-server received ShowTransfers' }
@@ -135,7 +137,9 @@ try {
   Wait-Until { [SSHMountMateWindowTest]::FindMainWindow($gui.Id) -ne [IntPtr]::Zero }
   $restoredWindow = [SSHMountMateWindowTest]::FindMainWindow($gui.Id)
   if ($gui.Id -ne $matching[0].Id) { throw 'Restored window belongs to another process' }
-  Wait-Until { (Trace-LineCount 'taskbar progress updated: Hidden') -ge 2 }
+  Wait-Until {
+    (Trace-LineCount 'taskbar progress updated: Normal { completed: 1, total: 2 }') -ge 2
+  }
   $matching = @(Get-Process | Where-Object {
     try { $_.Path -eq $binary } catch { $false }
   })

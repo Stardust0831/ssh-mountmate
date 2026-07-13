@@ -840,15 +840,26 @@ impl App {
                     {
                         self.status = format!("Update health confirmation failed: {error}");
                     }
-                    let progress = self.global_progress_state();
+                    let native_smoke = native_integration_smoke_enabled();
+                    let progress = if native_smoke {
+                        GlobalProgressState::Normal {
+                            completed: 1,
+                            total: 2,
+                        }
+                    } else {
+                        self.global_progress_state()
+                    };
+                    let mut tasks = vec![set_native_global_progress(id, progress)];
+                    if native_smoke {
+                        tasks.push(show_native_notification(
+                            native_integration_smoke_notification(),
+                        ));
+                    }
                     if self.pending_main_activation {
                         self.pending_main_activation = false;
-                        return Task::batch([
-                            self.activate_main_window(),
-                            set_native_global_progress(id, progress),
-                        ]);
+                        tasks.push(self.activate_main_window());
                     }
-                    return set_native_global_progress(id, progress);
+                    return Task::batch(tasks);
                 }
             }
             Message::Refresh => match storage::load_servers(&self.paths) {
@@ -958,11 +969,12 @@ impl App {
                 tasks.extend(notifications.into_iter().map(show_native_notification));
                 return Task::batch(tasks);
             }
-            Message::NotificationFinished(result) => {
-                if let Err(error) = result {
+            Message::NotificationFinished(result) => match result {
+                Ok(()) => diagnostic_trace("native notification submitted"),
+                Err(error) => {
                     diagnostic_trace(&format!("native notification failed: {error}"));
                 }
-            }
+            },
             Message::PopupOpened(id) => {
                 let index = self
                     .popup_order
@@ -3725,6 +3737,20 @@ fn transfer_label(locale: Locale, snapshot: &TransferSnapshot) -> String {
 
 fn transfer_is_active(snapshot: &TransferSnapshot) -> bool {
     snapshot.queued > 0 || snapshot.uploading > 0 || snapshot.errors > 0
+}
+
+fn native_integration_smoke_enabled() -> bool {
+    std::env::var_os("SSH_MOUNTMATE_E2E_NATIVE_SMOKE").is_some()
+}
+
+fn native_integration_smoke_notification() -> NativeNotification {
+    NativeNotification {
+        id: "native-integration-smoke".into(),
+        title: "SSH MountMate native integration".into(),
+        body: "Windows notification delivery is active.".into(),
+        progress: None,
+        level: NativeNotificationLevel::Info,
+    }
 }
 
 fn transfer_complete_notification(
