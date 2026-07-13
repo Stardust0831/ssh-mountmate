@@ -355,6 +355,10 @@ fn find_in_path(executable: &str, path: Option<&std::ffi::OsStr>) -> Option<Path
     })
 }
 
+pub fn find_system_executable(executable: &str) -> Option<PathBuf> {
+    find_in_path(executable, env::var_os("PATH").as_deref())
+}
+
 fn common_paths(executable: &str) -> Vec<PathBuf> {
     let mut paths = directories::BaseDirs::new()
         .map(|dirs| vec![dirs.home_dir().join(".local/bin").join(executable)])

@@ -1,5 +1,6 @@
 pub mod app_command;
 pub mod connection;
+pub mod dependency;
 pub mod model;
 pub mod mountpoint;
 pub mod paths;

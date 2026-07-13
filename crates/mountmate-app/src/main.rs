@@ -19,6 +19,7 @@ use mountmate_core::connection::{
     ConnectionDraft, ConnectionSource, DraftError, ImportAction, ImportStatus, SecretAction,
     SshImportPlan,
 };
+use mountmate_core::dependency::{DependencyStatus, check_dependencies};
 use mountmate_core::paths::AppPaths;
 use mountmate_core::process::MountStatus;
 use mountmate_core::service::MountService;
@@ -356,6 +357,8 @@ struct App {
     update_downloading: bool,
     update_progress: Arc<Mutex<UpdateDownloadProgress>>,
     prepared_update: Option<PreparedUpdateLaunch>,
+    dependency_status: Option<DependencyStatus>,
+    dependency_checking: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -625,6 +628,8 @@ enum Message {
     DownloadUpdate,
     UpdatePrepared(Result<PreparedUpdateLaunch, String>),
     InstallUpdateDecision(bool),
+    CheckDependencies,
+    DependenciesChecked(Result<DependencyStatus, String>),
     LanguageChanged(Language),
     RegisterFileManagerMenu,
     UnregisterFileManagerMenu,
@@ -763,6 +768,8 @@ impl App {
             update_downloading: false,
             update_progress: Arc::new(Mutex::new(UpdateDownloadProgress::default())),
             prepared_update: None,
+            dependency_status: None,
+            dependency_checking: false,
         };
         let mut tasks = vec![
             open_window.map(Message::MainWindowOpened),
@@ -970,6 +977,8 @@ impl App {
                 self.settings_draft = Some(SettingsDraft::from_settings(&self.settings));
                 self.screen = Screen::Settings;
                 self.status = locale.text(TextKey::Settings).into();
+                self.dependency_checking = true;
+                return self.dependency_check_task();
             }
             Message::CancelEditor => {
                 if !self.editor_saving {
@@ -1318,6 +1327,37 @@ impl App {
                     Locale::English => "Update installation was postponed".into(),
                     Locale::Chinese => "已暂缓安装更新".into(),
                 };
+            }
+            Message::CheckDependencies => {
+                if !self.dependency_checking {
+                    self.dependency_checking = true;
+                    return self.dependency_check_task();
+                }
+            }
+            Message::DependenciesChecked(result) => {
+                self.dependency_checking = false;
+                match result {
+                    Ok(status) => {
+                        let missing = status.missing();
+                        self.status = if missing.is_empty() {
+                            match locale {
+                                Locale::English => "All mount dependencies are available".into(),
+                                Locale::Chinese => "挂载依赖均已就绪".into(),
+                            }
+                        } else {
+                            match locale {
+                                Locale::English => {
+                                    format!("Missing dependencies: {}", missing.join(", "))
+                                }
+                                Locale::Chinese => {
+                                    format!("缺少依赖：{}", missing.join("、"))
+                                }
+                            }
+                        };
+                        self.dependency_status = Some(status);
+                    }
+                    Err(error) => self.status = error,
+                }
             }
             Message::LanguageChanged(language) => {
                 if let Some(draft) = &mut self.settings_draft {
@@ -1929,6 +1969,21 @@ impl App {
                 .unwrap_or_else(|error| Err(error.to_string()))
             },
             Message::StartupReconciled,
+        )
+    }
+
+    fn dependency_check_task(&self) -> Task<Message> {
+        let paths = self.paths.clone();
+        let app_root = application_root();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    check_dependencies(&paths, &app_root).map_err(|error| error.to_string())
+                })
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()))
+            },
+            Message::DependenciesChecked,
         )
     }
 
@@ -2985,6 +3040,49 @@ impl App {
         } else {
             column![]
         };
+        let mut dependency_section = column![
+            text(match locale {
+                Locale::English => "Mount dependencies",
+                Locale::Chinese => "挂载依赖",
+            })
+            .size(20)
+        ]
+        .spacing(6)
+        .max_width(640);
+        if self.dependency_checking {
+            dependency_section = dependency_section.push(text(match locale {
+                Locale::English => "Checking dependencies...",
+                Locale::Chinese => "正在检查依赖...",
+            }));
+        } else if let Some(dependencies) = &self.dependency_status {
+            let available = |value: bool| match (locale, value) {
+                (Locale::English, true) => "Available",
+                (Locale::English, false) => "Missing",
+                (Locale::Chinese, true) => "已就绪",
+                (Locale::Chinese, false) => "缺失",
+            };
+            dependency_section = dependency_section
+                .push(text(format!(
+                    "rclone: {}",
+                    available(dependencies.rclone.is_some())
+                )))
+                .push(text(format!(
+                    "{}: {}",
+                    dependencies.mount_dependency,
+                    available(dependencies.mount_dependency_installed)
+                )))
+                .push(text(format!(
+                    "OpenSSH: {}",
+                    available(dependencies.openssh.is_some())
+                )));
+        }
+        dependency_section = dependency_section.push(
+            button(match locale {
+                Locale::English => "Check again",
+                Locale::Chinese => "重新检查",
+            })
+            .on_press_maybe((!self.dependency_checking).then_some(Message::CheckDependencies)),
+        );
         let update_title = match locale {
             Locale::English => "Software updates",
             Locale::Chinese => "软件更新",
@@ -3075,6 +3173,7 @@ impl App {
             cache_limits,
             cache_timing,
             behavior,
+            dependency_section,
             update_section,
             tray_capability,
             file_manager
