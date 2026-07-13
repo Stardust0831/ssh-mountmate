@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, for example v0.1.0"
+        description: "Release tag, for example v0.4.0-alpha.1"
         required: true
         type: string
 
@@ -22,88 +22,209 @@ jobs:
         include:
           - os: windows-latest
             asset: SSHMountMate-windows-x64
+            rclone_platform: windows
+            rclone_arch: amd64
+            rclone_sha256: ef097ef9de37a57feb7d9f9c7afb34148ad3c65be8025f1d8f7f521554a701ea
           - os: windows-11-arm
             asset: SSHMountMate-windows-arm64
+            rclone_platform: windows
+            rclone_arch: arm64
+            rclone_sha256: 72194ad0aaf210d7a55808801191fecc7e175444dab7be7491b7a63074521f3a
           - os: macos-15-intel
             asset: SSHMountMate-macos-x64
+            rclone_platform: osx
+            rclone_arch: amd64
+            rclone_sha256: 4188aa84043d7a6240912923f47639a9d2da21f3b40a521c065c8d92e66563f6
           - os: macos-14
             asset: SSHMountMate-macos-arm64
+            rclone_platform: osx
+            rclone_arch: arm64
+            rclone_sha256: c2100e2d4a4b3be04c55cd45380cafe7647e1ad772bb055f52f00876ed701167
           - os: ubuntu-latest
             asset: SSHMountMate-linux-x64
+            rclone_platform: linux
+            rclone_arch: amd64
+            rclone_sha256: fe435e0c36228e7c2f116a8701f01127bb1f694005fc11d1f27186c8bca4115d
           - os: ubuntu-24.04-arm
             asset: SSHMountMate-linux-arm64
+            rclone_platform: linux
+            rclone_arch: arm64
+            rclone_sha256: 97685285c9ad6a0cf17d5844115d2a67245af6444db672187074bd9c358de419
     runs-on: ${{ matrix.os }}
 
     steps:
-      - name: Check out
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - name: Validate release version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          test "${RELEASE_TAG}" = "v${version}"
+      - uses: dtolnay/rust-toolchain@master
         with:
-          python-version: "3.12"
-
-      - name: Install Linux GUI libraries
+          toolchain: 1.97.0
+      - name: Install Linux GUI dependencies
         if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libgtk-3-dev libayatana-appindicator3-dev zip
+      - run: cargo test --workspace --all-features
+      - run: cargo build --release --package ssh-mountmate
+
+      - name: Bundle verified rclone
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          RCLONE_VERSION: v1.74.4
+          RCLONE_PLATFORM: ${{ matrix.rclone_platform }}
+          RCLONE_ARCH: ${{ matrix.rclone_arch }}
+          RCLONE_SHA256: ${{ matrix.rclone_sha256 }}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y python3-tk
+          set -euo pipefail
+          archive="rclone-${RCLONE_VERSION}-${RCLONE_PLATFORM}-${RCLONE_ARCH}.zip"
+          curl --fail --location --silent --show-error \
+            "https://downloads.rclone.org/${RCLONE_VERSION}/${archive}" \
+            --output "${RUNNER_TEMP}/${archive}"
+          echo "${RCLONE_SHA256}  ${RUNNER_TEMP}/${archive}" | shasum -a 256 --check
+          mkdir -p "${RUNNER_TEMP}/rclone" target/release/bin
+          unzip -q "${RUNNER_TEMP}/${archive}" -d "${RUNNER_TEMP}/rclone"
+          find "${RUNNER_TEMP}/rclone" -type f -name rclone -exec cp {} target/release/bin/rclone \;
+          chmod 755 target/release/bin/rclone
+          shasum -a 256 target/release/bin/rclone | awk '{print $1}' > target/release/bin/rclone.sha256
 
-      - name: Install Python build dependencies
+      - name: Bundle verified rclone
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RCLONE_VERSION: v1.74.4
+          RCLONE_PLATFORM: ${{ matrix.rclone_platform }}
+          RCLONE_ARCH: ${{ matrix.rclone_arch }}
+          RCLONE_SHA256: ${{ matrix.rclone_sha256 }}
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e ".[build]"
+          $archive = "rclone-$env:RCLONE_VERSION-$env:RCLONE_PLATFORM-$env:RCLONE_ARCH.zip"
+          $archivePath = Join-Path $env:RUNNER_TEMP $archive
+          Invoke-WebRequest "https://downloads.rclone.org/$env:RCLONE_VERSION/$archive" -OutFile $archivePath
+          $actual = (Get-FileHash -Algorithm SHA256 $archivePath).Hash.ToLowerInvariant()
+          if ($actual -ne $env:RCLONE_SHA256) { throw "rclone archive SHA-256 mismatch: $actual" }
+          $extract = Join-Path $env:RUNNER_TEMP rclone
+          Expand-Archive -Path $archivePath -DestinationPath $extract -Force
+          New-Item -ItemType Directory -Force target/release/bin | Out-Null
+          $binary = Get-ChildItem -Path $extract -Recurse -File -Filter rclone.exe | Select-Object -First 1
+          if (-not $binary) { throw "rclone archive did not contain rclone.exe" }
+          Copy-Item $binary.FullName target/release/bin/rclone.exe
+          (Get-FileHash -Algorithm SHA256 target/release/bin/rclone.exe).Hash.ToLowerInvariant() |
+            Set-Content -NoNewline target/release/bin/rclone.exe.sha256
 
-      - name: Run tests
-        run: python -m unittest discover -s tests -v
-
-      - name: Compile Python sources
-        run: python -m compileall -q src tests build launcher.py
-
-      - name: Build executable
-        run: python build/build_local.py
-
-      - name: Package asset
-        shell: python
+      - name: Assemble directory bundle
+        if: runner.os == 'Linux'
+        shell: bash
         run: |
-          from pathlib import Path
-          import zipfile
+          set -euo pipefail
+          root="target/package/SSHMountMate"
+          mkdir -p "${root}/bin"
+          cp target/release/SSHMountMate "${root}/SSHMountMate"
+          cp target/release/bin/rclone target/release/bin/rclone.sha256 "${root}/bin/"
+          cp THIRD_PARTY_NOTICES.md licenses/*.txt distribution/SSHMountMate.install-layout "${root}/"
+          chmod 755 "${root}/SSHMountMate" "${root}/bin/rclone"
+          "${root}/SSHMountMate" --version
 
-          root = Path(".")
-          dist = root / "dist"
-          release = root / "release"
-          release.mkdir(parents=True, exist_ok=True)
-          outputs = [
-              (release / "${{ matrix.asset }}.zip", dist / "onefile"),
-              (release / "${{ matrix.asset }}-onedir.zip", dist / "onedir"),
-          ]
-          for asset, source in outputs:
-              with zipfile.ZipFile(asset, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                  for path in source.rglob("*"):
-                      if path.is_file():
-                          zf.write(path, path.relative_to(source))
-              print(asset)
+      - name: Assemble directory bundle
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $root = 'target/package/SSHMountMate'
+          New-Item -ItemType Directory -Force "$root/bin" | Out-Null
+          Copy-Item target/release/SSHMountMate.exe "$root/SSHMountMate.exe"
+          Copy-Item target/release/bin/rclone.exe, target/release/bin/rclone.exe.sha256 "$root/bin/"
+          Copy-Item THIRD_PARTY_NOTICES.md, licenses/*.txt, distribution/SSHMountMate.install-layout $root
+          & "$root/SSHMountMate.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "release executable smoke test failed" }
 
-      - name: Upload packaged asset
-        uses: actions/upload-artifact@v4
+      - name: Assemble macOS application bundle
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          app="target/package/SSH MountMate.app"
+          contents="${app}/Contents"
+          mkdir -p "${contents}/MacOS" "${contents}/Resources/bin" "${contents}/Resources/licenses"
+          cp target/release/SSHMountMate "${contents}/MacOS/SSHMountMate"
+          cp target/release/bin/rclone target/release/bin/rclone.sha256 "${contents}/Resources/bin/"
+          cp THIRD_PARTY_NOTICES.md licenses/*.txt "${contents}/Resources/licenses/"
+          version="${RELEASE_TAG#v}"
+          sed -e "s/@VERSION@/${version}/g" -e "s/@BUILD_VERSION@/${GITHUB_RUN_NUMBER}/g" \
+            distribution/macos/Info.plist > "${contents}/Info.plist"
+          chmod 755 "${contents}/MacOS/SSHMountMate" "${contents}/Resources/bin/rclone"
+          plutil -lint "${contents}/Info.plist"
+          codesign --force --deep --sign - "${app}"
+          codesign --verify --deep --strict --verbose=2 "${app}"
+          "${contents}/MacOS/SSHMountMate" --version
+
+      - name: Package ZIP
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p release
+          (cd target/package && zip -q -r "${GITHUB_WORKSPACE}/release/${{ matrix.asset }}.zip" SSHMountMate)
+          unzip -t "release/${{ matrix.asset }}.zip"
+
+      - name: Package ZIP
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p release
+          ditto -c -k --keepParent "target/package/SSH MountMate.app" "release/${{ matrix.asset }}.zip"
+          unzip -t "release/${{ matrix.asset }}.zip"
+
+      - name: Package ZIP
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release | Out-Null
+          Compress-Archive -Path target/package/SSHMountMate -DestinationPath "release/${{ matrix.asset }}.zip"
+          $test = Join-Path $env:RUNNER_TEMP package-test
+          Expand-Archive "release/${{ matrix.asset }}.zip" $test
+          if (-not (Test-Path "$test/SSHMountMate/SSHMountMate.exe")) { throw "packaged executable missing" }
+          if (-not (Test-Path "$test/SSHMountMate/bin/rclone.exe")) { throw "packaged rclone missing" }
+
+      - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
-          path: release/*.zip
+          path: release/${{ matrix.asset }}.zip
+          if-no-files-found: error
 
   release:
     needs: build
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check out
-        uses: actions/checkout@v4
-
-      - name: Download assets
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
         with:
           path: release-assets
+          merge-multiple: true
+      - name: Validate release set
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=(
+            SSHMountMate-windows-x64.zip
+            SSHMountMate-windows-arm64.zip
+            SSHMountMate-macos-x64.zip
+            SSHMountMate-macos-arm64.zip
+            SSHMountMate-linux-x64.zip
+            SSHMountMate-linux-arm64.zip
+          )
+          for asset in "${expected[@]}"; do
+            test -s "release-assets/${asset}"
+          done
+          test "$(find release-assets -maxdepth 1 -name 'SSHMountMate-*.zip' | wc -l)" -eq 6
+          (cd release-assets && sha256sum SSHMountMate-*.zip > SHA256SUMS.txt)
+          sha256sum --check release-assets/SHA256SUMS.txt
 
-      - name: Create GitHub Release
+      - name: Create GitHub release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -111,33 +232,25 @@ jobs:
           INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
+          tag="${GITHUB_REF_NAME}"
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-            TAG="${INPUT_TAG}"
+            tag="${INPUT_TAG}"
           fi
-
-          mapfile -t FILES < <(find release-assets -type f | sort)
-          NOTES_ARGS=(--notes "Cross-platform Python build of SSH MountMate.")
-          if [ -f "release-notes/${TAG}.md" ]; then
-            NOTES_ARGS=(--notes-file "release-notes/${TAG}.md")
+          notes=(--notes "Native Rust release of SSH MountMate for Windows, macOS, and Linux.")
+          if [ -f "release-notes/${tag}.md" ]; then
+            notes=(--notes-file "release-notes/${tag}.md")
           fi
-          PRERELEASE_ARGS=()
-          case "$TAG" in
-            *-rc*|*-pre*|*-beta*|*-alpha*)
-              PRERELEASE_ARGS=(--prerelease)
-              ;;
+          prerelease=()
+          case "${tag}" in
+            *-rc*|*-pre*|*-beta*|*-alpha*) prerelease=(--prerelease) ;;
           esac
-
-          if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
-            gh release upload "$TAG" "${FILES[@]}" --clobber --repo "$GH_REPO"
-            gh release edit "$TAG" "${NOTES_ARGS[@]}" "${PRERELEASE_ARGS[@]}" --repo "$GH_REPO"
+          mapfile -t files < <(find release-assets -maxdepth 1 -type f | sort)
+          if gh release view "${tag}" --repo "${GH_REPO}" >/dev/null 2>&1; then
+            gh release upload "${tag}" "${files[@]}" --clobber --repo "${GH_REPO}"
+            gh release edit "${tag}" "${notes[@]}" "${prerelease[@]}" --repo "${GH_REPO}"
           else
-            gh release create "$TAG" "${FILES[@]}" \
-              --repo "$GH_REPO" \
-              --title "SSH MountMate ${TAG}" \
-              "${PRERELEASE_ARGS[@]}" \
-              "${NOTES_ARGS[@]}"
+            gh release create "${tag}" "${files[@]}" --repo "${GH_REPO}" \
+              --title "SSH MountMate ${tag}" "${prerelease[@]}" "${notes[@]}"
           fi
-          RELEASE_ID="$(gh release view "$TAG" --repo "$GH_REPO" --json databaseId --jq .databaseId)"
-          gh api -X PATCH "repos/$GH_REPO/releases/$RELEASE_ID" -f draft=false >/dev/null
-          gh release view "$TAG" --repo "$GH_REPO" >/dev/null
+          release_id="$(gh release view "${tag}" --repo "${GH_REPO}" --json databaseId --jq .databaseId)"
+          gh api -X PATCH "repos/${GH_REPO}/releases/${release_id}" -f draft=false >/dev/null
