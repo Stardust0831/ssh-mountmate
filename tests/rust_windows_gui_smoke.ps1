@@ -52,8 +52,20 @@ function Trace-PrefixCount([string] $Prefix) {
 Add-Type @'
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 
 public static class SSHMountMateWindowTest {
+    private delegate bool EnumWindowsCallback(IntPtr window, IntPtr parameter);
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowsCallback callback, IntPtr parameter);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetWindowText(IntPtr window, StringBuilder text, int count);
+
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
@@ -61,6 +73,24 @@ public static class SSHMountMateWindowTest {
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool IsWindowVisible(IntPtr window);
+
+    public static IntPtr FindMainWindow(uint processId) {
+        IntPtr result = IntPtr.Zero;
+        EnumWindows((window, parameter) => {
+            GetWindowThreadProcessId(window, out uint owner);
+            if (owner != processId || !IsWindowVisible(window)) {
+                return true;
+            }
+            StringBuilder title = new StringBuilder(256);
+            GetWindowText(window, title, title.Capacity);
+            if (title.ToString().StartsWith("SSH MountMate ", StringComparison.Ordinal)) {
+                result = window;
+                return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return result;
+    }
 }
 '@
 
@@ -77,11 +107,8 @@ try {
     -RedirectStandardOutput $stdout -RedirectStandardError $stderr
   $commandState = Join-Path $env:LOCALAPPDATA 'rsshmount/State/app-command.json'
   Wait-Until { (Test-Path $commandState -PathType Leaf) -and ((Get-Item $commandState).Length -gt 0) }
-  Wait-Until {
-    $gui.Refresh()
-    return $gui.MainWindowHandle -ne [IntPtr]::Zero
-  }
-  $initialWindow = $gui.MainWindowHandle
+  Wait-Until { [SSHMountMateWindowTest]::FindMainWindow($gui.Id) -ne [IntPtr]::Zero }
+  $initialWindow = [SSHMountMateWindowTest]::FindMainWindow($gui.Id)
   Wait-Until { Trace-Contains 'tray initialized' }
   Wait-Until { Trace-Contains 'taskbar progress updated: Hidden' }
 
@@ -105,11 +132,8 @@ try {
   Wait-Until { Trace-Contains 'ipc-server received ShowMain' }
   Wait-Until { Trace-Contains 'opening replacement main window' }
   Wait-Until { (Trace-PrefixCount 'main window opened ') -ge 2 }
-  Wait-Until {
-    $gui.Refresh()
-    return $gui.MainWindowHandle -ne [IntPtr]::Zero -and
-      [SSHMountMateWindowTest]::IsWindowVisible($gui.MainWindowHandle)
-  }
+  Wait-Until { [SSHMountMateWindowTest]::FindMainWindow($gui.Id) -ne [IntPtr]::Zero }
+  $restoredWindow = [SSHMountMateWindowTest]::FindMainWindow($gui.Id)
   if ($gui.Id -ne $matching[0].Id) { throw 'Restored window belongs to another process' }
   Wait-Until { (Trace-LineCount 'taskbar progress updated: Hidden') -ge 2 }
   $matching = @(Get-Process | Where-Object {
@@ -129,7 +153,7 @@ try {
   if ($traceContent -match 'taskbar progress failed|tray unavailable') {
     throw "Windows GUI native integration trace reported a failure:`n$traceContent"
   }
-  Write-Host "Windows GUI integration passed: pid=$($gui.Id) initial=$initialWindow restored=$($gui.MainWindowHandle)"
+  Write-Host "Windows GUI integration passed: pid=$($gui.Id) initial=$initialWindow restored=$restoredWindow"
   $succeeded = $true
 } finally {
   if ($gui -and -not $gui.HasExited) {
