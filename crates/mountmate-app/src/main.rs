@@ -3121,7 +3121,7 @@ impl App {
             .tray_error
             .as_ref()
             .map(|error| text(locale.tray_unavailable(error)).size(14));
-        let file_manager = if cfg!(windows) || cfg!(target_os = "linux") {
+        let file_manager = if cfg!(any(windows, target_os = "linux", target_os = "macos")) {
             column![
                 text(locale.text(TextKey::FileManagerIntegration)).size(20),
                 text(locale.text(TextKey::FileManagerIntegrationHelp)).size(14),

@@ -567,7 +567,28 @@ fn register_file_manager_menu(executable: &Path) -> Result<(), PlatformError> {
     Ok(())
 }
 
-#[cfg(all(not(windows), not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
+fn register_file_manager_menu(executable: &Path) -> Result<(), PlatformError> {
+    let services = home_directory()?.join("Library/Services");
+    std::fs::create_dir_all(&services).map_err(|error| PlatformError::Failed(error.to_string()))?;
+    for workflow in finder_workflows(&services, executable)? {
+        let staging = workflow
+            .path
+            .with_extension(format!("workflow.mountmate-{}.tmp", std::process::id()));
+        remove_workflow_if_present(&staging)?;
+        std::fs::create_dir_all(staging.join("Contents"))
+            .map_err(|error| PlatformError::Failed(error.to_string()))?;
+        let mut content = Vec::new();
+        plist::to_writer_xml(&mut content, &workflow.document)
+            .map_err(|error| PlatformError::Failed(error.to_string()))?;
+        mountmate_core::storage::atomic_write(&staging.join("Contents/document.wflow"), &content)
+            .map_err(|error| PlatformError::Failed(error.to_string()))?;
+        install_directory_atomically(&staging, &workflow.path)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(not(windows), not(any(target_os = "linux", target_os = "macos"))))]
 fn register_file_manager_menu(_executable: &Path) -> Result<(), PlatformError> {
     Err(PlatformError::Unsupported("file-manager integration"))
 }
@@ -605,9 +626,148 @@ fn unregister_file_manager_menu() -> Result<(), PlatformError> {
     Ok(())
 }
 
-#[cfg(all(not(windows), not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
+fn unregister_file_manager_menu() -> Result<(), PlatformError> {
+    let services = home_directory()?.join("Library/Services");
+    for name in FINDER_WORKFLOW_NAMES {
+        remove_workflow_if_present(&services.join(name))?;
+    }
+    Ok(())
+}
+
+#[cfg(all(not(windows), not(any(target_os = "linux", target_os = "macos"))))]
 fn unregister_file_manager_menu() -> Result<(), PlatformError> {
     Err(PlatformError::Unsupported("file-manager integration"))
+}
+
+#[cfg(target_os = "macos")]
+const FINDER_WORKFLOW_NAMES: [&str; 2] = [
+    "SSH MountMate - Refresh.workflow",
+    "SSH MountMate - Transfers.workflow",
+];
+
+#[cfg(target_os = "macos")]
+struct FinderWorkflow {
+    path: std::path::PathBuf,
+    document: plist::Value,
+}
+
+#[cfg(target_os = "macos")]
+fn finder_workflows(
+    services: &Path,
+    executable: &Path,
+) -> Result<Vec<FinderWorkflow>, PlatformError> {
+    let executable = executable
+        .to_str()
+        .ok_or_else(|| PlatformError::Failed("Finder executable path is not UTF-8".into()))?;
+    let executable = shell_single_quote(executable);
+    Ok(vec![
+        FinderWorkflow {
+            path: services.join(FINDER_WORKFLOW_NAMES[0]),
+            document: finder_workflow_document(
+                &format!("exec {executable} --refresh-path \"$1\""),
+                "7A5E99A1-E3B8-4E98-A066-7467D77EA181",
+            ),
+        },
+        FinderWorkflow {
+            path: services.join(FINDER_WORKFLOW_NAMES[1]),
+            document: finder_workflow_document(
+                &format!("exec {executable} --show-transfers"),
+                "DD970A96-6879-4267-BE24-5D7751D9343D",
+            ),
+        },
+    ])
+}
+
+#[cfg(target_os = "macos")]
+fn finder_workflow_document(command: &str, uuid: &str) -> plist::Value {
+    use plist::{Dictionary, Value};
+
+    fn string(value: &str) -> Value {
+        Value::String(value.into())
+    }
+
+    let mut accepts = Dictionary::new();
+    accepts.insert("Container".into(), string("List"));
+    accepts.insert("Optional".into(), Value::Boolean(true));
+    accepts.insert(
+        "Types".into(),
+        Value::Array(vec![string("com.apple.cocoa.path")]),
+    );
+
+    let mut parameters = Dictionary::new();
+    parameters.insert("COMMAND_STRING".into(), string(command));
+    parameters.insert("CheckedForUserDefaultShell".into(), Value::Boolean(true));
+    parameters.insert("inputMethod".into(), Value::Integer(1.into()));
+    parameters.insert("shell".into(), string("/bin/zsh"));
+    parameters.insert("source".into(), string(""));
+    parameters.insert(
+        "SUBSTITUTE_VARIABLES_IN_COMMAND".into(),
+        Value::Boolean(false),
+    );
+
+    let mut action = Dictionary::new();
+    action.insert("AMAccepts".into(), Value::Dictionary(accepts.clone()));
+    action.insert("AMActionVersion".into(), string("1.1.1"));
+    action.insert("AMApplication".into(), Value::Array(vec![string("Finder")]));
+    action.insert("AMProvides".into(), Value::Dictionary(accepts));
+    action.insert(
+        "ActionBundlePath".into(),
+        string("/System/Library/Automator/Run Shell Script.action"),
+    );
+    action.insert("ActionName".into(), string("Run Shell Script"));
+    action.insert("ActionParameters".into(), Value::Dictionary(parameters));
+    action.insert(
+        "BundleIdentifier".into(),
+        string("com.apple.RunShellScript"),
+    );
+    action.insert("Class Name".into(), string("RunShellScriptAction"));
+    action.insert("InputUUID".into(), string(uuid));
+    action.insert("OutputUUID".into(), string(uuid));
+    action.insert("UUID".into(), string(uuid));
+
+    let mut wrapped_action = Dictionary::new();
+    wrapped_action.insert("action".into(), Value::Dictionary(action));
+
+    let mut metadata = Dictionary::new();
+    metadata.insert("applicationBundleID".into(), string("com.apple.finder"));
+    metadata.insert(
+        "applicationPath".into(),
+        string("/System/Library/CoreServices/Finder.app"),
+    );
+    metadata.insert(
+        "serviceApplicationBundleID".into(),
+        string("com.apple.finder"),
+    );
+    metadata.insert(
+        "serviceApplicationPath".into(),
+        string("/System/Library/CoreServices/Finder.app"),
+    );
+    metadata.insert(
+        "serviceInputTypeIdentifier".into(),
+        string("com.apple.Automator.fileSystemObject"),
+    );
+    metadata.insert(
+        "serviceOutputTypeIdentifier".into(),
+        string("com.apple.Automator.nothing"),
+    );
+    metadata.insert("serviceProcessesInput".into(), Value::Boolean(false));
+    metadata.insert(
+        "workflowTypeIdentifier".into(),
+        string("com.apple.Automator.servicesMenu"),
+    );
+
+    let mut document = Dictionary::new();
+    document.insert("AMApplicationBuild".into(), string("509"));
+    document.insert("AMApplicationVersion".into(), string("2.10"));
+    document.insert("AMDocumentVersion".into(), string("2"));
+    document.insert(
+        "actions".into(),
+        Value::Array(vec![Value::Dictionary(wrapped_action)]),
+    );
+    document.insert("connectors".into(), Value::Dictionary(Dictionary::new()));
+    document.insert("workflowMetaData".into(), Value::Dictionary(metadata));
+    Value::Dictionary(document)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -675,7 +835,7 @@ fn linux_file_manager_entries(
     Ok(entries)
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
@@ -780,6 +940,49 @@ fn remove_if_present(path: &Path) -> Result<(), PlatformError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(PlatformError::Failed(error.to_string())),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn remove_workflow_if_present(path: &Path) -> Result<(), PlatformError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(PlatformError::Failed(error.to_string())),
+    };
+    let result = if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    result.map_err(|error| PlatformError::Failed(error.to_string()))
+}
+
+#[cfg(target_os = "macos")]
+fn workflow_exists(path: &Path) -> Result<bool, PlatformError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(PlatformError::Failed(error.to_string())),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn install_directory_atomically(staging: &Path, destination: &Path) -> Result<(), PlatformError> {
+    let backup =
+        destination.with_extension(format!("workflow.mountmate-{}.backup", std::process::id()));
+    remove_workflow_if_present(&backup)?;
+    let had_destination = workflow_exists(destination)?;
+    if had_destination {
+        std::fs::rename(destination, &backup)
+            .map_err(|error| PlatformError::Failed(error.to_string()))?;
+    }
+    if let Err(error) = std::fs::rename(staging, destination) {
+        if had_destination {
+            let _ = std::fs::rename(&backup, destination);
+        }
+        return Err(PlatformError::Failed(error.to_string()));
+    }
+    remove_workflow_if_present(&backup)
 }
 
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
@@ -921,17 +1124,17 @@ mod windows_tests {
     use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
     use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
-        ACCESS_ALLOWED_ACE, ACCESS_ALLOWED_ACE_TYPE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
-        CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
-        GetLengthSid, GetSecurityDescriptorControl, PSID, SE_DACL_PROTECTED, SECURITY_MAX_SID_SIZE,
-        TOKEN_QUERY, TOKEN_USER, TokenUser, WinLocalSystemSid,
+        ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, CreateWellKnownSid,
+        DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetLengthSid,
+        GetSecurityDescriptorControl, GetTokenInformation, PSID, SE_DACL_PROTECTED,
+        SECURITY_MAX_SID_SIZE, TOKEN_QUERY, TOKEN_USER, TokenUser, WinLocalSystemSid,
     };
     use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
-    use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, GetTokenInformation, OpenProcessToken,
-    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     use super::restrict_private_path;
+
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 
     fn aligned_buffer(bytes: usize) -> Vec<usize> {
         vec![0; bytes.div_ceil(size_of::<usize>())]

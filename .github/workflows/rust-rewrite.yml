@@ -91,7 +91,7 @@ jobs:
           test -x "${XDG_DATA_HOME}/nautilus/scripts/SSH MountMate - Refresh"
           test -f "${XDG_DATA_HOME}/nemo/actions/ssh-mountmate-refresh.nemo_action"
           test -f "${XDG_DATA_HOME}/kio/servicemenus/ssh-mountmate.desktop"
-          rg --fixed-strings -- '--refresh-path %f' \
+          grep -F -- '--refresh-path %f' \
             "${XDG_DATA_HOME}/kio/servicemenus/ssh-mountmate.desktop"
           target/release/SSHMountMate --unregister-file-manager-menu
           test ! -e "${XDG_DATA_HOME}/nautilus/scripts/SSH MountMate - Refresh"
@@ -101,16 +101,34 @@ jobs:
           target/release/SSHMountMate --register-login-startup
           startup="${XDG_CONFIG_HOME}/autostart/ssh-mountmate.desktop"
           test -f "${startup}"
-          rg --fixed-strings -- '--mount-startup-all' "${startup}"
+          grep -F -- '--mount-startup-all' "${startup}"
           target/release/SSHMountMate --unregister-login-startup
           test ! -e "${startup}"
-      - name: Smoke-test macOS login startup
+      - name: Smoke-test macOS platform registration
         if: runner.os == 'macOS'
         shell: bash
         run: |
           set -euo pipefail
-          export HOME="${RUNNER_TEMP}/login-startup-home"
+          export HOME="${RUNNER_TEMP}/platform-home"
           executable="$(pwd)/target/release/SSHMountMate"
+          target/release/SSHMountMate --register-file-manager-menu
+          refresh="${HOME}/Library/Services/SSH MountMate - Refresh.workflow/Contents/document.wflow"
+          transfers="${HOME}/Library/Services/SSH MountMate - Transfers.workflow/Contents/document.wflow"
+          plutil -lint "${refresh}" "${transfers}"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :workflowMetaData:workflowTypeIdentifier' "${refresh}")" = 'com.apple.Automator.servicesMenu'
+          test "$(/usr/libexec/PlistBuddy -c 'Print :workflowMetaData:serviceApplicationBundleID' "${refresh}")" = 'com.apple.finder'
+          command="$(/usr/libexec/PlistBuddy -c 'Print :actions:0:action:ActionParameters:COMMAND_STRING' "${refresh}")"
+          test "${command}" = "exec '${executable}' --refresh-path \"\$1\""
+          probe="${RUNNER_TEMP}/Finder Probe.workflow"
+          cp -R "$(dirname "$(dirname "${refresh}")")" "${probe}"
+          marker="${RUNNER_TEMP}/finder-workflow-ran"
+          /usr/libexec/PlistBuddy -c "Set :actions:0:action:ActionParameters:COMMAND_STRING /usr/bin/touch '${marker}'" "${probe}/Contents/document.wflow"
+          mkdir -p "${RUNNER_TEMP}/finder-selection"
+          automator -i "${RUNNER_TEMP}/finder-selection" "${probe}"
+          test -f "${marker}"
+          target/release/SSHMountMate --unregister-file-manager-menu
+          test ! -e "$(dirname "$(dirname "${refresh}")")"
+          test ! -e "$(dirname "$(dirname "${transfers}")")"
           target/release/SSHMountMate --register-login-startup
           startup="${HOME}/Library/LaunchAgents/io.github.stardust0831.ssh-mountmate.plist"
           plutil -lint "${startup}"
