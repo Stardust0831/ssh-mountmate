@@ -99,7 +99,7 @@ mkdir -p "$config_dir"
 password_obscured="$("$rclone" obscure "$server_password")"
 jq -n \
   --arg user "$server_user" \
-  --argjson port "$port" \
+  --arg port "$port" \
   --arg password "$password_obscured" \
   --arg mountpoint "$mountpoint" \
   '[{
