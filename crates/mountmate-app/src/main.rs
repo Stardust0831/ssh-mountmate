@@ -1552,8 +1552,10 @@ impl App {
             Ok(tray) => {
                 self.tray = Some(tray);
                 self.sync_tray();
+                diagnostic_trace("tray initialized");
             }
             Err(error) => {
+                diagnostic_trace(&format!("tray unavailable: {error}"));
                 self.tray_error = Some(error.clone());
                 self.status = self.locale().tray_unavailable(&error);
             }
@@ -3909,10 +3911,9 @@ fn set_native_global_progress(id: window::Id, state: GlobalProgressState) -> Tas
         let RawWindowHandle::Win32(handle) = handle.as_raw() else {
             return;
         };
-        if let Err(error) =
-            Platform.set_global_progress(Some(NativeWindowHandle(handle.hwnd.get())), state)
-        {
-            diagnostic_trace(&format!("taskbar progress failed: {error}"));
+        match Platform.set_global_progress(Some(NativeWindowHandle(handle.hwnd.get())), state) {
+            Ok(()) => diagnostic_trace(&format!("taskbar progress updated: {state:?}")),
+            Err(error) => diagnostic_trace(&format!("taskbar progress failed: {error}")),
         }
     })
     .discard()

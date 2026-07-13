@@ -1,0 +1,130 @@
+param(
+  [Parameter(Mandatory = $true)]
+  [string] $Binary
+)
+
+$ErrorActionPreference = 'Stop'
+$binary = (Resolve-Path $Binary).Path
+$testRoot = Join-Path $env:RUNNER_TEMP "ssh-mountmate-gui-e2e-$PID"
+$stdout = Join-Path $testRoot 'gui.stdout'
+$stderr = Join-Path $testRoot 'gui.stderr'
+$trace = Join-Path $testRoot 'gui.trace'
+$gui = $null
+$succeeded = $false
+
+function Wait-Until([scriptblock] $Condition, [int] $Attempts = 200) {
+  for ($attempt = 0; $attempt -lt $Attempts; $attempt++) {
+    if (& $Condition) { return }
+    Start-Sleep -Milliseconds 100
+  }
+  throw 'Timed out waiting for the Windows GUI integration-test condition'
+}
+
+function Invoke-SecondInstance([string[]] $Arguments) {
+  $processInfo = [System.Diagnostics.ProcessStartInfo]::new($binary)
+  $processInfo.UseShellExecute = $false
+  $processInfo.CreateNoWindow = $true
+  $Arguments | ForEach-Object { $processInfo.ArgumentList.Add($_) }
+  $process = [System.Diagnostics.Process]::Start($processInfo)
+  if (-not $process.WaitForExit(15000)) {
+    $process.Kill($true)
+    throw "Second SSH MountMate instance timed out: $($Arguments -join ' ')"
+  }
+  if ($process.ExitCode -ne 0) {
+    throw "Second SSH MountMate instance failed with $($process.ExitCode): $($Arguments -join ' ')"
+  }
+}
+
+function Trace-Contains([string] $Text) {
+  return (Test-Path $trace) -and ((Get-Content $trace -Raw) -match [regex]::Escape($Text))
+}
+
+function Trace-LineCount([string] $Text) {
+  if (-not (Test-Path $trace)) { return 0 }
+  return @(Get-Content $trace | Where-Object { $_ -eq $Text }).Count
+}
+
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class SSHMountMateWindowTest {
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+}
+'@
+
+try {
+  New-Item -ItemType Directory -Force $testRoot | Out-Null
+  $env:HOME = Join-Path $testRoot 'home'
+  $env:USERPROFILE = $env:HOME
+  $env:APPDATA = Join-Path $testRoot 'roaming'
+  $env:LOCALAPPDATA = Join-Path $testRoot 'local'
+  $env:SSH_MOUNTMATE_TRACE_FILE = $trace
+  New-Item -ItemType Directory -Force $env:HOME, $env:APPDATA, $env:LOCALAPPDATA | Out-Null
+
+  $gui = Start-Process -FilePath $binary -PassThru `
+    -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+  $commandState = Join-Path $env:LOCALAPPDATA 'rsshmount/State/app-command.json'
+  Wait-Until { (Test-Path $commandState -PathType Leaf) -and ((Get-Item $commandState).Length -gt 0) }
+  Wait-Until {
+    $gui.Refresh()
+    return $gui.MainWindowHandle -ne [IntPtr]::Zero
+  }
+  $initialWindow = $gui.MainWindowHandle
+  Wait-Until { Trace-Contains 'tray initialized' }
+  Wait-Until { Trace-Contains 'taskbar progress updated: Hidden' }
+
+  Invoke-SecondInstance @('--show-transfers')
+  Wait-Until { Trace-Contains 'ipc-server received ShowTransfers' }
+  $matching = @(Get-Process | Where-Object {
+    try { $_.Path -eq $binary } catch { $false }
+  })
+  if ($matching.Count -ne 1 -or $matching[0].Id -ne $gui.Id) {
+    throw "Expected one SSH MountMate GUI process, found $($matching.Count)"
+  }
+
+  if (-not [SSHMountMateWindowTest]::PostMessage($initialWindow, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)) {
+    throw "Could not post WM_CLOSE to SSH MountMate: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+  }
+  Wait-Until { Trace-Contains 'closing main window to tray' }
+  if ($gui.HasExited) { throw 'SSH MountMate exited instead of remaining in the tray' }
+
+  Invoke-SecondInstance @('--show-main')
+  Wait-Until { Trace-Contains 'opening replacement main window' }
+  Wait-Until {
+    $gui.Refresh()
+    return $gui.MainWindowHandle -ne [IntPtr]::Zero
+  }
+  if ($gui.Id -ne $matching[0].Id) { throw 'Restored window belongs to another process' }
+  Wait-Until { (Trace-LineCount 'taskbar progress updated: Hidden') -ge 2 }
+
+  if ((Test-Path $stdout) -and (Get-Item $stdout).Length -ne 0) {
+    throw 'Windows GUI unexpectedly wrote to stdout'
+  }
+  if ((Test-Path $stderr) -and ((Get-Content $stderr -Raw) -match 'panicked')) {
+    throw "Windows GUI reported a native integration failure:`n$(Get-Content $stderr -Raw)"
+  }
+  $traceContent = Get-Content $trace -Raw
+  if ($traceContent -match 'taskbar progress failed|tray unavailable') {
+    throw "Windows GUI native integration trace reported a failure:`n$traceContent"
+  }
+  Write-Host "Windows GUI integration passed: pid=$($gui.Id) initial=$initialWindow restored=$($gui.MainWindowHandle)"
+  $succeeded = $true
+} finally {
+  if ($gui -and -not $gui.HasExited) {
+    Stop-Process -Id $gui.Id -Force
+    $gui.WaitForExit()
+  }
+  if (-not $succeeded) {
+    if (Test-Path $trace) {
+      Write-Host '--- SSH MountMate event trace ---'
+      Get-Content $trace
+    }
+    if (Test-Path $stderr) {
+      Write-Host '--- SSH MountMate stderr ---'
+      Get-Content $stderr
+    }
+  }
+}

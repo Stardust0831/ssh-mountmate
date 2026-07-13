@@ -220,6 +220,11 @@ jobs:
           if ((Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run').PSObject.Properties.Name -contains 'SSHMountMate') {
             throw "Login startup command was not removed"
           }
+      - name: Exercise Windows one-instance, tray, and taskbar integration
+        if: runner.os == 'Windows'
+        timeout-minutes: 3
+        shell: pwsh
+        run: ./tests/rust_windows_gui_smoke.ps1 -Binary target/release/SSHMountMate.exe
       - name: Bundle verified rclone
         if: runner.os != 'Windows'
         shell: bash
