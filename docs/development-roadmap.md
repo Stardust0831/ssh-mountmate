@@ -115,6 +115,11 @@ Cross-platform considerations:
   [29278559051](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29278559051) passed quality,
   all six native build/lifecycle jobs, exact six-ZIP aggregation, and SHA-256 verification. It did
   not publish a GitHub Release.
+- Annotated tag `v0.4.0-alpha.2` resolves to commit `140f53c`. Publishing run
+  [29280113607](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29280113607) passed the same
+  quality, six-platform lifecycle, six-ZIP, and checksum gates and published
+  [`v0.4.0-alpha.2`](https://github.com/Stardust0831/ssh-mountmate/releases/tag/v0.4.0-alpha.2)
+  as a non-draft prerelease with six platform ZIPs plus `SHA256SUMS.txt`. PR #11 remains Draft.
 
 - Reduced the release matrix from twelve duplicate onefile/onedir ZIPs to six canonical ZIPs to
   reduce CI artifact and release download overhead. Windows and Linux keep onefile executables;
