@@ -1,14 +1,17 @@
 use std::env;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::rclone_binary::verify_bundled;
+use crate::rclone_binary::{file_sha256, verify_bundled};
 
 const DIRECTORY_BUNDLE_MARKER_NAME: &str = "SSHMountMate.install-layout";
 const DIRECTORY_BUNDLE_MARKER: &[u8] = b"ssh-mountmate-directory-bundle-v1\n";
+const MAX_PREPARED_ENTRIES: usize = 20_000;
+const MAX_PREPARED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallKind {
@@ -35,6 +38,12 @@ pub struct DirectoryPayload {
 pub struct TransactionPaths {
     pub prepared: PathBuf,
     pub backup: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedPayload {
+    pub replace_path: PathBuf,
+    pub executable: PathBuf,
 }
 
 #[derive(Debug, Error)]
@@ -101,6 +110,38 @@ pub enum TransactionPlanError {
     },
 }
 
+#[derive(Debug, Error)]
+pub enum PreparePayloadError {
+    #[error("directory payloads cannot replace a macOS application bundle")]
+    MacApplicationRequiresAppPayload,
+    #[error("update transaction paths are not siblings of the current installation")]
+    InvalidTransactionPaths,
+    #[error("update staging path already exists: {0}")]
+    PreparedExists(PathBuf),
+    #[error("a previous update backup still exists: {0}")]
+    BackupExists(PathBuf),
+    #[error("update payload contains too many entries")]
+    TooManyEntries,
+    #[error("update payload exceeds the extracted-size safety limit")]
+    PayloadTooLarge,
+    #[error("update payload contains a symbolic link or special file: {0}")]
+    UnsafeEntry(PathBuf),
+    #[error("staged executable failed copy verification")]
+    ExecutableDigestMismatch,
+    #[error("update payload verification failed: {0}")]
+    Verification(String),
+    #[error("update staging I/O failed at {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(transparent)]
+    Payload(#[from] PayloadError),
+    #[error(transparent)]
+    Transaction(#[from] TransactionPlanError),
+}
+
 pub fn detect_install_layout(executable: &Path) -> Result<InstallLayout, InstallLayoutError> {
     detect_install_layout_for(executable, env::consts::OS, &env::temp_dir())
 }
@@ -163,18 +204,329 @@ pub fn plan_transaction_paths(
         .and_then(|value| value.to_str())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| TransactionPlanError::MissingName(layout.replace_path.clone()))?;
-    let backup = parent.join(format!(".{name}.ssh-mountmate-backup"));
+    let backup = parent.join(transaction_file_name(name, layout.kind, "backup", None));
     if path_entry_exists(&backup)? {
         return Err(TransactionPlanError::BackupExists(backup));
     }
-    let prepared = parent.join(format!(
-        ".{name}.ssh-mountmate-prepared-{}",
-        Uuid::new_v4().simple()
+    let token = Uuid::new_v4().simple().to_string();
+    let prepared = parent.join(transaction_file_name(
+        name,
+        layout.kind,
+        "prepared",
+        Some(&token),
     ));
     if path_entry_exists(&prepared)? {
         return Err(TransactionPlanError::PreparedExists(prepared));
     }
     Ok(TransactionPaths { prepared, backup })
+}
+
+pub fn prepare_directory_payload(
+    layout: &InstallLayout,
+    payload: &DirectoryPayload,
+    transaction: &TransactionPaths,
+    os: &str,
+) -> Result<PreparedPayload, PreparePayloadError> {
+    validate_transaction_paths(layout, transaction)?;
+    match layout.kind {
+        InstallKind::MacApplicationBundle => {
+            Err(PreparePayloadError::MacApplicationRequiresAppPayload)
+        }
+        InstallKind::StandaloneExecutable => {
+            copy_standalone_payload(payload, &transaction.prepared)?;
+            Ok(PreparedPayload {
+                replace_path: transaction.prepared.clone(),
+                executable: transaction.prepared.clone(),
+            })
+        }
+        InstallKind::DirectoryBundle => {
+            let source_metadata = safe_source_metadata(&payload.root)?;
+            if !source_metadata.is_dir() {
+                return Err(PreparePayloadError::UnsafeEntry(payload.root.clone()));
+            }
+            fs::create_dir(&transaction.prepared).map_err(|source| PreparePayloadError::Io {
+                path: transaction.prepared.clone(),
+                source,
+            })?;
+            let result = (|| {
+                let mut totals = CopyTotals::default();
+                copy_directory_contents(
+                    &payload.root,
+                    &transaction.prepared,
+                    &source_metadata,
+                    &mut totals,
+                )?;
+                let verified = locate_directory_payload(&transaction.prepared, os)?;
+                if verified.root != transaction.prepared {
+                    return Err(PreparePayloadError::InvalidTransactionPaths);
+                }
+                verify_copied_executable(&payload.executable, &verified.executable)?;
+                Ok(PreparedPayload {
+                    replace_path: transaction.prepared.clone(),
+                    executable: verified.executable,
+                })
+            })();
+            if result.is_err() {
+                let _ = fs::remove_dir_all(&transaction.prepared);
+            }
+            result
+        }
+    }
+}
+
+fn transaction_file_name(
+    name: &str,
+    kind: InstallKind,
+    phase: &str,
+    token: Option<&str>,
+) -> String {
+    let (prefix, suffix) = transaction_name_parts(name, kind, phase);
+    match token {
+        Some(token) => format!("{prefix}-{token}{suffix}"),
+        None => format!("{prefix}{suffix}"),
+    }
+}
+
+fn transaction_name_parts(name: &str, kind: InstallKind, phase: &str) -> (String, String) {
+    if kind == InstallKind::StandaloneExecutable {
+        let path = Path::new(name);
+        if let (Some(stem), Some(extension)) = (
+            path.file_stem().and_then(|value| value.to_str()),
+            path.extension().and_then(|value| value.to_str()),
+        ) {
+            return (
+                format!(".{stem}.ssh-mountmate-{phase}"),
+                format!(".{extension}"),
+            );
+        }
+    }
+    (format!(".{name}.ssh-mountmate-{phase}"), String::new())
+}
+
+fn validate_transaction_paths(
+    layout: &InstallLayout,
+    transaction: &TransactionPaths,
+) -> Result<(), PreparePayloadError> {
+    let Some(parent) = layout.replace_path.parent() else {
+        return Err(PreparePayloadError::InvalidTransactionPaths);
+    };
+    if transaction.prepared.parent() != Some(parent) || transaction.backup.parent() != Some(parent)
+    {
+        return Err(PreparePayloadError::InvalidTransactionPaths);
+    }
+    let Some(name) = layout
+        .replace_path
+        .file_name()
+        .and_then(|value| value.to_str())
+    else {
+        return Err(PreparePayloadError::InvalidTransactionPaths);
+    };
+    if transaction
+        .backup
+        .file_name()
+        .and_then(|value| value.to_str())
+        != Some(transaction_file_name(name, layout.kind, "backup", None).as_str())
+        || !valid_prepared_name(
+            transaction
+                .prepared
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default(),
+            name,
+            layout.kind,
+        )
+    {
+        return Err(PreparePayloadError::InvalidTransactionPaths);
+    }
+    if path_entry_exists(&transaction.prepared)? {
+        return Err(PreparePayloadError::PreparedExists(
+            transaction.prepared.clone(),
+        ));
+    }
+    if path_entry_exists(&transaction.backup)? {
+        return Err(PreparePayloadError::BackupExists(
+            transaction.backup.clone(),
+        ));
+    }
+    Ok(())
+}
+
+fn valid_prepared_name(candidate: &str, target_name: &str, kind: InstallKind) -> bool {
+    let (prefix, suffix) = transaction_name_parts(target_name, kind, "prepared");
+    let Some(candidate) = candidate.strip_prefix(&format!("{prefix}-")) else {
+        return false;
+    };
+    let token = if suffix.is_empty() {
+        candidate
+    } else {
+        let Some(token) = candidate.strip_suffix(&suffix) else {
+            return false;
+        };
+        token
+    };
+    token.len() == 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[derive(Debug, Default)]
+struct CopyTotals {
+    entries: usize,
+    bytes: u64,
+}
+
+fn copy_standalone_payload(
+    payload: &DirectoryPayload,
+    destination: &Path,
+) -> Result<(), PreparePayloadError> {
+    let metadata = safe_source_metadata(&payload.executable)?;
+    if !metadata.is_file() {
+        return Err(PreparePayloadError::UnsafeEntry(payload.executable.clone()));
+    }
+    if metadata.len() > MAX_PREPARED_BYTES {
+        return Err(PreparePayloadError::PayloadTooLarge);
+    }
+    copy_regular_file(&payload.executable, destination, &metadata)?;
+    let result = verify_copied_executable(&payload.executable, destination);
+    if result.is_err() {
+        let _ = fs::remove_file(destination);
+    }
+    result
+}
+
+fn copy_directory_contents(
+    source: &Path,
+    destination: &Path,
+    metadata: &fs::Metadata,
+    totals: &mut CopyTotals,
+) -> Result<(), PreparePayloadError> {
+    bump_entry(totals)?;
+    for entry in fs::read_dir(source).map_err(|source_error| PreparePayloadError::Io {
+        path: source.to_owned(),
+        source: source_error,
+    })? {
+        let entry = entry.map_err(|source_error| PreparePayloadError::Io {
+            path: source.to_owned(),
+            source: source_error,
+        })?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let entry_metadata = safe_source_metadata(&source_path)?;
+        if entry_metadata.is_dir() {
+            fs::create_dir(&destination_path).map_err(|source_error| PreparePayloadError::Io {
+                path: destination_path.clone(),
+                source: source_error,
+            })?;
+            copy_directory_contents(&source_path, &destination_path, &entry_metadata, totals)?;
+        } else if entry_metadata.is_file() {
+            bump_entry(totals)?;
+            totals.bytes = totals.bytes.saturating_add(entry_metadata.len());
+            if totals.bytes > MAX_PREPARED_BYTES {
+                return Err(PreparePayloadError::PayloadTooLarge);
+            }
+            copy_regular_file(&source_path, &destination_path, &entry_metadata)?;
+        } else {
+            return Err(PreparePayloadError::UnsafeEntry(source_path));
+        }
+    }
+    fs::set_permissions(destination, metadata.permissions()).map_err(|source_error| {
+        PreparePayloadError::Io {
+            path: destination.to_owned(),
+            source: source_error,
+        }
+    })?;
+    Ok(())
+}
+
+fn safe_source_metadata(path: &Path) -> Result<fs::Metadata, PreparePayloadError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| PreparePayloadError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(PreparePayloadError::UnsafeEntry(path.to_owned()));
+    }
+    Ok(metadata)
+}
+
+fn bump_entry(totals: &mut CopyTotals) -> Result<(), PreparePayloadError> {
+    totals.entries = totals.entries.saturating_add(1);
+    if totals.entries > MAX_PREPARED_ENTRIES {
+        Err(PreparePayloadError::TooManyEntries)
+    } else {
+        Ok(())
+    }
+}
+
+fn copy_regular_file(
+    source: &Path,
+    destination: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), PreparePayloadError> {
+    let input = File::open(source).map_err(|source_error| PreparePayloadError::Io {
+        path: source.to_owned(),
+        source: source_error,
+    })?;
+    let mut output = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(destination)
+        .map_err(|source_error| PreparePayloadError::Io {
+            path: destination.to_owned(),
+            source: source_error,
+        })?;
+    let result = (|| {
+        let mut limited = input.take(metadata.len() + 1);
+        let copied = io::copy(&mut limited, &mut output).map_err(|source_error| {
+            PreparePayloadError::Io {
+                path: destination.to_owned(),
+                source: source_error,
+            }
+        })?;
+        if copied != metadata.len() {
+            return Err(PreparePayloadError::Io {
+                path: source.to_owned(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "source file changed while staging",
+                ),
+            });
+        }
+        output
+            .flush()
+            .map_err(|source_error| PreparePayloadError::Io {
+                path: destination.to_owned(),
+                source: source_error,
+            })?;
+        output
+            .sync_all()
+            .map_err(|source_error| PreparePayloadError::Io {
+                path: destination.to_owned(),
+                source: source_error,
+            })?;
+        fs::set_permissions(destination, metadata.permissions()).map_err(|source_error| {
+            PreparePayloadError::Io {
+                path: destination.to_owned(),
+                source: source_error,
+            }
+        })?;
+        Ok(())
+    })();
+    if result.is_err() {
+        drop(output);
+        let _ = fs::remove_file(destination);
+    }
+    result
+}
+
+fn verify_copied_executable(source: &Path, copied: &Path) -> Result<(), PreparePayloadError> {
+    let expected = file_sha256(source)
+        .map_err(|error| PreparePayloadError::Verification(error.to_string()))?;
+    let actual = file_sha256(copied)
+        .map_err(|error| PreparePayloadError::Verification(error.to_string()))?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(PreparePayloadError::ExecutableDigestMismatch)
+    }
 }
 
 fn detect_install_layout_for(
@@ -531,8 +883,9 @@ mod tests {
         let layout = detect_install_layout_for(&executable, "linux", temp.path()).unwrap();
 
         let transaction = plan_transaction_paths(&layout).unwrap();
-        assert_eq!(transaction.prepared.parent(), executable.parent());
-        assert_eq!(transaction.backup.parent(), executable.parent());
+        let canonical_executable = executable.canonicalize().unwrap();
+        assert_eq!(transaction.prepared.parent(), canonical_executable.parent());
+        assert_eq!(transaction.backup.parent(), canonical_executable.parent());
         assert_ne!(transaction.prepared, transaction.backup);
 
         create_file(&transaction.backup);
@@ -540,6 +893,141 @@ mod tests {
             plan_transaction_paths(&layout),
             Err(TransactionPlanError::BackupExists(_))
         ));
+    }
+
+    #[test]
+    fn standalone_windows_transaction_paths_keep_the_exe_extension() {
+        let temp = tempdir().unwrap();
+        let executable = temp.path().join("portable/SSHMountMate.exe");
+        create_file(&executable);
+        let layout =
+            detect_install_layout_for(&executable, "windows", &temp.path().join("unrelated-temp"))
+                .unwrap();
+
+        let transaction = plan_transaction_paths(&layout).unwrap();
+
+        assert_eq!(transaction.prepared.extension().unwrap(), "exe");
+        assert_eq!(transaction.backup.extension().unwrap(), "exe");
+        assert!(valid_prepared_name(
+            transaction.prepared.file_name().unwrap().to_str().unwrap(),
+            "SSHMountMate.exe",
+            InstallKind::StandaloneExecutable,
+        ));
+    }
+
+    #[test]
+    fn standalone_payload_is_copied_and_verified_on_the_install_volume() {
+        let temp = tempdir().unwrap();
+        let executable = temp.path().join("portable/SSHMountMate.exe");
+        create_file(&executable);
+        let layout =
+            detect_install_layout_for(&executable, "windows", &temp.path().join("unrelated-temp"))
+                .unwrap();
+        let payload_root = temp.path().join("extracted");
+        let payload_executable = create_directory_bundle(&payload_root, "windows");
+        fs::write(&payload_executable, b"new executable").unwrap();
+        let payload = locate_directory_payload(&payload_root, "windows").unwrap();
+        let transaction = plan_transaction_paths(&layout).unwrap();
+
+        let prepared =
+            prepare_directory_payload(&layout, &payload, &transaction, "windows").unwrap();
+
+        assert_eq!(prepared.replace_path, transaction.prepared);
+        assert_eq!(prepared.executable, transaction.prepared);
+        assert_eq!(fs::read(prepared.executable).unwrap(), b"new executable");
+        assert!(!transaction.backup.exists());
+    }
+
+    #[test]
+    fn directory_payload_is_copied_then_fully_revalidated() {
+        let temp = tempdir().unwrap();
+        let current_root = temp.path().join("installed");
+        let current_executable = create_directory_bundle(&current_root, "linux");
+        let layout = detect_install_layout_for(&current_executable, "linux", temp.path()).unwrap();
+        let payload_root = temp.path().join("extracted");
+        create_directory_bundle(&payload_root, "linux");
+        fs::write(payload_root.join("release-notes.txt"), b"new release").unwrap();
+        let payload = locate_directory_payload(&payload_root, "linux").unwrap();
+        let transaction = plan_transaction_paths(&layout).unwrap();
+
+        let prepared = prepare_directory_payload(&layout, &payload, &transaction, "linux").unwrap();
+
+        assert_eq!(prepared.replace_path, transaction.prepared);
+        assert_eq!(
+            fs::read(transaction.prepared.join("release-notes.txt")).unwrap(),
+            b"new release"
+        );
+        assert_eq!(
+            locate_directory_payload(&transaction.prepared, "linux")
+                .unwrap()
+                .executable,
+            prepared.executable
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_payload_entries_fail_staging_and_are_cleaned() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let current_root = temp.path().join("installed");
+        let current_executable = create_directory_bundle(&current_root, "linux");
+        let layout = detect_install_layout_for(&current_executable, "linux", temp.path()).unwrap();
+        let payload_root = temp.path().join("extracted");
+        create_directory_bundle(&payload_root, "linux");
+        let payload = locate_directory_payload(&payload_root, "linux").unwrap();
+        symlink("outside", payload_root.join("unsafe-link")).unwrap();
+        let transaction = plan_transaction_paths(&layout).unwrap();
+
+        assert!(matches!(
+            prepare_directory_payload(&layout, &payload, &transaction, "linux"),
+            Err(PreparePayloadError::UnsafeEntry(_))
+        ));
+        assert!(!transaction.prepared.exists());
+    }
+
+    #[test]
+    fn forged_transaction_paths_are_rejected_before_copying() {
+        let temp = tempdir().unwrap();
+        let executable = temp.path().join("SSHMountMate");
+        create_file(&executable);
+        let layout = detect_install_layout_for(&executable, "linux", temp.path()).unwrap();
+        let payload_root = temp.path().join("extracted");
+        create_directory_bundle(&payload_root, "linux");
+        let payload = locate_directory_payload(&payload_root, "linux").unwrap();
+        let forged = TransactionPaths {
+            prepared: temp.path().join("arbitrary-prepared"),
+            backup: temp.path().join("arbitrary-backup"),
+        };
+
+        assert!(matches!(
+            prepare_directory_payload(&layout, &payload, &forged, "linux"),
+            Err(PreparePayloadError::InvalidTransactionPaths)
+        ));
+        assert!(!forged.prepared.exists());
+    }
+
+    #[test]
+    fn occupied_prepared_path_is_never_removed_by_failed_staging() {
+        let temp = tempdir().unwrap();
+        let executable = temp.path().join("SSHMountMate");
+        create_file(&executable);
+        let layout = detect_install_layout_for(&executable, "linux", temp.path()).unwrap();
+        let payload_root = temp.path().join("extracted");
+        create_directory_bundle(&payload_root, "linux");
+        let payload = locate_directory_payload(&payload_root, "linux").unwrap();
+        let transaction = plan_transaction_paths(&layout).unwrap();
+        fs::write(&transaction.prepared, b"not owned by updater").unwrap();
+
+        assert!(matches!(
+            prepare_directory_payload(&layout, &payload, &transaction, "linux"),
+            Err(PreparePayloadError::PreparedExists(_))
+        ));
+        assert_eq!(
+            fs::read(&transaction.prepared).unwrap(),
+            b"not owned by updater"
+        );
     }
 
     #[cfg(unix)]
