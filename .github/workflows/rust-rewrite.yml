@@ -44,9 +44,19 @@ jobs:
         env:
           CARGO_ABOUT_VERSION: 0.9.1
           CARGO_ABOUT_SHA256: c0e7dc6f5d74b0beec5c0053d39ab24514c717d19acd91886907a22457ea9e989
+          CARGO_NET_RETRY: 10
         run: |
           set -euo pipefail
-          cargo fetch --locked
+          for target in \
+            x86_64-pc-windows-msvc \
+            aarch64-pc-windows-msvc \
+            x86_64-apple-darwin \
+            aarch64-apple-darwin \
+            x86_64-unknown-linux-gnu \
+            aarch64-unknown-linux-gnu
+          do
+            cargo fetch --locked --target "${target}"
+          done
           archive="cargo-about-${CARGO_ABOUT_VERSION}-x86_64-unknown-linux-musl.tar.gz"
           url="https://github.com/EmbarkStudios/cargo-about/releases/download/${CARGO_ABOUT_VERSION}/${archive}"
           curl --fail --location --silent --show-error "${url}" --output "${RUNNER_TEMP}/${archive}"
