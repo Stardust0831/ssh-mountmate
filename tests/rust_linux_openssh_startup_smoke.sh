@@ -174,7 +174,7 @@ jq -n '{
 "${binary}" --register-login-startup
 startup="${XDG_CONFIG_HOME}/autostart/ssh-mountmate.desktop"
 test -f "${startup}"
-grep -Fx "Exec=${binary} --mount-startup-all" "${startup}"
+grep -Fx "Exec=\"${binary}\" --mount-startup-all" "${startup}"
 
 "${binary}" --mount-startup-all
 for server_id in "${server_ids[@]}"; do

@@ -11,6 +11,28 @@ remote_root="${test_root}/remote"
 mountpoint="${test_root}/mount"
 server_pid=""
 
+start_server() {
+  local host_key="${1:?host key is required}"
+  "${rclone}" --cache-dir "${test_root}/server-cache" \
+    --log-file "${test_root}/sftp-server.log" -vv \
+    serve sftp "${remote_root}" --addr "127.0.0.1:${port}" \
+    --user "${server_user}" --pass "${server_password}" --key "${host_key}" \
+    --dir-cache-time 0s --poll-interval 0 &
+  server_pid=$!
+  local server_ready=false
+  for _ in $(seq 1 50); do
+    if ! kill -0 "${server_pid}" 2>/dev/null; then
+      break
+    fi
+    if ss -H -ltn "sport = :${port}" | grep -q .; then
+      server_ready=true
+      break
+    fi
+    sleep 0.1
+  done
+  test "${server_ready}" == true
+}
+
 cleanup() {
   status=$?
   if [[ "${status}" -ne 0 ]]; then
@@ -51,6 +73,11 @@ sudo chmod a+rw /dev/fuse
 
 mkdir -p "${remote_root}" "${mountpoint}" "${test_root}/home"
 printf '%s\n' 'initial remote content' >"${remote_root}/initial.txt"
+first_host_key="${test_root}/host-key-first"
+second_host_key="${test_root}/host-key-second"
+ssh-keygen -q -t ecdsa -b 256 -N '' -f "${first_host_key}"
+ssh-keygen -q -t ecdsa -b 256 -N '' -f "${second_host_key}"
+chmod 600 "${first_host_key}" "${second_host_key}"
 
 port=""
 for candidate in $(seq 42000 42100); do
@@ -60,25 +87,7 @@ for candidate in $(seq 42000 42100); do
   fi
 done
 test -n "${port}"
-
-"${rclone}" --cache-dir "${test_root}/server-cache" \
-  --log-file "${test_root}/sftp-server.log" -vv \
-  serve sftp "${remote_root}" --addr "127.0.0.1:${port}" \
-  --user "${server_user}" --pass "${server_password}" \
-  --dir-cache-time 0s --poll-interval 0 &
-server_pid=$!
-server_ready=false
-for _ in $(seq 1 50); do
-  if ! kill -0 "${server_pid}" 2>/dev/null; then
-    break
-  fi
-  if ss -H -ltn "sport = :${port}" | grep -q .; then
-    server_ready=true
-    break
-  fi
-  sleep 0.1
-done
-test "${server_ready}" == true
+start_server "${first_host_key}"
 
 export HOME="${test_root}/home"
 export XDG_CONFIG_HOME="${test_root}/config"
@@ -165,6 +174,34 @@ fi
 "${binary}" --unmount-id local-sftp
 if mountpoint -q "${mountpoint}"; then
   echo 'mountpoint remained active after unmount' >&2
+  exit 1
+fi
+test ! -e "${XDG_STATE_HOME}/rsshmount/local-sftp.json"
+
+known_hosts="${config_dir}/known_hosts"
+test -s "${known_hosts}"
+known_hosts_before="$(sha256sum "${known_hosts}" | cut -d ' ' -f 1)"
+kill "${server_pid}"
+wait "${server_pid}" || true
+server_pid=""
+start_server "${second_host_key}"
+
+set +e
+mismatch_output="$("${binary}" --mount-id local-sftp 2>&1)"
+mismatch_status=$?
+set -e
+printf '%s\n' "${mismatch_output}"
+if [[ "${mismatch_status}" -eq 0 ]]; then
+  echo 'mount unexpectedly accepted a changed SSH host key' >&2
+  exit 1
+fi
+if ! grep -Eiq '((host key|knownhosts).*(mismatch|changed)|key mismatch)' <<<"${mismatch_output}"; then
+  echo 'changed SSH host key did not produce an explicit user-facing mismatch' >&2
+  exit 1
+fi
+test "$(sha256sum "${known_hosts}" | cut -d ' ' -f 1)" = "${known_hosts_before}"
+if mountpoint -q "${mountpoint}"; then
+  echo 'changed-key mount attempt left the mountpoint active' >&2
   exit 1
 fi
 test ! -e "${XDG_STATE_HOME}/rsshmount/local-sftp.json"
