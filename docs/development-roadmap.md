@@ -6,25 +6,26 @@ until its stated evidence exists.
 
 ## Current sequence
 
-1. Finish the Rust onefile/onedir distribution work without changing mount behavior.
-2. Re-run the six-platform rewrite workflow and the non-publishing release workflow.
-3. Publish `v0.4.0-alpha.1` as a prerelease only after the required checks and packages pass.
-4. Implement optional macOS `rclone nfsmount` as an explicit Experimental backend.
-5. Keep macOS FUSE as the migration and UI default; keep Windows WinFsp and Linux FUSE3 unchanged.
-6. Do not promote NFS to the default or publish another release until real macOS x64 and ARM64
+1. Publish `v0.4.0-alpha.2` with six canonical assets after local checks and six-platform CI pass.
+2. Keep Windows/Linux as onefile and macOS as a native `.app`; do not publish duplicate onedir assets.
+3. Implement optional macOS `rclone nfsmount` later as an explicit Experimental backend.
+4. Keep macOS FUSE as the migration and UI default; keep Windows WinFsp and Linux FUSE3 unchanged.
+5. Do not promote NFS to the default or publish another NFS-related release until real macOS x64 and ARM64
    FUSE/NFS lifecycle evidence has been reviewed.
 
-## Prerelease scope: `v0.4.0-alpha.1`
+## Prerelease scope: `v0.4.0-alpha.2`
 
 Included work:
 
 - Pure Rust application and packaging; no Python runtime, fallback, source, or active Python CI.
-- Portable onefile and onedir packages on Windows, macOS, and Linux for x64 and ARM64.
-- Verified official rclone, external in onedir and SHA-256-verified/embedded in onefile.
-- Package-type-preserving self-update, authenticated health confirmation, rollback, and active-mount
-  survival checks.
+- Six canonical packages: Windows/Linux onefile and macOS native `.app`, each for x64 and ARM64.
+- Verified official rclone, embedded in Windows/Linux onefile and contained in the macOS application.
+- Canonical-asset self-update, authenticated health confirmation, rollback, and active-mount survival checks.
 - Legacy migration, changed-host-key handling, OpenSSH transport, concurrent login mounts,
   transfer popups/center, native notifications, tray/menu-bar integration, and file-manager refresh.
+- File-manager responsiveness improvement through the recommended 5-second VFS write-back window.
+- More reliable upload progress by combining VFS queue state with `core/stats` transfer details.
+- Capacity discovery fallback through a non-interactive remote `df -Pk` query.
 
 Explicitly excluded:
 
@@ -39,10 +40,10 @@ Required evidence before publishing:
 - Workspace Clippy with warnings denied.
 - Complete workspace tests.
 - Native Windows, macOS, and Linux x64/ARM64 builds.
-- Both onefile and onedir package smoke tests on all six targets.
+- Canonical package smoke tests on all six targets.
 - Real mount/refresh/queued-upload/unmount lifecycle checks.
 - Packaged update commit/rollback and update during a real queued upload.
-- A non-publishing `release.yml` run that validates exactly twelve ZIP assets plus checksums.
+- A non-publishing `release.yml` run that validates exactly six ZIP assets plus checksums.
 
 ## Next implementation: optional macOS NFS backend
 
@@ -61,6 +62,16 @@ Planned design constraints:
 ## Work log
 
 ### 2026-07-14
+
+- Reduced the release matrix from twelve duplicate onefile/onedir ZIPs to six canonical ZIPs to
+  reduce CI artifact and release download overhead. Windows and Linux keep onefile executables;
+  macOS keeps the native `.app` bundle under the canonical asset name.
+- Updated self-update asset selection to use the single canonical OS/architecture ZIP. Because all
+  published alpha.1 onedir assets had zero downloads, users of an old noncanonical alpha package
+  are directed to manually install alpha.2 once rather than maintaining duplicate package tracks.
+- Reduced downloadable rewrite-workflow artifacts to the canonical Windows/Linux onefile or macOS
+  application archive. Internal directory bundles remain available within jobs for lifecycle tests.
+- Started `v0.4.0-alpha.2` prerelease verification. macOS NFS remains documented and deferred.
 
 - Investigated reports that file copies could make the file manager unresponsive, transfer popups
   were not observed, and capacity was unavailable on some SFTP servers.
@@ -154,7 +165,7 @@ Planned design constraints:
 
 - The Rust rewrite PR remains Draft.
 - No merge is authorized by this document.
-- `v0.4.0-alpha.1` must be a prerelease, not a stable release.
+- `v0.4.0-alpha.2` must be a prerelease, not a stable release.
 - The macOS ARM64 active-upload package-replacement timing race is an explicit alpha exception, not
   evidence that the scenario passed. It must be resolved before a stable release.
 - A failed or incomplete architecture gate blocks publication unless it is replaced by successful

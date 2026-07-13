@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, for example v0.4.0-alpha.1"
+        description: "Release tag, for example v0.4.0-alpha.2"
         required: true
         type: string
       publish:
@@ -270,55 +270,24 @@ jobs:
         run: bash tests/rust_macos_gui_smoke.sh "target/package/SSH MountMate.app"
 
       - name: Package ZIP
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p release
-          (cd target/package && zip -q -r "${GITHUB_WORKSPACE}/release/${{ matrix.asset }}-onedir.zip" SSHMountMate)
-          unzip -t "release/${{ matrix.asset }}-onedir.zip"
-          extracted="${RUNNER_TEMP}/release-smoke"
-          unzip -q "release/${{ matrix.asset }}-onedir.zip" -d "${extracted}"
-          "${extracted}/SSHMountMate/SSHMountMate" --version
-          "${extracted}/SSHMountMate/bin/rclone" version
-          test -z "$(find "${extracted}" -type f \( -iname '*.py' -o -iname 'python*' -o -iname 'libpython*' \) -print -quit)"
-
-      - name: Package ZIP
         if: runner.os == 'macOS'
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p release
-          ditto -c -k --keepParent "target/package/SSH MountMate.app" "release/${{ matrix.asset }}-onedir.zip"
-          unzip -t "release/${{ matrix.asset }}-onedir.zip"
+          ditto -c -k --keepParent "target/package/SSH MountMate.app" "release/${{ matrix.asset }}.zip"
+          unzip -t "release/${{ matrix.asset }}.zip"
           extracted="${RUNNER_TEMP}/release-smoke"
           mkdir -p "${extracted}"
-          ditto -x -k "release/${{ matrix.asset }}-onedir.zip" "${extracted}"
+          ditto -x -k "release/${{ matrix.asset }}.zip" "${extracted}"
           app="${extracted}/SSH MountMate.app"
           codesign --verify --deep --strict --verbose=2 "${app}"
           "${app}/Contents/MacOS/SSHMountMate" --version
           "${app}/Contents/Resources/bin/rclone" version
           test -z "$(find "${extracted}" -type f \( -iname '*.py' -o -iname 'python*' -o -iname 'libpython*' \) -print -quit)"
 
-      - name: Package ZIP
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force release | Out-Null
-          Compress-Archive -Path target/package/SSHMountMate -DestinationPath "release/${{ matrix.asset }}-onedir.zip"
-          $test = Join-Path $env:RUNNER_TEMP package-test
-          Expand-Archive "release/${{ matrix.asset }}-onedir.zip" $test
-          if (-not (Test-Path "$test/SSHMountMate/SSHMountMate.exe")) { throw "packaged executable missing" }
-          if (-not (Test-Path "$test/SSHMountMate/bin/rclone.exe")) { throw "packaged rclone missing" }
-          $app = Start-Process -FilePath "$test/SSHMountMate/SSHMountMate.exe" -ArgumentList '--version' -Wait -PassThru
-          if ($app.ExitCode -ne 0) { throw "packaged SSH MountMate smoke test failed" }
-          $rclone = Start-Process -FilePath "$test/SSHMountMate/bin/rclone.exe" -ArgumentList 'version' -Wait -PassThru
-          if ($rclone.ExitCode -ne 0) { throw "packaged rclone smoke test failed" }
-          $python = Get-ChildItem $test -Recurse -File | Where-Object { $_.Name -match '^(python|libpython)' -or $_.Extension -eq '.py' }
-          if ($python) { throw "packaged archive contains Python runtime files" }
-
       - name: Build and package embedded-rclone onefile
-        if: runner.os != 'Windows'
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -328,10 +297,6 @@ jobs:
           mkdir -p target/onefile release
           cp target/release/SSHMountMate target/onefile/SSHMountMate
           chmod 755 target/onefile/SSHMountMate
-          if [[ "${RUNNER_OS}" == "macOS" ]]; then
-            codesign --force --sign - target/onefile/SSHMountMate
-            codesign --verify --strict --verbose=2 target/onefile/SSHMountMate
-          fi
           (cd target/onefile && zip -q "${GITHUB_WORKSPACE}/release/${{ matrix.asset }}.zip" SSHMountMate)
           extracted="${RUNNER_TEMP}/onefile-release-smoke"
           home="${RUNNER_TEMP}/onefile-home"
@@ -448,7 +413,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
-          path: release/${{ matrix.asset }}*.zip
+          path: release/${{ matrix.asset }}.zip
           if-no-files-found: error
 
   release:
@@ -467,22 +432,16 @@ jobs:
           set -euo pipefail
           expected=(
             SSHMountMate-windows-x64.zip
-            SSHMountMate-windows-x64-onedir.zip
             SSHMountMate-windows-arm64.zip
-            SSHMountMate-windows-arm64-onedir.zip
             SSHMountMate-macos-x64.zip
-            SSHMountMate-macos-x64-onedir.zip
             SSHMountMate-macos-arm64.zip
-            SSHMountMate-macos-arm64-onedir.zip
             SSHMountMate-linux-x64.zip
-            SSHMountMate-linux-x64-onedir.zip
             SSHMountMate-linux-arm64.zip
-            SSHMountMate-linux-arm64-onedir.zip
           )
           for asset in "${expected[@]}"; do
             test -s "release-assets/${asset}"
           done
-          test "$(find release-assets -maxdepth 1 -name 'SSHMountMate-*.zip' | wc -l)" -eq 12
+          test "$(find release-assets -maxdepth 1 -name 'SSHMountMate-*.zip' | wc -l)" -eq 6
           (cd release-assets && sha256sum SSHMountMate-*.zip > SHA256SUMS.txt)
           (cd release-assets && sha256sum --check SHA256SUMS.txt)
 

@@ -130,7 +130,7 @@ Use the latest GitHub Release and download the package for your platform:
 - `SSHMountMate-linux-x64.zip`
 - `SSHMountMate-linux-arm64.zip`
 
-Release builds are produced from the Rust workspace by six native GitHub Actions runners. Extract the complete package and keep its adjacent `bin` and license files together. macOS packages contain `SSH MountMate.app`.
+Release builds are produced from the Rust workspace by six native GitHub Actions runners. Windows and Linux ZIPs contain one executable with the verified official rclone embedded. macOS ZIPs contain the native `SSH MountMate.app` bundle with rclone and license notices inside the application.
 
 Bundled third-party notices can be viewed from Settings or with:
 
@@ -144,7 +144,7 @@ Program updates can be checked from Settings -> Check for updates, or from the c
 SSHMountMate --check-update
 ```
 
-The in-app updater downloads the matching native GitHub Release asset, verifies its size and SHA-256 digest, rejects unsafe ZIP paths, stages the new directory bundle or macOS application beside the current installation, and restarts SSH MountMate after confirmation. A startup health handshake commits the update; timeout or failure restores and relaunches the previous build. Existing rclone mounts and uploads continue while the GUI restarts.
+The in-app updater downloads the single matching native GitHub Release asset, verifies its size and SHA-256 digest, rejects unsafe ZIP paths, stages the new executable or macOS application beside the current installation, and restarts SSH MountMate after confirmation. A startup health handshake commits the update; timeout or failure restores and relaunches the previous build. Existing rclone mounts and uploads continue while the GUI restarts.
 
 Automatic installation requires SSH MountMate to be extracted to a permanent, user-writable folder. Builds launched directly from a ZIP temporary directory and assets without a trusted SHA-256 digest remain manual-update only. Automatic background checks can be disabled in Settings.
 
@@ -160,9 +160,9 @@ $env:PROCESSOR_ARCHITECTURE
 uname -m
 ```
 
-Use `x64` packages for `AMD64` / `x86_64`, and `arm64` packages for `ARM64` / `arm64` / `aarch64`. The plain `.zip` contains one executable with the verified official rclone embedded; it materializes rclone as a content-addressed managed copy on first use. The `-onedir.zip` contains the application and rclone as a normal directory bundle (or a native `.app` on macOS) and is recommended for desktop integration. Self-update preserves the installed package type.
+Use `x64` packages for `AMD64` / `x86_64`, and `arm64` packages for `ARM64` / `arm64` / `aarch64`. Windows and Linux provide one canonical onefile package per architecture; the executable materializes its embedded rclone as a content-addressed managed copy on first use. macOS provides one canonical native `.app` package per architecture. The release matrix intentionally has six ZIPs instead of separate onefile and onedir variants.
 
-On macOS, choose the `x64` assets for Intel Macs and `arm64` for Apple Silicon. Use the `-onedir.zip` variant for the native application bundle.
+On macOS, choose the `x64` asset for Intel Macs and `arm64` for Apple Silicon; both contain the native application bundle.
 
 ## Quick Start
 

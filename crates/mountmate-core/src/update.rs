@@ -15,8 +15,6 @@ use thiserror::Error;
 use url::Url;
 use zip::ZipArchive;
 
-use crate::update_install::{InstallKind, detect_install_layout};
-
 const REPOSITORY: &str = "Stardust0831/ssh-mountmate";
 const LATEST_RELEASE_API: &str =
     "https://api.github.com/repos/Stardust0831/ssh-mountmate/releases/latest";
@@ -129,23 +127,14 @@ pub fn architecture_name(arch: &str) -> &'static str {
 }
 
 pub fn expected_asset_name() -> String {
-    let onedir = std::env::current_exe()
-        .ok()
-        .and_then(|executable| detect_install_layout(&executable).ok())
-        .is_some_and(|layout| layout.kind != InstallKind::StandaloneExecutable);
-    expected_asset_name_for_package(OS, ARCH, onedir)
+    expected_asset_name_for(OS, ARCH)
 }
 
 pub fn expected_asset_name_for(os: &str, arch: &str) -> String {
-    expected_asset_name_for_package(os, arch, false)
-}
-
-pub fn expected_asset_name_for_package(os: &str, arch: &str, onedir: bool) -> String {
     format!(
-        "SSHMountMate-{}-{}{}.zip",
+        "SSHMountMate-{}-{}.zip",
         platform_name(os),
-        architecture_name(arch),
-        if onedir { "-onedir" } else { "" }
+        architecture_name(arch)
     )
 }
 
@@ -667,8 +656,8 @@ mod tests {
             "SSHMountMate-windows-x64.zip"
         );
         assert_eq!(
-            expected_asset_name_for_package("windows", "x86_64", true),
-            "SSHMountMate-windows-x64-onedir.zip"
+            expected_asset_name_for("macos", "aarch64"),
+            "SSHMountMate-macos-arm64.zip"
         );
     }
 

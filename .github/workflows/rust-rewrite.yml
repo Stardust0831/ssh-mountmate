@@ -367,7 +367,7 @@ jobs:
           $python = Get-ChildItem $extracted -Recurse -File | Where-Object { $_.Name -match '^(python|libpython)' -or $_.Extension -eq '.py' }
           if ($python) { throw "packaged archive contains Python runtime files" }
       - name: Build and verify embedded-rclone onefile
-        if: runner.os != 'Windows'
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -470,31 +470,24 @@ jobs:
         timeout-minutes: 5
         shell: bash
         run: bash tests/rust_macos_mount_smoke.sh "target/package/SSH MountMate.app"
-      - uses: actions/upload-artifact@v4
+      - name: Upload Windows onefile result
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: |
-            target/release/SSHMountMate
-            target/release/SSHMountMate.exe
-            target/release/bin/rclone
-            target/release/bin/rclone.sha256
-            target/release/bin/rclone.exe
-            target/release/bin/rclone.exe.sha256
-            target/release/THIRD_PARTY_NOTICES.md
-            target/release/*.txt
-            target/release/rclone-COPYING.txt
-            target/release/rfd-LICENSE.txt
-            target/release/sys-locale-LICENSE-MIT.txt
-            target/release/tray-icon-LICENSE-MIT.txt
-            target/release/windows-LICENSE-MIT.txt
-            target/release/notify-rust-LICENSE-MIT.txt
-            target/release/tauri-winrt-notification-LICENSE-MIT.txt
-            target/release/semver-LICENSE-MIT.txt
-            target/release/zip-LICENSE-MIT.txt
-            target/release/rustix-LICENSE-MIT.txt
-            target/release/SSHMountMate.install-layout
-            target/onefile/SSHMountMate
-            target/onefile/SSHMountMate.exe
-            target/package/SSH MountMate.app
-            target/package-smoke/${{ matrix.artifact }}.zip
+          path: target/onefile/SSHMountMate.exe
+          if-no-files-found: error
+      - name: Upload Linux onefile result
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: target/onefile/SSHMountMate
+          if-no-files-found: error
+      - name: Upload macOS application result
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: target/package-smoke/${{ matrix.artifact }}.zip
           if-no-files-found: error
