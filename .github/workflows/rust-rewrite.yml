@@ -401,11 +401,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "onefile build failed" }
           New-Item -ItemType Directory -Force target/onefile | Out-Null
           Copy-Item target/release/SSHMountMate.exe target/onefile/SSHMountMate.exe
-          $home = Join-Path $env:RUNNER_TEMP 'onefile-home'
-          $env:HOME = $home
-          $env:USERPROFILE = $home
-          $env:APPDATA = Join-Path $home 'roaming'
-          $env:LOCALAPPDATA = Join-Path $home 'local'
+          $onefileHome = Join-Path $env:RUNNER_TEMP 'onefile-home'
+          $env:HOME = $onefileHome
+          $env:USERPROFILE = $onefileHome
+          $env:APPDATA = Join-Path $onefileHome 'roaming'
+          $env:LOCALAPPDATA = Join-Path $onefileHome 'local'
           $rclonePath = (& .\target\onefile\SSHMountMate.exe --rclone-path).Trim()
           if ($LASTEXITCODE -ne 0 -or -not (Test-Path $rclonePath -PathType Leaf)) {
             throw "onefile did not materialize embedded rclone"

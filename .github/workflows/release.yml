@@ -364,11 +364,11 @@ jobs:
           Compress-Archive -Path target/onefile/SSHMountMate.exe -DestinationPath "release/${{ matrix.asset }}.zip"
           $test = Join-Path $env:RUNNER_TEMP onefile-release-smoke
           Expand-Archive "release/${{ matrix.asset }}.zip" $test
-          $home = Join-Path $env:RUNNER_TEMP 'onefile-home'
-          $env:HOME = $home
-          $env:USERPROFILE = $home
-          $env:APPDATA = Join-Path $home 'roaming'
-          $env:LOCALAPPDATA = Join-Path $home 'local'
+          $onefileHome = Join-Path $env:RUNNER_TEMP 'onefile-home'
+          $env:HOME = $onefileHome
+          $env:USERPROFILE = $onefileHome
+          $env:APPDATA = Join-Path $onefileHome 'roaming'
+          $env:LOCALAPPDATA = Join-Path $onefileHome 'local'
           $rclonePath = (& "$test/SSHMountMate.exe" --rclone-path).Trim()
           if ($LASTEXITCODE -ne 0 -or -not (Test-Path $rclonePath -PathType Leaf)) {
             throw "onefile did not materialize embedded rclone"

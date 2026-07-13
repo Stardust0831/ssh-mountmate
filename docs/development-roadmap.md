@@ -85,6 +85,10 @@ Planned design constraints:
   compilation is delegated to native CI because this workspace does not provide the GTK/pkg-config
   development environment used by the Linux runner.
 - Accepted macOS Experimental NFS as the next implementation task, explicitly after the prerelease.
+- Run 29255461001 proved quality and macOS ARM64 including the new onefile path, but Windows ARM64
+  exposed a PowerShell-only workflow bug: `$home` conflicts case-insensitively with the read-only
+  automatic `$HOME` variable. The workflow variable was renamed to `$onefileHome`; a replacement
+  six-platform run is required.
 
 ## Release decisions
 
