@@ -52,6 +52,10 @@ public static class SSHMountMateWindowTest {
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool IsWindowVisible(IntPtr window);
 }
 '@
 
@@ -85,17 +89,19 @@ try {
     throw "Expected one SSH MountMate GUI process, found $($matching.Count)"
   }
 
-  if (-not [SSHMountMateWindowTest]::PostMessage($initialWindow, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)) {
-    throw "Could not post WM_CLOSE to SSH MountMate: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+  if (-not [SSHMountMateWindowTest]::PostMessage($initialWindow, 0x0112, [IntPtr]0xF060, [IntPtr]::Zero)) {
+    throw "Could not post SC_CLOSE to SSH MountMate: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
   }
   Wait-Until { Trace-Contains 'closing main window to tray' }
+  Wait-Until { -not [SSHMountMateWindowTest]::IsWindowVisible($initialWindow) }
   if ($gui.HasExited) { throw 'SSH MountMate exited instead of remaining in the tray' }
 
   Invoke-SecondInstance @('--show-main')
   Wait-Until { Trace-Contains 'opening replacement main window' }
   Wait-Until {
     $gui.Refresh()
-    return $gui.MainWindowHandle -ne [IntPtr]::Zero
+    return $gui.MainWindowHandle -ne [IntPtr]::Zero -and
+      [SSHMountMateWindowTest]::IsWindowVisible($gui.MainWindowHandle)
   }
   if ($gui.Id -ne $matching[0].Id) { throw 'Restored window belongs to another process' }
   Wait-Until { (Trace-LineCount 'taskbar progress updated: Hidden') -ge 2 }
