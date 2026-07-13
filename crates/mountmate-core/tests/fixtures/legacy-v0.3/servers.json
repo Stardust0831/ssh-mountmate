@@ -1,0 +1,53 @@
+[
+  {
+    "id": "legacy-password",
+    "name": "Legacy Password",
+    "mode": "manual",
+    "source": "manual",
+    "host": "password.example",
+    "user": "alice",
+    "port": "2202",
+    "auth": "password",
+    "password_obscured": "obscured-password-secret",
+    "connection_method": "native",
+    "remote_path": "/project/data",
+    "mountpoint": "/legacy/password-mount",
+    "cache_mode": "minimal",
+    "network_mode": true
+  },
+  {
+    "id": "legacy-sai",
+    "name": "SAI-alice",
+    "mode": "manual",
+    "source": "sai_cluster",
+    "host_alias": "SAI-alice",
+    "host": "sai.example",
+    "user": "alice",
+    "port": "12022",
+    "auth": "key",
+    "key_file": "/legacy/keys/id_ed25519",
+    "key_pass_obscured": "obscured-key-passphrase",
+    "connection_method": "native",
+    "remote_path": "$HOME/work",
+    "mountpoint": "__home_mnt__",
+    "cache_mode": "full",
+    "ssh_config_managed": true,
+    "copy_key_to_ssh_dir": true,
+    "managed_ssh_config_path": "/legacy/.ssh/ssh-mountmate.d"
+  },
+  {
+    "id": "legacy-openssh",
+    "name": "Legacy OpenSSH",
+    "mode": "ssh_config",
+    "source": "ssh_config",
+    "host_alias": "legacy-cluster",
+    "host": "resolved.example",
+    "user": "bob",
+    "port": "22",
+    "auth": "key",
+    "connection_method": "openssh",
+    "remote_path": "/shared",
+    "mountpoint": "/legacy/openssh-mount",
+    "ssh_config_path": "/legacy/.ssh/config"
+  }
+]

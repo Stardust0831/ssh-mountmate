@@ -1,0 +1,1 @@
+legacy mount log remains readable

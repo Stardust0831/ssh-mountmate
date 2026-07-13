@@ -1,0 +1,8 @@
+{
+  "pid": 4242,
+  "server_id": "legacy-password",
+  "remote": "legacy-password:project/data",
+  "mountpoint": "/legacy/password-mount",
+  "log": "/legacy/state/legacy-password.log",
+  "rc_addr": "127.0.0.1:45321"
+}
