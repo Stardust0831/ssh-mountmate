@@ -15,23 +15,25 @@ $server = $null
 $mounted = $false
 $succeeded = $false
 
-function Invoke-SSHMountMate([string[]] $Arguments) {
+function Invoke-SSHMountMate([string[]] $Arguments, [switch] $NoCapture) {
   $processInfo = [System.Diagnostics.ProcessStartInfo]::new($binary)
   $processInfo.UseShellExecute = $false
   $processInfo.CreateNoWindow = $true
-  $processInfo.RedirectStandardOutput = $true
-  $processInfo.RedirectStandardError = $true
+  $processInfo.RedirectStandardOutput = -not $NoCapture
+  $processInfo.RedirectStandardError = -not $NoCapture
   $Arguments | ForEach-Object { $processInfo.ArgumentList.Add($_) }
   $process = [System.Diagnostics.Process]::Start($processInfo)
-  $stdout = $process.StandardOutput.ReadToEndAsync()
-  $stderr = $process.StandardError.ReadToEndAsync()
+  if (-not $NoCapture) {
+    $stdout = $process.StandardOutput.ReadToEndAsync()
+    $stderr = $process.StandardError.ReadToEndAsync()
+  }
   $exited = $process.WaitForExit(60000)
   if (-not $exited) {
     $process.Kill($true)
     $process.WaitForExit()
   }
-  $output = $stdout.GetAwaiter().GetResult()
-  $errorOutput = $stderr.GetAwaiter().GetResult()
+  $output = if ($NoCapture) { '' } else { $stdout.GetAwaiter().GetResult() }
+  $errorOutput = if ($NoCapture) { '' } else { $stderr.GetAwaiter().GetResult() }
   if (-not $exited) {
     throw "SSH MountMate $($Arguments -join ' ') timed out`n$output$errorOutput"
   }
@@ -152,7 +154,7 @@ try {
   } | ConvertTo-Json | Set-Content (Join-Path $configDir 'settings.json')
 
   Write-Host '[windows-mount-e2e] mounting drive'
-  Invoke-SSHMountMate @('--mount-id', 'local-sftp') | Out-Null
+  Invoke-SSHMountMate -Arguments @('--mount-id', 'local-sftp') -NoCapture | Out-Null
   $mounted = $true
   Wait-Until { Test-Path "${mountpoint}\initial.txt" }
   if ((Get-Content "${mountpoint}\initial.txt" -Raw) -ne 'initial remote content') {
@@ -192,7 +194,7 @@ try {
   } 50
 
   Write-Host '[windows-mount-e2e] unmounting drive'
-  Invoke-SSHMountMate @('--unmount-id', 'local-sftp') | Out-Null
+  Invoke-SSHMountMate -Arguments @('--unmount-id', 'local-sftp') -NoCapture | Out-Null
   $mounted = $false
   Wait-Until { -not (Test-Path "${mountpoint}\") }
   $state = Join-Path $env:LOCALAPPDATA 'rsshmount/State/local-sftp.json'
@@ -201,7 +203,9 @@ try {
   $succeeded = $true
 } finally {
   if ($mounted) {
-    try { Invoke-SSHMountMate @('--unmount-id', 'local-sftp') | Out-Null } catch {}
+    try {
+      Invoke-SSHMountMate -Arguments @('--unmount-id', 'local-sftp') -NoCapture | Out-Null
+    } catch {}
   }
   if ($server -and -not $server.HasExited) {
     $server.Kill($true)
