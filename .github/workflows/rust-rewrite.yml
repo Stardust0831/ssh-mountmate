@@ -377,6 +377,11 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: bash tests/rust_linux_mount_smoke.sh target/package/SSHMountMate
+      - name: Exercise OpenSSH and concurrent login mounts
+        if: runner.os == 'Linux'
+        timeout-minutes: 5
+        shell: bash
+        run: bash tests/rust_linux_openssh_startup_smoke.sh target/package/SSHMountMate
       - name: Exercise packaged update and rollback
         if: runner.os == 'macOS'
         shell: bash
