@@ -43,6 +43,7 @@ windows-sys = "0.61"
 windows = "0.61.3"
 windows-registry = "0.6.1"
 zip = { version = "7.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zbus = "5.17"
 
 [profile.release]
 lto = "thin"

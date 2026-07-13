@@ -20,6 +20,7 @@ tray-icon.workspace = true
 gtk = "0.18"
 libloading = "0.8"
 tray-icon = { workspace = true, features = ["gtk"] }
+zbus.workspace = true
 
 [[bin]]
 name = "SSHMountMate"

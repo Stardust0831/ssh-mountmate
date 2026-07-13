@@ -167,6 +167,9 @@ fn set_pixel(rgba: &mut [u8], width: u32, x: u32, y: u32, color: [u8; 4]) {
 
 #[cfg(target_os = "linux")]
 fn initialize_desktop_menu_runtime() -> Result<(), String> {
+    if !status_notifier_watcher_available()? {
+        return Err("No StatusNotifierWatcher tray host is available on this desktop".into());
+    }
     let appindicator_available = [
         "libayatana-appindicator3.so.1",
         "libappindicator3.so.1",
@@ -185,6 +188,37 @@ fn initialize_desktop_menu_runtime() -> Result<(), String> {
     } else {
         Err("GTK could not be initialized for the system tray".into())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn status_notifier_watcher_available() -> Result<bool, String> {
+    let connection = zbus::blocking::Connection::session().map_err(|error| error.to_string())?;
+    let reply = connection
+        .call_method(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            Some("org.freedesktop.DBus"),
+            "NameHasOwner",
+            &"org.kde.StatusNotifierWatcher",
+        )
+        .map_err(|error| error.to_string())?;
+    let has_watcher = reply
+        .body()
+        .deserialize::<bool>()
+        .map_err(|error| error.to_string())?;
+    if !has_watcher {
+        return Ok(false);
+    }
+    let watcher = zbus::blocking::Proxy::new(
+        &connection,
+        "org.kde.StatusNotifierWatcher",
+        "/StatusNotifierWatcher",
+        "org.kde.StatusNotifierWatcher",
+    )
+    .map_err(|error| error.to_string())?;
+    watcher
+        .get_property::<bool>("IsStatusNotifierHostRegistered")
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(not(target_os = "linux"))]

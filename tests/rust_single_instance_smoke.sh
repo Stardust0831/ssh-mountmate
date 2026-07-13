@@ -6,6 +6,8 @@ binary="$(realpath "$binary")"
 test_root="$(mktemp -d "${TMPDIR:-/tmp}/ssh-mountmate-ipc-XXXXXX")"
 app_pid=""
 wm_pid=""
+tray_host_pid=""
+notification_pid=""
 
 cleanup() {
   status=$?
@@ -16,6 +18,14 @@ cleanup() {
   if [[ -n "$wm_pid" ]]; then
     kill "$wm_pid" 2>/dev/null || true
     wait "$wm_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$tray_host_pid" ]]; then
+    kill "$tray_host_pid" 2>/dev/null || true
+    wait "$tray_host_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$notification_pid" ]]; then
+    kill "$notification_pid" 2>/dev/null || true
+    wait "$notification_pid" 2>/dev/null || true
   fi
   if [[ "$status" != "0" ]]; then
     printf '%s\n' '--- SSH MountMate stdout ---' >&2
@@ -53,12 +63,46 @@ export WGPU_BACKEND="${WGPU_BACKEND:-gl}"
 export LIBGL_ALWAYS_SOFTWARE=1
 export NO_AT_BRIDGE=1
 export SSH_MOUNTMATE_TRACE_FILE="$test_root/gui.trace"
+export SSH_MOUNTMATE_E2E_NATIVE_SMOKE=1
 unset WAYLAND_DISPLAY WAYLAND_SOCKET
 
 openbox >"$test_root/openbox.stdout" 2>"$test_root/openbox.stderr" &
 wm_pid=$!
 sleep 0.3
 kill -0 "$wm_pid" || { echo "Openbox did not stay running" >&2; exit 1; }
+
+dunst >"$test_root/dunst.stdout" 2>"$test_root/dunst.stderr" &
+notification_pid=$!
+gtk-sni-tray-standalone --watcher \
+  >"$test_root/tray-host.stdout" 2>"$test_root/tray-host.stderr" &
+tray_host_pid=$!
+watcher_ready=false
+for _ in {1..100}; do
+  if gdbus call --session \
+    --dest org.kde.StatusNotifierWatcher \
+    --object-path /StatusNotifierWatcher \
+    --method org.freedesktop.DBus.Properties.Get \
+    org.kde.StatusNotifierWatcher IsStatusNotifierHostRegistered \
+    2>/dev/null | grep -q true; then
+    watcher_ready=true
+    break
+  fi
+  sleep 0.05
+done
+[[ "$watcher_ready" == true ]] || { echo "StatusNotifierWatcher did not start" >&2; exit 1; }
+notification_ready=false
+for _ in {1..100}; do
+  if gdbus call --session \
+    --dest org.freedesktop.DBus \
+    --object-path /org/freedesktop/DBus \
+    --method org.freedesktop.DBus.NameHasOwner org.freedesktop.Notifications \
+    2>/dev/null | grep -q true; then
+    notification_ready=true
+    break
+  fi
+  sleep 0.05
+done
+[[ "$notification_ready" == true ]] || { echo "Notification daemon did not start" >&2; exit 1; }
 
 "$binary" >"$test_root/gui.stdout" 2>"$test_root/gui.stderr" &
 app_pid=$!
@@ -70,6 +114,16 @@ for _ in {1..400}; do
 done
 [[ -s "$state" ]] || { echo "App command state was not created" >&2; exit 1; }
 [[ "$(stat -c %a "$state")" == "600" ]] || { echo "App command state is not mode 600" >&2; exit 1; }
+for expected in 'tray initialized' 'native notification submitted'; do
+  for _ in {1..200}; do
+    grep -Fqx "$expected" "$test_root/gui.trace" 2>/dev/null && break
+    sleep 0.05
+  done
+  grep -Fqx "$expected" "$test_root/gui.trace" || {
+    echo "Missing native integration trace: $expected" >&2
+    exit 1
+  }
+done
 
 "$binary" --show-transfers
 "$binary" --mount-id missing
@@ -115,6 +169,10 @@ done
 [[ ! -s "$test_root/gui.stdout" ]] || { echo "GUI unexpectedly wrote to stdout" >&2; exit 1; }
 if grep -Eq "panicked|ERROR_OUT_OF_HOST_MEMORY" "$test_root/gui.stderr"; then
   cat "$test_root/gui.stderr" >&2
+  exit 1
+fi
+if grep -Eq "tray unavailable|native notification failed" "$test_root/gui.trace"; then
+  cat "$test_root/gui.trace" >&2
   exit 1
 fi
 
