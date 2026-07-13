@@ -68,3 +68,20 @@ and Linux freedesktop desktop notifications.
 - License text: `licenses/tauri-winrt-notification-LICENSE-MIT.txt`
 
 `notify-rust` uses this Tauri library as its Windows Toast backend.
+
+## semver
+
+- Project: https://github.com/dtolnay/semver
+- License: MIT OR Apache-2.0 (distributed under the MIT option)
+- License text: `licenses/semver-LICENSE-MIT.txt`
+
+The Rust update engine uses `semver` for release and prerelease ordering.
+
+## zip
+
+- Project: https://github.com/zip-rs/zip2
+- License: MIT
+- License text: `licenses/zip-LICENSE-MIT.txt`
+
+The Rust update engine uses `zip` with only the Deflate backend enabled to inspect and safely
+extract verified release archives.
