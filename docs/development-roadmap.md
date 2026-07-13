@@ -8,9 +8,11 @@ until its stated evidence exists.
 
 1. Publish `v0.4.0-alpha.2` with six canonical assets after local checks and six-platform CI pass.
 2. Keep Windows/Linux as onefile and macOS as a native `.app`; do not publish duplicate onedir assets.
-3. Implement optional macOS `rclone nfsmount` later as an explicit Experimental backend.
-4. Keep macOS FUSE as the migration and UI default; keep Windows WinFsp and Linux FUSE3 unchanged.
-5. Do not promote NFS to the default or publish another NFS-related release until real macOS x64 and ARM64
+3. Design an optional installed distribution with stable identity and paths, with Windows as the first target.
+4. Keep portable execution available for mounting and diagnostics; installation must not become a mount prerequisite.
+5. Implement optional macOS `rclone nfsmount` later as an explicit Experimental backend.
+6. Keep macOS FUSE as the migration and UI default; keep Windows WinFsp and Linux FUSE3 unchanged.
+7. Do not promote NFS to the default or publish another NFS-related release until real macOS x64 and ARM64
    FUSE/NFS lifecycle evidence has been reviewed.
 
 ## Prerelease scope: `v0.4.0-alpha.2`
@@ -59,9 +61,49 @@ Planned design constraints:
 - Run the same real lifecycle suite for macOS FUSE and NFS on x64 and ARM64, including non-blocking
   performance records.
 
+## Post-prerelease design: installed distribution and stable desktop identity
+
+The application does not need installation to perform an rclone mount, but installation should
+become the recommended desktop path once its update and rollback model is proven. The portable
+package remains useful for first-run evaluation, recovery, and environments where installation is
+not permitted.
+
+Planned Windows direction:
+
+- Prefer a per-user installation under a fixed user-writable location so self-update does not need
+  administrator elevation or attempt to replace files under `Program Files`.
+- Create a stable Start menu shortcut and AUMID for Toast identity, rather than relying on the path
+  and identity of an arbitrary downloaded executable.
+- Register Explorer refresh/transfer commands and login startup against the installed executable.
+- Make upgrades preserve settings, mounts, the managed rclone copy, and the authenticated update
+  health/rollback protocol.
+- Provide an uninstaller that removes application files, Start menu entries, Explorer commands,
+  login startup, and notification registration without deleting user connection data or cache
+  unless the user explicitly requests that cleanup.
+- Keep the portable onefile download available and clearly report that moving it can invalidate
+  startup and file-manager registrations.
+
+Cross-platform considerations:
+
+- macOS already ships a native `.app`; the installed path should be `/Applications` or the user's
+  Applications folder, followed later by production signing/notarization and an appropriate
+  distribution container.
+- Linux should keep a portable binary while evaluating desktop-entry integration and distro-neutral
+  or package-manager-specific installers separately.
+- Installer choice, signing, update ownership, downgrade behavior, repair, uninstall cleanup, and
+  migration from the alpha portable packages require a dedicated design and CI matrix. They are not
+  part of `v0.4.0-alpha.2`.
+
 ## Work log
 
 ### 2026-07-14
+
+- Recorded installation as a post-alpha design task. The main benefit is stable application path
+  and desktop identity for self-update, login startup, Explorer commands, Windows Toast/AUMID, and
+  complete uninstall cleanup; mounting itself remains available without installation.
+- Chose Windows per-user installation as the first design target while retaining the portable
+  onefile. macOS continues to use the native `.app`, and Linux installer formats remain a separate
+  evaluation. No installer was added to the in-progress six-asset alpha.2 release.
 
 - Reduced the release matrix from twelve duplicate onefile/onedir ZIPs to six canonical ZIPs to
   reduce CI artifact and release download overhead. Windows and Linux keep onefile executables;
