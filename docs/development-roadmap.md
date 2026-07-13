@@ -95,6 +95,9 @@ Planned design constraints:
   PowerShell with `$null` and closed the child's stdout pipe. Both workflows now launch the
   diagnostic command with explicit stdout/stderr file redirection. A replacement six-platform run
   remains required before the non-publishing release dry run.
+- Release-workflow review found that `publish=false` skipped the complete release aggregation job,
+  including twelve-asset validation. The aggregation and checksum verification now run for dry
+  runs; only the GitHub Release creation step is conditional on tag publication or `publish=true`.
 
 ## Release decisions
 

@@ -448,7 +448,6 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: github.event_name == 'push' || inputs.publish
     needs: build
     runs-on: ubuntu-latest
 
@@ -484,6 +483,7 @@ jobs:
           sha256sum --check release-assets/SHA256SUMS.txt
 
       - name: Create GitHub release
+        if: github.event_name == 'push' || inputs.publish
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
