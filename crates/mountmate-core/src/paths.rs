@@ -115,6 +115,14 @@ impl AppPaths {
         self.data_dir.join("bin")
     }
 
+    pub fn update_helper_dir(&self) -> PathBuf {
+        self.data_dir.join("update")
+    }
+
+    pub fn update_state_dir(&self) -> PathBuf {
+        self.state_dir.join("update")
+    }
+
     pub fn mount_cache_dir(&self, remote_name: &str) -> PathBuf {
         self.cache_dir.join(path_component(remote_name))
     }
@@ -187,5 +195,7 @@ mod tests {
             PathBuf::from("state/host_22.log")
         );
         assert_eq!(paths.managed_bin_dir(), PathBuf::from("data/bin"));
+        assert_eq!(paths.update_helper_dir(), PathBuf::from("data/update"));
+        assert_eq!(paths.update_state_dir(), PathBuf::from("state/update"));
     }
 }

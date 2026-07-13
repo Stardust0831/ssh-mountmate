@@ -530,6 +530,13 @@ fn validate_transaction_shape(
     Ok(())
 }
 
+pub(crate) fn transaction_shape_is_valid(
+    layout: &InstallLayout,
+    transaction: &TransactionPaths,
+) -> bool {
+    validate_transaction_shape(layout, transaction).is_ok()
+}
+
 fn validate_prepared_payload(
     kind: InstallKind,
     prepared: &PreparedPayload,
@@ -615,14 +622,14 @@ fn remove_path_entry(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
     use rustix::fs::{CWD, RenameFlags, renameat_with};
 
     renameat_with(CWD, source, CWD, destination, RenameFlags::NOREPLACE).map_err(io::Error::from)
 }
 
 #[cfg(windows)]
-fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
     use windows_sys::Win32::Storage::FileSystem::MoveFileW;
