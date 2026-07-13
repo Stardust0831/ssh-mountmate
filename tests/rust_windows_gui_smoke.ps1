@@ -44,6 +44,11 @@ function Trace-LineCount([string] $Text) {
   return @(Get-Content $trace | Where-Object { $_ -eq $Text }).Count
 }
 
+function Trace-PrefixCount([string] $Prefix) {
+  if (-not (Test-Path $trace)) { return 0 }
+  return @(Get-Content $trace | Where-Object { $_.StartsWith($Prefix) }).Count
+}
+
 Add-Type @'
 using System;
 using System.Runtime.InteropServices;
@@ -97,7 +102,9 @@ try {
   if ($gui.HasExited) { throw 'SSH MountMate exited instead of remaining in the tray' }
 
   Invoke-SecondInstance @('--show-main')
+  Wait-Until { Trace-Contains 'ipc-server received ShowMain' }
   Wait-Until { Trace-Contains 'opening replacement main window' }
+  Wait-Until { (Trace-PrefixCount 'main window opened ') -ge 2 }
   Wait-Until {
     $gui.Refresh()
     return $gui.MainWindowHandle -ne [IntPtr]::Zero -and
@@ -105,6 +112,12 @@ try {
   }
   if ($gui.Id -ne $matching[0].Id) { throw 'Restored window belongs to another process' }
   Wait-Until { (Trace-LineCount 'taskbar progress updated: Hidden') -ge 2 }
+  $matching = @(Get-Process | Where-Object {
+    try { $_.Path -eq $binary } catch { $false }
+  })
+  if ($matching.Count -ne 1 -or $matching[0].Id -ne $gui.Id) {
+    throw "Restoring the main window created another GUI process; found $($matching.Count)"
+  }
 
   if ((Test-Path $stdout) -and (Get-Item $stdout).Length -ne 0) {
     throw 'Windows GUI unexpectedly wrote to stdout'
