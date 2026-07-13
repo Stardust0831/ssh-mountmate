@@ -3747,7 +3747,7 @@ fn native_integration_smoke_notification() -> NativeNotification {
     NativeNotification {
         id: "native-integration-smoke".into(),
         title: "SSH MountMate native integration".into(),
-        body: "Windows notification delivery is active.".into(),
+        body: "Native notification delivery is active.".into(),
         progress: None,
         level: NativeNotificationLevel::Info,
     }

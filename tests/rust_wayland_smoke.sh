@@ -4,12 +4,12 @@ set -euo pipefail
 binary="$(realpath "${1:-target/debug/SSHMountMate}")"
 test_root="$(mktemp -d "${TMPDIR:-/tmp}/ssh-mountmate-wayland-XXXXXX")"
 weston_pid=""
-notification_pid=""
+notification_probe_pid=""
 app_pid=""
 
 cleanup() {
   status=$?
-  for pid in "$app_pid" "$notification_pid" "$weston_pid"; do
+  for pid in "$app_pid" "$notification_probe_pid" "$weston_pid"; do
     if [[ -n "$pid" ]]; then
       kill "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
@@ -22,8 +22,10 @@ cleanup() {
     cat "$test_root/gui.stderr" >&2 2>/dev/null || true
     printf '%s\n' '--- Weston log ---' >&2
     cat "$test_root/weston.log" >&2 2>/dev/null || true
-    printf '%s\n' '--- Notification daemon stderr ---' >&2
-    cat "$test_root/notification-daemon.stderr" >&2 2>/dev/null || true
+    printf '%s\n' '--- Notification probe stderr ---' >&2
+    cat "$test_root/notification-probe.stderr" >&2 2>/dev/null || true
+    printf '%s\n' '--- Notification records ---' >&2
+    cat "$test_root/notifications.log" >&2 2>/dev/null || true
   fi
   rm -rf "$test_root"
   trap - EXIT
@@ -72,10 +74,15 @@ done
   exit 1
 }
 
-/usr/lib/notification-daemon/notification-daemon \
-  >"$test_root/notification-daemon.stdout" \
-  2>"$test_root/notification-daemon.stderr" &
-notification_pid=$!
+notification_probe="$(dirname "$binary")/examples/freedesktop_notification_probe"
+[[ -x "$notification_probe" ]] || {
+  echo "Freedesktop notification probe is missing: $notification_probe" >&2
+  exit 1
+}
+"$notification_probe" "$test_root/notifications.log" \
+  >"$test_root/notification-probe.stdout" \
+  2>"$test_root/notification-probe.stderr" &
+notification_probe_pid=$!
 notification_ready=false
 for _ in {1..100}; do
   if gdbus call --session \
@@ -88,7 +95,7 @@ for _ in {1..100}; do
   fi
   sleep 0.05
 done
-[[ "$notification_ready" == true ]] || { echo "Wayland notification daemon did not start" >&2; exit 1; }
+[[ "$notification_ready" == true ]] || { echo "Wayland notification protocol probe did not start" >&2; exit 1; }
 
 "$binary" >"$test_root/gui.stdout" 2>"$test_root/gui.stderr" &
 app_pid=$!
@@ -111,6 +118,20 @@ for expected in \
   done
   grep -Fq "$expected" "$test_root/gui.trace" || {
     echo "Missing Wayland integration trace: $expected" >&2
+    exit 1
+  }
+done
+
+for expected in \
+  'app=SSH MountMate' \
+  'summary=SSH MountMate native integration' \
+  'body=Native notification delivery is active.'; do
+  for _ in {1..200}; do
+    grep -Fq "$expected" "$test_root/notifications.log" 2>/dev/null && break
+    sleep 0.05
+  done
+  grep -Fq "$expected" "$test_root/notifications.log" || {
+    echo "Missing Freedesktop notification record: $expected" >&2
     exit 1
   }
 done
