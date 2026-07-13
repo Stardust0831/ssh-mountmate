@@ -60,6 +60,24 @@ Planned design constraints:
 
 ## Work log
 
+### 2026-07-14
+
+- Investigated reports that file copies could make the file manager unresponsive, transfer popups
+  were not observed, and capacity was unavailable on some SFTP servers.
+- Restored the recommended write-back delay from the forced `0s` override to rclone's upstream `5s`
+  default. Schema 9 migrates only the recognizable prior recommended profile; custom zero-delay
+  profiles remain unchanged. The delay applies on the next mount and gives file close, rename, and
+  metadata operations a stable local-cache window before upload begins.
+- Transfer snapshots now recover per-file bytes, speed, and percentage from `core/stats` when
+  `vfs/stats` confirms an active upload but `vfs/queue` temporarily omits its file details. Core
+  transfers are not treated as uploads unless the VFS disk cache independently reports an upload.
+- Capacity discovery now falls back to a non-interactive remote `df -Pk` query after local mount,
+  Lustre project quota, and `rclone about` data are unavailable. Direct password profiles without a
+  managed SSH route continue to avoid password prompts.
+- Focused Rust 1.97 tests passed for settings migration, mount arguments, transfer reconciliation,
+  download misclassification, and remote capacity parsing. Full workspace verification and native
+  CI are still required before another prerelease.
+
 ### 2026-07-13
 
 - Preserved user-owned untracked files (`issue-1-reply.md` and five screenshots); none are staged.

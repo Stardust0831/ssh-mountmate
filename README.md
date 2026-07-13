@@ -263,7 +263,7 @@ If rclone reports `knownhosts: key mismatch`, SSH MountMate stops the mount rath
 
 ## Transfers And Remote Refresh
 
-Mounted connection cards show rclone's real VFS upload queue. When an upload starts, that connection gets its own bottom-right progress window; multiple active connections are stacked separately. The Transfer center remains available for manually viewing all mounts together. A file is only shown as cloud-synced after rclone reports no queued or active uploads. SSH MountMate warns before unmounting or exiting while uploads remain.
+Mounted connection cards show rclone's real VFS upload queue. The recommended cache profile keeps rclone's upstream five-second write-back window so Explorer/Finder can finish close, rename, and metadata operations before remote upload begins. When an upload is queued or starts, that connection gets its own bottom-right progress window; multiple active connections are stacked separately. The Transfer center remains available for manually viewing all mounts together. A file is only shown as cloud-synced after rclone reports no queued or active uploads. SSH MountMate warns before unmounting or exiting while uploads remain.
 
 Refresh clears the VFS directory cache, actively reloads the requested directory, and verifies it with a direct remote listing. If local writes are still queued, the result states that the verified remote snapshot does not yet include those uploads.
 
@@ -273,7 +273,7 @@ The Rust application keeps a native system-tray icon on Windows, a menu-bar item
 
 ## Capacity Display
 
-For mounted connections, SSH MountMate shows used and total capacity on each card. On Lustre paths, it first tries to read the remote directory's project ID with `lfs project -d` and then reads project quota with `lfs quota -p`. If the path is not on Lustre, `lfs` is unavailable, or the project has no nonzero hard block limit, the app falls back to `rclone about`.
+For mounted connections, SSH MountMate shows used and total capacity on each card. On Lustre paths, it first tries to read the remote directory's project ID with `lfs project -d` and then reads project quota with `lfs quota -p`. If the path is not on Lustre, `lfs` is unavailable, or the project has no nonzero hard block limit, the app falls back to `rclone about` and then a non-interactive remote `df -Pk` query when the SSH profile supports it.
 
 ## Settings
 

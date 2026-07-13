@@ -18,6 +18,10 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const LUSTRE_CAPACITY_SCRIPT: &str = r#"set -eu
 target=${1:-.}
 if [ -z "$target" ]; then target=.; fi
+case "$target" in
+  '~') target=$HOME ;;
+  '~/'*) target=$HOME/${target#\~/} ;;
+esac
 if ! command -v lfs >/dev/null 2>&1; then exit 0; fi
 if [ -d "$target" ]; then
   resolved=$(cd "$target" 2>/dev/null && pwd -P) || exit 0
@@ -38,11 +42,31 @@ fi
 printf '%s\n' "$quota_out"
 "#;
 
+const FILESYSTEM_CAPACITY_SCRIPT: &str = r#"set -eu
+target=${1:-.}
+if [ -z "$target" ]; then target=.; fi
+case "$target" in
+  '~') target=$HOME ;;
+  '~/'*) target=$HOME/${target#\~/} ;;
+esac
+if [ -d "$target" ]; then
+  resolved=$(cd "$target" 2>/dev/null && pwd -P) || exit 0
+else
+  resolved=$(readlink -f -- "$target" 2>/dev/null || printf '%s' "$target")
+fi
+df -Pk "$resolved" 2>/dev/null | awk '
+  NR == 2 && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ {
+    print $2 "\t" $3 "\t" $4
+  }
+'
+"#;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapacitySource {
     LocalMountpoint,
     LustreProjectQuota,
     RcloneAbout,
+    RemoteFilesystem,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,10 +109,23 @@ pub fn mounted_capacity(
     if let Some(capacity) = local_mount_capacity(&state.mountpoint) {
         return Ok(Some(capacity));
     }
-    if let Some(capacity) = lustre_project_capacity(server)? {
+    if server.source != "sai_cluster"
+        && let Some(capacity) = lustre_project_capacity(server)?
+    {
         return Ok(Some(capacity));
     }
-    rclone_about_capacity(&state.rclone, rclone_config, &state.remote)
+    let rclone_result = rclone_about_capacity(&state.rclone, rclone_config, &state.remote);
+    if let Ok(Some(capacity)) = &rclone_result {
+        return Ok(Some(*capacity));
+    }
+    let remote_result = remote_filesystem_capacity(server);
+    if let Ok(Some(capacity)) = &remote_result {
+        return Ok(Some(*capacity));
+    }
+    match (rclone_result, remote_result) {
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        _ => Ok(None),
+    }
 }
 
 pub fn local_mount_capacity(mountpoint: &Path) -> Option<CapacityInfo> {
@@ -142,6 +179,25 @@ fn capacity_from_about(about: RcloneAbout) -> Option<CapacityInfo> {
 }
 
 fn lustre_project_capacity(server: &ServerConfig) -> Result<Option<CapacityInfo>, CapacityError> {
+    let Some(output) = ssh_capacity_output(server, LUSTRE_CAPACITY_SCRIPT)? else {
+        return Ok(None);
+    };
+    Ok(parse_lustre_quota(&output))
+}
+
+fn remote_filesystem_capacity(
+    server: &ServerConfig,
+) -> Result<Option<CapacityInfo>, CapacityError> {
+    let Some(output) = ssh_capacity_output(server, FILESYSTEM_CAPACITY_SCRIPT)? else {
+        return Ok(None);
+    };
+    Ok(parse_filesystem_capacity(&output))
+}
+
+fn ssh_capacity_output(
+    server: &ServerConfig,
+    script: &str,
+) -> Result<Option<String>, CapacityError> {
     if server.auth == AuthMethod::Password
         && server.source != "ssh_config"
         && !server.ssh_config_managed
@@ -190,7 +246,7 @@ fn lustre_project_capacity(server: &ServerConfig) -> Result<Option<CapacityInfo>
         "sh".into(),
         "-s".into(),
         "--".into(),
-        remote_path_for_capacity(server),
+        quote_remote_shell_argument(&remote_path_for_capacity(server)),
     ]);
     let mut command = Command::new(ssh);
     command
@@ -200,15 +256,11 @@ fn lustre_project_capacity(server: &ServerConfig) -> Result<Option<CapacityInfo>
         .stderr(Stdio::null());
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
-    let output = run_with_timeout(
-        command,
-        Some(LUSTRE_CAPACITY_SCRIPT.as_bytes()),
-        Duration::from_secs(12),
-    )?;
+    let output = run_with_timeout(command, Some(script.as_bytes()), Duration::from_secs(12))?;
     if !output.status.success() {
         return Ok(None);
     }
-    Ok(parse_lustre_quota(&String::from_utf8_lossy(&output.stdout)))
+    Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
 }
 
 fn run_with_timeout(
@@ -239,6 +291,10 @@ fn remote_path_for_capacity(server: &ServerConfig) -> String {
     }
 }
 
+fn quote_remote_shell_argument(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 pub fn parse_lustre_quota(output: &str) -> Option<CapacityInfo> {
     for line in output.lines() {
         let line = line.trim();
@@ -263,6 +319,29 @@ pub fn parse_lustre_quota(output: &str) -> Option<CapacityInfo> {
             limit_kib.saturating_mul(1024),
             used_kib.saturating_mul(1024),
             CapacitySource::LustreProjectQuota,
+        );
+    }
+    None
+}
+
+pub fn parse_filesystem_capacity(output: &str) -> Option<CapacityInfo> {
+    for line in output.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() < 3 {
+            continue;
+        }
+        let (Ok(total_kib), Ok(used_kib), Ok(available_kib)) = (
+            fields[0].parse::<u64>(),
+            fields[1].parse::<u64>(),
+            fields[2].parse::<u64>(),
+        ) else {
+            continue;
+        };
+        let total_kib = total_kib.max(used_kib.saturating_add(available_kib));
+        return capacity_from_usage(
+            total_kib.saturating_mul(1024),
+            used_kib.saturating_mul(1024),
+            CapacitySource::RemoteFilesystem,
         );
     }
     None
@@ -321,5 +400,28 @@ mod tests {
         })
         .unwrap();
         assert_eq!((from_parts.used, from_parts.total), (25, 100));
+    }
+
+    #[test]
+    fn remote_df_capacity_uses_kib_blocks_and_tolerates_rounding() {
+        let capacity = parse_filesystem_capacity("1048576 262144 786400\n").unwrap();
+        assert_eq!(capacity.total, 1_048_576 * 1024);
+        assert_eq!(capacity.used, 262_144 * 1024);
+        assert_eq!(capacity.percent, 25);
+        assert_eq!(capacity.source, CapacitySource::RemoteFilesystem);
+    }
+
+    #[test]
+    fn malformed_remote_df_is_ignored() {
+        assert!(parse_filesystem_capacity("capacity unavailable\n").is_none());
+        assert!(parse_filesystem_capacity("0 0 0\n").is_none());
+    }
+
+    #[test]
+    fn remote_capacity_path_is_one_shell_argument() {
+        assert_eq!(
+            quote_remote_shell_argument("~/folder with 'quotes'"),
+            "'~/folder with '\\''quotes'\\'''"
+        );
     }
 }

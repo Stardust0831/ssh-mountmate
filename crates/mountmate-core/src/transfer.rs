@@ -26,6 +26,8 @@ pub struct ActiveTransfer {
     #[serde(default)]
     pub name: String,
     #[serde(default)]
+    pub size: u64,
+    #[serde(default)]
     pub bytes: u64,
     #[serde(default)]
     pub percentage: f64,
@@ -111,12 +113,18 @@ pub fn build_transfer_snapshot(
     let mut files = Vec::with_capacity(queue.queue.len());
     let mut queued_bytes = 0_u64;
     let mut transferred_bytes = 0_u64;
+    let mut matched_active = vec![false; core.transferring.len()];
     for item in queue.queue {
         queued_bytes = queued_bytes.saturating_add(item.size);
         let active = core
             .transferring
             .iter()
-            .find(|candidate| transfer_matches(&item.name, &candidate.name));
+            .enumerate()
+            .find(|(_, candidate)| transfer_matches(&item.name, &candidate.name));
+        if let Some((index, _)) = active {
+            matched_active[index] = true;
+        }
+        let active = active.map(|(_, transfer)| transfer);
         let active_bytes = active.map_or(0, |transfer| transfer.bytes);
         let uploaded = if item.size == 0 {
             active_bytes
@@ -154,7 +162,50 @@ pub fn build_transfer_snapshot(
             tries: item.tries,
         });
     }
-    let queued = files.len().max(vfs.disk_cache.uploads_queued);
+    let matched_uploads = matched_active.iter().filter(|matched| **matched).count();
+    let missing_upload_details = vfs
+        .disk_cache
+        .uploads_in_progress
+        .saturating_sub(matched_uploads);
+    for transfer in core
+        .transferring
+        .iter()
+        .zip(matched_active)
+        .filter(|(_, matched)| !matched)
+        .map(|(transfer, _)| transfer)
+        .take(missing_upload_details)
+    {
+        let uploaded = if transfer.size == 0 {
+            transfer.bytes
+        } else {
+            transfer.bytes.min(transfer.size)
+        };
+        let percentage = if transfer.percentage > 0.0 {
+            transfer.percentage
+        } else if transfer.size > 0 {
+            uploaded as f64 * 100.0 / transfer.size as f64
+        } else {
+            0.0
+        };
+        queued_bytes = queued_bytes.saturating_add(transfer.size);
+        transferred_bytes = transferred_bytes.saturating_add(uploaded);
+        files.push(TransferFile {
+            id: serde_json::Value::Null,
+            name: transfer.name.clone(),
+            size: transfer.size,
+            bytes: uploaded,
+            percentage: percentage.clamp(0.0, 100.0),
+            speed: transfer.speed_avg.max(transfer.speed),
+            eta: transfer.eta,
+            uploading: true,
+            tries: 0,
+        });
+    }
+    let queued = files.len().max(
+        vfs.disk_cache
+            .uploads_queued
+            .saturating_add(vfs.disk_cache.uploads_in_progress),
+    );
     let uploading = files
         .iter()
         .filter(|file| file.uploading)
@@ -254,6 +305,54 @@ mod tests {
         assert_eq!(snapshot.uploading, 1);
         assert_eq!(snapshot.percentage, 0.0);
         assert!(!snapshot.synced);
+    }
+
+    #[test]
+    fn active_upload_gets_progress_when_queue_details_temporarily_disappear() {
+        let snapshot = build_transfer_snapshot(
+            QueueResponse::default(),
+            VfsStatsResponse {
+                disk_cache: DiskCacheStats {
+                    uploads_in_progress: 1,
+                    ..DiskCacheStats::default()
+                },
+            },
+            CoreStatsResponse {
+                transferring: vec![ActiveTransfer {
+                    name: "folder/file.bin".into(),
+                    size: 100,
+                    bytes: 40,
+                    speed: 12.0,
+                    ..ActiveTransfer::default()
+                }],
+            },
+        );
+
+        assert_eq!(snapshot.files.len(), 1);
+        assert_eq!(snapshot.queued, 1);
+        assert_eq!(snapshot.uploading, 1);
+        assert_eq!(snapshot.queued_bytes, 100);
+        assert_eq!(snapshot.transferred_bytes, 40);
+        assert_eq!(snapshot.percentage, 40.0);
+    }
+
+    #[test]
+    fn unrelated_core_download_is_not_presented_as_an_upload() {
+        let snapshot = build_transfer_snapshot(
+            QueueResponse::default(),
+            VfsStatsResponse::default(),
+            CoreStatsResponse {
+                transferring: vec![ActiveTransfer {
+                    name: "download.bin".into(),
+                    size: 100,
+                    bytes: 40,
+                    ..ActiveTransfer::default()
+                }],
+            },
+        );
+
+        assert!(snapshot.files.is_empty());
+        assert!(snapshot.synced);
     }
 
     #[test]

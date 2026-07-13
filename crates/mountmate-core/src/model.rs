@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const SETTINGS_SCHEMA_VERSION: u32 = 8;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 9;
 
 fn default_port() -> String {
     "22".into()
@@ -27,7 +27,7 @@ fn default_cache_age() -> String {
 }
 
 fn default_write_back() -> String {
-    "0s".into()
+    "5s".into()
 }
 
 fn default_dir_cache_time() -> String {
@@ -324,6 +324,14 @@ impl Settings {
         {
             self.apply_recommended_cache_defaults(false);
         }
+        if version < 9
+            && self.vfs_cache_mode == "full"
+            && self.vfs_cache_max_age == "30m"
+            && self.vfs_write_back == "0s"
+            && self.dir_cache_time == "5m"
+        {
+            self.vfs_write_back = default_write_back();
+        }
         self.settings_schema_version = SETTINGS_SCHEMA_VERSION;
         self
     }
@@ -383,8 +391,33 @@ mod tests {
         assert_eq!(settings.vfs_cache_mode, "full");
         assert_eq!(settings.vfs_cache_max_size, "20G");
         assert_eq!(settings.vfs_cache_max_age, "30m");
-        assert_eq!(settings.vfs_write_back, "0s");
+        assert_eq!(settings.vfs_write_back, "5s");
         assert_eq!(settings.dir_cache_time, "5m");
+    }
+
+    #[test]
+    fn recommended_zero_delay_migrates_but_custom_profiles_are_preserved() {
+        let recommended = Settings {
+            settings_schema_version: 8,
+            vfs_cache_mode: "full".into(),
+            vfs_cache_max_age: "30m".into(),
+            vfs_write_back: "0s".into(),
+            dir_cache_time: "5m".into(),
+            ..Settings::default()
+        }
+        .migrate();
+        assert_eq!(recommended.vfs_write_back, "5s");
+
+        let custom = Settings {
+            settings_schema_version: 8,
+            vfs_cache_mode: "full".into(),
+            vfs_cache_max_age: "2h".into(),
+            vfs_write_back: "0s".into(),
+            dir_cache_time: "5m".into(),
+            ..Settings::default()
+        }
+        .migrate();
+        assert_eq!(custom.vfs_write_back, "0s");
     }
 
     #[test]

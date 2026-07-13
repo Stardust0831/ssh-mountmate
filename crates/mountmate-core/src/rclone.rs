@@ -420,7 +420,7 @@ mod tests {
         assert!(
             command
                 .windows(2)
-                .any(|item| item == ["--vfs-write-back", "0s"])
+                .any(|item| item == ["--vfs-write-back", "5s"])
         );
         assert!(
             command

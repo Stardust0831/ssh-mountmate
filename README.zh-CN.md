@@ -263,7 +263,7 @@ SSH MountMate 会尽量启用 rclone 的 host key 校验。
 
 ## 传输进度和远端刷新
 
-已挂载连接的卡片会显示 rclone 真实的 VFS 上传队列。上传开始时，对应配置会在右下角显示自己的进度窗；多个正在上传的配置会分别堆叠显示。传输中心继续作为手动查看全部挂载的汇总入口。只有 rclone 报告队列与活动上传均为空时，程序才显示“云端已同步”。仍有上传时取消挂载或退出，程序会先警告。
+已挂载连接的卡片会显示 rclone 真实的 VFS 上传队列。推荐缓存配置保留 rclone 上游默认的 5 秒写回窗口，让资源管理器或 Finder 先完成关闭文件、重命名和属性更新，再开始远端上传。文件进入队列或开始上传时，对应配置会在右下角显示自己的进度窗；多个正在上传的配置会分别堆叠显示。传输中心继续作为手动查看全部挂载的汇总入口。只有 rclone 报告队列与活动上传均为空时，程序才显示“云端已同步”。仍有上传时取消挂载或退出，程序会先警告。
 
 刷新会清除 VFS 目录缓存、主动重新读取目标目录，并通过直接远端列表进行核验。如果仍有本地写入等待上传，结果会明确说明当前核验的远端快照尚未包含这些文件。
 
@@ -271,7 +271,7 @@ SSH MountMate 会尽量启用 rclone 的 host key 校验。
 
 ## 容量显示
 
-对已挂载连接，SSH MountMate 会在连接卡片上显示已用容量和总容量。对于 Lustre 路径，程序会优先用 `lfs project -d` 读取远端目录的 project ID，再用 `lfs quota -p` 读取 project quota。如果路径不在 Lustre 上、远端没有 `lfs`，或该 project 没有非零 hard block limit，则回退使用 `rclone about`。
+对已挂载连接，SSH MountMate 会在连接卡片上显示已用容量和总容量。对于 Lustre 路径，程序会优先用 `lfs project -d` 读取远端目录的 project ID，再用 `lfs quota -p` 读取 project quota。如果路径不在 Lustre 上、远端没有 `lfs`，或该 project 没有非零 hard block limit，则回退使用 `rclone about`；当 SSH 配置支持非交互登录时，还会继续尝试远端 `df -Pk`。
 
 ## 设置
 

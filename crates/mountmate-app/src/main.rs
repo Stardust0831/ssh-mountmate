@@ -3753,7 +3753,7 @@ fn transfer_label(locale: Locale, snapshot: &TransferSnapshot) -> String {
 }
 
 fn transfer_is_active(snapshot: &TransferSnapshot) -> bool {
-    snapshot.queued > 0 || snapshot.uploading > 0 || snapshot.errors > 0
+    snapshot.queued > 0 || snapshot.uploading > 0 || snapshot.errors > 0 || snapshot.out_of_space
 }
 
 fn native_integration_smoke_enabled() -> bool {
@@ -4146,6 +4146,23 @@ mod localization_tests {
             global_progress_state(&TransferTotals::default(), false),
             GlobalProgressState::Hidden
         );
+    }
+
+    #[test]
+    fn exhausted_cache_is_visible_as_active_transfer_work() {
+        let snapshot = TransferSnapshot {
+            files: Vec::new(),
+            queued: 0,
+            uploading: 0,
+            queued_bytes: 0,
+            transferred_bytes: 0,
+            percentage: 0.0,
+            errors: 0,
+            out_of_space: true,
+            synced: false,
+        };
+
+        assert!(transfer_is_active(&snapshot));
     }
 
     #[test]
