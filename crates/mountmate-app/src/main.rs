@@ -25,6 +25,9 @@ use mountmate_core::ssh::{
 };
 use mountmate_core::storage::{self, read_json};
 use mountmate_core::transfer::TransferSnapshot;
+use mountmate_core::update_helper::{
+    UpdateHealthAuthorization, run_update_helper, write_update_health_marker,
+};
 use mountmate_core::{
     APP_NAME, AuthMethod, ConnectionMethod, MountState, ServerConfig, Settings, VERSION,
 };
@@ -88,7 +91,14 @@ fn run() -> Result<(), String> {
             println!("File-manager commands removed");
             return Ok(());
         }
-        LaunchAction::Gui(_) | LaunchAction::Headless(_) => {}
+        LaunchAction::RunUpdateHelper(authorization) => {
+            let executable = std::env::current_exe()
+                .map_err(|error| format!("Could not locate the update helper: {error}"))?;
+            run_update_helper(&authorization.plan_path, &authorization.token, &executable)
+                .map_err(|error| error.to_string())?;
+            return Ok(());
+        }
+        LaunchAction::Gui { .. } | LaunchAction::Headless(_) => {}
     }
 
     let paths = AppPaths::discover();
@@ -96,7 +106,7 @@ fn run() -> Result<(), String> {
         Ok(lock) => Arc::new(lock),
         Err(AppCommandError::AlreadyRunning) => {
             let command = match action {
-                LaunchAction::Gui(command) | LaunchAction::Headless(command) => command,
+                LaunchAction::Gui { command, .. } | LaunchAction::Headless(command) => command,
                 _ => unreachable!(),
             };
             send_command_retry(&paths.app_command_state(), &command, Duration::from_secs(2))
@@ -108,7 +118,10 @@ fn run() -> Result<(), String> {
 
     match action {
         LaunchAction::Headless(command) => run_headless(&paths, command),
-        LaunchAction::Gui(initial_command) => {
+        LaunchAction::Gui {
+            command: initial_command,
+            update_health,
+        } => {
             let (command_sender, command_receiver) = async_channel::unbounded();
             let command_server = Arc::new(
                 AppCommandServer::start(paths.app_command_state(), &Platform, move |command| {
@@ -123,6 +136,7 @@ fn run() -> Result<(), String> {
                 command_server,
                 command_receiver: CommandSubscription(command_receiver),
                 initial_command,
+                update_health,
             };
             iced::daemon(move || App::new(bootstrap.clone()), App::update, App::view)
                 .title(App::title)
@@ -142,6 +156,7 @@ struct Bootstrap {
     command_server: Arc<AppCommandServer>,
     command_receiver: CommandSubscription,
     initial_command: AppCommand,
+    update_health: Option<UpdateHealthAuthorization>,
 }
 
 #[derive(Clone)]
@@ -314,6 +329,7 @@ struct App {
     ssh_import_actions: Vec<ImportAction>,
     pending_delete: Option<String>,
     status: String,
+    update_health: Option<UpdateHealthAuthorization>,
 }
 
 #[derive(Default)]
@@ -637,6 +653,7 @@ impl App {
             command_server,
             command_receiver,
             initial_command,
+            update_health,
         } = bootstrap;
         let service = MountService::new(paths.clone(), application_root());
         let settings = storage::load_settings(&paths).unwrap_or_default();
@@ -698,6 +715,7 @@ impl App {
             ssh_import_actions: Vec::new(),
             pending_delete: None,
             status,
+            update_health,
         };
         let mut tasks = vec![
             open_window.map(Message::MainWindowOpened),
@@ -730,6 +748,14 @@ impl App {
                     self.main_window_ready = true;
                     self.main_window_opening = false;
                     self.initialize_tray();
+                    if let Some(authorization) = self.update_health.take()
+                        && let Err(error) = write_update_health_marker(
+                            &self.paths.update_state_dir(),
+                            &authorization,
+                        )
+                    {
+                        self.status = format!("Update health confirmation failed: {error}");
+                    }
                     let progress = self.global_progress_state();
                     if self.pending_main_activation {
                         self.pending_main_activation = false;

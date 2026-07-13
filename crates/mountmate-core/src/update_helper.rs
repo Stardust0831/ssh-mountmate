@@ -1,8 +1,14 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -11,15 +17,26 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::rclone_binary::file_sha256;
-use crate::storage::{StorageError, read_json, write_private_json};
+use crate::storage::{StorageError, read_json};
 use crate::update_install::{
-    InstallLayout, PreparedPayload, TransactionPaths, rename_no_replace, transaction_shape_is_valid,
+    AppliedUpdate, InstallLayout, PreparedPayload, TransactionPaths, apply_prepared_update,
+    commit_applied_update, rename_no_replace, rollback_applied_update, transaction_shape_is_valid,
 };
 
 const UPDATE_PLAN_SCHEMA: u32 = 1;
 const MAX_UPDATE_PLAN_BYTES: u64 = 1024 * 1024;
 const MAX_RELAUNCH_ARGUMENTS: usize = 32;
 const MAX_RELAUNCH_ARGUMENT_BYTES: usize = 16 * 1024;
+const DEFAULT_PARENT_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
+const UPDATE_HEALTH_SCHEMA: u32 = 1;
+
+#[cfg(windows)]
+const DETACHED_PROCESS: u32 = 0x0000_0008;
+#[cfg(windows)]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -44,9 +61,43 @@ pub struct UpdateHelperPlan {
     pub relaunch_arguments: Vec<String>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
 pub struct UpdateHelperAuthorization {
     pub plan_path: PathBuf,
     pub token: String,
+}
+
+impl std::fmt::Debug for UpdateHelperAuthorization {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UpdateHelperAuthorization")
+            .field("plan_path", &self.plan_path)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct UpdateHealthAuthorization {
+    pub marker_path: PathBuf,
+    pub token: String,
+}
+
+impl std::fmt::Debug for UpdateHealthAuthorization {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UpdateHealthAuthorization")
+            .field("marker_path", &self.marker_path)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateHealthMarker {
+    schema: u32,
+    token_sha256: String,
 }
 
 #[derive(Debug, Error)]
@@ -75,6 +126,30 @@ pub enum UpdateHelperError {
     CurrentProcessIdentity,
     #[error("timed out waiting for the parent application process to exit")]
     ParentExitTimeout,
+    #[error("the authenticated update plan could not be removed before installation")]
+    PlanCleanup,
+    #[error("the update helper could not start {path}: {source}")]
+    Launch {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("the new application exited before reporting healthy: {0}")]
+    NewApplicationExited(ExitStatus),
+    #[error("timed out waiting for the new application to report healthy")]
+    HealthTimeout,
+    #[error("the new application wrote an invalid update health marker")]
+    InvalidHealthMarker,
+    #[error("the prepared update could not be installed: {0}")]
+    InstallFailed(String),
+    #[error("the healthy update was installed but its backup could not be removed: {0}")]
+    CommitFailed(String),
+    #[error("the update failed and the previous version was restored: {0}")]
+    UpdateRolledBack(String),
+    #[error("the update failed and rollback also failed: update: {update}; rollback: {rollback}")]
+    RollbackFailed { update: String, rollback: String },
+    #[error("the previous version was restored but could not be restarted: {0}")]
+    RestoredRelaunchFailed(String),
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error("update helper I/O failed at {path}: {source}")]
@@ -124,6 +199,62 @@ pub fn wait_for_parent_exit(
         Duration::from_millis(100),
         &mut SystemProcessIdentityProbe,
     )
+}
+
+pub fn launch_update_helper(
+    helper_executable: &Path,
+    authorization: &UpdateHelperAuthorization,
+) -> Result<u32, UpdateHelperError> {
+    let mut command = detached_command(helper_executable);
+    command
+        .arg("--run-update-helper")
+        .arg(&authorization.plan_path)
+        .arg("--update-helper-token")
+        .arg(&authorization.token);
+    command
+        .spawn()
+        .map(|child| child.id())
+        .map_err(|source| UpdateHelperError::Launch {
+            path: helper_executable.to_owned(),
+            source,
+        })
+}
+
+pub fn run_update_helper(
+    plan_path: &Path,
+    token: &str,
+    helper_executable: &Path,
+) -> Result<(), UpdateHelperError> {
+    let plan = load_authenticated_plan(plan_path, token)?;
+    verify_running_helper(&plan, helper_executable)?;
+    fs::remove_file(plan_path).map_err(|_| UpdateHelperError::PlanCleanup)?;
+    wait_for_parent_exit(&plan.parent, DEFAULT_PARENT_EXIT_TIMEOUT)?;
+    let applied = apply_prepared_update(&plan.layout, &plan.prepared, &plan.transaction)
+        .map_err(|error| UpdateHelperError::InstallFailed(error.to_string()))?;
+    complete_applied_update(
+        &plan,
+        &applied,
+        DEFAULT_HEALTH_TIMEOUT,
+        &mut SystemUpdateLauncher,
+    )
+}
+
+pub fn write_update_health_marker(
+    state_directory: &Path,
+    authorization: &UpdateHealthAuthorization,
+) -> Result<(), UpdateHelperError> {
+    if !valid_token(&authorization.token)
+        || authorization.marker_path.parent() != Some(state_directory)
+    {
+        return Err(UpdateHelperError::InvalidPlan);
+    }
+    reject_existing_path(&authorization.marker_path)?;
+    let marker = UpdateHealthMarker {
+        schema: UPDATE_HEALTH_SCHEMA,
+        token_sha256: sha256_text(&authorization.token),
+    };
+    write_private_new_json(&authorization.marker_path, &marker)?;
+    Ok(())
 }
 
 pub fn materialize_update_helper(
@@ -253,7 +384,7 @@ pub fn write_update_plan(
         relaunch_arguments,
     };
     validate_plan_fields(&plan)?;
-    write_private_json(&plan_path, &plan)?;
+    write_private_new_json(&plan_path, &plan)?;
     Ok(UpdateHelperAuthorization { plan_path, token })
 }
 
@@ -335,6 +466,52 @@ fn reject_existing_path(path: &Path) -> Result<(), UpdateHelperError> {
             source,
         }),
     }
+}
+
+fn write_private_new_json<T: Serialize>(path: &Path, value: &T) -> Result<(), UpdateHelperError> {
+    let content = serde_json::to_vec_pretty(value).map_err(|source| {
+        UpdateHelperError::Storage(StorageError::Json {
+            path: path.to_owned(),
+            source,
+        })
+    })?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|source| UpdateHelperError::Io {
+        path: parent.to_owned(),
+        source,
+    })?;
+    let mut file = match OpenOptions::new().create_new(true).write(true).open(path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(UpdateHelperError::StatePathExists(path.to_owned()));
+        }
+        Err(source) => {
+            return Err(UpdateHelperError::Io {
+                path: path.to_owned(),
+                source,
+            });
+        }
+    };
+    let result = (|| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(&content)?;
+        file.flush()?;
+        file.sync_all()
+    })();
+    if let Err(source) = result {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(UpdateHelperError::Io {
+            path: path.to_owned(),
+            source,
+        });
+    }
+    Ok(())
 }
 
 fn random_token() -> String {
@@ -432,6 +609,179 @@ fn copy_new_file(
     result
 }
 
+trait UpdateChild {
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>>;
+    fn terminate(&mut self) -> io::Result<()>;
+}
+
+trait UpdateLauncher {
+    fn launch(
+        &mut self,
+        executable: &Path,
+        arguments: &[String],
+    ) -> Result<Box<dyn UpdateChild>, UpdateHelperError>;
+}
+
+struct SystemUpdateLauncher;
+
+impl UpdateLauncher for SystemUpdateLauncher {
+    fn launch(
+        &mut self,
+        executable: &Path,
+        arguments: &[String],
+    ) -> Result<Box<dyn UpdateChild>, UpdateHelperError> {
+        let mut command = detached_command(executable);
+        command.args(arguments);
+        command
+            .spawn()
+            .map(|child| Box::new(child) as Box<dyn UpdateChild>)
+            .map_err(|source| UpdateHelperError::Launch {
+                path: executable.to_owned(),
+                source,
+            })
+    }
+}
+
+impl UpdateChild for Child {
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        Child::try_wait(self)
+    }
+
+    fn terminate(&mut self) -> io::Result<()> {
+        match self.try_wait()? {
+            Some(_) => Ok(()),
+            None => {
+                self.kill()?;
+                self.wait().map(|_| ())
+            }
+        }
+    }
+}
+
+fn detached_command(executable: &Path) -> Command {
+    let mut command = Command::new(executable);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    #[cfg(unix)]
+    command.process_group(0);
+    command
+}
+
+fn complete_applied_update(
+    plan: &UpdateHelperPlan,
+    applied: &AppliedUpdate,
+    health_timeout: Duration,
+    launcher: &mut dyn UpdateLauncher,
+) -> Result<(), UpdateHelperError> {
+    let mut arguments = plan.relaunch_arguments.clone();
+    arguments.push("--update-health-marker".into());
+    arguments.push(plan.health_marker.to_string_lossy().into_owned());
+    arguments.push("--update-health-token".into());
+    arguments.push(plan.health_token.clone());
+
+    let mut child = match launcher.launch(&applied.executable, &arguments) {
+        Ok(child) => child,
+        Err(error) => return rollback_and_relaunch(plan, applied, error.to_string(), launcher),
+    };
+    let deadline = Instant::now() + health_timeout;
+    loop {
+        let marker_exists = match path_entry_exists(&plan.health_marker) {
+            Ok(exists) => exists,
+            Err(error) => {
+                let _ = child.terminate();
+                return rollback_and_relaunch(plan, applied, error.to_string(), launcher);
+            }
+        };
+        let child_status = match child.try_wait() {
+            Ok(status) => status,
+            Err(source) => {
+                let error = UpdateHelperError::Io {
+                    path: applied.executable.clone(),
+                    source,
+                };
+                let _ = child.terminate();
+                return rollback_and_relaunch(plan, applied, error.to_string(), launcher);
+            }
+        };
+        if let Some(status) = child_status {
+            return rollback_and_relaunch(
+                plan,
+                applied,
+                UpdateHelperError::NewApplicationExited(status).to_string(),
+                launcher,
+            );
+        }
+        if marker_exists {
+            match validate_health_marker(&plan.health_marker, &plan.health_token) {
+                Ok(()) => {
+                    commit_applied_update(applied)
+                        .map_err(|error| UpdateHelperError::CommitFailed(error.to_string()))?;
+                    let _ = fs::remove_file(&plan.health_marker);
+                    return Ok(());
+                }
+                Err(error) => {
+                    let _ = child.terminate();
+                    return rollback_and_relaunch(plan, applied, error.to_string(), launcher);
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            let failure = UpdateHelperError::HealthTimeout.to_string();
+            let _ = child.terminate();
+            return rollback_and_relaunch(plan, applied, failure, launcher);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn validate_health_marker(path: &Path, token: &str) -> Result<(), UpdateHelperError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|_| UpdateHelperError::InvalidHealthMarker)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 4096 {
+        return Err(UpdateHelperError::InvalidHealthMarker);
+    }
+    let marker: UpdateHealthMarker =
+        read_json(path).map_err(|_| UpdateHelperError::InvalidHealthMarker)?;
+    if marker.schema != UPDATE_HEALTH_SCHEMA || marker.token_sha256 != sha256_text(token) {
+        return Err(UpdateHelperError::InvalidHealthMarker);
+    }
+    Ok(())
+}
+
+fn rollback_and_relaunch(
+    plan: &UpdateHelperPlan,
+    applied: &AppliedUpdate,
+    update_error: String,
+    launcher: &mut dyn UpdateLauncher,
+) -> Result<(), UpdateHelperError> {
+    rollback_applied_update(applied).map_err(|rollback| UpdateHelperError::RollbackFailed {
+        update: update_error.clone(),
+        rollback: rollback.to_string(),
+    })?;
+    let _ = remove_path_entry_if_present(&applied.failed_payload);
+    launcher
+        .launch(&applied.executable, &plan.relaunch_arguments)
+        .map_err(|error| UpdateHelperError::RestoredRelaunchFailed(error.to_string()))?;
+    Err(UpdateHelperError::UpdateRolledBack(update_error))
+}
+
+fn remove_path_entry_if_present(path: &Path) -> io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProcessIdentitySnapshot {
     started_at: u64,
@@ -491,7 +841,9 @@ fn wait_for_parent_exit_with_probe(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
+    use std::rc::Rc;
 
     use tempfile::tempdir;
 
@@ -501,6 +853,48 @@ mod tests {
     struct FakeProbe {
         snapshots: VecDeque<Option<ProcessIdentitySnapshot>>,
         fallback: Option<ProcessIdentitySnapshot>,
+    }
+
+    struct FakeUpdateChild {
+        terminated: Rc<Cell<bool>>,
+    }
+
+    type RecordedLaunches = Rc<RefCell<Vec<(PathBuf, Vec<String>)>>>;
+
+    impl UpdateChild for FakeUpdateChild {
+        fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+            Ok(None)
+        }
+
+        fn terminate(&mut self) -> io::Result<()> {
+            self.terminated.set(true);
+            Ok(())
+        }
+    }
+
+    struct FakeUpdateLauncher {
+        launches: RecordedLaunches,
+        terminated: Rc<Cell<bool>>,
+        health: Option<UpdateHealthAuthorization>,
+    }
+
+    impl UpdateLauncher for FakeUpdateLauncher {
+        fn launch(
+            &mut self,
+            executable: &Path,
+            arguments: &[String],
+        ) -> Result<Box<dyn UpdateChild>, UpdateHelperError> {
+            self.launches
+                .borrow_mut()
+                .push((executable.to_owned(), arguments.to_vec()));
+            if let Some(health) = self.health.take() {
+                let state_directory = health.marker_path.parent().unwrap().to_owned();
+                write_update_health_marker(&state_directory, &health)?;
+            }
+            Ok(Box::new(FakeUpdateChild {
+                terminated: self.terminated.clone(),
+            }))
+        }
     }
 
     impl ProcessIdentityProbe for FakeProbe {
@@ -555,6 +949,45 @@ mod tests {
 
             fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
         }
+    }
+
+    fn applied_standalone_update() -> (tempfile::TempDir, UpdateHelperPlan, AppliedUpdate, PathBuf)
+    {
+        #[cfg(windows)]
+        let temp = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        #[cfg(not(windows))]
+        let temp = tempdir().unwrap();
+        let executable = temp.path().join(if cfg!(windows) {
+            "SSHMountMate.exe"
+        } else {
+            "SSHMountMate"
+        });
+        create_test_executable(&executable, b"old executable");
+        let layout = crate::update_install::detect_install_layout(&executable).unwrap();
+        let transaction = crate::update_install::plan_transaction_paths(&layout).unwrap();
+        create_test_executable(&transaction.prepared, b"new executable");
+        let prepared = PreparedPayload {
+            replace_path: transaction.prepared.clone(),
+            executable: transaction.prepared.clone(),
+            executable_sha256: file_sha256(&transaction.prepared).unwrap(),
+        };
+        let health_marker = temp.path().join("health-update.json");
+        let plan = UpdateHelperPlan {
+            schema: UPDATE_PLAN_SCHEMA,
+            token_sha256: "a".repeat(64),
+            parent: ParentProcessIdentity {
+                executable: layout.executable.clone(),
+                ..parent()
+            },
+            layout: layout.clone(),
+            prepared: prepared.clone(),
+            transaction: transaction.clone(),
+            health_marker,
+            health_token: "b".repeat(64),
+            relaunch_arguments: vec!["--show-main".into()],
+        };
+        let applied = apply_prepared_update(&layout, &prepared, &transaction).unwrap();
+        (temp, plan, applied, executable)
     }
 
     #[test]
@@ -665,7 +1098,7 @@ mod tests {
         .unwrap();
         let mut plan: UpdateHelperPlan = read_json(&authorization.plan_path).unwrap();
         plan.health_marker = temp.path().join("../outside-health.json");
-        write_private_json(&authorization.plan_path, &plan).unwrap();
+        crate::storage::write_private_json(&authorization.plan_path, &plan).unwrap();
         assert!(matches!(
             load_authenticated_plan(&authorization.plan_path, &authorization.token),
             Err(UpdateHelperError::InvalidPlan)
@@ -775,10 +1208,94 @@ mod tests {
             relaunch_arguments: Vec::new(),
         };
 
-        assert_eq!(verify_running_helper(&plan, &helper).unwrap(), helper);
+        assert_eq!(
+            verify_running_helper(&plan, &helper).unwrap(),
+            helper.canonicalize().unwrap()
+        );
         assert!(matches!(
             verify_running_helper(&plan, &source),
             Err(UpdateHelperError::HelperNotDetached)
+        ));
+    }
+
+    #[test]
+    fn healthy_relaunch_commits_the_new_executable_and_removes_the_backup() {
+        let (_temp, plan, applied, executable) = applied_standalone_update();
+        let launches = Rc::new(RefCell::new(Vec::new()));
+        let terminated = Rc::new(Cell::new(false));
+        let mut launcher = FakeUpdateLauncher {
+            launches: launches.clone(),
+            terminated: terminated.clone(),
+            health: Some(UpdateHealthAuthorization {
+                marker_path: plan.health_marker.clone(),
+                token: plan.health_token.clone(),
+            }),
+        };
+
+        complete_applied_update(&plan, &applied, Duration::from_secs(1), &mut launcher).unwrap();
+
+        assert_eq!(fs::read(executable).unwrap(), b"new executable");
+        assert!(!applied.backup.exists());
+        assert!(!plan.health_marker.exists());
+        assert!(!terminated.get());
+        let launches = launches.borrow();
+        assert_eq!(launches.len(), 1);
+        assert!(launches[0].1.contains(&"--update-health-marker".into()));
+        assert!(launches[0].1.contains(&plan.health_token));
+    }
+
+    #[test]
+    fn health_timeout_terminates_the_new_version_and_restores_the_old_one() {
+        let (_temp, plan, applied, executable) = applied_standalone_update();
+        let launches = Rc::new(RefCell::new(Vec::new()));
+        let terminated = Rc::new(Cell::new(false));
+        let mut launcher = FakeUpdateLauncher {
+            launches: launches.clone(),
+            terminated: terminated.clone(),
+            health: None,
+        };
+
+        assert!(matches!(
+            complete_applied_update(&plan, &applied, Duration::ZERO, &mut launcher),
+            Err(UpdateHelperError::UpdateRolledBack(_))
+        ));
+
+        assert!(terminated.get());
+        assert_eq!(fs::read(executable).unwrap(), b"old executable");
+        assert!(!applied.backup.exists());
+        assert!(!applied.failed_payload.exists());
+        let launches = launches.borrow();
+        assert_eq!(launches.len(), 2);
+        assert_eq!(launches[1].1, plan.relaunch_arguments);
+    }
+
+    #[test]
+    fn health_markers_are_authenticated_and_cannot_be_reused() {
+        let temp = tempdir().unwrap();
+        let authorization = UpdateHealthAuthorization {
+            marker_path: temp.path().join("health.json"),
+            token: "c".repeat(64),
+        };
+        write_update_health_marker(temp.path(), &authorization).unwrap();
+        validate_health_marker(&authorization.marker_path, &authorization.token).unwrap();
+        assert!(matches!(
+            validate_health_marker(&authorization.marker_path, &"d".repeat(64)),
+            Err(UpdateHelperError::InvalidHealthMarker)
+        ));
+        assert!(matches!(
+            write_update_health_marker(temp.path(), &authorization),
+            Err(UpdateHelperError::StatePathExists(_))
+        ));
+        let outside = temp.path().join("outside");
+        assert!(matches!(
+            write_update_health_marker(
+                &outside,
+                &UpdateHealthAuthorization {
+                    marker_path: authorization.marker_path.clone(),
+                    token: authorization.token.clone(),
+                }
+            ),
+            Err(UpdateHelperError::InvalidPlan)
         ));
     }
 }

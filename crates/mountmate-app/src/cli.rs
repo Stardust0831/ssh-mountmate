@@ -1,10 +1,17 @@
+use std::path::PathBuf;
+
 use mountmate_core::app_command::AppCommand;
+use mountmate_core::update_helper::{UpdateHealthAuthorization, UpdateHelperAuthorization};
 use mountmate_core::{APP_NAME, VERSION};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LaunchAction {
-    Gui(AppCommand),
+    Gui {
+        command: AppCommand,
+        update_health: Option<UpdateHealthAuthorization>,
+    },
     Headless(AppCommand),
+    RunUpdateHelper(UpdateHelperAuthorization),
     RegisterFileManagerMenu,
     UnregisterFileManagerMenu,
     Help,
@@ -18,10 +25,16 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Launc
         .filter(|argument| !argument.starts_with("-psn_"))
         .collect();
     if arguments.is_empty() {
-        return Ok(LaunchAction::Gui(AppCommand::ShowMain));
+        return Ok(LaunchAction::Gui {
+            command: AppCommand::ShowMain,
+            update_health: None,
+        });
     }
     let mut action = None;
     let mut relative_dir = String::new();
+    let mut update_helper_token = None;
+    let mut update_health_marker = None;
+    let mut update_health_token = None;
     let mut index = 0;
     while index < arguments.len() {
         let argument = &arguments[index];
@@ -35,8 +48,14 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Launc
             "--unregister-file-manager-menu" | "--unregister-shell-menu" => {
                 Some(LaunchAction::UnregisterFileManagerMenu)
             }
-            "--show-main" => Some(LaunchAction::Gui(AppCommand::ShowMain)),
-            "--show-transfers" => Some(LaunchAction::Gui(AppCommand::ShowTransfers)),
+            "--show-main" => Some(LaunchAction::Gui {
+                command: AppCommand::ShowMain,
+                update_health: None,
+            }),
+            "--show-transfers" => Some(LaunchAction::Gui {
+                command: AppCommand::ShowTransfers,
+                update_health: None,
+            }),
             "--mount-all" | "--mount-startup-all" => {
                 Some(LaunchAction::Headless(AppCommand::MountAll))
             }
@@ -61,6 +80,36 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Launc
                 relative_dir = next_value(&arguments, &mut index, argument)?;
                 None
             }
+            "--run-update-helper" => {
+                Some(LaunchAction::RunUpdateHelper(UpdateHelperAuthorization {
+                    plan_path: PathBuf::from(next_value(&arguments, &mut index, argument)?),
+                    token: String::new(),
+                }))
+            }
+            "--update-helper-token" => {
+                set_once(
+                    &mut update_helper_token,
+                    next_value(&arguments, &mut index, argument)?,
+                    argument,
+                )?;
+                None
+            }
+            "--update-health-marker" => {
+                set_once(
+                    &mut update_health_marker,
+                    PathBuf::from(next_value(&arguments, &mut index, argument)?),
+                    argument,
+                )?;
+                None
+            }
+            "--update-health-token" => {
+                set_once(
+                    &mut update_health_token,
+                    next_value(&arguments, &mut index, argument)?,
+                    argument,
+                )?;
+                None
+            }
             _ => return Err(format!("unknown argument: {argument}")),
         };
         if let Some(candidate) = candidate {
@@ -81,7 +130,49 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Launc
             _ => return Err("--relative-dir requires --refresh-id".into()),
         }
     }
+    match &mut action {
+        LaunchAction::RunUpdateHelper(authorization) => {
+            authorization.token = update_helper_token
+                .ok_or_else(|| "--run-update-helper requires --update-helper-token".to_owned())?;
+            if update_health_marker.is_some() || update_health_token.is_some() {
+                return Err("update health arguments cannot be used by the update helper".into());
+            }
+        }
+        LaunchAction::Gui { update_health, .. } => {
+            if update_helper_token.is_some() {
+                return Err("--update-helper-token requires --run-update-helper".into());
+            }
+            *update_health = match (update_health_marker, update_health_token) {
+                (None, None) => None,
+                (Some(marker_path), Some(token)) => {
+                    Some(UpdateHealthAuthorization { marker_path, token })
+                }
+                _ => {
+                    return Err(
+                        "--update-health-marker and --update-health-token must be used together"
+                            .into(),
+                    );
+                }
+            };
+        }
+        _ => {
+            if update_helper_token.is_some()
+                || update_health_marker.is_some()
+                || update_health_token.is_some()
+            {
+                return Err("internal update arguments require their matching command".into());
+            }
+        }
+    }
     Ok(action)
+}
+
+fn set_once<T>(slot: &mut Option<T>, value: T, option: &str) -> Result<(), String> {
+    if slot.replace(value).is_some() {
+        Err(format!("{option} can only be used once"))
+    } else {
+        Ok(())
+    }
 }
 
 fn next_value(arguments: &[String], index: &mut usize, option: &str) -> Result<String, String> {
@@ -164,7 +255,10 @@ mod tests {
         );
         assert_eq!(
             parse(args(&["--show-transfers"])).unwrap(),
-            LaunchAction::Gui(AppCommand::ShowTransfers)
+            LaunchAction::Gui {
+                command: AppCommand::ShowTransfers,
+                update_health: None,
+            }
         );
         assert_eq!(
             parse(args(&["--register-shell-menu"])).unwrap(),
@@ -201,5 +295,39 @@ mod tests {
     fn help_keeps_command_columns_readable() {
         assert!(help().contains("\n  --show-main"));
         assert!(help().contains("\n  -V, --version"));
+        assert!(!help().contains("update-helper"));
+        assert!(!help().contains("update-health"));
+    }
+
+    #[test]
+    fn internal_update_commands_require_complete_paired_authorization() {
+        assert!(matches!(
+            parse(args(&[
+                "--run-update-helper",
+                "/state/plan.json",
+                "--update-helper-token",
+                "secret"
+            ])),
+            Ok(LaunchAction::RunUpdateHelper(_))
+        ));
+        assert!(parse(args(&["--run-update-helper", "/state/plan.json"])).is_err());
+        assert!(
+            parse(args(&[
+                "--show-main",
+                "--update-health-marker",
+                "/state/health.json"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(args(&[
+                "--show-main",
+                "--update-health-marker",
+                "/state/health.json",
+                "--update-health-token",
+                "secret"
+            ]))
+            .is_ok()
+        );
     }
 }
