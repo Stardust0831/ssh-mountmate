@@ -6,13 +6,17 @@ until its stated evidence exists.
 
 ## Current sequence
 
-1. Publish `v0.4.0-alpha.2` with six canonical assets after local checks and six-platform CI pass.
-2. Keep Windows/Linux as onefile and macOS as a native `.app`; do not publish duplicate onedir assets.
-3. Design an optional installed distribution with stable identity and paths, with Windows as the first target.
-4. Keep portable execution available for mounting and diagnostics; installation must not become a mount prerequisite.
-5. Implement optional macOS `rclone nfsmount` later as an explicit Experimental backend.
-6. Keep macOS FUSE as the migration and UI default; keep Windows WinFsp and Linux FUSE3 unchanged.
-7. Do not promote NFS to the default or publish another NFS-related release until real macOS x64 and ARM64
+1. Finish the Rust rewrite merge-readiness audit without changing mount backends or server code.
+2. Verify settings UI semantics: enums use selectors, booleans use switches, values show units, and
+   platform-specific controls are hidden where unsupported.
+3. Re-run format, warnings-denied Clippy, workspace tests, and all six native lifecycle jobs.
+4. Review remaining risks and decide whether draft PR #11 is ready for merge; do not merge solely
+   because a prerelease exists.
+5. Design an optional installed distribution later, with Windows as the first target and portable
+   execution retained.
+6. Implement optional macOS `rclone nfsmount` later as an explicit Experimental backend.
+7. Keep macOS FUSE as the migration and UI default; keep Windows WinFsp and Linux FUSE3 unchanged.
+8. Do not promote NFS to the default or publish another NFS-related release until real macOS x64 and ARM64
    FUSE/NFS lifecycle evidence has been reviewed.
 
 ## Prerelease scope: `v0.4.0-alpha.2`
@@ -47,7 +51,7 @@ Required evidence before publishing:
 - Packaged update commit/rollback and update during a real queued upload.
 - A non-publishing `release.yml` run that validates exactly six ZIP assets plus checksums.
 
-## Next implementation: optional macOS NFS backend
+## Deferred implementation: optional macOS NFS backend
 
 Planned design constraints:
 
@@ -97,6 +101,17 @@ Cross-platform considerations:
 ## Work log
 
 ### 2026-07-14
+
+- Audited the settings page for merge readiness. Cache mode and language already use typed dropdown
+  choices; connection source, authentication, and transport also remain typed selectors.
+- Replaced the three settings booleans (mount at login, automatic transfer popup, and automatic
+  update checks) with switch controls. Added bilingual size/duration unit guidance and examples for
+  cache limits, cache timing, and buffer size without changing their persisted string fields.
+- Replaced the compile-time file-manager visibility expression with a small explicit platform
+  predicate and tests for Windows, Linux, macOS, and unsupported targets. No settings schema version
+  changed, so legacy settings and custom rclone values continue to deserialize unchanged.
+- Local format, core warnings-denied Clippy, all 151 core tests, and the legacy migration test passed.
+  Full GUI compilation remains delegated to native CI because this workspace lacks GTK/pkg-config.
 
 - Recorded installation as a post-alpha design task. The main benefit is stable application path
   and desktop identity for self-update, login startup, Explorer commands, Windows Toast/AUMID, and
