@@ -13,4 +13,4 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cargo test --package mountmate-core --test packaged_update -- --ignored --test-threads=1
+cargo test --package mountmate-core --test packaged_update --all-features -- --ignored --test-threads=1

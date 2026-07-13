@@ -296,7 +296,14 @@ impl TestEnvironment {
     fn new(root: &Path) -> io::Result<Self> {
         let home = root.join("home");
         fs::create_dir_all(&home)?;
-        let mut values = vec![(OsString::from("HOME"), home.as_os_str().to_owned())];
+        let mut values = vec![
+            (OsString::from("HOME"), home.as_os_str().to_owned()),
+            (
+                OsString::from("SSH_MOUNTMATE_E2E_INHERIT_UPDATE_STDERR"),
+                OsString::from("1"),
+            ),
+            (OsString::from("RUST_BACKTRACE"), OsString::from("1")),
+        ];
 
         #[cfg(windows)]
         let paths = {

@@ -225,19 +225,32 @@ pub fn run_update_helper(
     token: &str,
     helper_executable: &Path,
 ) -> Result<(), UpdateHelperError> {
+    e2e_update_trace("loading authenticated plan");
     let plan = load_authenticated_plan(plan_path, token)?;
+    e2e_update_trace("verifying detached helper");
     verify_running_helper(&plan, helper_executable)?;
+    e2e_update_trace("removing authenticated plan");
     fs::remove_file(plan_path).map_err(|_| UpdateHelperError::PlanCleanup)?;
+    e2e_update_trace("waiting for parent exit");
     wait_for_parent_exit(&plan.parent, DEFAULT_PARENT_EXIT_TIMEOUT)?;
+    e2e_update_trace("verifying authorized installation");
     verify_authorized_installation(&plan)?;
+    e2e_update_trace("applying prepared update");
     let applied = apply_prepared_update(&plan.layout, &plan.prepared, &plan.transaction)
         .map_err(|error| UpdateHelperError::InstallFailed(error.to_string()))?;
+    e2e_update_trace("waiting for updated application health");
     complete_applied_update(
         &plan,
         &applied,
         DEFAULT_HEALTH_TIMEOUT,
         &mut SystemUpdateLauncher,
     )
+}
+
+fn e2e_update_trace(message: &str) {
+    if std::env::var_os("SSH_MOUNTMATE_E2E_INHERIT_UPDATE_STDERR").is_some() {
+        eprintln!("[update-e2e] {message}");
+    }
 }
 
 fn verify_authorized_installation(plan: &UpdateHelperPlan) -> Result<(), UpdateHelperError> {
@@ -677,6 +690,9 @@ fn detached_command(executable: &Path) -> Command {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if std::env::var_os("SSH_MOUNTMATE_E2E_INHERIT_UPDATE_STDERR").is_some() {
+        command.stderr(Stdio::inherit());
+    }
     #[cfg(windows)]
     command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     #[cfg(unix)]

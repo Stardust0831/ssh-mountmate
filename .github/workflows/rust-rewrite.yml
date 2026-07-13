@@ -45,7 +45,7 @@ jobs:
         shell: bash
         env:
           CARGO_ABOUT_VERSION: 0.9.1
-          CARGO_ABOUT_SHA256: c0e7dc6f5d74b0beec5c0053d39ab24514c717d19acd91886907a22457ea9e989
+          CARGO_ABOUT_SHA256: c0e7dc6f5d74b0beec5c0053d39ab24514c717d19acd91886907a22457ea9e98
           CARGO_NET_RETRY: 10
           RUSTUP_TOOLCHAIN: 1.88.0
         run: |
@@ -53,10 +53,11 @@ jobs:
           archive="cargo-about-${CARGO_ABOUT_VERSION}-x86_64-unknown-linux-musl.tar.gz"
           url="https://github.com/EmbarkStudios/cargo-about/releases/download/${CARGO_ABOUT_VERSION}/${archive}"
           curl --fail --location --silent --show-error "${url}" --output "${RUNNER_TEMP}/${archive}"
-          actual="$(sha256sum "${RUNNER_TEMP}/${archive}" | cut -d ' ' -f 1)"
-          test "${actual}" = "${CARGO_ABOUT_SHA256}"
+          echo "${CARGO_ABOUT_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum --check
           tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}"
           cargo_about="${RUNNER_TEMP}/cargo-about-${CARGO_ABOUT_VERSION}-x86_64-unknown-linux-musl/cargo-about"
+          test -x "${cargo_about}"
+          "${cargo_about}" --version
           generated="${RUNNER_TEMP}/RUST-THIRD-PARTY.txt"
           sh scripts/generate-rust-licenses.sh "${cargo_about}" "${generated}" online
           cmp "${generated}" licenses/RUST-THIRD-PARTY.txt
@@ -107,7 +108,7 @@ jobs:
           toolchain: 1.97.0
       - name: Linux GUI dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libgtk-3-dev libayatana-appindicator3-dev zip xvfb openbox dbus-x11
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dri libgtk-3-dev libayatana-appindicator3-dev zip xvfb openbox dbus-x11
       - run: cargo test --workspace --all-features
       - run: cargo build --release --package ssh-mountmate
       - name: Smoke-test command-line entry points
@@ -354,7 +355,7 @@ jobs:
         shell: pwsh
         run: |
           $env:SSH_MOUNTMATE_PACKAGE_ROOT = (Resolve-Path 'target/package/SSHMountMate').Path
-          cargo test --package mountmate-core --test packaged_update -- --ignored --test-threads=1
+          cargo test --package mountmate-core --test packaged_update --all-features -- --ignored --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "packaged update integration test failed" }
       - uses: actions/upload-artifact@v4
         with:
