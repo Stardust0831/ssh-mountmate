@@ -332,7 +332,7 @@ pub fn file_sha256(path: &Path) -> Result<String, RcloneBinaryError> {
         source,
     })?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
+    let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
         let read = file
             .read(&mut buffer)
