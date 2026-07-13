@@ -8,6 +8,8 @@ test_root="$(mktemp -d "${RUNNER_TEMP:-/tmp}/ssh-mountmate-openssh-e2e-XXXXXX")"
 remote_root="${test_root}/remote"
 mount_root="${test_root}/mounts"
 server_pid=""
+gui_pid=""
+window_manager_pid=""
 server_ids=(native-a native-b openssh-a openssh-b)
 
 cleanup() {
@@ -21,6 +23,22 @@ cleanup() {
       printf '%s\n' '--- SSH MountMate state and logs ---' >&2
       find "${XDG_STATE_HOME}/rsshmount" -maxdepth 1 -type f -print -exec tail -100 {} \; >&2 || true
     fi
+    if [[ -f "${test_root}/gui.trace" ]]; then
+      printf '%s\n' '--- SSH MountMate GUI trace ---' >&2
+      cat "${test_root}/gui.trace" >&2 || true
+    fi
+    if [[ -f "${test_root}/gui.stderr" ]]; then
+      printf '%s\n' '--- SSH MountMate GUI stderr ---' >&2
+      cat "${test_root}/gui.stderr" >&2 || true
+    fi
+  fi
+  if [[ -n "${gui_pid}" ]]; then
+    kill "${gui_pid}" 2>/dev/null || true
+    wait "${gui_pid}" 2>/dev/null || true
+  fi
+  if [[ -n "${window_manager_pid}" ]]; then
+    kill "${window_manager_pid}" 2>/dev/null || true
+    wait "${window_manager_pid}" 2>/dev/null || true
   fi
   if [[ -x "${binary}" ]]; then
     "${binary}" --unmount-all >/dev/null 2>&1 || true
@@ -45,6 +63,9 @@ test -x "${rclone}"
 command -v ssh >/dev/null
 command -v ssh-keygen >/dev/null
 command -v ssh-keyscan >/dev/null
+command -v xdotool >/dev/null
+command -v openbox >/dev/null
+test -n "${DISPLAY:-}"
 if [[ ! -c /dev/fuse ]]; then
   sudo modprobe fuse || true
 fi
@@ -163,10 +184,10 @@ jq -n '{
   settings_schema_version: 8,
   vfs_cache_mode: "full",
   vfs_cache_max_age: "30m",
-  vfs_write_back: "0s",
+  vfs_write_back: "30s",
   dir_cache_time: "5m",
   startup_all: true,
-  auto_show_transfers: false,
+  auto_show_transfers: true,
   auto_check_updates: false,
   language: "en"
 }' >"${config_dir}/settings.json"
@@ -204,6 +225,105 @@ if (( start_spread > 1 )); then
   echo "Login mounts did not start concurrently; process start spread was ${start_spread}s" >&2
   exit 1
 fi
+
+dd if=/dev/zero of="${mount_root}/native-a/popup-upload.bin" bs=1M count=4 conv=fsync status=none
+dd if=/dev/zero of="${mount_root}/openssh-a/popup-upload.bin" bs=1M count=4 conv=fsync status=none
+openbox >"${test_root}/openbox.log" 2>&1 &
+window_manager_pid=$!
+sleep 0.3
+kill -0 "${window_manager_pid}"
+export SSH_MOUNTMATE_TRACE_FILE="${test_root}/gui.trace"
+"${binary}" >"${test_root}/gui.stdout" 2>"${test_root}/gui.stderr" &
+gui_pid=$!
+
+popup_windows=()
+for _ in $(seq 1 150); do
+  if ! kill -0 "${gui_pid}" 2>/dev/null; then
+    echo 'SSH MountMate GUI exited before transfer popups appeared' >&2
+    exit 1
+  fi
+  mapfile -t popup_windows < <(
+    xdotool search --onlyvisible --name '^File transfer$' 2>/dev/null || true
+  )
+  if [[ "${#popup_windows[@]}" -eq 2 ]] \
+    && grep -Fq 'transfer popup opened: native-a ' "${test_root}/gui.trace" 2>/dev/null \
+    && grep -Fq 'transfer popup opened: openssh-a ' "${test_root}/gui.trace" 2>/dev/null; then
+    break
+  fi
+  sleep 0.1
+done
+if [[ "${#popup_windows[@]}" -ne 2 ]]; then
+  echo "expected two simultaneous transfer popup windows, found ${#popup_windows[@]}" >&2
+  exit 1
+fi
+grep -F 'transfer popup opened: native-a ' "${test_root}/gui.trace"
+grep -F 'transfer popup opened: openssh-a ' "${test_root}/gui.trace"
+
+popup_x=()
+popup_y=()
+popup_geometry_ready=false
+for _ in $(seq 1 50); do
+  popup_x=()
+  popup_y=()
+  for popup in "${popup_windows[@]}"; do
+    popup_x+=("$(xdotool getwindowgeometry --shell "${popup}" | awk -F= '$1 == "X" { print $2 }')")
+    popup_y+=("$(xdotool getwindowgeometry --shell "${popup}" | awk -F= '$1 == "Y" { print $2 }')")
+  done
+  if (( popup_x[0] - popup_x[1] <= 10 && popup_x[1] - popup_x[0] <= 10 )) \
+    && [[ "${popup_y[0]}" -ne "${popup_y[1]}" ]]; then
+    popup_geometry_ready=true
+    break
+  fi
+  sleep 0.1
+done
+if [[ "${popup_geometry_ready}" != true ]]; then
+  echo 'transfer popup windows are not aligned at the right edge' >&2
+  exit 1
+fi
+
+"${binary}" --show-transfers
+for _ in $(seq 1 50); do
+  if grep -Fq 'transfer center shown with 2 popup(s)' "${test_root}/gui.trace" 2>/dev/null; then
+    break
+  fi
+  sleep 0.1
+done
+grep -F 'ipc-server received ShowTransfers' "${test_root}/gui.trace"
+grep -F 'transfer center shown with 2 popup(s)' "${test_root}/gui.trace"
+mapfile -t main_windows < <(
+  xdotool search --onlyvisible --name '^SSH MountMate ' 2>/dev/null || true
+)
+test "${#main_windows[@]}" -eq 1
+
+for _ in $(seq 1 450); do
+  if [[ -f "${remote_root}/native-a/popup-upload.bin" ]] \
+    && [[ -f "${remote_root}/openssh-a/popup-upload.bin" ]] \
+    && [[ "$(stat -c %s "${remote_root}/native-a/popup-upload.bin")" -eq $((4 * 1024 * 1024)) ]] \
+    && [[ "$(stat -c %s "${remote_root}/openssh-a/popup-upload.bin")" -eq $((4 * 1024 * 1024)) ]]; then
+    break
+  fi
+  sleep 0.1
+done
+test "$(stat -c %s "${remote_root}/native-a/popup-upload.bin")" -eq $((4 * 1024 * 1024))
+test "$(stat -c %s "${remote_root}/openssh-a/popup-upload.bin")" -eq $((4 * 1024 * 1024))
+
+for _ in $(seq 1 100); do
+  mapfile -t popup_windows < <(
+    xdotool search --onlyvisible --name '^File transfer$' 2>/dev/null || true
+  )
+  if [[ "${#popup_windows[@]}" -eq 0 ]] \
+    && grep -Fq 'transfer popup completed: native-a ' "${test_root}/gui.trace" 2>/dev/null \
+    && grep -Fq 'transfer popup completed: openssh-a ' "${test_root}/gui.trace" 2>/dev/null; then
+    break
+  fi
+  sleep 0.1
+done
+test "${#popup_windows[@]}" -eq 0
+grep -F 'transfer popup completed: native-a ' "${test_root}/gui.trace"
+grep -F 'transfer popup completed: openssh-a ' "${test_root}/gui.trace"
+kill "${gui_pid}"
+wait "${gui_pid}" || true
+gui_pid=""
 
 "${binary}" --unmount-all
 for server_id in "${server_ids[@]}"; do

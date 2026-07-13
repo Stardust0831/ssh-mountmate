@@ -976,6 +976,9 @@ impl App {
                 }
             },
             Message::PopupOpened(id) => {
+                if let Some(server_id) = self.popup_windows.get(&id) {
+                    diagnostic_trace(&format!("transfer popup opened: {server_id} {id:?}"));
+                }
                 let index = self
                     .popup_order
                     .iter()
@@ -1611,6 +1614,10 @@ impl App {
             AppCommand::ShowTransfers => {
                 self.screen = Screen::TransferCenter;
                 self.status = self.locale().text(TextKey::TransferCenter).into();
+                diagnostic_trace(&format!(
+                    "transfer center shown with {} popup(s)",
+                    self.popup_windows.len()
+                ));
                 Task::batch([self.show_main_window(), self.transfer_task()])
             }
             AppCommand::Mount { id } => self.handle_mount_command(id, MountOperation::Mount),
@@ -2305,6 +2312,7 @@ impl App {
             .collect();
         for popup in completed_windows {
             if let Some(server_id) = self.popup_windows.remove(&popup) {
+                diagnostic_trace(&format!("transfer popup completed: {server_id} {popup:?}"));
                 self.dismissed_popups.remove(&server_id);
             }
             self.popup_order.retain(|window| *window != popup);

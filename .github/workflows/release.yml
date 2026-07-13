@@ -330,11 +330,13 @@ jobs:
         shell: bash
         run: bash tests/rust_linux_mount_smoke.sh target/package/SSHMountMate
 
-      - name: Exercise OpenSSH and concurrent login mounts
+      - name: Exercise OpenSSH, concurrent login mounts, and transfer windows
         if: runner.os == 'Linux'
         timeout-minutes: 5
         shell: bash
-        run: bash tests/rust_linux_openssh_startup_smoke.sh target/package/SSHMountMate
+        run: |
+          xvfb-run -a dbus-run-session -- \
+            bash tests/rust_linux_openssh_startup_smoke.sh target/package/SSHMountMate
 
       - name: Exercise packaged update and rollback
         if: runner.os == 'macOS'

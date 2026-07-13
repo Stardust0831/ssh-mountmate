@@ -112,7 +112,7 @@ jobs:
           toolchain: 1.97.0
       - name: Linux GUI dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dri libgtk-3-dev libayatana-appindicator3-dev zip xvfb openbox dbus-x11 fuse3 jq kmod openssh-client
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dri libgtk-3-dev libayatana-appindicator3-dev zip xvfb xdotool openbox dbus-x11 fuse3 jq kmod openssh-client
       - name: Install verified FUSE-T for macOS mount integration
         if: runner.os == 'macOS'
         shell: bash
@@ -377,11 +377,13 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: bash tests/rust_linux_mount_smoke.sh target/package/SSHMountMate
-      - name: Exercise OpenSSH and concurrent login mounts
+      - name: Exercise OpenSSH, concurrent login mounts, and transfer windows
         if: runner.os == 'Linux'
         timeout-minutes: 5
         shell: bash
-        run: bash tests/rust_linux_openssh_startup_smoke.sh target/package/SSHMountMate
+        run: |
+          xvfb-run -a dbus-run-session -- \
+            bash tests/rust_linux_openssh_startup_smoke.sh target/package/SSHMountMate
       - name: Exercise packaged update and rollback
         if: runner.os == 'macOS'
         shell: bash
