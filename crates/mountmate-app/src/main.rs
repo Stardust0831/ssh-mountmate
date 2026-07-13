@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iced::widget::{
@@ -25,9 +25,11 @@ use mountmate_core::ssh::{
 };
 use mountmate_core::storage::{self, read_json};
 use mountmate_core::transfer::TransferSnapshot;
+use mountmate_core::update::{UpdateInfo, check_for_updates};
 use mountmate_core::update_helper::{
     UpdateHealthAuthorization, run_update_helper, write_update_health_marker,
 };
+use mountmate_core::update_workflow::{PreparedUpdateLaunch, prepare_update_install};
 use mountmate_core::{
     APP_NAME, AuthMethod, ConnectionMethod, MountState, ServerConfig, Settings, VERSION,
 };
@@ -70,6 +72,22 @@ fn run() -> Result<(), String> {
         }
         LaunchAction::Licenses => {
             println!("{}", cli::licenses());
+            return Ok(());
+        }
+        LaunchAction::CheckUpdate => {
+            let info = check_for_updates(VERSION).map_err(|error| error.to_string())?;
+            if info.is_newer {
+                println!("Update available: {}", info.latest_version);
+                println!("Release: {}", info.release_url);
+                println!(
+                    "Verified asset: {}",
+                    info.asset
+                        .as_ref()
+                        .map_or("unavailable", |asset| asset.name.as_str())
+                );
+            } else {
+                println!("SSH MountMate {VERSION} is up to date");
+            }
             return Ok(());
         }
         LaunchAction::RegisterFileManagerMenu => {
@@ -330,6 +348,18 @@ struct App {
     pending_delete: Option<String>,
     status: String,
     update_health: Option<UpdateHealthAuthorization>,
+    update_info: Option<UpdateInfo>,
+    update_checking: bool,
+    update_error: Option<String>,
+    update_downloading: bool,
+    update_progress: Arc<Mutex<UpdateDownloadProgress>>,
+    prepared_update: Option<PreparedUpdateLaunch>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct UpdateDownloadProgress {
+    received: u64,
+    total: u64,
 }
 
 #[derive(Default)]
@@ -585,6 +615,14 @@ enum Message {
     StartupAllChanged(bool),
     AutoTransfersChanged(bool),
     AutoUpdatesChanged(bool),
+    CheckForUpdates,
+    UpdateChecked {
+        manual: bool,
+        result: Result<UpdateInfo, String>,
+    },
+    DownloadUpdate,
+    UpdatePrepared(Result<PreparedUpdateLaunch, String>),
+    InstallUpdateDecision(bool),
     LanguageChanged(Language),
     RegisterFileManagerMenu,
     UnregisterFileManagerMenu,
@@ -716,6 +754,12 @@ impl App {
             pending_delete: None,
             status,
             update_health,
+            update_info: None,
+            update_checking: false,
+            update_error: None,
+            update_downloading: false,
+            update_progress: Arc::new(Mutex::new(UpdateDownloadProgress::default())),
+            prepared_update: None,
         };
         let mut tasks = vec![
             open_window.map(Message::MainWindowOpened),
@@ -723,6 +767,10 @@ impl App {
         ];
         if screen == Screen::TransferCenter {
             tasks.push(app.transfer_task());
+        }
+        if app.settings.auto_check_updates {
+            app.update_checking = true;
+            tasks.push(app.check_update_task(false));
         }
         let task = Task::batch(tasks);
         (app, task)
@@ -1190,6 +1238,80 @@ impl App {
                 if let Some(draft) = &mut self.settings_draft {
                     draft.auto_check_updates = value;
                 }
+            }
+            Message::CheckForUpdates => {
+                if !self.update_checking && !self.update_downloading {
+                    self.update_checking = true;
+                    self.update_error = None;
+                    return self.check_update_task(true);
+                }
+            }
+            Message::UpdateChecked { manual, result } => {
+                self.update_checking = false;
+                match result {
+                    Ok(info) if info.is_newer => {
+                        self.status = match locale {
+                            Locale::English => {
+                                format!("Update {} is available", info.latest_version)
+                            }
+                            Locale::Chinese => format!("发现新版本 {}", info.latest_version),
+                        };
+                        self.update_info = Some(info);
+                        self.update_error = None;
+                    }
+                    Ok(info) => {
+                        self.update_info = None;
+                        self.update_error = None;
+                        if manual {
+                            self.status = match locale {
+                                Locale::English => {
+                                    format!("SSH MountMate {} is up to date", info.current_version)
+                                }
+                                Locale::Chinese => {
+                                    format!("SSH MountMate {} 已是最新版本", info.current_version)
+                                }
+                            };
+                        }
+                    }
+                    Err(error) => {
+                        if manual {
+                            self.status = error.clone();
+                            self.update_error = Some(error);
+                        } else {
+                            diagnostic_trace(&format!("automatic update check failed: {error}"));
+                        }
+                    }
+                }
+            }
+            Message::DownloadUpdate => {
+                if !self.update_downloading {
+                    return self.prepare_update_task();
+                }
+            }
+            Message::UpdatePrepared(result) => {
+                self.update_downloading = false;
+                match result {
+                    Ok(prepared) => {
+                        self.prepared_update = Some(prepared);
+                        return self.confirm_prepared_update();
+                    }
+                    Err(error) => {
+                        self.update_error = Some(error.clone());
+                        self.status = error;
+                    }
+                }
+            }
+            Message::InstallUpdateDecision(install) => {
+                if install {
+                    return self.launch_prepared_update();
+                }
+                if let Some(prepared) = self.prepared_update.take() {
+                    prepared.cancel();
+                }
+                self.status = match locale {
+                    Locale::English => "Update installation was postponed".into(),
+                    Locale::Chinese => "已暂缓安装更新".into(),
+                };
             }
             Message::LanguageChanged(language) => {
                 if let Some(draft) = &mut self.settings_draft {
@@ -1752,6 +1874,133 @@ impl App {
             },
             Message::FileManagerMenuFinished,
         )
+    }
+
+    fn check_update_task(&self, manual: bool) -> Task<Message> {
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(|| {
+                    check_for_updates(VERSION).map_err(|error| error.to_string())
+                })
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()))
+            },
+            move |result| Message::UpdateChecked { manual, result },
+        )
+    }
+
+    fn prepare_update_task(&mut self) -> Task<Message> {
+        let Some(asset) = self
+            .update_info
+            .as_ref()
+            .and_then(|info| info.asset.clone())
+        else {
+            self.status = match self.locale() {
+                Locale::English => "This release has no verified asset for this platform".into(),
+                Locale::Chinese => "此版本没有适用于当前平台的已验证安装包".into(),
+            };
+            return Task::none();
+        };
+        let executable = match std::env::current_exe() {
+            Ok(executable) => executable,
+            Err(error) => {
+                self.status = error.to_string();
+                return Task::none();
+            }
+        };
+        if let Ok(mut progress) = self.update_progress.lock() {
+            *progress = UpdateDownloadProgress::default();
+        }
+        self.update_downloading = true;
+        self.update_error = None;
+        self.status = match self.locale() {
+            Locale::English => "Downloading and verifying update...".into(),
+            Locale::Chinese => "正在下载并验证更新...".into(),
+        };
+        let paths = self.paths.clone();
+        let progress = self.update_progress.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let mut report = |received, total| {
+                        if let Ok(mut current) = progress.lock() {
+                            *current = UpdateDownloadProgress { received, total };
+                        }
+                    };
+                    prepare_update_install(
+                        &paths,
+                        &asset,
+                        &executable,
+                        vec!["--show-main".into()],
+                        Some(&mut report),
+                    )
+                    .map_err(|error| error.to_string())
+                })
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()))
+            },
+            Message::UpdatePrepared,
+        )
+    }
+
+    fn confirm_prepared_update(&mut self) -> Task<Message> {
+        let active = self
+            .transfers
+            .values()
+            .filter(|snapshot| transfer_is_active(snapshot))
+            .count();
+        let unknown = self
+            .servers
+            .iter()
+            .filter(|server| self.mount_statuses.get(&server.id) == Some(&MountStatus::Mounted))
+            .filter(|server| {
+                self.transfer_errors.contains_key(&server.id)
+                    || !self.transfers.contains_key(&server.id)
+            })
+            .count();
+        if active == 0 && unknown == 0 {
+            return self.launch_prepared_update();
+        }
+        let description = match self.locale() {
+            Locale::English => format!(
+                "Installing restarts SSH MountMate while leaving rclone mounts running. {active} connection(s) still have pending transfer work and {unknown} mounted connection(s) have unknown transfer state. Install now?"
+            ),
+            Locale::Chinese => format!(
+                "安装更新会重启 SSH MountMate，但 rclone 挂载会继续运行。当前有 {active} 个连接仍有待处理传输，另有 {unknown} 个已挂载连接的传输状态未知。现在安装吗？"
+            ),
+        };
+        Task::perform(
+            async move {
+                rfd::AsyncMessageDialog::new()
+                    .set_title(APP_NAME)
+                    .set_description(description)
+                    .set_level(rfd::MessageLevel::Warning)
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show()
+                    .await
+            },
+            |result| Message::InstallUpdateDecision(result == rfd::MessageDialogResult::Yes),
+        )
+    }
+
+    fn launch_prepared_update(&mut self) -> Task<Message> {
+        let Some(prepared) = self.prepared_update.take() else {
+            return Task::none();
+        };
+        match prepared.launch() {
+            Ok(_) => {
+                self.status = match self.locale() {
+                    Locale::English => "Restarting into the verified update...".into(),
+                    Locale::Chinese => "正在重启并应用已验证更新...".into(),
+                };
+                iced::exit()
+            }
+            Err(error) => {
+                self.update_error = Some(error.to_string());
+                self.status = error.to_string();
+                Task::none()
+            }
+        }
     }
 
     fn status_task(&self) -> Task<Message> {
@@ -2693,11 +2942,97 @@ impl App {
         } else {
             column![]
         };
+        let update_title = match locale {
+            Locale::English => "Software updates",
+            Locale::Chinese => "软件更新",
+        };
+        let current_version = match locale {
+            Locale::English => format!("Current version: {VERSION}"),
+            Locale::Chinese => format!("当前版本：{VERSION}"),
+        };
+        let mut update_section =
+            column![text(update_title).size(20), text(current_version).size(14)]
+                .spacing(8)
+                .max_width(640);
+        if self.update_checking {
+            update_section = update_section.push(text(match locale {
+                Locale::English => "Checking for updates...",
+                Locale::Chinese => "正在检查更新...",
+            }));
+        } else if let Some(info) = &self.update_info {
+            update_section = update_section.push(text(match locale {
+                Locale::English => format!("{} is available", info.latest_version),
+                Locale::Chinese => format!("可更新至 {}", info.latest_version),
+            }));
+            if info.asset.is_none() {
+                update_section = update_section.push(text(match locale {
+                    Locale::English => "A verified package is not available for this platform",
+                    Locale::Chinese => "当前平台暂无已验证的安装包",
+                }));
+            }
+        }
+        if self.update_downloading {
+            let progress = self
+                .update_progress
+                .lock()
+                .map(|progress| *progress)
+                .unwrap_or_default();
+            let percentage = if progress.total == 0 {
+                0.0
+            } else {
+                progress.received as f32 * 100.0 / progress.total as f32
+            };
+            update_section = update_section
+                .push(progress_bar(0.0..=100.0, percentage.clamp(0.0, 100.0)))
+                .push(text(match locale {
+                    Locale::English => format!(
+                        "Downloaded {} of {}",
+                        format_bytes(progress.received),
+                        if progress.total == 0 {
+                            "unknown".into()
+                        } else {
+                            format_bytes(progress.total)
+                        }
+                    ),
+                    Locale::Chinese => format!(
+                        "已下载 {} / {}",
+                        format_bytes(progress.received),
+                        if progress.total == 0 {
+                            "未知大小".into()
+                        } else {
+                            format_bytes(progress.total)
+                        }
+                    ),
+                }));
+        }
+        if let Some(error) = &self.update_error {
+            update_section = update_section.push(text(error).size(13));
+        }
+        let check_label = match locale {
+            Locale::English => "Check now",
+            Locale::Chinese => "立即检查",
+        };
+        let install_label = match locale {
+            Locale::English => "Download and install",
+            Locale::Chinese => "下载并安装",
+        };
+        let check = button(check_label).on_press_maybe(
+            (!self.update_checking && !self.update_downloading).then_some(Message::CheckForUpdates),
+        );
+        let install = button(install_label).on_press_maybe(
+            self.update_info
+                .as_ref()
+                .is_some_and(|info| info.asset.is_some())
+                .then_some(Message::DownloadUpdate)
+                .filter(|_| !self.update_downloading),
+        );
+        update_section = update_section.push(row![check, install].spacing(10));
         let content = column![
             cache_profile,
             cache_limits,
             cache_timing,
             behavior,
+            update_section,
             tray_capability,
             file_manager
         ]

@@ -12,6 +12,7 @@ pub(crate) enum LaunchAction {
     },
     Headless(AppCommand),
     RunUpdateHelper(UpdateHelperAuthorization),
+    CheckUpdate,
     RegisterFileManagerMenu,
     UnregisterFileManagerMenu,
     Help,
@@ -42,6 +43,7 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Launc
             "-h" | "--help" => Some(LaunchAction::Help),
             "-V" | "--version" => Some(LaunchAction::Version),
             "--licenses" => Some(LaunchAction::Licenses),
+            "--check-update" => Some(LaunchAction::CheckUpdate),
             "--register-file-manager-menu" | "--register-shell-menu" => {
                 Some(LaunchAction::RegisterFileManagerMenu)
             }
@@ -203,6 +205,7 @@ Usage: SSHMountMate [COMMAND]
   --refresh-path PATH            Refresh the mount containing a local directory
   --register-file-manager-menu   Register file-manager commands for this executable
   --unregister-file-manager-menu Remove file-manager commands
+  --check-update                 Check GitHub for a verified platform update
   --licenses                     Print bundled third-party notices
   -h, --help                     Print this help
   -V, --version                  Print the version"#
@@ -264,6 +267,10 @@ mod tests {
             parse(args(&["--register-shell-menu"])).unwrap(),
             LaunchAction::RegisterFileManagerMenu
         );
+        assert_eq!(
+            parse(args(&["--check-update"])).unwrap(),
+            LaunchAction::CheckUpdate
+        );
     }
 
     #[test]
@@ -294,6 +301,7 @@ mod tests {
     #[test]
     fn help_keeps_command_columns_readable() {
         assert!(help().contains("\n  --show-main"));
+        assert!(help().contains("\n  --check-update"));
         assert!(help().contains("\n  -V, --version"));
         assert!(!help().contains("update-helper"));
         assert!(!help().contains("update-health"));

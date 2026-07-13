@@ -15,6 +15,7 @@ pub mod transfer;
 pub mod update;
 pub mod update_helper;
 pub mod update_install;
+pub mod update_workflow;
 
 pub use model::{AuthMethod, ConnectionMethod, MountPhase, MountState, ServerConfig, Settings};
 

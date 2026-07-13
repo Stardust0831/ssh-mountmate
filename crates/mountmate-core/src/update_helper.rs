@@ -229,6 +229,7 @@ pub fn run_update_helper(
     verify_running_helper(&plan, helper_executable)?;
     fs::remove_file(plan_path).map_err(|_| UpdateHelperError::PlanCleanup)?;
     wait_for_parent_exit(&plan.parent, DEFAULT_PARENT_EXIT_TIMEOUT)?;
+    verify_authorized_installation(&plan)?;
     let applied = apply_prepared_update(&plan.layout, &plan.prepared, &plan.transaction)
         .map_err(|error| UpdateHelperError::InstallFailed(error.to_string()))?;
     complete_applied_update(
@@ -237,6 +238,18 @@ pub fn run_update_helper(
         DEFAULT_HEALTH_TIMEOUT,
         &mut SystemUpdateLauncher,
     )
+}
+
+fn verify_authorized_installation(plan: &UpdateHelperPlan) -> Result<(), UpdateHelperError> {
+    let current_digest = file_sha256(&plan.layout.executable)
+        .map_err(|error| UpdateHelperError::InstallFailed(error.to_string()))?;
+    if current_digest == plan.parent.executable_sha256 {
+        Ok(())
+    } else {
+        Err(UpdateHelperError::InstallFailed(
+            "the installation changed after the update was authorized".into(),
+        ))
+    }
 }
 
 pub fn write_update_health_marker(
@@ -1296,6 +1309,39 @@ mod tests {
                 }
             ),
             Err(UpdateHelperError::InvalidPlan)
+        ));
+    }
+
+    #[test]
+    fn installation_digest_must_still_match_the_authorized_parent() {
+        let temp = tempdir().unwrap();
+        let executable = temp.path().join("SSHMountMate");
+        create_test_executable(&executable, b"authorized executable");
+        let executable = executable.canonicalize().unwrap();
+        let mut plan_parent = parent();
+        plan_parent.executable = executable.clone();
+        plan_parent.executable_sha256 = file_sha256(&executable).unwrap();
+        let plan = UpdateHelperPlan {
+            schema: UPDATE_PLAN_SCHEMA,
+            token_sha256: "a".repeat(64),
+            parent: plan_parent,
+            layout: InstallLayout {
+                kind: InstallKind::StandaloneExecutable,
+                executable: executable.clone(),
+                replace_path: executable.clone(),
+            },
+            prepared: prepared(),
+            transaction: transaction(),
+            health_marker: temp.path().join("health.json"),
+            health_token: "b".repeat(64),
+            relaunch_arguments: Vec::new(),
+        };
+        verify_authorized_installation(&plan).unwrap();
+
+        fs::write(&executable, b"externally replaced").unwrap();
+        assert!(matches!(
+            verify_authorized_installation(&plan),
+            Err(UpdateHelperError::InstallFailed(_))
         ));
     }
 }
