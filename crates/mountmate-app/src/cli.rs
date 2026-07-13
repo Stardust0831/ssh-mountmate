@@ -221,6 +221,8 @@ Usage: SSHMountMate [COMMAND]
 pub(crate) fn licenses() -> &'static str {
     concat!(
         include_str!("../../../THIRD_PARTY_NOTICES.md"),
+        "\n\n--- complete Rust dependency licenses ---\n\n",
+        include_str!("../../../licenses/RUST-THIRD-PARTY.txt"),
         "\n\n--- rclone license ---\n\n",
         include_str!("../../../licenses/rclone-COPYING.txt"),
         "\n\n--- rfd license ---\n\n",

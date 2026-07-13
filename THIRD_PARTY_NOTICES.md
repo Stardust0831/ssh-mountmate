@@ -2,6 +2,10 @@
 
 SSH MountMate release builds bundle the official rclone binary for the target platform.
 
+The complete generated inventory and license text for every Rust crate linked on the six release
+targets is available in `licenses/RUST-THIRD-PARTY.txt`. CI regenerates it from `Cargo.lock` with
+cargo-about and rejects stale output.
+
 ## rclone
 
 - Project: https://rclone.org/
