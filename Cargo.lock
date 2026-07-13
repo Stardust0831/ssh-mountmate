@@ -4219,6 +4219,7 @@ dependencies = [
  "mountmate-platform",
  "rfd",
  "sys-locale",
+ "tempfile",
  "tokio",
  "tray-icon",
  "zbus",

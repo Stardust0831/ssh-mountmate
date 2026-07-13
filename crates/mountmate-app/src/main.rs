@@ -1,7 +1,9 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::File;
 use std::hash::{Hash, Hasher};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -11,7 +13,9 @@ use iced::widget::{
     Space, button, checkbox, column, container, pick_list, progress_bar, row, scrollable, text,
     text_input, toggler,
 };
-use iced::{Center, Element, Fill, Length, Point, Size, Subscription, Task, Theme, window};
+use iced::{
+    Center, Element, Fill, Length, Point, Size, Subscription, Task, Theme, clipboard, window,
+};
 use mountmate_core::app_command::{
     AppCommand, AppCommandError, AppCommandServer, InstanceLock, send_command_retry,
 };
@@ -367,6 +371,7 @@ struct App {
     screen: Screen,
     connection_draft: Option<ConnectionDraft>,
     settings_draft: Option<SettingsDraft>,
+    log_view: Option<MountLogView>,
     editor_saving: bool,
     ssh_import_loading: bool,
     ssh_import_plan: Option<SshImportPlan>,
@@ -449,6 +454,25 @@ enum Screen {
     TransferCenter,
     ConnectionEditor,
     Settings,
+    LogViewer,
+}
+
+#[derive(Debug, Clone)]
+struct LoadedMountLog {
+    path: PathBuf,
+    content: String,
+    truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+struct MountLogView {
+    server_id: String,
+    display_name: String,
+    path: PathBuf,
+    content: String,
+    truncated: bool,
+    loading: bool,
+    return_screen: Screen,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -617,6 +641,14 @@ enum Message {
     OpenTransfers,
     CloseTransfers,
     OpenSettings,
+    OpenLog(String),
+    ReloadLog,
+    LogLoaded {
+        id: String,
+        result: Result<LoadedMountLog, String>,
+    },
+    CopyLog,
+    CloseLog,
     CancelEditor,
     ConnectionSourceChanged(ConnectionSource),
     ConnectionFieldChanged(ConnectionField, String),
@@ -784,6 +816,7 @@ impl App {
             screen,
             connection_draft: None,
             settings_draft: None,
+            log_view: None,
             editor_saving: false,
             ssh_import_loading: false,
             ssh_import_plan: None,
@@ -1050,6 +1083,54 @@ impl App {
                 self.status = locale.text(TextKey::Settings).into();
                 self.dependency_checking = true;
                 return self.dependency_check_task();
+            }
+            Message::OpenLog(id) => return self.open_log(id),
+            Message::ReloadLog => {
+                let Some(log_view) = &mut self.log_view else {
+                    return Task::none();
+                };
+                log_view.loading = true;
+                self.status = locale.text(TextKey::LoadingLog).into();
+                return load_log_task(log_view.server_id.clone(), log_view.path.clone());
+            }
+            Message::LogLoaded { id, result } => {
+                let Some(log_view) = &mut self.log_view else {
+                    return Task::none();
+                };
+                if log_view.server_id != id {
+                    return Task::none();
+                }
+                log_view.loading = false;
+                match result {
+                    Ok(log) => {
+                        log_view.path = log.path;
+                        log_view.content = log.content;
+                        log_view.truncated = log.truncated;
+                        self.status = locale.text(TextKey::Logs).into();
+                    }
+                    Err(error) => self.status = error,
+                }
+            }
+            Message::CopyLog => {
+                let Some(log_view) = &self.log_view else {
+                    return Task::none();
+                };
+                if log_view.content.is_empty() {
+                    self.status = locale.text(TextKey::NoLogContent).into();
+                    return Task::none();
+                }
+                self.status = locale.text(TextKey::LogCopied).into();
+                return clipboard::write(log_view.content.clone());
+            }
+            Message::CloseLog => {
+                if let Some(log_view) = self.log_view.take() {
+                    self.screen = log_view.return_screen;
+                    self.status = match self.screen {
+                        Screen::Settings => locale.text(TextKey::Settings),
+                        _ => locale.text(TextKey::Ready),
+                    }
+                    .into();
+                }
             }
             Message::CancelEditor => {
                 if !self.editor_saving {
@@ -1534,9 +1615,9 @@ impl App {
                     return Task::none();
                 }
                 self.editor_saving = true;
-                self.status = locale.removing(&id);
                 let paths = self.paths.clone();
                 let server = self.servers.iter().find(|server| server.id == id).cloned();
+                self.status = locale.removing(&operation_display_name(server.as_ref(), &id));
                 return Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
@@ -2424,14 +2505,15 @@ impl App {
         }
         self.mount_statuses
             .insert(id.clone(), MountStatus::Starting);
+        let server = self.servers.iter().find(|server| server.id == id).cloned();
+        let display_name = operation_display_name(server.as_ref(), &id);
         self.status = match operation {
-            MountOperation::Mount => self.locale().mounting(&id),
-            MountOperation::Unmount => self.locale().unmounting(&id),
+            MountOperation::Mount => self.locale().mounting(&display_name),
+            MountOperation::Unmount => self.locale().unmounting(&display_name),
         };
         let service = self.service.clone();
         let settings = self.settings.clone();
         let locale = self.locale();
-        let server = self.servers.iter().find(|server| server.id == id).cloned();
         let result_id = id.clone();
         Task::perform(
             async move {
@@ -2444,12 +2526,12 @@ impl App {
                             .map(|state| match locale {
                                 Locale::English => format!(
                                     "Mounted {} at {}",
-                                    state.remote,
+                                    display_name,
                                     state.mountpoint.display()
                                 ),
                                 Locale::Chinese => format!(
                                     "已将 {} 挂载到 {}",
-                                    state.remote,
+                                    display_name,
                                     state.mountpoint.display()
                                 ),
                             })
@@ -2458,8 +2540,8 @@ impl App {
                     MountOperation::Unmount => service
                         .unmount(&id)
                         .map(|()| match locale {
-                            Locale::English => format!("Unmounted {id}"),
-                            Locale::Chinese => format!("已卸载 {id}"),
+                            Locale::English => format!("Unmounted {display_name}"),
+                            Locale::Chinese => format!("已卸载 {display_name}"),
                         })
                         .map_err(|error| error.to_string()),
                 })
@@ -2477,7 +2559,9 @@ impl App {
     fn open_mountpoint(&mut self, id: String) -> Task<Message> {
         let state_file = self.paths.state_file(&id);
         let locale = self.locale();
-        self.status = locale.opening(&id);
+        let display_name =
+            operation_display_name(self.servers.iter().find(|server| server.id == id), &id);
+        self.status = locale.opening(&display_name);
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
@@ -2492,6 +2576,28 @@ impl App {
         )
     }
 
+    fn open_log(&mut self, id: String) -> Task<Message> {
+        let Some(server) = self.servers.iter().find(|server| server.id == id) else {
+            self.status = self.locale().text(TextKey::ConnectionGone).into();
+            return Task::none();
+        };
+        let return_screen = self.screen;
+        let display_name = server.display_name().to_owned();
+        let path = self.paths.mount_log(server.remote_name());
+        self.log_view = Some(MountLogView {
+            server_id: id.clone(),
+            display_name,
+            path: path.clone(),
+            content: String::new(),
+            truncated: false,
+            loading: true,
+            return_screen,
+        });
+        self.screen = Screen::LogViewer;
+        self.status = self.locale().text(TextKey::LoadingLog).into();
+        load_log_task(id, path)
+    }
+
     fn view(&self, window: window::Id) -> Element<'_, Message> {
         if window == self.main_window {
             match self.screen {
@@ -2499,6 +2605,7 @@ impl App {
                 Screen::TransferCenter => self.transfer_center_view(),
                 Screen::ConnectionEditor => self.connection_editor_view(),
                 Screen::Settings => self.settings_view(),
+                Screen::LogViewer => self.log_viewer_view(),
             }
         } else {
             self.transfer_popup_view(window)
@@ -2523,6 +2630,20 @@ impl App {
         } else {
             format!("{} ({active_transfers})", locale.text(TextKey::Transfers))
         };
+        let can_mount_all = self.servers.iter().any(|server| {
+            !self.busy.contains(&server.id)
+                && !matches!(
+                    self.mount_statuses.get(&server.id),
+                    Some(MountStatus::Mounted | MountStatus::Starting)
+                )
+        });
+        let can_unmount_all = self.servers.iter().any(|server| {
+            !self.busy.contains(&server.id)
+                && (matches!(
+                    self.mount_statuses.get(&server.id),
+                    Some(MountStatus::Mounted | MountStatus::Starting)
+                ) || self.paths.state_file(&server.id).exists())
+        });
         let toolbar = row![
             text(APP_NAME).size(28),
             Space::new().width(Fill),
@@ -2533,6 +2654,14 @@ impl App {
         ]
         .spacing(10)
         .align_y(Center);
+        let batch_actions = row![
+            button(locale.text(TextKey::MountAll))
+                .on_press_maybe(can_mount_all.then_some(Message::AppCommand(AppCommand::MountAll))),
+            button(locale.text(TextKey::UnmountAll)).on_press_maybe(
+                can_unmount_all.then_some(Message::AppCommand(AppCommand::UnmountAll))
+            ),
+        ]
+        .spacing(10);
 
         let mut connections = column![].spacing(8);
         if self.servers.is_empty() {
@@ -2568,6 +2697,7 @@ impl App {
         container(
             column![
                 toolbar,
+                batch_actions,
                 scrollable(connections).height(Fill),
                 row![text(&self.status), Space::new().width(Fill), text(VERSION)],
             ]
@@ -3174,6 +3304,27 @@ impl App {
         } else {
             column![]
         };
+        let mut logs = column![
+            text(locale.text(TextKey::Logs)).size(20),
+            text(locale.text(TextKey::LogsHelp)).size(14),
+        ]
+        .spacing(8)
+        .max_width(640);
+        if self.servers.is_empty() {
+            logs = logs.push(text(locale.text(TextKey::NoSavedConnections)).size(14));
+        } else {
+            for server in &self.servers {
+                logs = logs.push(
+                    row![
+                        text(server.display_name()).width(Fill),
+                        button(locale.text(TextKey::ViewLog))
+                            .on_press(Message::OpenLog(server.id.clone())),
+                    ]
+                    .spacing(10)
+                    .align_y(Center),
+                );
+            }
+        }
         let mut dependency_section = column![
             text(match locale {
                 Locale::English => "Mount dependencies",
@@ -3307,6 +3458,7 @@ impl App {
             cache_limits,
             cache_timing,
             behavior,
+            logs,
             dependency_section,
             update_section,
             tray_capability,
@@ -3315,6 +3467,54 @@ impl App {
         .spacing(18)
         .max_width(900);
         editor_shell(header, scrollable(content), &self.status)
+    }
+
+    fn log_viewer_view(&self) -> Element<'_, Message> {
+        let locale = self.locale();
+        let Some(log_view) = &self.log_view else {
+            return container(text(locale.text(TextKey::NoLogContent))).into();
+        };
+        let header = row![
+            text(format!(
+                "{} — {}",
+                locale.text(TextKey::Logs),
+                log_view.display_name
+            ))
+            .size(28),
+            Space::new().width(Fill),
+            button(locale.text(TextKey::Refresh))
+                .on_press_maybe((!log_view.loading).then_some(Message::ReloadLog)),
+            button(locale.text(TextKey::CopyLog))
+                .on_press_maybe((!log_view.content.is_empty()).then_some(Message::CopyLog)),
+            button(locale.text(TextKey::Back)).on_press(Message::CloseLog),
+        ]
+        .spacing(10)
+        .align_y(Center);
+        let mut details = column![text(log_view.path.display().to_string()).size(13)].spacing(6);
+        if log_view.loading {
+            details = details.push(text(locale.text(TextKey::LoadingLog)));
+        }
+        if log_view.truncated {
+            details = details.push(text(locale.text(TextKey::LogTruncated)).size(13));
+        }
+        let log_text = if log_view.content.is_empty() {
+            locale.text(TextKey::NoLogContent)
+        } else {
+            &log_view.content
+        };
+        let content = column![
+            details,
+            scrollable(
+                container(text(log_text).size(13))
+                    .padding(12)
+                    .width(Fill)
+                    .style(container::rounded_box)
+            )
+            .height(Fill),
+        ]
+        .spacing(10)
+        .height(Fill);
+        editor_shell(header, content, &self.status)
     }
 
     fn transfer_popup_view(&self, window: window::Id) -> Element<'_, Message> {
@@ -3467,8 +3667,10 @@ fn connection_card<'a>(
     }
     let edit = button(locale.text(TextKey::Edit))
         .on_press_maybe(can_modify.then(|| Message::Edit(id.clone())));
+    let log = button(locale.text(TextKey::ViewLog)).on_press(Message::OpenLog(id.clone()));
     let actions: Element<'_, Message> = if confirming_remove {
         row![
+            log,
             button(locale.text(TextKey::Cancel)).on_press(Message::CancelRemove),
             button(locale.text(TextKey::ConfirmRemove)).on_press(Message::ConfirmRemove),
         ]
@@ -3476,6 +3678,7 @@ fn connection_card<'a>(
         .into()
     } else {
         row![
+            log,
             edit,
             button(locale.text(TextKey::Remove))
                 .on_press_maybe(can_modify.then_some(Message::Remove(id))),
@@ -3693,6 +3896,59 @@ fn editor_shell<'a>(
     .into()
 }
 
+const LOG_VIEW_LIMIT: u64 = 2 * 1024 * 1024;
+
+fn load_log_task(id: String, path: PathBuf) -> Task<Message> {
+    let result_id = id.clone();
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(move || read_mount_log(path))
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()))
+        },
+        move |result| Message::LogLoaded {
+            id: result_id.clone(),
+            result,
+        },
+    )
+}
+
+fn read_mount_log(path: PathBuf) -> Result<LoadedMountLog, String> {
+    let mut file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LoadedMountLog {
+                path,
+                content: String::new(),
+                truncated: false,
+            });
+        }
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    let length = file
+        .metadata()
+        .map_err(|error| format!("{}: {error}", path.display()))?
+        .len();
+    let start = length.saturating_sub(LOG_VIEW_LIMIT);
+    if start > 0 {
+        file.seek(SeekFrom::Start(start))
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+    }
+    let mut bytes = Vec::with_capacity((length - start).min(LOG_VIEW_LIMIT) as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    if start > 0
+        && let Some(newline) = bytes.iter().position(|byte| *byte == b'\n')
+    {
+        bytes.drain(..=newline);
+    }
+    Ok(LoadedMountLog {
+        path,
+        content: String::from_utf8_lossy(&bytes).into_owned(),
+        truncated: start > 0,
+    })
+}
+
 fn validate_setting_value(
     name: &str,
     value: &str,
@@ -3734,6 +3990,12 @@ fn display_mountpoint(server: &ServerConfig, locale: Locale) -> &str {
     } else {
         &server.mountpoint
     }
+}
+
+fn operation_display_name(server: Option<&ServerConfig>, id: &str) -> String {
+    server
+        .map(|server| server.display_name().to_owned())
+        .unwrap_or_else(|| id.to_owned())
 }
 
 fn status_label(locale: Locale, status: MountStatus) -> &'static str {
@@ -4175,6 +4437,40 @@ mod localization_tests {
         assert!(file_manager_settings_visible("macos"));
         assert!(!file_manager_settings_visible("freebsd"));
         assert!(!file_manager_settings_visible("android"));
+    }
+
+    #[test]
+    fn mount_status_messages_use_the_display_name_not_the_internal_id() {
+        let server = ServerConfig {
+            id: "NAS".into(),
+            name: "jzj".into(),
+            ..ServerConfig::default()
+        };
+        assert_eq!(operation_display_name(Some(&server), &server.id), "jzj");
+        assert_eq!(operation_display_name(None, "missing-id"), "missing-id");
+        assert_eq!(
+            Locale::Chinese.mounting(server.display_name()),
+            "正在挂载 jzj..."
+        );
+    }
+
+    #[test]
+    fn log_view_is_bounded_copyable_text_and_handles_missing_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing.log");
+        let empty = read_mount_log(missing.clone()).unwrap();
+        assert_eq!(empty.path, missing);
+        assert!(empty.content.is_empty());
+        assert!(!empty.truncated);
+
+        let path = temp.path().join("large.log");
+        let mut bytes = vec![b'x'; LOG_VIEW_LIMIT as usize + 32];
+        bytes.extend_from_slice(b"\nfinal log line\n");
+        std::fs::write(&path, bytes).unwrap();
+        let loaded = read_mount_log(path.clone()).unwrap();
+        assert_eq!(loaded.path, path);
+        assert!(loaded.truncated);
+        assert_eq!(loaded.content, "final log line\n");
     }
 
     #[test]

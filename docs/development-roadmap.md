@@ -112,6 +112,14 @@ Cross-platform considerations:
   changed, so legacy settings and custom rclone values continue to deserialize unchanged.
 - Local format, core warnings-denied Clippy, all 151 core tests, and the legacy migration test passed.
   Full GUI compilation remains delegated to native CI because this workspace lacks GTK/pkg-config.
+- Restored explicit Mount all and Unmount all buttons in the main window. The batch operations had
+  remained available through tray and command IPC, but were not discoverable in the Rust main UI.
+- Added a read-only mount-log viewer reachable from every connection card and from a Logs section in
+  Settings. It supports refresh and Copy log, handles not-yet-created logs, and bounds rendering to
+  the most recent 2 MiB so a large rclone log cannot freeze the GUI.
+- Fixed operation status text to use the connection display name instead of its stable internal ID.
+  Renaming a configuration from `NAS` to `jzj`, for example, now reports `jzj` while preserving the
+  existing ID, state filename, and backward compatibility.
 
 - Recorded installation as a post-alpha design task. The main benefit is stable application path
   and desktop identity for self-update, login startup, Explorer commands, Windows Toast/AUMID, and
