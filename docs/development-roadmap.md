@@ -104,6 +104,17 @@ Cross-platform considerations:
 - Chose Windows per-user installation as the first design target while retaining the portable
   onefile. macOS continues to use the native `.app`, and Linux installer formats remain a separate
   evaluation. No installer was added to the in-progress six-asset alpha.2 release.
+- Rewrite run [29276353414](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29276353414)
+  passed the quality gate and all six native Windows, Linux, and macOS x64/ARM64 jobs on commit
+  `6838b61`, including canonical artifact upload and real mount lifecycles.
+- The first six-asset release dry run
+  [29277440840](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29277440840) exposed a
+  release-only Windows packaging bug: removal of the old onedir step also removed the command that
+  created `release/`. Commit `4030719` makes the Windows onefile step create its output directory.
+- The replacement release dry run
+  [29278559051](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29278559051) passed quality,
+  all six native build/lifecycle jobs, exact six-ZIP aggregation, and SHA-256 verification. It did
+  not publish a GitHub Release.
 
 - Reduced the release matrix from twelve duplicate onefile/onedir ZIPs to six canonical ZIPs to
   reduce CI artifact and release download overhead. Windows and Linux keep onefile executables;
