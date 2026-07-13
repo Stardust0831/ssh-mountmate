@@ -501,23 +501,31 @@ fn write_private_new_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Up
             source,
         })
     })?;
+    write_private_new_file(path, |file| file.write_all(&content))
+}
+
+fn write_private_new_file(
+    path: &Path,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> Result<(), UpdateHelperError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(|source| UpdateHelperError::Io {
         path: parent.to_owned(),
         source,
     })?;
-    let mut file = match OpenOptions::new().create_new(true).write(true).open(path) {
-        Ok(file) => file,
-        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
-            return Err(UpdateHelperError::StatePathExists(path.to_owned()));
-        }
-        Err(source) => {
-            return Err(UpdateHelperError::Io {
-                path: path.to_owned(),
-                source,
-            });
-        }
-    };
+    let temporary = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        Uuid::new_v4().simple()
+    ));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|source| UpdateHelperError::Io {
+            path: temporary.clone(),
+            source,
+        })?;
     let result = (|| {
         #[cfg(unix)]
         {
@@ -525,19 +533,33 @@ fn write_private_new_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Up
 
             file.set_permissions(fs::Permissions::from_mode(0o600))?;
         }
-        file.write_all(&content)?;
+        write(&mut file)?;
         file.flush()?;
         file.sync_all()
     })();
+    drop(file);
     if let Err(source) = result {
-        drop(file);
-        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&temporary);
         return Err(UpdateHelperError::Io {
             path: path.to_owned(),
             source,
         });
     }
-    Ok(())
+    let result = match rename_no_replace(&temporary, path) {
+        Ok(()) => Ok(()),
+        Err(source) => match path_entry_exists(path) {
+            Ok(true) => Err(UpdateHelperError::StatePathExists(path.to_owned())),
+            Ok(false) => Err(UpdateHelperError::Io {
+                path: path.to_owned(),
+                source,
+            }),
+            Err(error) => Err(error),
+        },
+    };
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn random_token() -> String {
@@ -873,6 +895,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::rc::Rc;
+    use std::sync::mpsc;
 
     use tempfile::tempdir;
 
@@ -1326,6 +1349,37 @@ mod tests {
             ),
             Err(UpdateHelperError::InvalidPlan)
         ));
+    }
+
+    #[test]
+    fn private_state_files_are_atomically_published() {
+        let temp = tempdir().unwrap();
+        let target = temp.path().join("health.json");
+        let writer_target = target.clone();
+        let (partial_tx, partial_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            write_private_new_file(&writer_target, |file| {
+                file.write_all(b"{")?;
+                file.sync_all()?;
+                partial_tx.send(()).unwrap();
+                finish_rx.recv().unwrap();
+                file.write_all(b"\"healthy\":true}")
+            })
+        });
+
+        partial_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!target.exists());
+        finish_tx.send(()).unwrap();
+        writer.join().unwrap().unwrap();
+        assert_eq!(fs::read(&target).unwrap(), br#"{"healthy":true}"#);
+
+        assert!(matches!(
+            write_private_new_file(&target, |file| file.write_all(b"replacement")),
+            Err(UpdateHelperError::StatePathExists(_))
+        ));
+        assert_eq!(fs::read(&target).unwrap(), br#"{"healthy":true}"#);
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
     }
 
     #[test]
