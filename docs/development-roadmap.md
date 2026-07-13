@@ -74,9 +74,12 @@ Planned design constraints:
 - Capacity discovery now falls back to a non-interactive remote `df -Pk` query after local mount,
   Lustre project quota, and `rclone about` data are unavailable. Direct password profiles without a
   managed SSH route continue to avoid password prompts.
-- Focused Rust 1.97 tests passed for settings migration, mount arguments, transfer reconciliation,
-  download misclassification, and remote capacity parsing. Full workspace verification and native
-  CI are still required before another prerelease.
+- Local Rust 1.97 format checks, core Clippy, all 151 core tests, and legacy migration passed.
+  Workspace compilation was locally limited only by missing GTK/pkg-config system packages.
+- Native run [29272903757](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29272903757)
+  passed quality and all six Windows, Linux, and macOS x64/ARM64 jobs, including package smoke tests
+  and real SFTP mount, queued-upload, refresh, remote-completion, and unmount lifecycles. No release
+  was published from this change.
 
 ### 2026-07-13
 
