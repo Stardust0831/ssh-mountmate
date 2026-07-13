@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-package_root="$(realpath "${1:?packaged SSH MountMate root is required}")"
+source_package_root="$(realpath "${1:?packaged SSH MountMate root is required}")"
+test_root="$(mktemp -d "${RUNNER_TEMP:-/tmp}/ssh-mountmate-mount-e2e-XXXXXX")"
+package_root="${test_root}/install/SSHMountMate"
+mkdir -p "$(dirname "${package_root}")"
+cp -a "${source_package_root}" "${package_root}"
 binary="${package_root}/SSHMountMate"
 rclone="${package_root}/bin/rclone"
-test_root="$(mktemp -d "${RUNNER_TEMP:-/tmp}/ssh-mountmate-mount-e2e-XXXXXX")"
+server_rclone="${test_root}/server-rclone"
 server_user="mountmate"
 server_password="test-only-password"
 remote_root="${test_root}/remote"
@@ -13,7 +17,7 @@ server_pid=""
 
 start_server() {
   local host_key="${1:?host key is required}"
-  "${rclone}" --cache-dir "${test_root}/server-cache" \
+  "${server_rclone}" --cache-dir "${test_root}/server-cache" \
     --log-file "${test_root}/sftp-server.log" -vv \
     serve sftp "${remote_root}" --addr "127.0.0.1:${port}" \
     --user "${server_user}" --pass "${server_password}" --key "${host_key}" \
@@ -62,6 +66,8 @@ trap cleanup EXIT
 
 test -x "${binary}"
 test -x "${rclone}"
+cp "${rclone}" "${server_rclone}"
+chmod 755 "${server_rclone}"
 if [[ ! -c /dev/fuse ]]; then
   sudo modprobe fuse || true
 fi
@@ -121,7 +127,7 @@ jq -n '{
   settings_schema_version: 8,
   vfs_cache_mode: "full",
   vfs_cache_max_age: "30m",
-  vfs_write_back: "5s",
+  vfs_write_back: "90s",
   dir_cache_time: "5m",
   auto_show_transfers: false,
   auto_check_updates: false,
@@ -148,7 +154,13 @@ dd if=/dev/zero of="${mountpoint}/upload.bin" bs=1M count=8 conv=fsync status=no
 queued_output="$("${binary}" --refresh-id local-sftp)"
 grep -F 'local file(s) are still waiting to upload' <<<"${queued_output}"
 
-for _ in $(seq 1 300); do
+export SSH_MOUNTMATE_ACTIVE_PACKAGE_ROOT="${package_root}"
+export SSH_MOUNTMATE_ACTIVE_STATE_FILE="${XDG_STATE_HOME}/rsshmount/local-sftp.json"
+cargo test --package mountmate-core --test packaged_update --all-features \
+  packaged_update_preserves_real_active_mount -- \
+  --ignored --exact --test-threads=1
+
+for _ in $(seq 1 1200); do
   if [[ -f "${remote_root}/upload.bin" ]] \
     && [[ "$(stat -c %s "${remote_root}/upload.bin")" -eq $((8 * 1024 * 1024)) ]]; then
     break

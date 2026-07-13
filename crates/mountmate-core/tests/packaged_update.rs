@@ -8,10 +8,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use mountmate_core::LEGACY_APP_ID;
+use mountmate_core::MountState;
 use mountmate_core::model::Settings;
 use mountmate_core::paths::AppPaths;
 use mountmate_core::rclone_binary::file_sha256;
-use mountmate_core::storage::save_settings;
+use mountmate_core::service::MountService;
+use mountmate_core::storage::{read_json, save_settings};
 use mountmate_core::update_helper::{
     ParentProcessIdentity, materialize_update_helper, write_update_plan,
 };
@@ -19,11 +21,13 @@ use mountmate_core::update_install::{
     detect_install_layout, locate_directory_payload, plan_transaction_paths,
     prepare_directory_payload,
 };
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind};
 use tempfile::TempDir;
 use wait_timeout::ChildExt;
 
 const PACKAGE_ROOT_ENV: &str = "SSH_MOUNTMATE_PACKAGE_ROOT";
+const ACTIVE_PACKAGE_ROOT_ENV: &str = "SSH_MOUNTMATE_ACTIVE_PACKAGE_ROOT";
+const ACTIVE_STATE_FILE_ENV: &str = "SSH_MOUNTMATE_ACTIVE_STATE_FILE";
 const VERSION_MARKER: &str = "SSHMountMate.update-e2e-version";
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const HELPER_TIMEOUT: Duration = Duration::from_secs(75);
@@ -40,6 +44,18 @@ fn packaged_update_commits_after_real_gui_health_confirmation() {
 #[ignore = "requires a packaged SSH MountMate bundle and a graphical session"]
 fn packaged_update_rolls_back_when_new_gui_cannot_report_healthy() {
     run_scenario(Scenario::Rollback).unwrap();
+}
+
+#[test]
+#[ignore = "requires a packaged application with a real active mount and queued upload"]
+fn packaged_update_preserves_real_active_mount() {
+    if env::var_os(ACTIVE_PACKAGE_ROOT_ENV).is_none()
+        && env::var_os(ACTIVE_STATE_FILE_ENV).is_none()
+    {
+        eprintln!("active-mount update fixture is not present; explicit mount smoke will run it");
+        return;
+    }
+    run_active_mount_update().unwrap();
 }
 
 #[derive(Clone, Copy)]
@@ -199,6 +215,182 @@ fn run_scenario(scenario: Scenario) -> TestResult {
             )
             .into());
         }
+        Ok(())
+    })();
+
+    let _ = parent.kill();
+    let _ = parent.wait();
+    let _ = terminate_processes_at(&installed_executable, Duration::from_secs(5));
+    result
+}
+
+fn run_active_mount_update() -> TestResult {
+    let install_root = env::var_os(ACTIVE_PACKAGE_ROOT_ENV)
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::other(format!("{ACTIVE_PACKAGE_ROOT_ENV} is not set")))?
+        .canonicalize()?;
+    let state_file = env::var_os(ACTIVE_STATE_FILE_ENV)
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::other(format!("{ACTIVE_STATE_FILE_ENV} is not set")))?
+        .canonicalize()?;
+    let original_state: MountState = read_json(&state_file)?;
+    let discovered_paths = AppPaths::discover();
+    if discovered_paths
+        .state_file(&original_state.server_id)
+        .canonicalize()?
+        != state_file
+    {
+        return Err(io::Error::other(
+            "active mount state is outside the current SSH MountMate environment",
+        )
+        .into());
+    }
+    let original_rclone = original_state.rclone.canonicalize()?;
+    if original_rclone.starts_with(&install_root) {
+        return Err(io::Error::other(
+            "the active mount is using rclone from the replaceable package instead of the managed copy",
+        )
+        .into());
+    }
+
+    let installed_executable = package_executable(&install_root);
+    let queued = run_inherited_output(
+        &installed_executable,
+        &["--refresh-id", original_state.server_id.as_str()],
+    )?;
+    if !queued.status.success()
+        || !String::from_utf8_lossy(&queued.stdout).contains("still waiting to upload")
+    {
+        return Err(io::Error::other(format!(
+            "active update did not begin with a verified queued upload\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&queued.stdout),
+            String::from_utf8_lossy(&queued.stderr)
+        ))
+        .into());
+    }
+
+    let temporary = test_directory()?;
+    let payload_root = temporary
+        .path()
+        .join(format!("active-payload-{}", package_name()));
+    copy_tree(&install_root, &payload_root)?;
+    fs::write(version_marker(&payload_root), b"new\n")?;
+    resign_macos_bundle(&payload_root)?;
+
+    let layout = detect_install_layout(&installed_executable)?;
+    let transaction = plan_transaction_paths(&layout)?;
+    let payload = locate_directory_payload(&payload_root, env::consts::OS)?;
+    let prepared = prepare_directory_payload(&layout, &payload, &transaction, env::consts::OS)?;
+    let helper = materialize_update_helper(
+        &temporary.path().join("active-detached-updater"),
+        &installed_executable,
+    )?;
+
+    let parent_stdout = temporary.path().join("active-parent.stdout");
+    let parent_stderr = temporary.path().join("active-parent.stderr");
+    let mut parent = spawn_logged_inherited(
+        &installed_executable,
+        &["--show-main"],
+        &parent_stdout,
+        &parent_stderr,
+    )?;
+
+    let result = (|| {
+        let parent_identity = wait_for_parent_identity(
+            &mut parent,
+            &layout.executable,
+            &discovered_paths.app_command_state(),
+            &parent_stderr,
+        )?;
+        let authorization = write_update_plan(
+            &discovered_paths.update_state_dir(),
+            parent_identity,
+            layout,
+            prepared,
+            transaction.clone(),
+            vec!["--show-main".into()],
+        )?;
+
+        let helper_stdout = temporary.path().join("active-helper.stdout");
+        let helper_stderr = temporary.path().join("active-helper.stderr");
+        let helper_arguments = vec![
+            OsString::from("--run-update-helper"),
+            authorization.plan_path.as_os_str().to_owned(),
+            OsString::from("--update-helper-token"),
+            OsString::from(&authorization.token),
+        ];
+        parent.kill()?;
+        parent.wait()?;
+        thread::sleep(Duration::from_secs(1));
+        let mut updater =
+            spawn_logged_inherited(&helper, &helper_arguments, &helper_stdout, &helper_stderr)?;
+        let status = match updater.wait_timeout(HELPER_TIMEOUT)? {
+            Some(status) => status,
+            None => {
+                updater.kill()?;
+                updater.wait()?;
+                return Err(io::Error::other(format!(
+                    "active-mount update helper timed out\n{}",
+                    read_diagnostic(&helper_stderr)
+                ))
+                .into());
+            }
+        };
+        if !status.success() {
+            return Err(io::Error::other(format!(
+                "active-mount packaged update failed with {status}\n{}",
+                read_diagnostic(&helper_stderr)
+            ))
+            .into());
+        }
+        if fs::read_to_string(version_marker(&install_root))?.trim() != "new" {
+            return Err(
+                io::Error::other("active package was not replaced by the new payload").into(),
+            );
+        }
+        if transaction.backup.exists() || transaction.prepared.exists() {
+            return Err(io::Error::other(
+                "active-mount update left a prepared payload or backup behind",
+            )
+            .into());
+        }
+
+        let updated_state: MountState = read_json(&state_file)?;
+        if updated_state != original_state {
+            return Err(io::Error::other(
+                "active mount state changed while the GUI package was replaced",
+            )
+            .into());
+        }
+        if !process_identity_is_live(
+            updated_state.pid,
+            updated_state.process_started_at,
+            &original_rclone,
+        ) {
+            return Err(io::Error::other(
+                "the rclone mount process exited while the GUI package was replaced",
+            )
+            .into());
+        }
+        fs::read(updated_state.mountpoint.join("initial.txt"))?;
+        let snapshot = MountService::new(discovered_paths.clone(), install_root.clone())
+            .transfer_snapshot(&updated_state.server_id)?;
+        if snapshot.queued == 0 && snapshot.uploading == 0 {
+            return Err(io::Error::other(
+                "the queued upload disappeared during GUI package replacement",
+            )
+            .into());
+        }
+        if !terminate_processes_at(&installed_executable, PROCESS_TIMEOUT)? {
+            return Err(io::Error::other(
+                "updated GUI was not running after active-mount health confirmation",
+            )
+            .into());
+        }
+        println!(
+            "Active mount survived packaged update: pid={} queued={} uploading={}",
+            updated_state.pid, snapshot.queued, snapshot.uploading
+        );
         Ok(())
     })();
 
@@ -415,6 +607,29 @@ fn spawn_logged<A: AsRef<OsStr>>(
     command.spawn()
 }
 
+fn spawn_logged_inherited<A: AsRef<OsStr>>(
+    executable: &Path,
+    arguments: &[A],
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> io::Result<Child> {
+    let stdout = File::create(stdout_path)?;
+    let stderr = File::create(stderr_path)?;
+    Command::new(executable)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+}
+
+fn run_inherited_output<A: AsRef<OsStr>>(
+    executable: &Path,
+    arguments: &[A],
+) -> io::Result<std::process::Output> {
+    Command::new(executable).args(arguments).output()
+}
+
 fn wait_for_parent_identity(
     child: &mut Child,
     expected_executable: &Path,
@@ -497,6 +712,26 @@ fn terminate_processes_at(executable: &Path, timeout: Duration) -> io::Result<bo
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn process_identity_is_live(pid: u32, started_at: Option<u64>, executable: &Path) -> bool {
+    let pid = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
+    );
+    system.process(pid).is_some_and(|process| {
+        !matches!(
+            process.status(),
+            ProcessStatus::Dead | ProcessStatus::Zombie
+        ) && started_at.is_none_or(|expected| process.start_time() == expected)
+            && process
+                .exe()
+                .and_then(|path| path.canonicalize().ok())
+                .is_some_and(|path| path == executable)
+    })
 }
 
 fn read_diagnostic(path: &Path) -> String {

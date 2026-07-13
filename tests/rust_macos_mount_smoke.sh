@@ -3,10 +3,14 @@ set -euo pipefail
 
 bundle_input="${1:?packaged SSH MountMate application is required}"
 bundle_parent="$(cd "$(dirname "$bundle_input")" && pwd)"
-bundle="$bundle_parent/$(basename "$bundle_input")"
+source_bundle="$bundle_parent/$(basename "$bundle_input")"
+test_root="$(mktemp -d "${RUNNER_TEMP:-/tmp}/ssh-mountmate-mount-e2e-XXXXXX")"
+bundle="$test_root/install/SSH MountMate.app"
+mkdir -p "$(dirname "$bundle")"
+/usr/bin/ditto "$source_bundle" "$bundle"
 binary="$bundle/Contents/MacOS/SSHMountMate"
 rclone="$bundle/Contents/Resources/bin/rclone"
-test_root="$(mktemp -d "${RUNNER_TEMP:-/tmp}/ssh-mountmate-mount-e2e-XXXXXX")"
+server_rclone="$test_root/server-rclone"
 server_user="mountmate"
 server_password="test-only-password"
 remote_root="$test_root/remote"
@@ -54,6 +58,8 @@ trap cleanup EXIT
 
 test -x "$binary"
 test -x "$rclone"
+cp "$rclone" "$server_rclone"
+chmod 755 "$server_rclone"
 test -e /usr/local/lib/libfuse-t.dylib
 command -v jq >/dev/null
 command -v nc >/dev/null
@@ -71,7 +77,7 @@ for candidate in {42000..42100}; do
 done
 test -n "$port"
 
-"$rclone" --cache-dir "$test_root/server-cache" \
+"$server_rclone" --cache-dir "$test_root/server-cache" \
   --log-file "$test_root/sftp-server.log" -vv \
   serve sftp "$remote_root" --addr "127.0.0.1:$port" \
   --user "$server_user" --pass "$server_password" \
@@ -121,7 +127,7 @@ jq -n '{
   settings_schema_version: 8,
   vfs_cache_mode: "full",
   vfs_cache_max_age: "30m",
-  vfs_write_back: "5s",
+  vfs_write_back: "90s",
   dir_cache_time: "5m",
   auto_show_transfers: false,
   auto_check_updates: false,
@@ -146,7 +152,13 @@ sync
 queued_output="$("$binary" --refresh-id local-sftp)"
 grep -F 'local file(s) are still waiting to upload' <<<"$queued_output"
 
-for _ in {1..400}; do
+export SSH_MOUNTMATE_ACTIVE_PACKAGE_ROOT="$bundle"
+export SSH_MOUNTMATE_ACTIVE_STATE_FILE="$XDG_STATE_HOME/rsshmount/local-sftp.json"
+cargo test --package mountmate-core --test packaged_update --all-features \
+  packaged_update_preserves_real_active_mount -- \
+  --ignored --exact --test-threads=1
+
+for _ in {1..1200}; do
   if [[ -f "$remote_root/upload.bin" ]] \
     && [[ "$(file_size "$remote_root/upload.bin")" -eq $((8 * 1024 * 1024)) ]]; then
     break

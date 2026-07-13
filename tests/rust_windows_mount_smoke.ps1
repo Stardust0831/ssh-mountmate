@@ -4,10 +4,15 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$packageRoot = (Resolve-Path $PackageRoot).Path
+$sourcePackageRoot = (Resolve-Path $PackageRoot).Path
+$testRoot = Join-Path $env:RUNNER_TEMP "ssh-mountmate-mount-e2e-$PID"
+$packageRoot = Join-Path $testRoot 'install/SSHMountMate'
+New-Item -ItemType Directory -Force $packageRoot | Out-Null
+Get-ChildItem -LiteralPath $sourcePackageRoot -Force |
+  Copy-Item -Destination $packageRoot -Recurse -Force
 $binary = Join-Path $packageRoot 'SSHMountMate.exe'
 $rclone = Join-Path $packageRoot 'bin/rclone.exe'
-$testRoot = Join-Path $env:RUNNER_TEMP "ssh-mountmate-mount-e2e-$PID"
+$serverRclone = Join-Path $testRoot 'server-rclone.exe'
 $remoteRoot = Join-Path $testRoot 'remote'
 $serverLog = Join-Path $testRoot 'sftp-server.log'
 $winFspLog = Join-Path $testRoot 'winfsp-install.log'
@@ -54,6 +59,7 @@ function Wait-Until([scriptblock] $Condition, [int] $Attempts = 100) {
 try {
   if (-not (Test-Path $binary -PathType Leaf)) { throw 'Packaged SSH MountMate is missing' }
   if (-not (Test-Path $rclone -PathType Leaf)) { throw 'Packaged rclone is missing' }
+  Copy-Item $rclone $serverRclone
   New-Item -ItemType Directory -Force $remoteRoot | Out-Null
   Set-Content -Path (Join-Path $remoteRoot 'initial.txt') -Value 'initial remote content' -NoNewline
 
@@ -84,7 +90,7 @@ try {
   $port = ([System.Net.IPEndPoint] $listener.LocalEndpoint).Port
   $listener.Stop()
 
-  $serverInfo = [System.Diagnostics.ProcessStartInfo]::new($rclone)
+  $serverInfo = [System.Diagnostics.ProcessStartInfo]::new($serverRclone)
   $serverInfo.UseShellExecute = $false
   $serverInfo.CreateNoWindow = $true
   @(
@@ -146,7 +152,7 @@ try {
     settings_schema_version = 8
     vfs_cache_mode = 'full'
     vfs_cache_max_age = '30m'
-    vfs_write_back = '10s'
+    vfs_write_back = '90s'
     dir_cache_time = '5m'
     auto_show_transfers = $false
     auto_check_updates = $false
@@ -179,11 +185,19 @@ try {
   if ($queuedOutput -notmatch 'local file\(s\) are still waiting to upload') {
     throw 'A queued write was reported as remotely complete'
   }
+  $env:SSH_MOUNTMATE_ACTIVE_PACKAGE_ROOT = $packageRoot
+  $env:SSH_MOUNTMATE_ACTIVE_STATE_FILE = Join-Path $env:LOCALAPPDATA 'rsshmount/State/local-sftp.json'
+  & cargo test --package mountmate-core --test packaged_update --all-features `
+    packaged_update_preserves_real_active_mount -- `
+    --ignored --exact --test-threads=1
+  if ($LASTEXITCODE -ne 0) {
+    throw 'Active-mount packaged update integration test failed'
+  }
   $remoteUpload = Join-Path $remoteRoot 'upload.bin'
   Wait-Until {
     (Test-Path $remoteUpload -PathType Leaf) -and
       ((Get-Item $remoteUpload).Length -eq (8 * 1024 * 1024))
-  } 300
+  } 1200
   $mountedHash = (Get-FileHash -Algorithm SHA256 "${mountpoint}\upload.bin").Hash
   $remoteHash = (Get-FileHash -Algorithm SHA256 $remoteUpload).Hash
   if ($mountedHash -ne $remoteHash) { throw 'Uploaded file digest did not match the mount' }
@@ -226,4 +240,5 @@ try {
       Get-ChildItem $stateDir -Filter '*.log' | ForEach-Object { Get-Content $_ -Tail 100 }
     }
   }
+  Remove-Item $testRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
