@@ -39,12 +39,15 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
+      - name: Install stable Cargo for cross-target license metadata
+        run: rustup toolchain install 1.88.0 --profile minimal
       - name: Verify generated Rust license inventory
         shell: bash
         env:
           CARGO_ABOUT_VERSION: 0.9.1
           CARGO_ABOUT_SHA256: c0e7dc6f5d74b0beec5c0053d39ab24514c717d19acd91886907a22457ea9e989
           CARGO_NET_RETRY: 10
+          RUSTUP_TOOLCHAIN: 1.88.0
         run: |
           set -euo pipefail
           archive="cargo-about-${CARGO_ABOUT_VERSION}-x86_64-unknown-linux-musl.tar.gz"

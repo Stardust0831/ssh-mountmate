@@ -74,8 +74,8 @@ fn run_scenario(scenario: Scenario) -> TestResult {
     let payload_root = temporary.path().join(format!("payload-{}", package_name()));
     copy_tree(&package_root, &install_root)?;
     copy_tree(&package_root, &payload_root)?;
-    fs::write(install_root.join(VERSION_MARKER), b"old\n")?;
-    fs::write(payload_root.join(VERSION_MARKER), b"new\n")?;
+    fs::write(version_marker(&install_root), b"old\n")?;
+    fs::write(version_marker(&payload_root), b"new\n")?;
     resign_macos_bundle(&install_root)?;
     resign_macos_bundle(&payload_root)?;
 
@@ -111,7 +111,7 @@ fn run_scenario(scenario: Scenario) -> TestResult {
         let parent_identity = wait_for_parent_identity(
             &mut parent,
             &layout.executable,
-            &environment.paths.app_instance_lock(),
+            &environment.paths.app_command_state(),
             &parent_stderr,
         )?;
         let authorization = write_update_plan(
@@ -131,6 +131,9 @@ fn run_scenario(scenario: Scenario) -> TestResult {
             OsString::from("--update-helper-token"),
             OsString::from(&authorization.token),
         ];
+        parent.kill()?;
+        parent.wait()?;
+        thread::sleep(Duration::from_secs(1));
         let mut updater = spawn_logged(
             &helper,
             &helper_arguments,
@@ -138,9 +141,6 @@ fn run_scenario(scenario: Scenario) -> TestResult {
             &helper_stdout,
             &helper_stderr,
         )?;
-
-        parent.kill()?;
-        parent.wait()?;
         let status = match updater.wait_timeout(HELPER_TIMEOUT)? {
             Some(status) => status,
             None => {
@@ -175,7 +175,7 @@ fn run_scenario(scenario: Scenario) -> TestResult {
             _ => {}
         }
 
-        let installed_marker = fs::read_to_string(install_root.join(VERSION_MARKER))?;
+        let installed_marker = fs::read_to_string(version_marker(&install_root))?;
         if installed_marker.trim() != scenario.expected_marker() {
             return Err(io::Error::other(format!(
                 "installed bundle marker is {:?}, expected {:?}",
@@ -231,6 +231,14 @@ fn package_executable(root: &Path) -> PathBuf {
         root.join("SSHMountMate.exe")
     } else {
         root.join("SSHMountMate")
+    }
+}
+
+fn version_marker(root: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        root.join("Contents/Resources").join(VERSION_MARKER)
+    } else {
+        root.join(VERSION_MARKER)
     }
 }
 
@@ -403,7 +411,7 @@ fn spawn_logged<A: AsRef<OsStr>>(
 fn wait_for_parent_identity(
     child: &mut Child,
     expected_executable: &Path,
-    instance_lock: &Path,
+    command_state: &Path,
     stderr_path: &Path,
 ) -> TestResult<ParentProcessIdentity> {
     let expected_executable = expected_executable.canonicalize()?;
@@ -423,7 +431,7 @@ fn wait_for_parent_identity(
             true,
             ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
         );
-        if instance_lock.exists()
+        if command_state.exists()
             && let Some(process) = system.process(pid)
             && let Some(executable) = process.exe().and_then(|path| path.canonicalize().ok())
             && executable == expected_executable
