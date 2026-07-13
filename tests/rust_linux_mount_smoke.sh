@@ -4,13 +4,27 @@ set -euo pipefail
 package_root="$(realpath "${1:?packaged SSH MountMate root is required}")"
 binary="${package_root}/SSHMountMate"
 test_root="$(mktemp -d "${RUNNER_TEMP:-/tmp}/ssh-mountmate-mount-e2e-XXXXXX")"
-system_home="${HOME}"
-remote_name=".ssh-mountmate-e2e-${GITHUB_RUN_ID:-$$}-${GITHUB_RUN_ATTEMPT:-1}"
-remote_root="${system_home}/${remote_name}"
+test_user="mountmatee2e"
+server_home="${test_root}/server-home"
+remote_name="remote"
+remote_root="${server_home}/${remote_name}"
 mountpoint="${test_root}/mount"
 sshd_pid=""
+user_created=false
 
 cleanup() {
+  status=$?
+  if [[ "${status}" -ne 0 ]]; then
+    if [[ -f "${test_root}/sshd.log" ]]; then
+      printf '%s\n' '--- sshd log ---' >&2
+      tail -100 "${test_root}/sshd.log" >&2 || true
+    fi
+    if [[ -n "${XDG_STATE_HOME:-}" && -d "${XDG_STATE_HOME}/rsshmount" ]]; then
+      printf '%s\n' '--- SSH MountMate logs ---' >&2
+      find "${XDG_STATE_HOME}/rsshmount" -maxdepth 1 -type f -name '*.log' \
+        -exec tail -100 {} \; >&2 || true
+    fi
+  fi
   if [[ -x "${binary}" ]]; then
     "${binary}" --unmount-id local-sftp >/dev/null 2>&1 || true
   fi
@@ -20,7 +34,10 @@ cleanup() {
   if [[ -n "${sshd_pid}" ]]; then
     sudo kill "${sshd_pid}" 2>/dev/null || true
   fi
-  rm -rf "${remote_root}" "${test_root}"
+  if [[ "${user_created}" == true ]]; then
+    sudo userdel --remove "${test_user}" >/dev/null 2>&1 || true
+  fi
+  sudo rm -rf "${test_root}"
 }
 trap cleanup EXIT
 
@@ -35,12 +52,20 @@ fi
 test -c /dev/fuse
 sudo chmod a+rw /dev/fuse
 
-mkdir -p "${remote_root}" "${mountpoint}" "${test_root}/home"
+chmod 755 "${test_root}"
+sudo useradd --create-home --home-dir "${server_home}" --shell /bin/bash "${test_user}"
+user_created=true
+sudo passwd --delete "${test_user}" >/dev/null
+sudo install -d -o "${test_user}" -g "${test_user}" -m 700 "${server_home}/.ssh"
+sudo install -d -o "${test_user}" -g "${test_user}" -m 777 "${remote_root}"
+mkdir -p "${mountpoint}" "${test_root}/home"
 printf '%s\n' 'initial remote content' >"${remote_root}/initial.txt"
 ssh-keygen -q -t ed25519 -N '' -f "${test_root}/client-key"
 ssh-keygen -q -t ed25519 -N '' -f "${test_root}/host-key"
-cp "${test_root}/client-key.pub" "${test_root}/authorized_keys"
-chmod 600 "${test_root}/client-key" "${test_root}/host-key" "${test_root}/authorized_keys"
+sudo install -o "${test_user}" -g "${test_user}" -m 600 \
+  "${test_root}/client-key.pub" "${server_home}/.ssh/authorized_keys"
+chmod 600 "${test_root}/client-key" "${test_root}/host-key"
+sudo chown root:root "${test_root}/host-key"
 
 port=""
 for candidate in $(seq 42000 42100); do
@@ -56,12 +81,12 @@ Port ${port}
 ListenAddress 127.0.0.1
 HostKey ${test_root}/host-key
 PidFile ${test_root}/sshd.pid
-AuthorizedKeysFile ${test_root}/authorized_keys
+AuthorizedKeysFile .ssh/authorized_keys
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 UsePAM no
 StrictModes no
-AllowUsers $(id -un)
+AllowUsers ${test_user}
 Subsystem sftp internal-sftp
 LogLevel VERBOSE
 EOF
@@ -72,14 +97,14 @@ sshd_pid="$(cat "${test_root}/sshd.pid")"
 for _ in $(seq 1 50); do
   if ssh -i "${test_root}/client-key" -p "${port}" \
     -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
-    -o UserKnownHostsFile=/dev/null "$(id -un)@127.0.0.1" true 2>/dev/null; then
+    -o UserKnownHostsFile=/dev/null "${test_user}@127.0.0.1" true 2>/dev/null; then
     break
   fi
   sleep 0.1
 done
 ssh -i "${test_root}/client-key" -p "${port}" \
   -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
-  -o UserKnownHostsFile=/dev/null "$(id -un)@127.0.0.1" true
+  -o UserKnownHostsFile=/dev/null "${test_user}@127.0.0.1" true
 
 export HOME="${test_root}/home"
 export XDG_CONFIG_HOME="${test_root}/config"
@@ -89,7 +114,7 @@ export XDG_DATA_HOME="${test_root}/data"
 config_dir="${XDG_CONFIG_HOME}/rsshmount"
 mkdir -p "${config_dir}"
 jq -n \
-  --arg user "$(id -un)" \
+  --arg user "${test_user}" \
   --arg port "${port}" \
   --arg key "${test_root}/client-key" \
   --arg remote "${remote_name}" \
