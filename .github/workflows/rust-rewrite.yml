@@ -70,7 +70,7 @@ jobs:
           toolchain: 1.97.0
       - name: Linux GUI dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libgtk-3-dev libayatana-appindicator3-dev
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libgtk-3-dev libayatana-appindicator3-dev zip
       - run: cargo test --workspace --all-features
       - run: cargo build --release --package ssh-mountmate
       - name: Smoke-test command-line entry points
@@ -247,6 +247,58 @@ jobs:
           codesign --force --deep --sign - "${app}"
           codesign --verify --deep --strict --verbose=2 "${app}"
           "${contents}/MacOS/SSHMountMate" --version
+      - name: Smoke-test packaged archive
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="target/package/SSHMountMate"
+          archive="target/package-smoke/${{ matrix.artifact }}.zip"
+          extracted="${RUNNER_TEMP}/package-smoke"
+          mkdir -p "${root}/bin" "$(dirname "${archive}")"
+          cp target/release/SSHMountMate "${root}/SSHMountMate"
+          cp target/release/bin/rclone target/release/bin/rclone.sha256 "${root}/bin/"
+          cp THIRD_PARTY_NOTICES.md licenses/*.txt distribution/SSHMountMate.install-layout "${root}/"
+          chmod 755 "${root}/SSHMountMate" "${root}/bin/rclone"
+          (cd target/package && zip -q -r "${GITHUB_WORKSPACE}/${archive}" SSHMountMate)
+          unzip -q "${archive}" -d "${extracted}"
+          "${extracted}/SSHMountMate/SSHMountMate" --version
+          "${extracted}/SSHMountMate/bin/rclone" version
+          test -z "$(find "${extracted}" -type f \( -iname '*.py' -o -iname 'python*' -o -iname 'libpython*' \) -print -quit)"
+      - name: Smoke-test packaged archive
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="target/package-smoke/${{ matrix.artifact }}.zip"
+          extracted="${RUNNER_TEMP}/package-smoke"
+          mkdir -p "$(dirname "${archive}")" "${extracted}"
+          ditto -c -k --keepParent "target/package/SSH MountMate.app" "${archive}"
+          ditto -x -k "${archive}" "${extracted}"
+          app="${extracted}/SSH MountMate.app"
+          codesign --verify --deep --strict --verbose=2 "${app}"
+          "${app}/Contents/MacOS/SSHMountMate" --version
+          "${app}/Contents/Resources/bin/rclone" version
+          test -z "$(find "${extracted}" -type f \( -iname '*.py' -o -iname 'python*' -o -iname 'libpython*' \) -print -quit)"
+      - name: Smoke-test packaged archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $root = 'target/package/SSHMountMate'
+          $archive = 'target/package-smoke/${{ matrix.artifact }}.zip'
+          $extracted = Join-Path $env:RUNNER_TEMP package-smoke
+          New-Item -ItemType Directory -Force "$root/bin", (Split-Path $archive) | Out-Null
+          Copy-Item target/release/SSHMountMate.exe "$root/SSHMountMate.exe"
+          Copy-Item target/release/bin/rclone.exe, target/release/bin/rclone.exe.sha256 "$root/bin/"
+          Copy-Item THIRD_PARTY_NOTICES.md, licenses/*.txt, distribution/SSHMountMate.install-layout $root
+          Compress-Archive -Path $root -DestinationPath $archive
+          Expand-Archive $archive $extracted
+          $app = Start-Process -FilePath "$extracted/SSHMountMate/SSHMountMate.exe" -ArgumentList '--version' -Wait -PassThru
+          if ($app.ExitCode -ne 0) { throw "packaged SSH MountMate smoke test failed" }
+          $rclone = Start-Process -FilePath "$extracted/SSHMountMate/bin/rclone.exe" -ArgumentList 'version' -Wait -PassThru
+          if ($rclone.ExitCode -ne 0) { throw "packaged rclone smoke test failed" }
+          $python = Get-ChildItem $extracted -Recurse -File | Where-Object { $_.Name -match '^(python|libpython)' -or $_.Extension -eq '.py' }
+          if ($python) { throw "packaged archive contains Python runtime files" }
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
@@ -271,4 +323,5 @@ jobs:
             target/release/rustix-LICENSE-MIT.txt
             target/release/SSHMountMate.install-layout
             target/package/SSH MountMate.app
+            target/package-smoke/${{ matrix.artifact }}.zip
           if-no-files-found: error

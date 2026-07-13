@@ -17,24 +17,22 @@ It uses rclone for the actual mount operation and provides a small GUI around th
 - Choose the connection method per mount: rclone native SFTP or system OpenSSH.
 - Store passwords and key passphrases through `rclone obscure`, not as plain text.
 - Check for rclone and platform mount dependencies.
-- Bundle the official rclone binary in release builds.
-- Download the official rclone zip into an app-managed local bin directory when the bundled binary is unavailable.
-- Show copyable manual install commands when automatic installation cannot finish.
+- Bundle and verify the official rclone binary in release builds.
 - Configure global rclone VFS cache options in the GUI.
 - Show mount status, capacity usage, logs, and common actions per connection.
 - Show the real rclone upload queue and remote-transfer progress after local file copies appear complete.
 - Verify remote directory contents on refresh and expose refresh/transfer actions from connection-card context menus.
 - Mount or unmount all saved connections from the main window.
-- Build both single-file and faster-starting onedir packages for Windows, macOS, and Linux with GitHub Actions.
+- Build native Rust packages for Windows, macOS, and Linux on x64 and arm64 with GitHub Actions.
 
 ## Requirements
 
-SSH MountMate release builds bundle the official rclone binary for the target platform. If the bundled binary is unavailable, the app can download the official rclone zip into its own local bin directory and use that managed copy. Windows can also fall back to winget.
+SSH MountMate release builds bundle the official rclone binary for the target platform and verify it before use. Source builds can use an explicitly configured rclone, a previously managed copy, or a compatible rclone found on `PATH`.
 
 Windows:
 
 - Windows 10 or 11
-- bundled rclone, or a source-run managed/system rclone
+- bundled rclone, or a source-build configured/system rclone
 - WinFsp
 - OpenSSH Client
 
@@ -49,7 +47,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "Add-WindowsCapability -O
 
 macOS:
 
-- bundled rclone, or a source-run managed/system rclone
+- bundled rclone, or a source-build configured/system rclone
 - macFUSE
 - OpenSSH Client
 
@@ -58,8 +56,6 @@ Important macOS note: SSH MountMate release builds use the bundled official rclo
 ```bash
 curl https://rclone.org/install.sh | sudo bash
 ```
-
-SSH MountMate's fallback dependency installer also uses the official rclone zip on macOS and stores it inside the app's user data directory, so it does not require `sudo` for rclone itself.
 
 macFUSE is still required for mounting on macOS, and it can be installed with Homebrew Cask:
 
@@ -77,7 +73,7 @@ sudo xattr -r -d com.apple.quarantine /path/to/SSHMountMate*
 
 Linux:
 
-- bundled rclone, or a source-run managed/system rclone
+- bundled rclone, or a source-build configured/system rclone
 - FUSE support, usually `fuse3`
 - OpenSSH Client
 
@@ -107,19 +103,11 @@ sudo zypper install -y fuse3 openssh
 
 </details>
 
-In the Settings window, `Check dependencies` shows the current mount-layer dependency as `WinFsp`, `macFUSE`, or `FUSE`. If macOS/Linux system dependencies are missing, `Install missing dependencies` opens copyable commands instead of trying to modify the system silently.
+In the Settings window, `Check dependencies` reports rclone, OpenSSH, and the current mount-layer dependency (`WinFsp`, `macFUSE`, or `FUSE`). SSH MountMate does not silently modify system packages.
 
 ## Bundled And Managed rclone
 
-Release builds bundle rclone inside the executable. During build, SSH MountMate downloads the official rclone zip for the build runner's platform and CPU architecture and embeds the extracted binary with PyInstaller.
-
-If a bundled rclone is not available, SSH MountMate can still build the official zip URL from the current platform and CPU architecture:
-
-```text
-https://downloads.rclone.org/rclone-current-<platform>-<arch>.zip
-```
-
-The platform part is `windows`, `osx`, or `linux`. The architecture part is usually `amd64` for Intel/AMD 64-bit machines or `arm64` for Apple Silicon/AArch64 machines. Managed `rclone` copies are stored under `%LOCALAPPDATA%\SSHMountMate\bin` on Windows, `~/Library/Application Support/SSHMountMate/bin` on macOS, and `${XDG_DATA_HOME:-~/.local/share}/ssh-mountmate/bin` on Linux. These managed copies are preferred over PATH on later launches.
+Release workflows download a pinned official rclone archive for the target platform and architecture, verify its SHA-256 digest, and place rclone beside the Rust application inside the package. At runtime SSH MountMate verifies the bundled digest again and materializes a content-addressed managed copy in the application data directory. Explicitly configured and existing legacy managed copies remain supported for migration; a compatible system rclone is the final source-build fallback.
 
 The remote server is assumed to be a Linux server reachable over SSH/SFTP.
 
@@ -134,9 +122,7 @@ Use the latest GitHub Release and download the package for your platform:
 - `SSHMountMate-linux-x64.zip`
 - `SSHMountMate-linux-arm64.zip`
 
-Release builds are produced by GitHub Actions from the same Python source tree.
-
-The names above are backward-compatible onefile packages. Each platform also has an `-onedir.zip` package. Extract the complete onedir package and launch the executable inside it; keeping its adjacent files together avoids onefile extraction on every start and usually starts faster.
+Release builds are produced from the Rust workspace by six native GitHub Actions runners. Extract the complete package and keep its adjacent `bin` and license files together. macOS packages contain `SSH MountMate.app`.
 
 Bundled third-party notices can be viewed from Settings or with:
 
@@ -150,7 +136,7 @@ Program updates can be checked from Settings -> Check for updates, or from the c
 SSHMountMate --check-update
 ```
 
-Packaged builds preserve the current onefile or onedir package type. The in-app updater downloads the matching GitHub Release asset, verifies GitHub's published SHA-256 digest, rejects unsafe ZIP paths, stages the new build beside the current installation, and restarts SSH MountMate after confirmation. If the new process exits during startup, the updater restores and relaunches the previous build. Existing rclone mounts and uploads continue while the GUI restarts.
+The in-app updater downloads the matching native GitHub Release asset, verifies its size and SHA-256 digest, rejects unsafe ZIP paths, stages the new directory bundle or macOS application beside the current installation, and restarts SSH MountMate after confirmation. A startup health handshake commits the update; timeout or failure restores and relaunches the previous build. Existing rclone mounts and uploads continue while the GUI restarts.
 
 Automatic installation requires SSH MountMate to be extracted to a permanent, user-writable folder. Builds launched directly from a ZIP temporary directory and assets without a trusted SHA-256 digest remain manual-update only. Automatic background checks can be disabled in Settings.
 
@@ -271,7 +257,7 @@ Mounted connection cards show rclone's real VFS upload queue. When an upload sta
 
 Refresh clears the VFS directory cache, actively reloads the requested directory, and verifies it with a direct remote listing. If local writes are still queued, the result states that the verified remote snapshot does not yet include those uploads.
 
-Right-click a connection card for Open, Refresh, Transfers, and Log actions. On Windows, Settings can register the same Refresh and Transfers commands in Explorer. The registration points back to the same `SSHMountMate.exe`; no helper executable is installed. A short-lived right-click process forwards its request to the running app over authenticated loopback IPC and exits.
+Right-click a connection card for Open, Refresh, Transfers, and Log actions. Settings can register Refresh and Transfers commands in Windows Explorer, macOS Finder Quick Actions, and Nautilus, Nemo, or KDE file managers on Linux. The commands point back to the same SSH MountMate executable; no helper program is installed. A short-lived file-manager process forwards its request to the running app over authenticated loopback IPC and exits.
 
 The Rust application keeps a native system-tray icon on Windows, a menu-bar item on macOS, and an AppIndicator on supported Linux desktops. Closing the main window hides it without stopping mounts or transfer monitoring. The tray menu can restore the main window, open Transfers, mount or unmount all connections, and explicitly exit the interface. Exit asks for confirmation when uploads are active or cloud state is unknown; rclone mount processes remain independent of the GUI.
 
@@ -286,9 +272,9 @@ The Settings window contains:
 - dependency checks
 - program update check
 - mount log access
-- transfer center and Windows Explorer context-menu registration
+- transfer center and file-manager command registration
 - language selection
-- Windows/macOS login startup mount option
+- login startup mount option
 - rclone VFS cache root
 - VFS cache mode
 - max cache size
@@ -300,44 +286,36 @@ The Settings window contains:
 
 Each setting option has a `?` help icon in the GUI. Hover the icon to see what the option does. Batch mount and unmount concurrency are fixed internally at 4 and 8 workers.
 
-On macOS, the login startup option writes per-config user LaunchAgent files under `~/Library/LaunchAgents/`. Each job calls SSH MountMate's headless `--mount-id` entrypoint and mounts the saved config after the user logs in.
+Login startup uses the current user's Windows Run key, a macOS LaunchAgent under `~/Library/LaunchAgents/`, or a Linux XDG autostart entry. It calls the Rust application's headless `--mount-startup-all` entrypoint after login.
 
 ## Building From Source
 
-Install Python 3.10 or newer.
+Install the Rust toolchain declared in `rust-toolchain.toml` and the GUI development libraries required by your operating system.
 
 Run from the repository root:
 
 ```bash
-python -m pip install -e ".[build]"
-python build/build_local.py
+cargo build --release --package ssh-mountmate
 ```
 
-Both variants are written to:
-
-```text
-dist/onefile/
-dist/onedir/
-```
-
-PyInstaller builds for the current operating system. Use GitHub Actions or native machines to build all three platforms.
+The executable is written to `target/release/`. Release packaging downloads and verifies the platform-specific rclone binary, so use the release workflow or the corresponding native operating system to produce distributable packages.
 
 ## Development
 
 Run the GUI from source:
 
 ```bash
-python -m pip install -e .
-python -m ssh_mountmate
+cargo run --package ssh-mountmate
 ```
 
 Useful checks:
 
 ```bash
-python -m py_compile $(find src build -name '*.py' -print) launcher.py
-python -m ssh_mountmate --version
-python -m ssh_mountmate --install-help
-python -m ssh_mountmate --licenses
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+cargo run --package ssh-mountmate -- --version
+cargo run --package ssh-mountmate -- --licenses
 ```
 
 ## License
@@ -346,4 +324,4 @@ SSH MountMate's application code is released under the MIT License. See `LICENSE
 
 Release builds bundle rclone. rclone is distributed under the MIT License. See `THIRD_PARTY_NOTICES.md`, `licenses/rclone-COPYING.txt`, or the in-app Settings -> View licenses window.
 
-The bundled Noto Sans CJK SC font is distributed under the SIL Open Font License. See `src/ssh_mountmate/assets/fonts/LICENSE-Noto-CJK.txt`.
+Bundled Rust dependency notices are listed in `THIRD_PARTY_NOTICES.md` and `licenses/`.

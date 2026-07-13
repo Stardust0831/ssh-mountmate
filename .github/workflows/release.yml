@@ -166,17 +166,32 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p release
           (cd target/package && zip -q -r "${GITHUB_WORKSPACE}/release/${{ matrix.asset }}.zip" SSHMountMate)
           unzip -t "release/${{ matrix.asset }}.zip"
+          extracted="${RUNNER_TEMP}/release-smoke"
+          unzip -q "release/${{ matrix.asset }}.zip" -d "${extracted}"
+          "${extracted}/SSHMountMate/SSHMountMate" --version
+          "${extracted}/SSHMountMate/bin/rclone" version
+          test -z "$(find "${extracted}" -type f \( -iname '*.py' -o -iname 'python*' -o -iname 'libpython*' \) -print -quit)"
 
       - name: Package ZIP
         if: runner.os == 'macOS'
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p release
           ditto -c -k --keepParent "target/package/SSH MountMate.app" "release/${{ matrix.asset }}.zip"
           unzip -t "release/${{ matrix.asset }}.zip"
+          extracted="${RUNNER_TEMP}/release-smoke"
+          mkdir -p "${extracted}"
+          ditto -x -k "release/${{ matrix.asset }}.zip" "${extracted}"
+          app="${extracted}/SSH MountMate.app"
+          codesign --verify --deep --strict --verbose=2 "${app}"
+          "${app}/Contents/MacOS/SSHMountMate" --version
+          "${app}/Contents/Resources/bin/rclone" version
+          test -z "$(find "${extracted}" -type f \( -iname '*.py' -o -iname 'python*' -o -iname 'libpython*' \) -print -quit)"
 
       - name: Package ZIP
         if: runner.os == 'Windows'
@@ -188,6 +203,12 @@ jobs:
           Expand-Archive "release/${{ matrix.asset }}.zip" $test
           if (-not (Test-Path "$test/SSHMountMate/SSHMountMate.exe")) { throw "packaged executable missing" }
           if (-not (Test-Path "$test/SSHMountMate/bin/rclone.exe")) { throw "packaged rclone missing" }
+          $app = Start-Process -FilePath "$test/SSHMountMate/SSHMountMate.exe" -ArgumentList '--version' -Wait -PassThru
+          if ($app.ExitCode -ne 0) { throw "packaged SSH MountMate smoke test failed" }
+          $rclone = Start-Process -FilePath "$test/SSHMountMate/bin/rclone.exe" -ArgumentList 'version' -Wait -PassThru
+          if ($rclone.ExitCode -ne 0) { throw "packaged rclone smoke test failed" }
+          $python = Get-ChildItem $test -Recurse -File | Where-Object { $_.Name -match '^(python|libpython)' -or $_.Extension -eq '.py' }
+          if ($python) { throw "packaged archive contains Python runtime files" }
 
       - uses: actions/upload-artifact@v4
         with:
