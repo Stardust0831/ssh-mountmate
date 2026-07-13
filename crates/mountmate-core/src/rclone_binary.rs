@@ -386,6 +386,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn file_hashing_does_not_require_a_megabyte_of_stack() {
+        const CHILD_PATH: &str = "SSH_MOUNTMATE_SMALL_STACK_HASH_PATH";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let digest = std::thread::Builder::new()
+                .stack_size(256 * 1024)
+                .spawn(move || file_sha256(Path::new(&path)))
+                .unwrap()
+                .join()
+                .unwrap()
+                .unwrap();
+            assert_eq!(digest.len(), 64);
+            return;
+        }
+
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("two-megabytes.bin");
+        fs::write(&path, vec![0x5a; 2 * 1024 * 1024]).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "rclone_binary::tests::file_hashing_does_not_require_a_megabyte_of_stack",
+            ])
+            .env(CHILD_PATH, &path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
     fn mac_application_resources_are_resolved_from_contents() {
         let executable = Path::new("/Applications/SSH MountMate.app/Contents/MacOS/SSHMountMate");
         let root = application_root(executable);
