@@ -106,11 +106,24 @@ Planned design constraints:
   then exposed a checksum working-directory bug: `SHA256SUMS.txt` contained asset basenames but was
   checked from the repository root. Checksum verification now executes inside `release-assets/`;
   a replacement dry run is required and no release was created.
+- Run [29264097069](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29264097069)
+  passed quality and all six native rewrite jobs on commit `1a9673e`.
+- Release dry run
+  [29264106144](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29264106144) passed quality,
+  Windows x64/ARM64, Linux x64/ARM64, and macOS x64. Its macOS ARM64 real lifecycle reached a live
+  mount, remote refresh, and a reported queued upload, but the active-update assertion failed after
+  the upload completed and disappeared from the queue during package replacement. The rclone log
+  records the completed upload and final remote rename. Per the prerelease decision, this timing
+  race is deferred and explicitly non-blocking only for the macOS ARM64 release job; it remains
+  visible as a warning and macOS x64 remains blocking.
 
 ## Release decisions
 
 - The Rust rewrite PR remains Draft.
 - No merge is authorized by this document.
 - `v0.4.0-alpha.1` must be a prerelease, not a stable release.
-- A failed or incomplete architecture gate blocks publication unless the failure is rerun and
-  replaced by successful authoritative evidence.
+- The macOS ARM64 active-upload package-replacement timing race is an explicit alpha exception, not
+  evidence that the scenario passed. It must be resolved before a stable release.
+- A failed or incomplete architecture gate blocks publication unless it is replaced by successful
+  authoritative evidence or recorded above as a narrowly scoped, user-approved prerelease
+  exception. Stable releases do not inherit alpha exceptions automatically.
