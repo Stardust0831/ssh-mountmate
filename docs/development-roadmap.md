@@ -89,6 +89,12 @@ Planned design constraints:
   exposed a PowerShell-only workflow bug: `$home` conflicts case-insensitively with the read-only
   automatic `$HOME` variable. The workflow variable was renamed to `$onefileHome`; a replacement
   six-platform run is required.
+- Run [29256312407](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29256312407)
+  passed quality plus Linux and macOS on x64/ARM64. Both Windows jobs compiled the onefile
+  executable successfully, then failed because directly piping output from a GUI-subsystem EXE left
+  PowerShell with `$null` and closed the child's stdout pipe. Both workflows now launch the
+  diagnostic command with explicit stdout/stderr file redirection. A replacement six-platform run
+  remains required before the non-publishing release dry run.
 
 ## Release decisions
 

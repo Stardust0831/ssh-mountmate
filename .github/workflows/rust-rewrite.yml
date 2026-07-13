@@ -406,9 +406,20 @@ jobs:
           $env:USERPROFILE = $onefileHome
           $env:APPDATA = Join-Path $onefileHome 'roaming'
           $env:LOCALAPPDATA = Join-Path $onefileHome 'local'
-          $rclonePath = (& .\target\onefile\SSHMountMate.exe --rclone-path).Trim()
-          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $rclonePath -PathType Leaf)) {
-            throw "onefile did not materialize embedded rclone"
+          $stdout = Join-Path $env:RUNNER_TEMP 'onefile-rclone-path.txt'
+          $stderr = Join-Path $env:RUNNER_TEMP 'onefile-rclone-path.stderr'
+          $app = Start-Process `
+            -FilePath '.\target\onefile\SSHMountMate.exe' `
+            -ArgumentList '--rclone-path' `
+            -RedirectStandardOutput $stdout `
+            -RedirectStandardError $stderr `
+            -Wait -PassThru
+          if ($app.ExitCode -ne 0) {
+            throw "onefile rclone resolution failed`n$(Get-Content $stderr -Raw)"
+          }
+          $rclonePath = (Get-Content $stdout -Raw).Trim()
+          if (-not (Test-Path $rclonePath -PathType Leaf)) {
+            throw "onefile did not materialize embedded rclone at '$rclonePath'"
           }
           $actual = (Get-FileHash -Algorithm SHA256 $rclonePath).Hash.ToLowerInvariant()
           if ($actual -ne $env:SSH_MOUNTMATE_EMBED_RCLONE_SHA256) {
