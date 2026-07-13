@@ -10,12 +10,70 @@ on:
         description: "Release tag, for example v0.4.0-alpha.1"
         required: true
         type: string
+      publish:
+        description: "Create or update the GitHub release after all builds pass"
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: write
 
 jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.0
+          components: rustfmt, clippy
+      - name: Enforce Rust-only product tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git ls-files '*.py' '*.spec' pyproject.toml launcher.py)"
+          python_action='actions/setup''-python'
+          if git grep -n "${python_action}" -- .github; then
+            echo 'Python setup actions are not allowed in the Rust release tree' >&2
+            exit 1
+          fi
+      - name: Audit dependency licenses and sources
+        uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe
+        with:
+          command: check
+          command-arguments: licenses sources
+          arguments: --all-features
+      - name: Install Linux GUI dependencies
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgtk-3-dev libayatana-appindicator3-dev
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-features
+      - name: Install stable Cargo for cross-target license metadata
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Verify generated Rust license inventory
+        shell: bash
+        env:
+          CARGO_ABOUT_VERSION: 0.9.1
+          CARGO_ABOUT_SHA256: c0e7dc6f5d74b0beec5c0053d39ab24514c717d19acd91886907a22457ea9e98
+          CARGO_NET_RETRY: 10
+          RUSTUP_TOOLCHAIN: 1.88.0
+        run: |
+          set -euo pipefail
+          archive="cargo-about-${CARGO_ABOUT_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          url="https://github.com/EmbarkStudios/cargo-about/releases/download/${CARGO_ABOUT_VERSION}/${archive}"
+          curl --fail --location --silent --show-error "${url}" --output "${RUNNER_TEMP}/${archive}"
+          echo "${CARGO_ABOUT_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum --check
+          tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}"
+          cargo_about="${RUNNER_TEMP}/cargo-about-${CARGO_ABOUT_VERSION}-x86_64-unknown-linux-musl/cargo-about"
+          test -x "${cargo_about}"
+          "${cargo_about}" --version
+          generated="${RUNNER_TEMP}/RUST-THIRD-PARTY.txt"
+          sh scripts/generate-rust-licenses.sh "${cargo_about}" "${generated}" online
+          cmp "${generated}" licenses/RUST-THIRD-PARTY.txt
+
   build:
+    needs: quality
     strategy:
       fail-fast: false
       matrix:
@@ -73,9 +131,25 @@ jobs:
           toolchain: 1.97.0
       - name: Install Linux GUI dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dri libgtk-3-dev libayatana-appindicator3-dev zip xvfb openbox dbus-x11 fuse3 jq kmod openssh-client
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dri libgtk-3-dev libayatana-appindicator3-dev zip xvfb xdotool openbox dbus-x11 dunst haskell-gtk-sni-tray-utils weston fuse3 jq kmod openssh-client
       - run: cargo test --workspace --all-features
       - run: cargo build --release --package ssh-mountmate
+
+      - name: Build Freedesktop notification protocol probe
+        if: runner.os == 'Linux'
+        run: cargo build --release --package ssh-mountmate --example freedesktop_notification_probe
+
+      - name: Exercise Linux X11 notification and tray integration
+        if: runner.os == 'Linux'
+        timeout-minutes: 3
+        shell: bash
+        run: xvfb-run -a dbus-run-session -- bash tests/rust_single_instance_smoke.sh target/release/SSHMountMate
+
+      - name: Exercise Linux Wayland notification and tray capability integration
+        if: runner.os == 'Linux'
+        timeout-minutes: 3
+        shell: bash
+        run: dbus-run-session -- bash tests/rust_wayland_smoke.sh target/release/SSHMountMate
 
       - name: Exercise Windows one-instance, tray, and taskbar integration
         if: runner.os == 'Windows'
@@ -174,6 +248,12 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "${app}"
           "${contents}/MacOS/SSHMountMate" --version
 
+      - name: Exercise macOS notification, menu bar, and Dock integration
+        if: runner.os == 'macOS'
+        timeout-minutes: 3
+        shell: bash
+        run: bash tests/rust_macos_gui_smoke.sh "target/package/SSH MountMate.app"
+
       - name: Package ZIP
         if: runner.os == 'Linux'
         shell: bash
@@ -263,6 +343,7 @@ jobs:
           if-no-files-found: error
 
   release:
+    if: github.event_name == 'push' || inputs.publish
     needs: build
     runs-on: ubuntu-latest
 
