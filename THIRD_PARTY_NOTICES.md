@@ -94,3 +94,14 @@ extract verified release archives.
 
 The Rust update installer uses `rustix` to atomically rename files and directories without
 overwriting an existing backup on Linux and macOS.
+
+## plist, quick-xml, and time
+
+- Projects: https://github.com/ebarnard/rust-plist/, https://github.com/tafia/quick-xml,
+  and https://github.com/time-rs/time
+- License: MIT
+- License texts: `licenses/plist-LICENSE-MIT.txt`, `licenses/quick-xml-LICENSE-MIT.txt`,
+  and `licenses/time-LICENSE-MIT.txt`
+
+The macOS login-startup integration uses `plist`, with its XML and time dependencies, to write
+a structured per-user LaunchAgent without invoking shell utilities.

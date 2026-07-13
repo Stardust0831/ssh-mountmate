@@ -47,6 +47,7 @@ pub trait PlatformIntegration: Send + Sync {
     ) -> Result<(), PlatformError>;
     fn register_file_manager_menu(&self, executable: &Path) -> Result<(), PlatformError>;
     fn unregister_file_manager_menu(&self) -> Result<(), PlatformError>;
+    fn set_login_startup(&self, executable: &Path, enabled: bool) -> Result<(), PlatformError>;
 }
 
 pub struct Platform;
@@ -208,6 +209,10 @@ impl PlatformIntegration for Platform {
 
     fn unregister_file_manager_menu(&self) -> Result<(), PlatformError> {
         unregister_file_manager_menu()
+    }
+
+    fn set_login_startup(&self, executable: &Path, enabled: bool) -> Result<(), PlatformError> {
+        set_login_startup(executable, enabled)
     }
 }
 
@@ -574,6 +579,118 @@ fn unregister_file_manager_menu() -> Result<(), PlatformError> {
     Err(PlatformError::Unsupported("file-manager integration"))
 }
 
+#[cfg(windows)]
+fn set_login_startup(executable: &Path, enabled: bool) -> Result<(), PlatformError> {
+    const VALUE_NAME: &str = "SSHMountMate";
+
+    let key = windows_registry::CURRENT_USER
+        .create(r"Software\Microsoft\Windows\CurrentVersion\Run")
+        .map_err(|error| PlatformError::Failed(error.to_string()))?;
+    if enabled {
+        key.set_string(VALUE_NAME, &windows_startup_command(executable))
+            .map_err(|error| PlatformError::Failed(error.to_string()))
+    } else {
+        match key.remove_value(VALUE_NAME) {
+            Ok(()) => Ok(()),
+            Err(error) if error.code().0 as u32 == 0x8007_0002 => Ok(()),
+            Err(error) => Err(PlatformError::Failed(error.to_string())),
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn windows_startup_command(executable: &Path) -> String {
+    format!(r#""{}" --mount-startup-all"#, executable.to_string_lossy())
+}
+
+#[cfg(target_os = "macos")]
+fn set_login_startup(executable: &Path, enabled: bool) -> Result<(), PlatformError> {
+    use plist::{Dictionary, Value};
+
+    let home = home_directory()?;
+    let path = home
+        .join("Library/LaunchAgents")
+        .join("io.github.stardust0831.ssh-mountmate.plist");
+    if !enabled {
+        return remove_if_present(&path);
+    }
+    let executable = executable
+        .to_str()
+        .ok_or_else(|| PlatformError::Failed("startup executable path is not UTF-8".into()))?;
+    let mut dictionary = Dictionary::new();
+    dictionary.insert(
+        "Label".into(),
+        Value::String("io.github.stardust0831.ssh-mountmate".into()),
+    );
+    dictionary.insert(
+        "ProgramArguments".into(),
+        Value::Array(vec![
+            Value::String(executable.into()),
+            Value::String("--mount-startup-all".into()),
+        ]),
+    );
+    dictionary.insert("RunAtLoad".into(), Value::Boolean(true));
+    dictionary.insert("ProcessType".into(), Value::String("Background".into()));
+    let mut content = Vec::new();
+    plist::to_writer_xml(&mut content, &Value::Dictionary(dictionary))
+        .map_err(|error| PlatformError::Failed(error.to_string()))?;
+    mountmate_core::storage::atomic_write(&path, &content)
+        .map_err(|error| PlatformError::Failed(error.to_string()))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn set_login_startup(executable: &Path, enabled: bool) -> Result<(), PlatformError> {
+    let home = home_directory()?;
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    let path = config.join("autostart/ssh-mountmate.desktop");
+    if !enabled {
+        return remove_if_present(&path);
+    }
+    let executable = executable
+        .to_str()
+        .ok_or_else(|| PlatformError::Failed("startup executable path is not UTF-8".into()))?;
+    let command = desktop_exec_argument(executable);
+    let content = format!(
+        "[Desktop Entry]\nType=Application\nName=SSH MountMate\nExec={command} --mount-startup-all\nTerminal=false\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n"
+    );
+    mountmate_core::storage::atomic_write(&path, content.as_bytes())
+        .map_err(|error| PlatformError::Failed(error.to_string()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn set_login_startup(_executable: &Path, _enabled: bool) -> Result<(), PlatformError> {
+    Err(PlatformError::Unsupported("login startup"))
+}
+
+#[cfg(unix)]
+fn home_directory() -> Result<std::path::PathBuf, PlatformError> {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| PlatformError::Failed("could not locate the user home directory".into()))
+}
+
+#[cfg(unix)]
+fn remove_if_present(path: &Path) -> Result<(), PlatformError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(PlatformError::Failed(error.to_string())),
+    }
+}
+
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn desktop_exec_argument(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('`', "\\`")
+        .replace('$', "\\$");
+    format!("\"{escaped}\"")
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
@@ -644,6 +761,19 @@ mod tests {
         assert_eq!(
             explorer_command(executable, entry),
             r#""C:\SSHMountMate.exe" --show-transfers"#
+        );
+    }
+
+    #[test]
+    fn startup_commands_quote_executable_paths_without_a_shell() {
+        let executable = Path::new(r"C:\Program Files\SSH MountMate\SSHMountMate.exe");
+        assert_eq!(
+            windows_startup_command(executable),
+            r#""C:\Program Files\SSH MountMate\SSHMountMate.exe" --mount-startup-all"#
+        );
+        assert_eq!(
+            desktop_exec_argument("/home/user/SSH MountMate/bin/$current"),
+            r#""/home/user/SSH MountMate/bin/\$current""#
         );
     }
 }

@@ -134,11 +134,7 @@ jobs:
           find "${RUNNER_TEMP}/rclone" -type f -name rclone -exec cp {} target/release/bin/rclone \;
           test -x target/release/bin/rclone || chmod 755 target/release/bin/rclone
           shasum -a 256 target/release/bin/rclone | awk '{print $1}' > target/release/bin/rclone.sha256
-          cp THIRD_PARTY_NOTICES.md licenses/rclone-COPYING.txt licenses/rfd-LICENSE.txt \
-            licenses/sys-locale-LICENSE-MIT.txt licenses/tray-icon-LICENSE-MIT.txt \
-            licenses/windows-LICENSE-MIT.txt licenses/notify-rust-LICENSE-MIT.txt \
-            licenses/tauri-winrt-notification-LICENSE-MIT.txt licenses/semver-LICENSE-MIT.txt \
-            licenses/zip-LICENSE-MIT.txt licenses/rustix-LICENSE-MIT.txt target/release/
+          cp THIRD_PARTY_NOTICES.md licenses/*.txt target/release/
           cp distribution/SSHMountMate.install-layout target/release/
       - name: Bundle verified rclone
         if: runner.os == 'Windows'
@@ -162,7 +158,7 @@ jobs:
           Copy-Item $binary.FullName target/release/bin/rclone.exe
           (Get-FileHash -Algorithm SHA256 target/release/bin/rclone.exe).Hash.ToLowerInvariant() |
             Set-Content -NoNewline target/release/bin/rclone.exe.sha256
-          Copy-Item THIRD_PARTY_NOTICES.md, licenses/rclone-COPYING.txt, licenses/rfd-LICENSE.txt, licenses/sys-locale-LICENSE-MIT.txt, licenses/tray-icon-LICENSE-MIT.txt, licenses/windows-LICENSE-MIT.txt, licenses/notify-rust-LICENSE-MIT.txt, licenses/tauri-winrt-notification-LICENSE-MIT.txt, licenses/semver-LICENSE-MIT.txt, licenses/zip-LICENSE-MIT.txt, licenses/rustix-LICENSE-MIT.txt target/release/
+          Copy-Item THIRD_PARTY_NOTICES.md, licenses/*.txt target/release/
           Copy-Item distribution/SSHMountMate.install-layout target/release/
       - name: Assemble and verify macOS application bundle
         if: runner.os == 'macOS'
@@ -194,6 +190,7 @@ jobs:
             target/release/bin/rclone.exe
             target/release/bin/rclone.exe.sha256
             target/release/THIRD_PARTY_NOTICES.md
+            target/release/*.txt
             target/release/rclone-COPYING.txt
             target/release/rfd-LICENSE.txt
             target/release/sys-locale-LICENSE-MIT.txt

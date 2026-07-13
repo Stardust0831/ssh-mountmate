@@ -631,6 +631,7 @@ enum Message {
     FileManagerMenuFinished(Result<bool, String>),
     SaveSettings,
     SettingsSaved(Result<Settings, String>),
+    StartupReconciled(Result<(), String>),
     Mount(String),
     MountFinished {
         id: String,
@@ -773,6 +774,9 @@ impl App {
         if app.settings.auto_check_updates {
             app.update_checking = true;
             tasks.push(app.check_update_task(false));
+        }
+        if app.settings.startup_all {
+            tasks.push(app.reconcile_startup_task());
         }
         let task = Task::batch(tasks);
         (app, task)
@@ -1342,6 +1346,11 @@ impl App {
                     Err(error) => self.status = error,
                 }
             }
+            Message::StartupReconciled(result) => {
+                if let Err(error) = result {
+                    diagnostic_trace(&format!("login startup reconciliation failed: {error}"));
+                }
+            }
             Message::Mount(id) => return self.start_mount_operation(id, None),
             Message::MountFinished {
                 id,
@@ -1830,12 +1839,28 @@ impl App {
         self.status = self.locale().text(TextKey::SavingSettings).into();
         let paths = self.paths.clone();
         let result_settings = settings.clone();
+        let previous_settings = self.settings.clone();
+        let executable = match std::env::current_exe() {
+            Ok(executable) => executable,
+            Err(error) => {
+                self.editor_saving = false;
+                self.status = error.to_string();
+                return Task::none();
+            }
+        };
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    storage::save_settings(&paths, &settings)
-                        .map(|()| result_settings)
-                        .map_err(|error| error.to_string())
+                    storage::save_settings(&paths, &settings).map_err(|error| error.to_string())?;
+                    if let Err(error) =
+                        Platform.set_login_startup(&executable, settings.startup_all)
+                    {
+                        let _ = storage::save_settings(&paths, &previous_settings);
+                        let _ =
+                            Platform.set_login_startup(&executable, previous_settings.startup_all);
+                        return Err(error.to_string());
+                    }
+                    Ok(result_settings)
                 })
                 .await
                 .unwrap_or_else(|error| Err(error.to_string()))
@@ -1888,6 +1913,22 @@ impl App {
                 .unwrap_or_else(|error| Err(error.to_string()))
             },
             move |result| Message::UpdateChecked { manual, result },
+        )
+    }
+
+    fn reconcile_startup_task(&self) -> Task<Message> {
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+                    Platform
+                        .set_login_startup(&executable, true)
+                        .map_err(|error| error.to_string())
+                })
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()))
+            },
+            Message::StartupReconciled,
         )
     }
 
