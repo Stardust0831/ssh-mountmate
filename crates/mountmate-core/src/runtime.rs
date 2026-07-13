@@ -10,7 +10,9 @@ use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System, UpdateKind};
+use sysinfo::{
+    Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, Signal, System, UpdateKind,
+};
 use thiserror::Error;
 
 use crate::mountpoint::{path_key, system_mountpoint_ready};
@@ -108,6 +110,9 @@ impl ProcessControl for SystemProcessControl {
                 .with_exe(UpdateKind::Always),
         );
         let process = system.process(pid)?;
+        if terminal_process_status(process.status()) {
+            return None;
+        }
         Some(snapshot_from_process(process))
     }
 
@@ -133,6 +138,10 @@ fn snapshot_from_process(process: &sysinfo::Process) -> ProcessSnapshot {
         arguments,
         started_at: process.start_time(),
     }
+}
+
+fn terminal_process_status(status: ProcessStatus) -> bool {
+    matches!(status, ProcessStatus::Dead | ProcessStatus::Zombie)
 }
 
 fn signal_verified_process(state: &MountState, windows: bool, force: bool) -> Result<bool, String> {
@@ -671,6 +680,14 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn dead_and_zombie_processes_are_terminal() {
+        assert!(terminal_process_status(ProcessStatus::Dead));
+        assert!(terminal_process_status(ProcessStatus::Zombie));
+        assert!(!terminal_process_status(ProcessStatus::Run));
+        assert!(!terminal_process_status(ProcessStatus::Sleep));
+    }
 
     struct FakeProcesses {
         snapshots: RefCell<VecDeque<Option<ProcessSnapshot>>>,
