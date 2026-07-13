@@ -113,6 +113,21 @@ jobs:
       - name: Linux GUI dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dri libgtk-3-dev libayatana-appindicator3-dev zip xvfb openbox dbus-x11 fuse3 jq kmod openssh-client
+      - name: Install verified FUSE-T for macOS mount integration
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          FUSE_T_VERSION: 1.2.7
+          FUSE_T_SHA256: 6a29c747e61a86a405a189efc3de42812d73147135f93a1bb0624c1e7b90e654
+        run: |
+          set -euo pipefail
+          package="fuse-t-macos-installer-${FUSE_T_VERSION}.pkg"
+          curl --fail --location --silent --show-error \
+            "https://github.com/macos-fuse-t/fuse-t/releases/download/${FUSE_T_VERSION}/${package}" \
+            --output "${RUNNER_TEMP}/${package}"
+          echo "${FUSE_T_SHA256}  ${RUNNER_TEMP}/${package}" | shasum -a 256 --check
+          sudo installer -pkg "${RUNNER_TEMP}/${package}" -target /
+          test -e /usr/local/lib/libfuse-t.dylib
       - run: cargo test --workspace --all-features
       - run: cargo build --release --package ssh-mountmate
       - name: Smoke-test command-line entry points
@@ -380,6 +395,11 @@ jobs:
         timeout-minutes: 5
         shell: pwsh
         run: ./tests/rust_windows_mount_smoke.ps1 -PackageRoot target/package/SSHMountMate
+      - name: Exercise real SFTP mount, refresh, upload, and unmount
+        if: runner.os == 'macOS'
+        timeout-minutes: 5
+        shell: bash
+        run: bash tests/rust_macos_mount_smoke.sh "target/package/SSH MountMate.app"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
