@@ -80,6 +80,23 @@ jobs:
           target/release/SSHMountMate --version
           target/release/SSHMountMate --help >/dev/null
           target/release/SSHMountMate --licenses >/dev/null
+      - name: Smoke-test Linux file-manager integration
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export HOME="${RUNNER_TEMP}/file-manager-home"
+          export XDG_DATA_HOME="${HOME}/.local/share"
+          target/release/SSHMountMate --register-file-manager-menu
+          test -x "${XDG_DATA_HOME}/nautilus/scripts/SSH MountMate - Refresh"
+          test -f "${XDG_DATA_HOME}/nemo/actions/ssh-mountmate-refresh.nemo_action"
+          test -f "${XDG_DATA_HOME}/kio/servicemenus/ssh-mountmate.desktop"
+          rg --fixed-strings -- '--refresh-path %f' \
+            "${XDG_DATA_HOME}/kio/servicemenus/ssh-mountmate.desktop"
+          target/release/SSHMountMate --unregister-file-manager-menu
+          test ! -e "${XDG_DATA_HOME}/nautilus/scripts/SSH MountMate - Refresh"
+          test ! -e "${XDG_DATA_HOME}/nemo/actions/ssh-mountmate-refresh.nemo_action"
+          test ! -e "${XDG_DATA_HOME}/kio/servicemenus/ssh-mountmate.desktop"
       - name: Smoke-test command-line entry points
         if: runner.os == 'Windows'
         shell: pwsh

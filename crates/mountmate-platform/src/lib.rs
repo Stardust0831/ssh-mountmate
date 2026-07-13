@@ -548,7 +548,26 @@ fn register_file_manager_menu(executable: &Path) -> Result<(), PlatformError> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn register_file_manager_menu(executable: &Path) -> Result<(), PlatformError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = home_directory()?;
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/share"));
+    for entry in linux_file_manager_entries(&data_home, executable)? {
+        mountmate_core::storage::atomic_write(&entry.path, entry.content.as_bytes())
+            .map_err(|error| PlatformError::Failed(error.to_string()))?;
+        if entry.executable {
+            std::fs::set_permissions(&entry.path, std::fs::Permissions::from_mode(0o700))
+                .map_err(|error| PlatformError::Failed(error.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
 fn register_file_manager_menu(_executable: &Path) -> Result<(), PlatformError> {
     Err(PlatformError::Unsupported("file-manager integration"))
 }
@@ -574,9 +593,91 @@ fn unregister_file_manager_menu() -> Result<(), PlatformError> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn unregister_file_manager_menu() -> Result<(), PlatformError> {
+    let home = home_directory()?;
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/share"));
+    for entry in linux_file_manager_entries(&data_home, Path::new("/unused"))? {
+        remove_if_present(&entry.path)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
 fn unregister_file_manager_menu() -> Result<(), PlatformError> {
     Err(PlatformError::Unsupported("file-manager integration"))
+}
+
+#[cfg(any(target_os = "linux", test))]
+struct LinuxFileManagerEntry {
+    path: std::path::PathBuf,
+    content: String,
+    executable: bool,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_file_manager_entries(
+    data_home: &Path,
+    executable: &Path,
+) -> Result<Vec<LinuxFileManagerEntry>, PlatformError> {
+    let executable = executable
+        .to_str()
+        .ok_or_else(|| PlatformError::Failed("file-manager executable path is not UTF-8".into()))?;
+    let shell_executable = shell_single_quote(executable);
+    let desktop_executable = desktop_exec_argument(executable);
+    let refresh_script = format!(
+        "#!/bin/sh\nset -eu\nselected=${{NAUTILUS_SCRIPT_SELECTED_FILE_PATHS:-${{NEMO_SCRIPT_SELECTED_FILE_PATHS:-}}}}\nif [ -n \"$selected\" ]; then\n  path=$(printf '%s\\n' \"$selected\" | head -n 1)\nelse\n  path=$PWD\nfi\nexec {shell_executable} --refresh-path \"$path\"\n"
+    );
+    let transfers_script =
+        format!("#!/bin/sh\nset -eu\nexec {shell_executable} --show-transfers\n");
+    let nemo_refresh = format!(
+        "[Nemo Action]\nName=Refresh with SSH MountMate\nComment=Refresh the selected mounted directory\nExec={desktop_executable} --refresh-path %P\nSelection=any\nExtensions=dir;\n"
+    );
+    let nemo_transfers = format!(
+        "[Nemo Action]\nName=Open SSH MountMate transfers\nExec={desktop_executable} --show-transfers\nSelection=any\nExtensions=dir;\n"
+    );
+    let dolphin = format!(
+        "[Desktop Entry]\nType=Service\nMimeType=inode/directory;\nActions=SSHMountMateRefresh;SSHMountMateTransfers;\nX-KDE-ServiceTypes=KonqPopupMenu/Plugin\n\n[Desktop Action SSHMountMateRefresh]\nName=Refresh with SSH MountMate\nExec={desktop_executable} --refresh-path %f\n\n[Desktop Action SSHMountMateTransfers]\nName=Open SSH MountMate transfers\nExec={desktop_executable} --show-transfers\n"
+    );
+    let mut entries = Vec::new();
+    for manager in ["nautilus", "nemo"] {
+        let scripts = data_home.join(manager).join("scripts");
+        entries.push(LinuxFileManagerEntry {
+            path: scripts.join("SSH MountMate - Refresh"),
+            content: refresh_script.clone(),
+            executable: true,
+        });
+        entries.push(LinuxFileManagerEntry {
+            path: scripts.join("SSH MountMate - Transfers"),
+            content: transfers_script.clone(),
+            executable: true,
+        });
+    }
+    entries.push(LinuxFileManagerEntry {
+        path: data_home.join("nemo/actions/ssh-mountmate-refresh.nemo_action"),
+        content: nemo_refresh,
+        executable: false,
+    });
+    entries.push(LinuxFileManagerEntry {
+        path: data_home.join("nemo/actions/ssh-mountmate-transfers.nemo_action"),
+        content: nemo_transfers,
+        executable: false,
+    });
+    for directory in ["kio/servicemenus", "kservices5/ServiceMenus"] {
+        entries.push(LinuxFileManagerEntry {
+            path: data_home.join(directory).join("ssh-mountmate.desktop"),
+            content: dolphin.clone(),
+            executable: false,
+        });
+    }
+    Ok(entries)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 #[cfg(windows)]
@@ -775,5 +876,36 @@ mod tests {
             desktop_exec_argument("/home/user/SSH MountMate/bin/$current"),
             r#""/home/user/SSH MountMate/bin/\$current""#
         );
+    }
+
+    #[test]
+    fn linux_file_manager_entries_cover_major_desktops_and_quote_paths() {
+        let data = Path::new("/home/user/.local/share");
+        let executable = Path::new("/opt/SSH MountMate/user's/SSHMountMate");
+        let entries = linux_file_manager_entries(data, executable).unwrap();
+
+        assert_eq!(entries.len(), 8);
+        assert!(entries.iter().any(|entry| {
+            entry
+                .path
+                .ends_with("nautilus/scripts/SSH MountMate - Refresh")
+                && entry.executable
+                && entry
+                    .content
+                    .contains("exec '/opt/SSH MountMate/user'\"'\"'s/SSHMountMate' --refresh-path")
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry
+                .path
+                .ends_with("kio/servicemenus/ssh-mountmate.desktop")
+                && entry
+                    .content
+                    .contains("Exec=\"/opt/SSH MountMate/user's/SSHMountMate\" --refresh-path %f")
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry
+                .path
+                .ends_with("nemo/actions/ssh-mountmate-refresh.nemo_action")
+        }));
     }
 }
