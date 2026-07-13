@@ -3216,7 +3216,7 @@ fn format_bytes(bytes: u64) -> String {
 fn application_root() -> PathBuf {
     std::env::current_exe()
         .ok()
-        .and_then(|path| path.parent().map(Path::to_owned))
+        .map(|path| mountmate_core::rclone_binary::application_root(&path))
         .unwrap_or_else(|| PathBuf::from("."))
 }
 

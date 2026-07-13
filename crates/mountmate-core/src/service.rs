@@ -67,7 +67,7 @@ impl MountService {
     pub fn discover() -> Self {
         let app_root = std::env::current_exe()
             .ok()
-            .and_then(|path| path.parent().map(Path::to_owned))
+            .map(|path| crate::rclone_binary::application_root(&path))
             .unwrap_or_else(|| PathBuf::from("."));
         Self::new(AppPaths::discover(), app_root)
     }

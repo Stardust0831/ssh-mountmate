@@ -99,6 +99,10 @@ pub enum PayloadError {
     AmbiguousDirectoryBundle,
     #[error("the update bundle does not contain the expected executable: {0}")]
     MissingExecutable(PathBuf),
+    #[error("the macOS update bundle is incomplete: {0}")]
+    IncompleteMacApplication(PathBuf),
+    #[error("the update bundle contains a corrupt rclone at {path}: {message}")]
+    CorruptRclone { path: PathBuf, message: String },
     #[error(transparent)]
     Layout(#[from] InstallLayoutError),
 }
@@ -123,8 +127,6 @@ pub enum TransactionPlanError {
 
 #[derive(Debug, Error)]
 pub enum PreparePayloadError {
-    #[error("directory payloads cannot replace a macOS application bundle")]
-    MacApplicationRequiresAppPayload,
     #[error("update transaction paths are not siblings of the current installation")]
     InvalidTransactionPaths,
     #[error("update staging path already exists: {0}")]
@@ -284,9 +286,6 @@ pub fn prepare_directory_payload(
 ) -> Result<PreparedPayload, PreparePayloadError> {
     validate_transaction_paths(layout, transaction)?;
     match layout.kind {
-        InstallKind::MacApplicationBundle => {
-            Err(PreparePayloadError::MacApplicationRequiresAppPayload)
-        }
         InstallKind::StandaloneExecutable => {
             let executable_sha256 = copy_standalone_payload(payload, &transaction.prepared)?;
             Ok(PreparedPayload {
@@ -295,7 +294,7 @@ pub fn prepare_directory_payload(
                 executable_sha256,
             })
         }
-        InstallKind::DirectoryBundle => {
+        InstallKind::DirectoryBundle | InstallKind::MacApplicationBundle => {
             let source_metadata = safe_source_metadata(&payload.root)?;
             if !source_metadata.is_dir() {
                 return Err(PreparePayloadError::UnsafeEntry(payload.root.clone()));
@@ -459,7 +458,10 @@ fn rebase_path(root: &Path, relative: &Path) -> PathBuf {
 }
 
 fn transaction_name_parts(name: &str, kind: InstallKind, phase: &str) -> (String, String) {
-    if kind == InstallKind::StandaloneExecutable {
+    if matches!(
+        kind,
+        InstallKind::StandaloneExecutable | InstallKind::MacApplicationBundle
+    ) {
         let path = Path::new(name);
         if let (Some(stem), Some(extension)) = (
             path.file_stem().and_then(|value| value.to_str()),
@@ -549,8 +551,7 @@ fn validate_prepared_payload(
         })?;
     let expected_type = match kind {
         InstallKind::StandaloneExecutable => metadata.is_file(),
-        InstallKind::DirectoryBundle => metadata.is_dir(),
-        InstallKind::MacApplicationBundle => return Err(ApplyUpdateError::InvalidTransaction),
+        InstallKind::DirectoryBundle | InstallKind::MacApplicationBundle => metadata.is_dir(),
     };
     if metadata.file_type().is_symlink() || !expected_type {
         return Err(ApplyUpdateError::InvalidPreparedPayload(
@@ -574,7 +575,10 @@ fn validate_prepared_payload(
             prepared.executable.clone(),
         ));
     }
-    if kind == InstallKind::DirectoryBundle {
+    if matches!(
+        kind,
+        InstallKind::DirectoryBundle | InstallKind::MacApplicationBundle
+    ) {
         let verified = locate_directory_payload(&prepared.replace_path, os)
             .map_err(|_| ApplyUpdateError::InvalidPreparedPayload(prepared.replace_path.clone()))?;
         if verified.root != prepared.replace_path || verified.executable != prepared.executable {
@@ -990,6 +994,9 @@ fn collect_directory_payload_candidate(
     os: &str,
     candidates: &mut Vec<DirectoryPayload>,
 ) -> Result<(), PayloadError> {
+    if os == "macos" && root.extension().is_some_and(|extension| extension == "app") {
+        return collect_mac_application_payload(root, candidates);
+    }
     if directory_bundle_status(root, os)? == DirectoryBundleStatus::NotBundle {
         return Ok(());
     }
@@ -1017,6 +1024,44 @@ fn collect_directory_payload_candidate(
         root: root.to_owned(),
         executable,
     });
+    Ok(())
+}
+
+fn collect_mac_application_payload(
+    root: &Path,
+    candidates: &mut Vec<DirectoryPayload>,
+) -> Result<(), PayloadError> {
+    let root = root
+        .canonicalize()
+        .map_err(|source| PayloadError::Inspect {
+            path: root.to_owned(),
+            source,
+        })?;
+    let executable = root.join("Contents/MacOS/SSHMountMate");
+    let info = root.join("Contents/Info.plist");
+    let rclone = root.join("Contents/Resources/bin/rclone");
+    if !is_regular_file_without_symlink(&executable)
+        || !is_regular_file_without_symlink(&info)
+        || !is_regular_file_without_symlink(&rclone)
+        || !is_regular_file_without_symlink(&rclone.with_file_name("rclone.sha256"))
+    {
+        return Err(PayloadError::IncompleteMacApplication(root));
+    }
+    verify_bundled(&rclone).map_err(|error| PayloadError::CorruptRclone {
+        path: rclone,
+        message: error.to_string(),
+    })?;
+    let executable = executable
+        .canonicalize()
+        .map_err(|source| PayloadError::Inspect {
+            path: executable,
+            source,
+        })?;
+    let layout = detect_install_layout_for(&executable, "macos", Path::new("/private/tmp"))?;
+    if layout.kind != InstallKind::MacApplicationBundle || layout.replace_path != root {
+        return Err(PayloadError::IncompleteMacApplication(root));
+    }
+    candidates.push(DirectoryPayload { root, executable });
     Ok(())
 }
 
@@ -1061,6 +1106,21 @@ mod tests {
             DIRECTORY_BUNDLE_MARKER,
         )
         .unwrap();
+        executable
+    }
+
+    fn create_mac_application(root: &Path, executable_contents: &[u8]) -> PathBuf {
+        let executable = root.join("Contents/MacOS/SSHMountMate");
+        let rclone = root.join("Contents/Resources/bin/rclone");
+        create_file(&executable);
+        fs::write(&executable, executable_contents).unwrap();
+        create_file(&rclone);
+        fs::write(
+            rclone.with_file_name("rclone.sha256"),
+            format!("{:x}", Sha256::digest(b"binary")),
+        )
+        .unwrap();
+        fs::write(root.join("Contents/Info.plist"), b"<?xml version=\"1.0\"?>").unwrap();
         executable
     }
 
@@ -1169,6 +1229,51 @@ mod tests {
             locate_directory_payload(&extracted, "linux"),
             Err(PayloadError::AmbiguousDirectoryBundle)
         ));
+    }
+
+    #[test]
+    fn mac_application_payload_is_discovered_and_rclone_is_verified() {
+        for wrapped in [false, true] {
+            let temp = tempdir().unwrap();
+            let extracted = temp.path().join("extracted");
+            let application = if wrapped {
+                extracted.join("SSH MountMate.app")
+            } else {
+                extracted.with_extension("app")
+            };
+            fs::create_dir_all(&extracted).unwrap();
+            let executable = create_mac_application(&application, b"new application");
+
+            let payload =
+                locate_directory_payload(if wrapped { &extracted } else { &application }, "macos")
+                    .unwrap();
+
+            assert_eq!(payload.root, application.canonicalize().unwrap());
+            assert_eq!(payload.executable, executable.canonicalize().unwrap());
+        }
+    }
+
+    #[test]
+    fn mac_application_payload_is_staged_swapped_and_rolled_back_as_one_bundle() {
+        let temp = tempdir().unwrap();
+        let installed = temp.path().join("SSH MountMate.app");
+        let installed_executable = create_mac_application(&installed, b"old application");
+        let layout =
+            detect_install_layout_for(&installed_executable, "macos", temp.path()).unwrap();
+        let extracted = temp.path().join("update/SSH MountMate.app");
+        create_mac_application(&extracted, b"new application");
+        let payload = locate_directory_payload(&extracted, "macos").unwrap();
+        let transaction = plan_transaction_paths(&layout).unwrap();
+
+        let prepared = prepare_directory_payload(&layout, &payload, &transaction, "macos").unwrap();
+        assert_eq!(prepared.replace_path.extension().unwrap(), "app");
+        let applied =
+            apply_prepared_update_for(&layout, &prepared, &transaction, "macos", temp.path())
+                .unwrap();
+        assert_eq!(fs::read(&applied.executable).unwrap(), b"new application");
+
+        rollback_applied_update(&applied).unwrap();
+        assert_eq!(fs::read(installed_executable).unwrap(), b"old application");
     }
 
     #[test]

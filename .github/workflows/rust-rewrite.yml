@@ -164,6 +164,25 @@ jobs:
             Set-Content -NoNewline target/release/bin/rclone.exe.sha256
           Copy-Item THIRD_PARTY_NOTICES.md, licenses/rclone-COPYING.txt, licenses/rfd-LICENSE.txt, licenses/sys-locale-LICENSE-MIT.txt, licenses/tray-icon-LICENSE-MIT.txt, licenses/windows-LICENSE-MIT.txt, licenses/notify-rust-LICENSE-MIT.txt, licenses/tauri-winrt-notification-LICENSE-MIT.txt, licenses/semver-LICENSE-MIT.txt, licenses/zip-LICENSE-MIT.txt, licenses/rustix-LICENSE-MIT.txt target/release/
           Copy-Item distribution/SSHMountMate.install-layout target/release/
+      - name: Assemble and verify macOS application bundle
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="target/package/SSH MountMate.app"
+          contents="${app}/Contents"
+          mkdir -p "${contents}/MacOS" "${contents}/Resources/bin" "${contents}/Resources/licenses"
+          cp target/release/SSHMountMate "${contents}/MacOS/SSHMountMate"
+          cp target/release/bin/rclone target/release/bin/rclone.sha256 "${contents}/Resources/bin/"
+          cp THIRD_PARTY_NOTICES.md licenses/*.txt "${contents}/Resources/licenses/"
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          sed -e "s/@VERSION@/${version}/g" -e "s/@BUILD_VERSION@/${GITHUB_RUN_NUMBER}/g" \
+            distribution/macos/Info.plist > "${contents}/Info.plist"
+          chmod 755 "${contents}/MacOS/SSHMountMate" "${contents}/Resources/bin/rclone"
+          plutil -lint "${contents}/Info.plist"
+          codesign --force --deep --sign - "${app}"
+          codesign --verify --deep --strict --verbose=2 "${app}"
+          "${contents}/MacOS/SSHMountMate" --version
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
@@ -186,4 +205,5 @@ jobs:
             target/release/zip-LICENSE-MIT.txt
             target/release/rustix-LICENSE-MIT.txt
             target/release/SSHMountMate.install-layout
+            target/package/SSH MountMate.app
           if-no-files-found: error

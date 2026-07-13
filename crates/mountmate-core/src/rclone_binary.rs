@@ -126,11 +126,25 @@ pub fn resolve_rclone(
     Ok(None)
 }
 
-pub fn bundled_candidates(app_root: &Path, windows: bool) -> [PathBuf; 2] {
+pub fn application_root(executable: &Path) -> PathBuf {
+    let parent = executable.parent().unwrap_or_else(|| Path::new("."));
+    if parent.file_name().is_some_and(|name| name == "MacOS")
+        && parent
+            .parent()
+            .is_some_and(|contents| contents.file_name().is_some_and(|name| name == "Contents"))
+    {
+        parent.parent().unwrap().to_owned()
+    } else {
+        parent.to_owned()
+    }
+}
+
+pub fn bundled_candidates(app_root: &Path, windows: bool) -> [PathBuf; 3] {
     let binary = binary_name(windows);
     [
         app_root.join("bin").join(binary),
         app_root.join("resources").join("bin").join(binary),
+        app_root.join("Resources").join("bin").join(binary),
     ]
 }
 
@@ -366,6 +380,18 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn mac_application_resources_are_resolved_from_contents() {
+        let executable = Path::new("/Applications/SSH MountMate.app/Contents/MacOS/SSHMountMate");
+        let root = application_root(executable);
+
+        assert_eq!(
+            root,
+            PathBuf::from("/Applications/SSH MountMate.app/Contents")
+        );
+        assert!(bundled_candidates(&root, false).contains(&root.join("Resources/bin/rclone")));
+    }
 
     fn paths(root: &Path) -> AppPaths {
         AppPaths {
