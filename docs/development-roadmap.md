@@ -98,6 +98,14 @@ Planned design constraints:
 - Release-workflow review found that `publish=false` skipped the complete release aggregation job,
   including twelve-asset validation. The aggregation and checksum verification now run for dry
   runs; only the GitHub Release creation step is conditional on tag publication or `publish=true`.
+- Run [29260504687](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29260504687)
+  passed quality and all six native rewrite jobs on commit `5db0968`.
+- The first complete release dry run
+  [29262384073](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29262384073) passed quality
+  and all six build/lifecycle jobs. Its aggregation job proved all twelve expected ZIPs existed,
+  then exposed a checksum working-directory bug: `SHA256SUMS.txt` contained asset basenames but was
+  checked from the repository root. Checksum verification now executes inside `release-assets/`;
+  a replacement dry run is required and no release was created.
 
 ## Release decisions
 

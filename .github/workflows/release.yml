@@ -480,7 +480,7 @@ jobs:
           done
           test "$(find release-assets -maxdepth 1 -name 'SSHMountMate-*.zip' | wc -l)" -eq 12
           (cd release-assets && sha256sum SSHMountMate-*.zip > SHA256SUMS.txt)
-          sha256sum --check release-assets/SHA256SUMS.txt
+          (cd release-assets && sha256sum --check SHA256SUMS.txt)
 
       - name: Create GitHub release
         if: github.event_name == 'push' || inputs.publish
