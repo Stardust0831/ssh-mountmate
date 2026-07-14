@@ -124,6 +124,14 @@ Cross-platform considerations:
   157 core tests, and the legacy migration test passed for alpha.4. Full local workspace Clippy was
   blocked before compiling the application because this workspace lacks `pkg-config` and GTK system
   development packages; the native CI quality and six-platform jobs remain the authoritative gate.
+- Rewrite run [29323451133](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29323451133)
+  passed quality and all six native Windows, Linux, and macOS x64/ARM64 build and lifecycle jobs on
+  commit `3d1c796`. The first Windows x64 attempt timed out before application initialization in the
+  GUI smoke test; its failed-job rerun passed the GUI, packaged update, and real SFTP lifecycle.
+- Non-publishing release run
+  [29325382751](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29325382751) passed quality,
+  all six native build/lifecycle jobs, exact six-ZIP aggregation, and SHA-256 verification without
+  creating a GitHub Release.
 
 - Audited the settings page for merge readiness. Cache mode and language already use typed dropdown
   choices; connection source, authentication, and transport also remain typed selectors.
