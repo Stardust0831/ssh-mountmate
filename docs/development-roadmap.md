@@ -134,6 +134,12 @@ Cross-platform considerations:
   type checking, shell syntax, all 159 non-network core tests, and legacy migration passed. Native
   GUI linking is unavailable locally because the workspace host lacks GTK libraries; six-platform
   CI remains required. No release was published from this work.
+- Initial native run
+  [29353046627](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29353046627)
+  proved that the Linux x64 application opened one shared popup for two simultaneous connections,
+  then failed in the new window-movement assertion because the script read Openbox geometry
+  immediately after requesting an asynchronous move. The smoke test now polls for the geometry
+  transition with a bounded timeout and reports an explicit failure; a replacement run is required.
 
 ### 2026-07-14
 

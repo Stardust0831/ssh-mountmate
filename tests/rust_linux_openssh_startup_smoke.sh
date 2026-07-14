@@ -261,10 +261,21 @@ popup="${popup_windows[0]}"
 popup_x_before="$(xdotool getwindowgeometry --shell "${popup}" | awk -F= '$1 == "X" { print $2 }')"
 popup_y_before="$(xdotool getwindowgeometry --shell "${popup}" | awk -F= '$1 == "Y" { print $2 }')"
 xdotool windowmove "${popup}" $((popup_x_before - 40)) $((popup_y_before - 40))
-popup_x_after="$(xdotool getwindowgeometry --shell "${popup}" | awk -F= '$1 == "X" { print $2 }')"
-popup_y_after="$(xdotool getwindowgeometry --shell "${popup}" | awk -F= '$1 == "Y" { print $2 }')"
-test "${popup_x_after}" -ne "${popup_x_before}"
-test "${popup_y_after}" -ne "${popup_y_before}"
+popup_moved=false
+for _ in $(seq 1 50); do
+  popup_x_after="$(xdotool getwindowgeometry --shell "${popup}" | awk -F= '$1 == "X" { print $2 }')"
+  popup_y_after="$(xdotool getwindowgeometry --shell "${popup}" | awk -F= '$1 == "Y" { print $2 }')"
+  if [[ "${popup_x_after}" -ne "${popup_x_before}" ]] \
+    && [[ "${popup_y_after}" -ne "${popup_y_before}" ]]; then
+    popup_moved=true
+    break
+  fi
+  sleep 0.1
+done
+if [[ "${popup_moved}" != true ]]; then
+  echo 'shared transfer popup did not move under the window manager' >&2
+  exit 1
+fi
 
 "${binary}" --show-transfers
 for _ in $(seq 1 50); do
