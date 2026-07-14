@@ -6,20 +6,21 @@ until its stated evidence exists.
 
 ## Current sequence
 
-1. Finish the Rust rewrite merge-readiness audit without changing mount backends or server code.
-2. Verify settings UI semantics: enums use selectors, booleans use switches, values show units, and
+1. Publish `v0.4.0-alpha.3` from the merge-ready Rust state after six-platform and six-asset gates.
+2. Keep the completed merge-readiness audit intact without changing mount backends or server code.
+3. Verify settings UI semantics: enums use selectors, booleans use switches, values show units, and
    platform-specific controls are hidden where unsupported.
-3. Re-run format, warnings-denied Clippy, workspace tests, and all six native lifecycle jobs.
-4. Review remaining risks and decide whether draft PR #11 is ready for merge; do not merge solely
+4. Re-run format, warnings-denied Clippy, workspace tests, and all six native lifecycle jobs.
+5. Review remaining risks and decide whether draft PR #11 is ready for merge; do not merge solely
    because a prerelease exists.
-5. Design an optional installed distribution later, with Windows as the first target and portable
+6. Design an optional installed distribution later, with Windows as the first target and portable
    execution retained.
-6. Implement optional macOS `rclone nfsmount` later as an explicit Experimental backend.
-7. Keep macOS FUSE as the migration and UI default; keep Windows WinFsp and Linux FUSE3 unchanged.
-8. Do not promote NFS to the default or publish another NFS-related release until real macOS x64 and ARM64
+7. Implement optional macOS `rclone nfsmount` later as an explicit Experimental backend.
+8. Keep macOS FUSE as the migration and UI default; keep Windows WinFsp and Linux FUSE3 unchanged.
+9. Do not promote NFS to the default or publish another NFS-related release until real macOS x64 and ARM64
    FUSE/NFS lifecycle evidence has been reviewed.
 
-## Prerelease scope: `v0.4.0-alpha.2`
+## Prerelease scope: `v0.4.0-alpha.3`
 
 Included work:
 
@@ -32,6 +33,9 @@ Included work:
 - File-manager responsiveness improvement through the recommended 5-second VFS write-back window.
 - More reliable upload progress by combining VFS queue state with `core/stats` transfer details.
 - Capacity discovery fallback through a non-interactive remote `df -Pk` query.
+- Main-window Mount all/Unmount all controls and a bounded, refreshable, copyable mount-log viewer.
+- Settings switches, typed dropdowns, bilingual value-unit guidance, and explicit platform visibility.
+- User-facing operation status based on connection display names rather than stable internal IDs.
 
 Explicitly excluded:
 
@@ -246,7 +250,7 @@ Cross-platform considerations:
 
 - The Rust rewrite PR remains Draft.
 - No merge is authorized by this document.
-- `v0.4.0-alpha.2` must be a prerelease, not a stable release.
+- `v0.4.0-alpha.3` must be a prerelease, not a stable release.
 - The macOS ARM64 active-upload package-replacement timing race is an explicit alpha exception, not
   evidence that the scenario passed. It must be resolved before a stable release.
 - A failed or incomplete architecture gate blocks publication unless it is replaced by successful
