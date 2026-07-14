@@ -364,12 +364,6 @@ impl<'a> MountRuntime<'a> {
         let process_started_at = spawned_snapshot
             .as_ref()
             .map(|snapshot| snapshot.started_at);
-        let rclone = spawned_snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.arguments.as_ref())
-            .and_then(|arguments| arguments.first())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| request.rclone.to_owned());
         let mut state = MountState {
             pid,
             server_id: server.id.clone(),
@@ -379,7 +373,7 @@ impl<'a> MountRuntime<'a> {
             rc_addr,
             phase: MountPhase::Starting,
             process_started_at,
-            rclone,
+            rclone: request.rclone.to_owned(),
         };
         if let Err(error) = self.save_state(&state) {
             let _ = self.stop_if_owned(&state);
@@ -884,6 +878,41 @@ mod tests {
         let saved: MountState = read_json(&paths.state_file("alpha")).unwrap();
         assert_eq!(saved.phase, MountPhase::Mounted);
         assert!(processes.signals.borrow().is_empty());
+    }
+
+    #[test]
+    fn mount_identity_uses_requested_rclone_during_pre_exec_snapshot_race() {
+        let temp = tempdir().unwrap();
+        let paths = paths(temp.path());
+        let (_, mut pre_exec) = state(
+            temp.path(),
+            Some(vec!["SSHMountMate".into(), "--mount-all".into()]),
+        );
+        pre_exec.started_at = 100;
+        let (_, mounted) = state(temp.path(), Some(matching_arguments(temp.path())));
+        let processes = FakeProcesses::new([Some(pre_exec), Some(mounted)]);
+        let rc = FakeRc {
+            pid: Ok(42),
+            quit_calls: RefCell::new(0),
+        };
+        let mountpoint = FakeMountpoint {
+            ready: RefCell::new(true),
+        };
+        let runtime =
+            MountRuntime::new(&paths, &processes, &rc, &mountpoint).with_options(options());
+
+        let mounted = runtime
+            .mount(MountRequest {
+                server: &server(),
+                settings: &Settings::default(),
+                rclone: Path::new("rclone"),
+                mountpoint: &temp.path().join("mnt"),
+                cache_dir: &temp.path().join("cache"),
+            })
+            .unwrap();
+
+        assert_eq!(mounted.phase, MountPhase::Mounted);
+        assert_eq!(mounted.rclone, Path::new("rclone"));
     }
 
     #[test]

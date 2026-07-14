@@ -110,6 +110,16 @@ Cross-platform considerations:
 
 ### 2026-07-15
 
+- Prepared `v0.4.0-alpha.5` and passed branch run
+  [29356803971](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29356803971)
+  on quality and all six native targets. The first tag run
+  [29357878112](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29357878112)
+  did not publish because Linux x64 failed while starting four concurrent mounts. The failure log
+  captured a pre-`exec` process snapshot whose command still named SSH MountMate; that transient
+  command was incorrectly persisted as the rclone executable and caused ownership validation to
+  reject the child after it executed rclone. Mount state now records the already resolved executable
+  passed to `Command::new`, with a regression test for the pre-`exec` snapshot race. The unpublished
+  tag must not be reused until the corrected commit passes native CI.
 - Investigated reports that refreshing a mounted subdirectory displayed `0` refreshed entries.
   The RC client did execute `vfs/forget` and `vfs/refresh`; the number came from the subsequent
   `operations/list` verification and represented the directory's current direct children, not the
