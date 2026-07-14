@@ -132,6 +132,23 @@ jobs:
           test -e /usr/local/lib/libfuse-t.dylib
       - run: cargo test --workspace --all-features
       - run: cargo build --release --package ssh-mountmate
+
+      - name: Verify Windows execution manifest
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $manifest = Join-Path $env:RUNNER_TEMP 'SSHMountMate.manifest'
+          & mt.exe -nologo "-inputresource:target/release/SSHMountMate.exe;#1" "-out:$manifest"
+          if ($LASTEXITCODE -ne 0) { throw 'could not extract Windows execution manifest' }
+          $content = Get-Content $manifest -Raw
+          if ($content -notmatch 'requestedExecutionLevel' `
+              -or $content -notmatch 'level="asInvoker"' `
+              -or $content -notmatch 'uiAccess="false"') {
+            throw "Windows executable is missing an explicit asInvoker manifest`n$content"
+          }
+          if ($content -match 'requireAdministrator|highestAvailable') {
+            throw "Windows executable unexpectedly requests elevation`n$content"
+          }
       - name: Smoke-test command-line entry points
         if: runner.os != 'Windows'
         shell: bash

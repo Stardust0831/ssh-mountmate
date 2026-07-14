@@ -315,7 +315,7 @@ pub fn materialize_update_helper(
     })?;
     let suffix = if cfg!(windows) { ".exe" } else { "" };
     let target = helper_directory.join(format!(
-        "SSHMountMate-updater-{}{}",
+        "SSHMountMate-helper-{}{}",
         &expected_digest[..16],
         suffix
     ));
@@ -328,7 +328,7 @@ pub fn materialize_update_helper(
     }
 
     let temporary = helper_directory.join(format!(
-        ".SSHMountMate-updater-{}{}",
+        ".SSHMountMate-helper-{}{}",
         Uuid::new_v4().simple(),
         suffix
     ));
@@ -1224,6 +1224,13 @@ mod tests {
         let second = materialize_update_helper(&helper_directory, &source).unwrap();
 
         assert_eq!(first, second);
+        assert!(
+            first
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("SSHMountMate-helper-")
+        );
         assert_eq!(fs::read(&first).unwrap(), b"helper executable");
         assert_ne!(first, source);
 

@@ -6,7 +6,8 @@ until its stated evidence exists.
 
 ## Current sequence
 
-1. Keep published prerelease `v0.4.0-alpha.5` as the verified six-platform baseline.
+1. Publish `v0.4.0-alpha.6` only after its Windows manifest, update-helper, quality, and six native
+   release jobs pass; keep `v0.4.0-alpha.5` available until then.
 2. Keep the completed merge-readiness audit intact without changing mount backends or server code.
 3. Review remaining risks and decide whether draft PR #11 is ready for merge; do not merge solely
    because a prerelease exists.
@@ -17,7 +18,7 @@ until its stated evidence exists.
 7. Do not promote NFS to the default or publish another NFS-related release until real macOS x64 and ARM64
    FUSE/NFS lifecycle evidence has been reviewed.
 
-## Prerelease scope: `v0.4.0-alpha.5`
+## Prerelease scope: `v0.4.0-alpha.6`
 
 Included work:
 
@@ -109,6 +110,15 @@ Cross-platform considerations:
 
 ### 2026-07-15
 
+- Investigated Windows self-update failure `os error 740` while an alpha.4 process attempted to
+  launch its detached helper. The helper is a byte-for-byte copy of the running application, but
+  its `SSHMountMate-updater-*` filename triggered Windows Installer Detection because the PE had no
+  explicit requested-execution-level manifest. Desktop Windows therefore treated it as requiring
+  elevation, while GitHub runners did not reproduce the UAC heuristic. The Windows MSVC build now
+  embeds an explicit `asInvoker` manifest, the helper uses the neutral `SSHMountMate-helper-*` name,
+  and both native workflows extract the PE manifest and reject missing or elevated execution levels.
+  Alpha.4 and alpha.5 cannot apply this fix before launching their old helper, so one manual install
+  of alpha.6 is required before later prerelease self-updates can use the corrected path.
 - Prepared `v0.4.0-alpha.5` and passed branch run
   [29356803971](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29356803971)
   on quality and all six native targets. The first tag run
