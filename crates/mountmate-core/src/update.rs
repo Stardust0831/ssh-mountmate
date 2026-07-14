@@ -16,8 +16,8 @@ use url::Url;
 use zip::ZipArchive;
 
 const REPOSITORY: &str = "Stardust0831/ssh-mountmate";
-const LATEST_RELEASE_API: &str =
-    "https://api.github.com/repos/Stardust0831/ssh-mountmate/releases/latest";
+const RELEASES_API: &str =
+    "https://api.github.com/repos/Stardust0831/ssh-mountmate/releases?per_page=100";
 const LATEST_RELEASE_PAGE: &str = "https://github.com/Stardust0831/ssh-mountmate/releases/latest";
 const DEFAULT_DOWNLOAD_LIMIT: u64 = 512 * 1024 * 1024;
 const MAX_ARCHIVE_FILES: usize = 20_000;
@@ -57,6 +57,10 @@ struct GithubRelease {
     html_url: String,
     #[serde(default)]
     body: String,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
     #[serde(default)]
     assets: Vec<ReleaseAsset>,
 }
@@ -202,15 +206,18 @@ fn parse_version(value: &str) -> Result<Version, UpdateError> {
 
 pub fn check_for_updates(current_version: &str) -> Result<UpdateInfo, UpdateError> {
     let client = update_client(Duration::from_secs(8))?;
-    match fetch_latest_release(&client) {
+    match fetch_releases(&client).and_then(|releases| {
+        select_release_for_channel(current_version, releases).map_err(|error| error.to_string())
+    }) {
         Ok(release) => update_info_from_release(current_version, release),
-        Err(api_error) => {
+        Err(api_error) if !current_is_prerelease(current_version)? => {
             fetch_latest_release_redirect(&client, current_version).map_err(|error| {
                 UpdateError::Request(format!(
                     "{api_error}; latest-release fallback failed: {error}"
                 ))
             })
         }
+        Err(api_error) => Err(UpdateError::Request(api_error)),
     }
 }
 
@@ -242,9 +249,9 @@ fn trusted_update_url(url: &Url) -> bool {
         )
 }
 
-fn fetch_latest_release(client: &Client) -> Result<GithubRelease, String> {
+fn fetch_releases(client: &Client) -> Result<Vec<GithubRelease>, String> {
     let response = client
-        .get(LATEST_RELEASE_API)
+        .get(RELEASES_API)
         .header(ACCEPT, "application/vnd.github+json")
         .header(USER_AGENT, "SSHMountMate-update-check")
         .send()
@@ -252,6 +259,31 @@ fn fetch_latest_release(client: &Client) -> Result<GithubRelease, String> {
         .error_for_status()
         .map_err(|error| error.to_string())?;
     response.json().map_err(|error| error.to_string())
+}
+
+fn current_is_prerelease(current_version: &str) -> Result<bool, UpdateError> {
+    Ok(!parse_version(current_version)?.pre.is_empty())
+}
+
+fn select_release_for_channel(
+    current_version: &str,
+    releases: Vec<GithubRelease>,
+) -> Result<GithubRelease, UpdateError> {
+    let include_prereleases = current_is_prerelease(current_version)?;
+    let mut candidates = releases
+        .into_iter()
+        .filter(|release| !release.draft)
+        .filter_map(|release| {
+            let version = parse_version(&release.tag_name).ok()?;
+            let is_prerelease = release.prerelease || !version.pre.is_empty();
+            (include_prereleases || !is_prerelease).then_some((version, release))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
+    candidates
+        .pop()
+        .map(|(_, release)| release)
+        .ok_or(UpdateError::MissingReleaseTag)
 }
 
 fn update_info_from_release(
@@ -638,6 +670,18 @@ mod tests {
         }
     }
 
+    fn release(tag: &str, prerelease: bool, draft: bool) -> GithubRelease {
+        GithubRelease {
+            tag_name: tag.into(),
+            name: String::new(),
+            html_url: String::new(),
+            body: String::new(),
+            draft,
+            prerelease,
+            assets: Vec::new(),
+        }
+    }
+
     fn write_zip(path: &Path, write: impl FnOnce(&mut ZipWriter<File>)) {
         let file = File::create(path).unwrap();
         let mut writer = ZipWriter::new(file);
@@ -671,6 +715,47 @@ mod tests {
         assert!(compare_versions("v0.4.0-rc.10", "v0.4.0").unwrap().is_lt());
         assert!(compare_versions("1", "1.0.0").unwrap().is_eq());
         assert!(compare_versions("1.2", "1.2.1").unwrap().is_lt());
+    }
+
+    #[test]
+    fn prerelease_channel_selects_the_highest_published_version() {
+        let selected = select_release_for_channel(
+            "v0.4.0-alpha.1",
+            vec![
+                release("v0.4.0-alpha.2", true, false),
+                release("v0.4.0-alpha.3", true, false),
+                release("v9.0.0-alpha.1", true, true),
+            ],
+        )
+        .unwrap();
+        assert_eq!(selected.tag_name, "v0.4.0-alpha.3");
+    }
+
+    #[test]
+    fn stable_channel_ignores_prereleases_and_prerelease_tags() {
+        let selected = select_release_for_channel(
+            "v0.4.0",
+            vec![
+                release("v0.5.0-alpha.1", true, false),
+                release("v0.5.0-beta.1", false, false),
+                release("v0.4.1", false, false),
+            ],
+        )
+        .unwrap();
+        assert_eq!(selected.tag_name, "v0.4.1");
+    }
+
+    #[test]
+    fn prerelease_channel_can_promote_to_a_newer_stable_release() {
+        let selected = select_release_for_channel(
+            "v0.4.0-rc.2",
+            vec![
+                release("v0.4.0-rc.3", true, false),
+                release("v0.4.0", false, false),
+            ],
+        )
+        .unwrap();
+        assert_eq!(selected.tag_name, "v0.4.0");
     }
 
     #[test]
@@ -730,6 +815,8 @@ mod tests {
             name: String::new(),
             html_url: String::new(),
             body: String::new(),
+            draft: false,
+            prerelease: false,
             assets: vec![ReleaseAsset {
                 name: expected_name,
                 url: format!(

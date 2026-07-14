@@ -6,7 +6,8 @@ until its stated evidence exists.
 
 ## Current sequence
 
-1. Publish `v0.4.0-alpha.3` from the merge-ready Rust state after six-platform and six-asset gates.
+1. Publish `v0.4.0-alpha.4` after the update-channel and host-key selection fixes pass six-platform
+   and six-asset gates.
 2. Keep the completed merge-readiness audit intact without changing mount backends or server code.
 3. Verify settings UI semantics: enums use selectors, booleans use switches, values show units, and
    platform-specific controls are hidden where unsupported.
@@ -20,7 +21,7 @@ until its stated evidence exists.
 9. Do not promote NFS to the default or publish another NFS-related release until real macOS x64 and ARM64
    FUSE/NFS lifecycle evidence has been reviewed.
 
-## Prerelease scope: `v0.4.0-alpha.3`
+## Prerelease scope: `v0.4.0-alpha.4`
 
 Included work:
 
@@ -36,6 +37,8 @@ Included work:
 - Main-window Mount all/Unmount all controls and a bounded, refreshable, copyable mount-log viewer.
 - Settings switches, typed dropdowns, bilingual value-unit guidance, and explicit platform visibility.
 - User-facing operation status based on connection display names rather than stable internal IDs.
+- Prerelease-aware update selection, with strict stable-channel exclusion of preview releases.
+- Target-aware known-hosts fallback that can use an existing matching user SSH host key.
 
 Explicitly excluded:
 
@@ -105,6 +108,22 @@ Cross-platform considerations:
 ## Work log
 
 ### 2026-07-14
+
+- Diagnosed a reported alpha.3 mount failure. Historical `--links` errors ended once symlink support
+  was enabled; the current failure was `knownhosts: key is unknown`. The managed known-hosts file
+  contained only an unrelated host, while the user's default known-hosts file already contained the
+  requested `154.44.25.21:61316` key. The endpoint was reachable, but a fresh keyscan returned no
+  keys, so disabling validation or silently trusting a key was rejected.
+- Changed native SFTP known-hosts fallback to prefer a file with an explicit target host/port match,
+  while retaining OpenSSH hashed-host compatibility when no plaintext match can be established.
+- Added separate update channels: prerelease builds select the highest published non-draft semantic
+  version, including prereleases and later stable versions; stable builds exclude both GitHub-marked
+  prereleases and tags with prerelease suffixes. Alpha.3 requires one manual update because its old
+  updater cannot discover prereleases.
+- Focused update-channel and known-hosts regression tests passed. Core warnings-denied Clippy, all
+  157 core tests, and the legacy migration test passed for alpha.4. Full local workspace Clippy was
+  blocked before compiling the application because this workspace lacks `pkg-config` and GTK system
+  development packages; the native CI quality and six-platform jobs remain the authoritative gate.
 
 - Audited the settings page for merge readiness. Cache mode and language already use typed dropdown
   choices; connection source, authentication, and transport also remain typed selectors.
@@ -270,7 +289,7 @@ Cross-platform considerations:
 
 - The Rust rewrite PR remains Draft.
 - No merge is authorized by this document.
-- `v0.4.0-alpha.3` must be a prerelease, not a stable release.
+- `v0.4.0-alpha.4` must be a prerelease, not a stable release.
 - The macOS ARM64 active-upload package-replacement timing race is an explicit alpha exception, not
   evidence that the scenario passed. It must be resolved before a stable release.
 - A failed or incomplete architecture gate blocks publication unless it is replaced by successful

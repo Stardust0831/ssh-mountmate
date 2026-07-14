@@ -25,8 +25,8 @@ use crate::runtime::{
 };
 use crate::ssh::{
     KnownHostsManager, RequestedTransport, ResolvedSshConfig, SshError, SshTransport,
-    choose_transport, list_ssh_config_hosts, readable_file, resolve_ssh_config,
-    select_readable_known_hosts,
+    choose_transport, known_hosts_marker, list_ssh_config_hosts, resolve_ssh_config,
+    select_known_hosts_for_marker,
 };
 use crate::storage::{StorageError, read_json};
 use crate::transfer::TransferSnapshot;
@@ -299,11 +299,17 @@ impl MountService {
         let manager = KnownHostsManager::new(&self.paths);
         match manager.pin_first_seen(Path::new("ssh-keyscan"), host, port) {
             Ok(Some(path)) => Ok(Some(path)),
-            Ok(None) => Ok(fallback_known_hosts(&self.paths, resolved, &default)),
+            Ok(None) => Ok(fallback_known_hosts(
+                &self.paths,
+                resolved,
+                &default,
+                host,
+                port,
+            )),
             Err(error @ (SshError::InvalidHost(_) | SshError::InvalidPort(_))) => {
                 Err(ServiceError::Ssh(error))
             }
-            Err(error) => fallback_known_hosts(&self.paths, resolved, &default)
+            Err(error) => fallback_known_hosts(&self.paths, resolved, &default, host, port)
                 .map(Some)
                 .ok_or(ServiceError::Ssh(error)),
         }
@@ -414,10 +420,14 @@ fn fallback_known_hosts(
     paths: &AppPaths,
     resolved: Option<&ResolvedSshConfig>,
     default: &Path,
+    host: &str,
+    port: &str,
 ) -> Option<PathBuf> {
-    resolved.map_or_else(
-        || readable_file(&paths.known_hosts()).or_else(|| readable_file(default)),
-        |config| select_readable_known_hosts(Some(&paths.known_hosts()), config, default),
+    select_known_hosts_for_marker(
+        Some(&paths.known_hosts()),
+        resolved,
+        default,
+        &known_hosts_marker(host, port),
     )
 }
 

@@ -2479,13 +2479,15 @@ dependencies = [
 
 [[package]]
 name = "mountmate-core"
-version = "0.4.0-alpha.3"
+version = "0.4.0-alpha.4"
 dependencies = [
+ "base64",
  "configparser",
  "directories",
  "fs2",
  "glob",
  "reqwest",
+ "ring",
  "rustix 1.1.4",
  "semver",
  "serde",
@@ -2503,7 +2505,7 @@ dependencies = [
 
 [[package]]
 name = "mountmate-platform"
-version = "0.4.0-alpha.3"
+version = "0.4.0-alpha.4"
 dependencies = [
  "mountmate-core",
  "notify-rust",
@@ -4209,7 +4211,7 @@ dependencies = [
 
 [[package]]
 name = "ssh-mountmate"
-version = "0.4.0-alpha.3"
+version = "0.4.0-alpha.4"
 dependencies = [
  "async-channel",
  "gtk",

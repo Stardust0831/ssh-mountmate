@@ -5,10 +5,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use base64::Engine;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
 use glob::glob;
+use ring::hmac;
 use thiserror::Error;
 use wait_timeout::ChildExt;
 
@@ -758,6 +760,86 @@ pub fn select_readable_known_hosts(
         .or_else(|| readable_file(default))
 }
 
+pub fn select_known_hosts_for_marker(
+    managed: Option<&Path>,
+    resolved: Option<&ResolvedSshConfig>,
+    default: &Path,
+    marker: &str,
+) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = managed.and_then(readable_file) {
+        candidates.push(path);
+    }
+    if let Some(config) = resolved {
+        candidates.extend(
+            config
+                .all("userknownhostsfile")
+                .iter()
+                .flat_map(|value| split_ssh_words(value))
+                .map(|value| expand_home(&value))
+                .filter_map(|path| readable_file(&path)),
+        );
+    }
+    if let Some(path) = readable_file(default) {
+        candidates.push(path);
+    }
+
+    candidates
+        .iter()
+        .find(|path| known_hosts_file_contains_marker(path, marker))
+        .cloned()
+        .or_else(|| {
+            candidates
+                .into_iter()
+                .find(|path| known_hosts_file_contains_hashed_marker(path, marker))
+        })
+}
+
+fn known_hosts_file_contains_marker(path: &Path, marker: &str) -> bool {
+    fs::read_to_string(path).is_ok_and(|content| {
+        content
+            .lines()
+            .any(|line| known_hosts_line_matches(line, marker))
+    })
+}
+
+fn known_hosts_file_contains_hashed_marker(path: &Path, marker: &str) -> bool {
+    fs::read_to_string(path).is_ok_and(|content| {
+        content.lines().any(|line| {
+            let mut parts = line.split_whitespace();
+            let first = parts.next();
+            let hosts = if first.is_some_and(|value| value.starts_with('@')) {
+                parts.next()
+            } else {
+                first
+            };
+            hosts.is_some_and(|hosts| {
+                hosts
+                    .split(',')
+                    .any(|host| hashed_host_matches(host, marker))
+            })
+        })
+    })
+}
+
+fn hashed_host_matches(value: &str, marker: &str) -> bool {
+    let Some(value) = value.strip_prefix("|1|") else {
+        return false;
+    };
+    let Some((encoded_salt, encoded_tag)) = value.split_once('|') else {
+        return false;
+    };
+    let engine = base64::engine::general_purpose::STANDARD;
+    let Ok(salt) = engine.decode(encoded_salt) else {
+        return false;
+    };
+    let Ok(tag) = engine.decode(encoded_tag) else {
+        return false;
+    };
+    let key = hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, &salt);
+    hmac::verify(&key, marker.as_bytes(), &tag).is_ok()
+}
+
 pub fn readable_file(path: &Path) -> Option<PathBuf> {
     let metadata = path.metadata().ok()?;
     if !metadata.is_file() {
@@ -994,6 +1076,53 @@ mod tests {
             select_readable_known_hosts(Some(&managed), &config, &fallback),
             Some(fallback)
         );
+    }
+
+    #[test]
+    fn unrelated_managed_keys_do_not_hide_a_matching_default_key() {
+        let temp = tempdir().unwrap();
+        let managed = temp.path().join("managed");
+        let default = temp.path().join("default");
+        fs::write(&managed, "[other.example]:2200 ssh-ed25519 AAAAOTHER\n").unwrap();
+        fs::write(&default, "[target.example]:2200 ssh-ed25519 AAAATARGET\n").unwrap();
+
+        assert_eq!(
+            select_known_hosts_for_marker(Some(&managed), None, &default, "[target.example]:2200"),
+            Some(default)
+        );
+    }
+
+    #[test]
+    fn hashed_hosts_remain_eligible_when_no_plaintext_marker_matches() {
+        let temp = tempdir().unwrap();
+        let managed = temp.path().join("managed");
+        fs::write(
+            &managed,
+            "|1|c2FsdA==|mF58uSfHH9jfpQnmp1eRRf3z0VY= ssh-ed25519 AAAAHASHED\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            select_known_hosts_for_marker(
+                Some(&managed),
+                None,
+                &temp.path().join("missing"),
+                "[target.example]:2200"
+            ),
+            Some(managed)
+        );
+    }
+
+    #[test]
+    fn hashed_hosts_do_not_match_a_different_marker() {
+        assert!(hashed_host_matches(
+            "|1|c2FsdA==|mF58uSfHH9jfpQnmp1eRRf3z0VY=",
+            "[target.example]:2200"
+        ));
+        assert!(!hashed_host_matches(
+            "|1|c2FsdA==|mF58uSfHH9jfpQnmp1eRRf3z0VY=",
+            "[other.example]:2200"
+        ));
     }
 
     #[test]
