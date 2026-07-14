@@ -6,10 +6,10 @@ until its stated evidence exists.
 
 ## Current sequence
 
-1. Prepare `v0.4.0-alpha.7` with safer pending-upload UX, compact settings, a dedicated log window,
-   and verified replacement of an older tray instance.
-2. Keep published prerelease `v0.4.0-alpha.6` as the last verified six-platform baseline until the
-   alpha.7 release workflow and package smoke tests pass.
+1. Keep published prerelease `v0.4.0-alpha.7` as the current verified six-platform baseline for
+   safer pending-upload UX, compact settings, a dedicated log window, and verified replacement of
+   an older tray instance.
+2. Collect user feedback on alpha.7 before changing mount backends or promoting the rewrite.
 3. Keep the completed merge-readiness audit intact without changing mount backends or server code.
 4. Review remaining risks and decide whether draft PR #11 is ready for merge; do not merge solely
    because a prerelease exists.
@@ -58,6 +58,19 @@ Local verification on 2026-07-15:
 - The configured independent `sol_reviewer` role was unavailable in the current collaboration tool,
   so no generic substitute was used. The primary agent reviewed the working-tree diff and retained
   six-platform release CI as the external acceptance gate.
+
+Publication evidence:
+
+- Branch run [29373324950](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29373324950)
+  passed quality and all six authoritative Windows, Linux, and macOS x64/ARM64 jobs.
+- Tag release run
+  [29374203001](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29374203001)
+  passed quality, all six native builds and real-mount lifecycles, packaged update/rollback checks,
+  exact six-ZIP aggregation, and SHA-256 manifest verification.
+- The run published
+  [`v0.4.0-alpha.7`](https://github.com/Stardust0831/ssh-mountmate/releases/tag/v0.4.0-alpha.7)
+  as a non-draft prerelease with six platform ZIPs plus `SHA256SUMS.txt`. The tag resolves to commit
+  `d3b4ae8`. PR #11 remains Draft; macOS NFS, server changes, and installer work remain deferred.
 
 ## Prerelease scope: `v0.4.0-alpha.6`
 
@@ -150,6 +163,14 @@ Cross-platform considerations:
 ## Work log
 
 ### 2026-07-15
+
+- Published
+  [`v0.4.0-alpha.7`](https://github.com/Stardust0831/ssh-mountmate/releases/tag/v0.4.0-alpha.7)
+  after release run
+  [29374203001](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29374203001) passed quality,
+  all six native package and real-mount lifecycle jobs, exact six-archive validation, and checksum
+  generation. The release is a non-draft prerelease with six platform ZIPs and `SHA256SUMS.txt`;
+  its tag resolves to `d3b4ae8`.
 
 - Investigated Windows self-update failure `os error 740` while an alpha.4 process attempted to
   launch its detached helper. The helper is a byte-for-byte copy of the running application, but
@@ -452,7 +473,7 @@ Cross-platform considerations:
 
 - The Rust rewrite PR remains Draft.
 - No merge is authorized by this document.
-- `v0.4.0-alpha.4` must be a prerelease, not a stable release.
+- `v0.4.0-alpha.7` is a prerelease, not a stable release.
 - The macOS ARM64 active-upload package-replacement timing race is an explicit alpha exception, not
   evidence that the scenario passed. It must be resolved before a stable release.
 - A failed or incomplete architecture gate blocks publication unless it is replaced by successful
