@@ -135,6 +135,12 @@ Cross-platform considerations:
   [29316640097](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29316640097) passed quality,
   all six native build/lifecycle jobs, exact six-ZIP aggregation, and SHA-256 verification. It
   retained exactly six non-empty canonical artifacts and did not create a GitHub Release.
+- Annotated tag `v0.4.0-alpha.3` resolves to the verified product commit `4cacae5`. Publishing run
+  [29318232183](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29318232183) passed the same
+  quality, six-platform lifecycle, six-ZIP, and checksum gates and published
+  [`v0.4.0-alpha.3`](https://github.com/Stardust0831/ssh-mountmate/releases/tag/v0.4.0-alpha.3)
+  as a non-draft prerelease with six platform ZIPs plus `SHA256SUMS.txt`. The checksum manifest has
+  exactly one entry for every platform ZIP. PR #11 remains Draft.
 - Preserved the user-owned untracked issue reply and five screenshots; none were staged. The
   prerelease still excludes an installer and macOS NFS, does not alter mount backends or server code,
   and does not merge Draft PR #11.
