@@ -4487,6 +4487,16 @@ fn set_native_global_progress(_id: window::Id, _state: GlobalProgressState) -> T
 }
 
 #[cfg(windows)]
+const WS_EX_TOOLWINDOW: isize = 0x0000_0080;
+#[cfg(windows)]
+const WS_EX_NOACTIVATE: isize = 0x0800_0000;
+
+#[cfg(windows)]
+fn movable_popup_extended_style(style: isize) -> isize {
+    (style & !WS_EX_NOACTIVATE) | WS_EX_TOOLWINDOW
+}
+
+#[cfg(windows)]
 fn configure_native_popup(window: &dyn window::Window, position: Point) {
     use window::raw_window_handle::RawWindowHandle;
 
@@ -4514,8 +4524,6 @@ fn configure_native_popup(window: &dyn window::Window, position: Point) {
     };
     let window = handle.hwnd.get();
     const GWL_EXSTYLE: i32 = -20;
-    const WS_EX_TOOLWINDOW: isize = 0x0000_0080;
-    const WS_EX_NOACTIVATE: isize = 0x0800_0000;
     const HWND_TOPMOST: isize = -1;
     const SWP_NOSIZE: u32 = 0x0001;
     const SWP_NOACTIVATE: u32 = 0x0010;
@@ -4526,11 +4534,7 @@ fn configure_native_popup(window: &dyn window::Window, position: Point) {
     // The handle belongs to Iced for this callback; these calls only adjust window styles.
     unsafe {
         let style = GetWindowLongPtrW(window, GWL_EXSTYLE);
-        SetWindowLongPtrW(
-            window,
-            GWL_EXSTYLE,
-            (style & !WS_EX_NOACTIVATE) | WS_EX_TOOLWINDOW,
-        );
+        SetWindowLongPtrW(window, GWL_EXSTYLE, movable_popup_extended_style(style));
         SetWindowPos(
             window,
             HWND_TOPMOST,
@@ -4699,6 +4703,14 @@ mod localization_tests {
             popup_transfer_summary(Locale::Chinese, &totals, 2),
             "3 个文件待传 - 已上传 100 B / 400 B"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_popup_style_is_activatable_and_keeps_tool_window_identity() {
+        let style = movable_popup_extended_style(WS_EX_NOACTIVATE);
+        assert_eq!(style & WS_EX_NOACTIVATE, 0);
+        assert_eq!(style & WS_EX_TOOLWINDOW, WS_EX_TOOLWINDOW);
     }
 
     #[test]

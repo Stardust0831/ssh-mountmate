@@ -137,9 +137,13 @@ Cross-platform considerations:
 - Initial native run
   [29353046627](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29353046627)
   proved that the Linux x64 application opened one shared popup for two simultaneous connections,
-  then failed in the new window-movement assertion because the script read Openbox geometry
-  immediately after requesting an asynchronous move. The smoke test now polls for the geometry
-  transition with a bounded timeout and reports an explicit failure; a replacement run is required.
+  then failed in a new window-movement assertion. Replacement run
+  [29353912807](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29353912807) reproduced the
+  assertion on Linux x64 and ARM64 after bounded polling. Openbox reparents decorated clients into
+  an outer frame, so the searched client window keeps the same parent-relative coordinates when the
+  frame moves; the assertion did not measure user-visible movement. The invalid coordinate check was
+  removed. Windows tests now verify that popup styling removes `WS_EX_NOACTIVATE`, retains
+  `WS_EX_TOOLWINDOW`, and enables standard window decorations. A replacement run is required.
 
 ### 2026-07-14
 
