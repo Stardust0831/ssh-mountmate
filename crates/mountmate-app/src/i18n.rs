@@ -186,17 +186,29 @@ impl Locale {
     }
 
     pub(crate) fn refresh_complete(self, result: &RefreshResult) -> String {
-        match (self, result.pending_uploads) {
-            (Self::English, 0) => {
-                format!("Remote refreshed: {} entries", result.entries.len())
+        let directory = if result.relative_dir.is_empty() {
+            match self {
+                Self::English => "mount root",
+                Self::Chinese => "挂载根目录",
             }
-            (Self::English, pending) => format!(
-                "Remote refreshed: {} entries; {pending} local file(s) still waiting to upload",
+        } else {
+            &result.relative_dir
+        };
+        match (self, result.pending_uploads) {
+            (Self::English, 0) => format!(
+                "Remote cache refreshed for {directory}; directory currently has {} direct entries",
                 result.entries.len()
             ),
-            (Self::Chinese, 0) => format!("云端已刷新：{} 个条目", result.entries.len()),
+            (Self::English, pending) => format!(
+                "Remote cache refreshed for {directory}; directory currently has {} direct entries; {pending} local file(s) still waiting to upload",
+                result.entries.len()
+            ),
+            (Self::Chinese, 0) => format!(
+                "已刷新 {directory} 的云端缓存；该目录当前有 {} 个直属条目",
+                result.entries.len()
+            ),
             (Self::Chinese, pending) => format!(
-                "云端已刷新：{} 个条目；仍有 {pending} 个本地文件等待上传",
+                "已刷新 {directory} 的云端缓存；该目录当前有 {} 个直属条目；仍有 {pending} 个本地文件等待上传",
                 result.entries.len()
             ),
         }
@@ -291,6 +303,7 @@ pub(crate) enum TextKey {
     FileManagerMenuRegistered,
     FileManagerMenuRemoved,
     FileTransfer,
+    HideDetails,
     Import,
     ImportSshConfig,
     IpHost,
@@ -350,6 +363,7 @@ pub(crate) enum TextKey {
     SettingsSaved,
     SettingsUnavailable,
     ShowTransferPopup,
+    ShowDetails,
     ShowMainWindow,
     Source,
     SshConfigFile,
@@ -405,6 +419,7 @@ fn english(key: TextKey) -> &'static str {
         TextKey::FileManagerMenuRegistered => "File-manager commands registered",
         TextKey::FileManagerMenuRemoved => "File-manager commands removed",
         TextKey::FileTransfer => "File transfer",
+        TextKey::HideDetails => "Hide details",
         TextKey::Import => "Import",
         TextKey::ImportSshConfig => "Import SSH config",
         TextKey::IpHost => "IP / Host",
@@ -419,7 +434,7 @@ fn english(key: TextKey) -> &'static str {
         TextKey::LogTruncated => "Showing the most recent 2 MiB of this log",
         TextKey::Logs => "Mount logs",
         TextKey::LogsHelp => {
-            "Open a read-only mount log viewer. Use Copy log to copy the visible text."
+            "Open a read-only mount log viewer. Select any range to copy it, or use Copy log for the full visible log."
         }
         TextKey::ManagedByOpenSsh => "Private key (managed by OpenSSH)",
         TextKey::MaximumAge => "Maximum age",
@@ -468,6 +483,7 @@ fn english(key: TextKey) -> &'static str {
         TextKey::SettingsSaved => "Settings saved",
         TextKey::SettingsUnavailable => "Settings unavailable",
         TextKey::ShowTransferPopup => "Show transfer popup automatically",
+        TextKey::ShowDetails => "Details",
         TextKey::ShowMainWindow => "Show SSH MountMate",
         TextKey::Source => "Source",
         TextKey::SshConfigFile => "SSH config file",
@@ -522,6 +538,7 @@ fn chinese(key: TextKey) -> &'static str {
         TextKey::FileManagerMenuRegistered => "文件管理器命令已注册",
         TextKey::FileManagerMenuRemoved => "文件管理器命令已移除",
         TextKey::FileTransfer => "文件传输",
+        TextKey::HideDetails => "收起详情",
         TextKey::Import => "导入",
         TextKey::ImportSshConfig => "导入 SSH 配置",
         TextKey::IpHost => "IP / 主机名",
@@ -535,7 +552,9 @@ fn chinese(key: TextKey) -> &'static str {
         TextKey::LogCopied => "日志已复制到剪贴板",
         TextKey::LogTruncated => "当前显示该日志最近的 2 MiB 内容",
         TextKey::Logs => "挂载日志",
-        TextKey::LogsHelp => "打开只读挂载日志窗口，可用“复制日志”复制当前显示的文本。",
+        TextKey::LogsHelp => {
+            "打开只读挂载日志窗口，可选中任意部分复制，或用“复制日志”复制当前显示的全部内容。"
+        }
         TextKey::ManagedByOpenSsh => "私钥（由 OpenSSH 管理）",
         TextKey::MaximumAge => "最长保留时间",
         TextKey::MaximumSize => "最大大小",
@@ -581,6 +600,7 @@ fn chinese(key: TextKey) -> &'static str {
         TextKey::SettingsSaved => "设置已保存",
         TextKey::SettingsUnavailable => "设置不可用",
         TextKey::ShowTransferPopup => "自动显示传输进度弹窗",
+        TextKey::ShowDetails => "展开详情",
         TextKey::ShowMainWindow => "显示 SSH MountMate",
         TextKey::Source => "来源",
         TextKey::SshConfigFile => "SSH 配置文件",
@@ -632,5 +652,22 @@ mod tests {
         let choice = Locale::Chinese.choice(AuthMethod::Key, "私钥");
         assert_eq!(choice.value, AuthMethod::Key);
         assert_eq!(choice.to_string(), "私钥");
+    }
+
+    #[test]
+    fn refresh_message_distinguishes_cache_refresh_from_directory_entry_count() {
+        let result = RefreshResult {
+            pending_uploads: 0,
+            relative_dir: "folder/child".into(),
+            entries: Vec::new(),
+        };
+        assert_eq!(
+            Locale::Chinese.refresh_complete(&result),
+            "已刷新 folder/child 的云端缓存；该目录当前有 0 个直属条目"
+        );
+        assert_eq!(
+            Locale::English.refresh_complete(&result),
+            "Remote cache refreshed for folder/child; directory currently has 0 direct entries"
+        );
     }
 }

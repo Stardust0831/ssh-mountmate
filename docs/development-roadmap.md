@@ -6,15 +6,18 @@ until its stated evidence exists.
 
 ## Current sequence
 
-1. Keep published prerelease `v0.4.0-alpha.4` available as the verified six-platform baseline.
-2. Keep the completed merge-readiness audit intact without changing mount backends or server code.
-3. Review remaining risks and decide whether draft PR #11 is ready for merge; do not merge solely
+1. Verify the post-alpha.4 refresh, shared-transfer-window, selectable-log, and persistent-capacity
+   changes on all six native targets; do not publish a release from this work without a separate
+   release decision.
+2. Keep published prerelease `v0.4.0-alpha.4` available as the verified six-platform baseline.
+3. Keep the completed merge-readiness audit intact without changing mount backends or server code.
+4. Review remaining risks and decide whether draft PR #11 is ready for merge; do not merge solely
    because a prerelease exists.
-4. Design an optional installed distribution later, with Windows as the first target and portable
+5. Design an optional installed distribution later, with Windows as the first target and portable
    execution retained.
-5. Implement optional macOS `rclone nfsmount` later as an explicit Experimental backend.
-6. Keep macOS FUSE as the migration and UI default; keep Windows WinFsp and Linux FUSE3 unchanged.
-7. Do not promote NFS to the default or publish another NFS-related release until real macOS x64 and ARM64
+6. Implement optional macOS `rclone nfsmount` later as an explicit Experimental backend.
+7. Keep macOS FUSE as the migration and UI default; keep Windows WinFsp and Linux FUSE3 unchanged.
+8. Do not promote NFS to the default or publish another NFS-related release until real macOS x64 and ARM64
    FUSE/NFS lifecycle evidence has been reviewed.
 
 ## Prerelease scope: `v0.4.0-alpha.4`
@@ -102,6 +105,35 @@ Cross-platform considerations:
   part of `v0.4.0-alpha.3`.
 
 ## Work log
+
+### 2026-07-15
+
+- Investigated reports that refreshing a mounted subdirectory displayed `0` refreshed entries.
+  The RC client did execute `vfs/forget` and `vfs/refresh`; the number came from the subsequent
+  `operations/list` verification and represented the directory's current direct children, not the
+  number of cache entries refreshed. Missing `list` responses were also silently treated as empty.
+- Found a separate Windows subdirectory defect in the Explorer command path. The registered `\\.`
+  suffix prevents a trailing backslash from escaping the command quote, but nested paths reached
+  rclone as `folder/.`. Refresh path normalization now removes current-directory components, and
+  the UI explicitly reports cache refresh separately from the verified direct-entry count.
+- Replaced per-mount transfer popup windows with one shared always-on-top transfer window. It has
+  normal window decorations so it can be dragged, stays compact by default, and can expand to show
+  every active mount and all per-file queue/upload details. Closing it suppresses reopening for the
+  same transfer generation, including across a transient empty queue; two confirmed synchronized
+  polls are still required before automatic closure.
+- Replaced the plain log label with a read-only multi-line editor. Mouse/keyboard selection and
+  native copy shortcuts work; edit actions are ignored, and the Copy log button copies the current
+  selection when present or the full loaded log otherwise.
+- Made the capacity bar persistent for every mounted connection. Known, checking, and unknown states
+  are rendered inside the stable bar area. A successful mount triggers capacity discovery
+  immediately, and concurrent mount completions schedule a follow-up query instead of waiting for
+  the 30-second timer. Connection and transfer-center progress bars are hidden while no transfer
+  work exists; VFS cache exhaustion remains an explicit error state rather than a false 100%.
+- Verified the official rclone v1.74.4 `operations/list` response for a real empty local directory is
+  a valid `{"list":[]}` response. Local format, workspace warnings-denied Clippy, application/test
+  type checking, shell syntax, all 159 non-network core tests, and legacy migration passed. Native
+  GUI linking is unavailable locally because the workspace host lacks GTK libraries; six-platform
+  CI remains required. No release was published from this work.
 
 ### 2026-07-14
 

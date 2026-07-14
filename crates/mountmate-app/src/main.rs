@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iced::widget::{
-    Space, button, checkbox, column, container, pick_list, progress_bar, row, scrollable, text,
-    text_input, toggler,
+    Space, button, checkbox, column, container, pick_list, progress_bar, row, scrollable, stack,
+    text, text_editor, text_input, toggler,
 };
 use iced::{
     Center, Element, Fill, Length, Point, Size, Subscription, Task, Theme, clipboard, window,
@@ -330,7 +330,13 @@ fn find_server<'a>(servers: &'a [ServerConfig], id: &str) -> Result<&'a ServerCo
 }
 
 fn print_refresh_result(result: &mountmate_core::rc::RefreshResult) {
-    println!("Remote verified: {} entries", result.entries.len());
+    let directory = if result.relative_dir.is_empty() {
+        "mount root"
+    } else {
+        &result.relative_dir
+    };
+    println!("Remote cache refreshed: {directory}");
+    println!("Remote verified: {} direct entries", result.entries.len());
     if result.pending_uploads > 0 {
         println!(
             "{} local file(s) are still waiting to upload",
@@ -363,8 +369,8 @@ struct App {
     tray_actions: TraySubscription,
     tray_error: Option<String>,
     exit_confirmation_open: bool,
-    popup_windows: HashMap<window::Id, String>,
-    popup_order: Vec<window::Id>,
+    transfer_popup: Option<window::Id>,
+    transfer_popup_expanded: bool,
     dismissed_popups: HashSet<String>,
     synced_polls: HashMap<String, u8>,
     notification_tracker: TransferNotificationTracker,
@@ -390,6 +396,7 @@ struct App {
     capacities: HashMap<String, CapacityInfo>,
     capacity_errors: HashSet<String>,
     capacity_refreshing: bool,
+    capacity_refresh_pending: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -469,7 +476,7 @@ struct MountLogView {
     server_id: String,
     display_name: String,
     path: PathBuf,
-    content: String,
+    content: text_editor::Content,
     truncated: bool,
     loading: bool,
     return_screen: Screen,
@@ -634,6 +641,7 @@ enum Message {
     NotificationFinished(Result<(), String>),
     PopupOpened(window::Id),
     ClosePopup(window::Id),
+    TogglePopupDetails,
     CloseRequested(window::Id),
     ExitDecision(bool),
     WindowClosed(window::Id),
@@ -648,6 +656,7 @@ enum Message {
         result: Result<LoadedMountLog, String>,
     },
     CopyLog,
+    LogAction(text_editor::Action),
     CloseLog,
     CancelEditor,
     ConnectionSourceChanged(ConnectionSource),
@@ -808,8 +817,8 @@ impl App {
             tray_actions: TraySubscription(tray_actions),
             tray_error: None,
             exit_confirmation_open: false,
-            popup_windows: HashMap::new(),
-            popup_order: Vec::new(),
+            transfer_popup: None,
+            transfer_popup_expanded: false,
             dismissed_popups: HashSet::new(),
             synced_polls: HashMap::new(),
             notification_tracker: TransferNotificationTracker::default(),
@@ -835,6 +844,7 @@ impl App {
             capacities: HashMap::new(),
             capacity_errors: HashSet::new(),
             capacity_refreshing: false,
+            capacity_refresh_pending: false,
         };
         let mut tasks = vec![
             open_window.map(Message::MainWindowOpened),
@@ -961,12 +971,16 @@ impl App {
                         }
                         Ok(None) => {
                             self.capacities.remove(&id);
-                            self.capacity_errors.remove(&id);
+                            self.capacity_errors.insert(id);
                         }
                         Err(_) => {
                             self.capacity_errors.insert(id);
                         }
                     }
+                }
+                if self.capacity_refresh_pending {
+                    self.capacity_refresh_pending = false;
+                    return self.capacity_task();
                 }
             }
             Message::TransfersLoaded(results) => {
@@ -1018,25 +1032,36 @@ impl App {
                 }
             },
             Message::PopupOpened(id) => {
-                if let Some(server_id) = self.popup_windows.get(&id) {
-                    diagnostic_trace(&format!("transfer popup opened: {server_id} {id:?}"));
-                }
-                let index = self
-                    .popup_order
-                    .iter()
-                    .position(|popup| *popup == id)
-                    .unwrap_or(0);
-                return configure_popup_window(id, index);
+                diagnostic_trace(&format!(
+                    "shared transfer popup opened for {} connection(s) {id:?}",
+                    self.active_transfer_ids().len()
+                ));
+                return configure_popup_window(id, transfer_popup_size(false));
             }
             Message::ClosePopup(id) => {
-                if let Some(server_id) = self.popup_windows.remove(&id) {
-                    self.dismissed_popups.insert(server_id);
+                if self.transfer_popup == Some(id) {
+                    self.dismissed_popups.extend(self.active_transfer_ids());
+                    self.transfer_popup = None;
+                    self.transfer_popup_expanded = false;
                 }
-                self.popup_order.retain(|popup| *popup != id);
                 return window::close(id);
+            }
+            Message::TogglePopupDetails => {
+                let Some(id) = self.transfer_popup else {
+                    return Task::none();
+                };
+                self.transfer_popup_expanded = !self.transfer_popup_expanded;
+                let size = transfer_popup_size(self.transfer_popup_expanded);
+                return Task::batch([window::resize(id, size), configure_popup_window(id, size)]);
             }
             Message::CloseRequested(id) if id == self.main_window => {
                 return self.hide_main_window();
+            }
+            Message::CloseRequested(id) if self.transfer_popup == Some(id) => {
+                self.dismissed_popups.extend(self.active_transfer_ids());
+                self.transfer_popup = None;
+                self.transfer_popup_expanded = false;
+                return window::close(id);
             }
             Message::CloseRequested(_) => {}
             Message::ExitDecision(confirmed) => {
@@ -1054,10 +1079,11 @@ impl App {
                 }
             }
             Message::WindowClosed(id) => {
-                if let Some(server_id) = self.popup_windows.remove(&id) {
-                    self.dismissed_popups.insert(server_id);
+                if self.transfer_popup == Some(id) {
+                    self.dismissed_popups.extend(self.active_transfer_ids());
+                    self.transfer_popup = None;
+                    self.transfer_popup_expanded = false;
                 }
-                self.popup_order.retain(|popup| *popup != id);
             }
             Message::AddConnection => {
                 let mut draft = ConnectionDraft::default();
@@ -1104,7 +1130,7 @@ impl App {
                 match result {
                     Ok(log) => {
                         log_view.path = log.path;
-                        log_view.content = log.content;
+                        log_view.content = text_editor::Content::with_text(&log.content);
                         log_view.truncated = log.truncated;
                         self.status = locale.text(TextKey::Logs).into();
                     }
@@ -1120,7 +1146,18 @@ impl App {
                     return Task::none();
                 }
                 self.status = locale.text(TextKey::LogCopied).into();
-                return clipboard::write(log_view.content.clone());
+                return clipboard::write(
+                    log_view
+                        .content
+                        .selection()
+                        .filter(|selection| !selection.is_empty())
+                        .unwrap_or_else(|| log_view.content.text()),
+                );
+            }
+            Message::LogAction(action) => {
+                if let Some(log_view) = &mut self.log_view {
+                    apply_read_only_log_action(&mut log_view.content, action);
+                }
             }
             Message::CloseLog => {
                 if let Some(log_view) = self.log_view.take() {
@@ -1563,6 +1600,9 @@ impl App {
                         self.status = message;
                         if matches!(operation, MountOperation::Unmount) {
                             tasks.push(self.close_popups_for_server(&id));
+                        } else {
+                            tasks.push(self.capacity_task());
+                            tasks.push(self.transfer_task());
                         }
                     }
                     Err(error) => {
@@ -1706,7 +1746,7 @@ impl App {
                 self.status = self.locale().text(TextKey::TransferCenter).into();
                 diagnostic_trace(&format!(
                     "transfer center shown with {} popup(s)",
-                    self.popup_windows.len()
+                    usize::from(self.transfer_popup.is_some())
                 ));
                 Task::batch([self.show_main_window(), self.transfer_task()])
             }
@@ -2285,6 +2325,7 @@ impl App {
 
     fn capacity_task(&mut self) -> Task<Message> {
         if self.capacity_refreshing {
+            self.capacity_refresh_pending = true;
             return Task::none();
         }
         let servers: Vec<_> = self
@@ -2297,7 +2338,14 @@ impl App {
             .cloned()
             .collect();
         if servers.is_empty() {
+            self.capacity_refreshing = false;
+            self.capacity_refresh_pending = false;
             return Task::none();
+        }
+        for server in &servers {
+            if !self.capacities.contains_key(&server.id) {
+                self.capacity_errors.remove(&server.id);
+            }
         }
         self.capacity_refreshing = true;
         let service = self.service.clone();
@@ -2379,63 +2427,61 @@ impl App {
     }
 
     fn reconcile_transfer_popups(&mut self) -> Task<Message> {
-        let active: HashSet<_> = self
-            .transfers
+        let active = self.active_transfer_ids();
+        let mut tasks = Vec::new();
+
+        retain_dismissed_transfers(
+            &mut self.dismissed_popups,
+            &active,
+            &self.notification_tracker.observed_active,
+        );
+
+        if active.is_empty() {
+            if self.transfer_popup.is_some()
+                && !self.notification_tracker.observed_active.is_empty()
+            {
+                return Task::none();
+            }
+            self.dismissed_popups.clear();
+            self.transfer_popup_expanded = false;
+            if let Some(popup) = self.transfer_popup.take() {
+                diagnostic_trace(&format!("shared transfer popup completed {popup:?}"));
+                tasks.push(window::close(popup));
+            }
+            return Task::batch(tasks);
+        }
+
+        if self.settings.auto_show_transfers
+            && self.transfer_popup.is_none()
+            && active.iter().any(|id| !self.dismissed_popups.contains(id))
+        {
+            let (popup, open) = window::open(transfer_window_settings());
+            self.transfer_popup = Some(popup);
+            self.transfer_popup_expanded = false;
+            tasks.push(open.map(Message::PopupOpened));
+        }
+
+        Task::batch(tasks)
+    }
+
+    fn active_transfer_ids(&self) -> HashSet<String> {
+        self.transfers
             .iter()
             .filter(|(id, snapshot)| {
                 transfer_is_active(snapshot)
                     && self.mount_statuses.get(*id) == Some(&MountStatus::Mounted)
             })
             .map(|(id, _)| id.clone())
-            .collect();
-        let mut tasks = Vec::new();
+            .collect()
+    }
 
-        let completed_windows: Vec<_> = self
-            .popup_windows
-            .iter()
-            .filter(|(_, server_id)| {
-                self.mount_statuses.get(*server_id) != Some(&MountStatus::Mounted)
-                    || (!active.contains(*server_id)
-                        && self.synced_polls.get(*server_id).copied().unwrap_or(0) >= 2)
-            })
-            .map(|(window, _)| *window)
-            .collect();
-        for popup in completed_windows {
-            if let Some(server_id) = self.popup_windows.remove(&popup) {
-                diagnostic_trace(&format!("transfer popup completed: {server_id} {popup:?}"));
-                self.dismissed_popups.remove(&server_id);
-            }
-            self.popup_order.retain(|window| *window != popup);
-            tasks.push(window::close(popup));
-        }
-
-        for server_id in self
-            .synced_polls
-            .iter()
-            .filter(|(_, polls)| **polls >= 2)
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>()
-        {
-            self.dismissed_popups.remove(&server_id);
-        }
-
-        if self.settings.auto_show_transfers {
-            for server_id in active {
-                let already_open = self
-                    .popup_windows
-                    .values()
-                    .any(|existing| existing == &server_id);
-                if already_open || self.dismissed_popups.contains(&server_id) {
-                    continue;
-                }
-                let (popup, open) = window::open(transfer_window_settings());
-                self.popup_windows.insert(popup, server_id);
-                self.popup_order.push(popup);
-                tasks.push(open.map(Message::PopupOpened));
-            }
-        }
-
-        Task::batch(tasks)
+    fn close_popups_for_server(&mut self, server_id: &str) -> Task<Message> {
+        self.dismissed_popups.remove(server_id);
+        self.transfers.remove(server_id);
+        self.transfer_errors.remove(server_id);
+        self.synced_polls.remove(server_id);
+        self.notification_tracker.forget(server_id);
+        self.reconcile_transfer_popups()
     }
 
     fn global_progress_state(&self) -> GlobalProgressState {
@@ -2455,27 +2501,6 @@ impl App {
         });
 
         global_progress_state(&totals, out_of_space)
-    }
-
-    fn close_popups_for_server(&mut self, server_id: &str) -> Task<Message> {
-        let windows: Vec<_> = self
-            .popup_windows
-            .iter()
-            .filter(|(_, existing)| existing.as_str() == server_id)
-            .map(|(window, _)| *window)
-            .collect();
-        let mut tasks = Vec::new();
-        for popup in windows {
-            self.popup_windows.remove(&popup);
-            self.popup_order.retain(|window| *window != popup);
-            tasks.push(window::close(popup));
-        }
-        self.dismissed_popups.remove(server_id);
-        self.transfers.remove(server_id);
-        self.transfer_errors.remove(server_id);
-        self.synced_polls.remove(server_id);
-        self.notification_tracker.forget(server_id);
-        Task::batch(tasks)
     }
 
     fn start_mount_operation(
@@ -2588,7 +2613,7 @@ impl App {
             server_id: id.clone(),
             display_name,
             path: path.clone(),
-            content: String::new(),
+            content: text_editor::Content::new(),
             truncated: false,
             loading: true,
             return_screen,
@@ -2685,7 +2710,9 @@ impl App {
                         transfer: self.transfers.get(&server.id),
                         transfer_unavailable: self.transfer_errors.contains_key(&server.id),
                         capacity: self.capacities.get(&server.id),
-                        capacity_unavailable: self.capacity_errors.contains(&server.id),
+                        capacity_checking: self.capacity_refreshing
+                            && !self.capacities.contains_key(&server.id)
+                            && !self.capacity_errors.contains(&server.id),
                         can_modify: self.can_modify(&server.id),
                         confirming_remove: self.pending_delete.as_deref() == Some(&server.id),
                     },
@@ -2730,6 +2757,11 @@ impl App {
         }));
         let summary = if mounted.is_empty() {
             locale.text(TextKey::NoMountedConnections).into()
+        } else if totals.out_of_space {
+            match locale {
+                Locale::English => "A local VFS cache is out of space".into(),
+                Locale::Chinese => "本地 VFS 缓存空间不足".into(),
+            }
         } else if totals.errors > 0 {
             match locale {
                 Locale::English => format!(
@@ -2817,10 +2849,11 @@ impl App {
         .spacing(10)
         .align_y(Center);
 
-        let overview = column![
-            text(summary).size(18),
-            progress_bar(0.0..=100.0, totals.percentage as f32),
-            text(if totals.progress_available {
+        let mut overview = column![text(summary).size(18)].spacing(8);
+        if totals.pending_files > 0 || totals.errors > 0 || totals.out_of_space {
+            overview = overview
+                .push(progress_bar(0.0..=100.0, totals.percentage as f32))
+                .push(text(if totals.progress_available {
                 match locale {
                     Locale::English => format!(
                         "{} uploading, {} queued, {} error(s)",
@@ -2842,10 +2875,9 @@ impl App {
                         totals.uploading, totals.queued, totals.errors
                     ),
                 }
-            })
-            .size(13),
-        ]
-        .spacing(8);
+                })
+                .size(13));
+        }
 
         let mut connections = column![].spacing(10);
         for server in mounted {
@@ -3497,74 +3529,109 @@ impl App {
         if log_view.truncated {
             details = details.push(text(locale.text(TextKey::LogTruncated)).size(13));
         }
-        let log_text = if log_view.content.is_empty() {
-            locale.text(TextKey::NoLogContent)
+        let log_content: Element<'_, Message> = if log_view.content.is_empty() {
+            container(text(locale.text(TextKey::NoLogContent)).size(13))
+                .padding(12)
+                .width(Fill)
+                .height(Fill)
+                .style(container::rounded_box)
+                .into()
         } else {
-            &log_view.content
+            text_editor(&log_view.content)
+                .on_action(Message::LogAction)
+                .size(13)
+                .height(Fill)
+                .into()
         };
-        let content = column![
-            details,
-            scrollable(
-                container(text(log_text).size(13))
-                    .padding(12)
-                    .width(Fill)
-                    .style(container::rounded_box)
-            )
-            .height(Fill),
-        ]
-        .spacing(10)
-        .height(Fill);
+        let content = column![details, log_content].spacing(10).height(Fill);
         editor_shell(header, content, &self.status)
     }
 
     fn transfer_popup_view(&self, window: window::Id) -> Element<'_, Message> {
         let locale = self.locale();
-        let Some(server_id) = self.popup_windows.get(&window) else {
+        if self.transfer_popup != Some(window) {
             return container(text(locale.text(TextKey::TransferCompleted)))
                 .padding(16)
                 .width(Fill)
                 .height(Fill)
                 .into();
-        };
-        let name = self
+        }
+        let active: Vec<_> = self
             .servers
             .iter()
-            .find(|server| &server.id == server_id)
-            .map_or(server_id.as_str(), ServerConfig::display_name);
-        let snapshot = self.transfers.get(server_id);
-        let summary = snapshot
-            .map(|snapshot| transfer_label(locale, snapshot))
-            .unwrap_or_else(|| locale.text(TextKey::CheckingTransferState).into());
-        let percentage = snapshot.map_or(0.0, |snapshot| snapshot.percentage as f32);
-        let current_file = snapshot
-            .and_then(|snapshot| snapshot.files.iter().find(|file| file.uploading))
-            .map(|file| {
-                let filename = Path::new(&file.name)
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy();
-                format!("{} - {}/s", filename, format_bytes(file.speed as u64))
+            .filter(|server| {
+                self.mount_statuses.get(&server.id) == Some(&MountStatus::Mounted)
+                    && self
+                        .transfers
+                        .get(&server.id)
+                        .is_some_and(transfer_is_active)
+            })
+            .collect();
+        let totals = transfer_totals(active.iter().map(|server| self.transfers.get(&server.id)));
+        let summary = popup_transfer_summary(locale, &totals, active.len());
+        let current_file = active
+            .iter()
+            .find_map(|server| {
+                self.transfers.get(&server.id).and_then(|snapshot| {
+                    snapshot
+                        .files
+                        .iter()
+                        .find(|file| file.uploading)
+                        .map(|file| {
+                            let filename = Path::new(&file.name)
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy();
+                            format!(
+                                "{}: {} - {}/s",
+                                server.display_name(),
+                                filename,
+                                format_bytes(file.speed.max(0.0) as u64)
+                            )
+                        })
+                })
             })
             .unwrap_or_else(|| locale.text(TextKey::WaitingRemoteConfirmation).into());
 
-        container(
-            column![
-                row![
-                    text(name).size(18),
-                    Space::new().width(Fill),
-                    button("x").on_press(Message::ClosePopup(window)),
-                ]
-                .align_y(Center),
-                text(summary).size(14),
-                progress_bar(0.0..=100.0, percentage),
-                text(current_file).size(12),
-            ]
-            .spacing(8),
-        )
-        .padding(14)
-        .width(Fill)
-        .height(Fill)
-        .into()
+        let header = row![
+            text(locale.text(TextKey::FileTransfer)).size(18),
+            Space::new().width(Fill),
+            button(if self.transfer_popup_expanded {
+                locale.text(TextKey::HideDetails)
+            } else {
+                locale.text(TextKey::ShowDetails)
+            })
+            .on_press(Message::TogglePopupDetails),
+            button("x").on_press(Message::ClosePopup(window)),
+        ]
+        .spacing(8)
+        .align_y(Center);
+        let mut content = column![
+            header,
+            text(summary).size(14),
+            progress_bar(0.0..=100.0, totals.percentage as f32),
+            text(current_file).size(12),
+        ]
+        .spacing(8);
+
+        if self.transfer_popup_expanded {
+            let mut details = column![].spacing(8);
+            for server in active {
+                details = details.push(transfer_connection_view(
+                    server,
+                    self.transfers.get(&server.id),
+                    self.transfer_errors.get(&server.id),
+                    locale,
+                ));
+            }
+            content = content.push(scrollable(details).height(Fill));
+        }
+
+        container(content)
+            .padding(14)
+            .width(Fill)
+            .height(Fill)
+            .into()
     }
 }
 
@@ -3574,9 +3641,70 @@ struct ConnectionCardState<'a> {
     transfer: Option<&'a TransferSnapshot>,
     transfer_unavailable: bool,
     capacity: Option<&'a CapacityInfo>,
-    capacity_unavailable: bool,
+    capacity_checking: bool,
     can_modify: bool,
     confirming_remove: bool,
+}
+
+fn capacity_progress_view(
+    capacity: Option<&CapacityInfo>,
+    checking: bool,
+    locale: Locale,
+) -> Element<'static, Message> {
+    let (percentage, label) = capacity_progress_state(capacity, checking, locale);
+    stack![
+        progress_bar(0.0..=100.0, percentage).girth(Length::Fixed(22.0)),
+        container(text(label).size(12))
+            .width(Fill)
+            .height(Length::Fixed(22.0))
+            .center_x(Fill)
+            .center_y(Length::Fixed(22.0)),
+    ]
+    .width(Fill)
+    .height(Length::Fixed(22.0))
+    .into()
+}
+
+fn capacity_progress_state(
+    capacity: Option<&CapacityInfo>,
+    checking: bool,
+    locale: Locale,
+) -> (f32, String) {
+    if let Some(capacity) = capacity {
+        (
+            capacity.percent as f32,
+            match locale {
+                Locale::English => format!(
+                    "Capacity: {} / {} used ({}%)",
+                    format_bytes(capacity.used),
+                    format_bytes(capacity.total),
+                    capacity.percent
+                ),
+                Locale::Chinese => format!(
+                    "容量：已用 {} / {}（{}%）",
+                    format_bytes(capacity.used),
+                    format_bytes(capacity.total),
+                    capacity.percent
+                ),
+            },
+        )
+    } else if checking {
+        (
+            0.0,
+            match locale {
+                Locale::English => "Capacity: checking...".into(),
+                Locale::Chinese => "容量：查询中...".into(),
+            },
+        )
+    } else {
+        (
+            0.0,
+            match locale {
+                Locale::English => "Capacity: unknown".into(),
+                Locale::Chinese => "容量：未知".into(),
+            },
+        )
+    }
 }
 
 fn connection_card<'a>(
@@ -3590,7 +3718,7 @@ fn connection_card<'a>(
         transfer,
         transfer_unavailable,
         capacity,
-        capacity_unavailable,
+        capacity_checking,
         can_modify,
         confirming_remove,
     } = state;
@@ -3628,38 +3756,10 @@ fn connection_card<'a>(
     .spacing(4)
     .width(Fill);
     if status == MountStatus::Mounted {
-        if let Some(capacity) = capacity {
-            details = details
-                .push(
-                    text(match locale {
-                        Locale::English => format!(
-                            "{} / {} used ({}%)",
-                            format_bytes(capacity.used),
-                            format_bytes(capacity.total),
-                            capacity.percent
-                        ),
-                        Locale::Chinese => format!(
-                            "已用 {} / {}（{}%）",
-                            format_bytes(capacity.used),
-                            format_bytes(capacity.total),
-                            capacity.percent
-                        ),
-                    })
-                    .size(13),
-                )
-                .push(progress_bar(0.0..=100.0, capacity.percent as f32));
-        } else if capacity_unavailable {
-            details = details.push(
-                text(match locale {
-                    Locale::English => "Capacity unavailable",
-                    Locale::Chinese => "容量信息不可用",
-                })
-                .size(13),
-            );
-        }
+        details = details.push(capacity_progress_view(capacity, capacity_checking, locale));
         if transfer_unavailable {
             details = details.push(text(locale.text(TextKey::TransferStateUnavailable)).size(13));
-        } else if let Some(snapshot) = transfer {
+        } else if let Some(snapshot) = transfer.filter(|snapshot| transfer_is_active(snapshot)) {
             details = details
                 .push(text(transfer_label(locale, snapshot)).size(13))
                 .push(progress_bar(0.0..=100.0, snapshot.percentage as f32));
@@ -3949,6 +4049,12 @@ fn read_mount_log(path: PathBuf) -> Result<LoadedMountLog, String> {
     })
 }
 
+fn apply_read_only_log_action(content: &mut text_editor::Content, action: text_editor::Action) {
+    if !action.is_edit() {
+        content.perform(action);
+    }
+}
+
 fn validate_setting_value(
     name: &str,
     value: &str,
@@ -4012,7 +4118,12 @@ fn status_label(locale: Locale, status: MountStatus) -> &'static str {
 }
 
 fn transfer_label(locale: Locale, snapshot: &TransferSnapshot) -> String {
-    if snapshot.errors > 0 {
+    if snapshot.out_of_space {
+        match locale {
+            Locale::English => "Local VFS cache is out of space".into(),
+            Locale::Chinese => "本地 VFS 缓存空间不足".into(),
+        }
+    } else if snapshot.errors > 0 {
         match locale {
             Locale::English => format!("{} upload error(s)", snapshot.errors),
             Locale::Chinese => format!("{} 个上传错误", snapshot.errors),
@@ -4062,6 +4173,76 @@ fn transfer_label(locale: Locale, snapshot: &TransferSnapshot) -> String {
 
 fn transfer_is_active(snapshot: &TransferSnapshot) -> bool {
     snapshot.queued > 0 || snapshot.uploading > 0 || snapshot.errors > 0 || snapshot.out_of_space
+}
+
+fn retain_dismissed_transfers(
+    dismissed: &mut HashSet<String>,
+    active: &HashSet<String>,
+    awaiting_confirmation: &HashSet<String>,
+) {
+    dismissed.retain(|id| active.contains(id) || awaiting_confirmation.contains(id));
+}
+
+fn popup_transfer_summary(
+    locale: Locale,
+    totals: &TransferTotals,
+    connection_count: usize,
+) -> String {
+    if connection_count == 0 {
+        return match locale {
+            Locale::English => "Waiting for remote confirmation".into(),
+            Locale::Chinese => "等待远端确认".into(),
+        };
+    }
+    if totals.out_of_space {
+        return match locale {
+            Locale::English => "A local VFS cache is out of space".into(),
+            Locale::Chinese => "本地 VFS 缓存空间不足".into(),
+        };
+    }
+    if totals.errors > 0 {
+        return match locale {
+            Locale::English => format!(
+                "{} upload error(s) across {connection_count} connection(s)",
+                totals.errors
+            ),
+            Locale::Chinese => {
+                format!(
+                    "{} 个上传错误，涉及 {connection_count} 个挂载",
+                    totals.errors
+                )
+            }
+        };
+    }
+    if totals.progress_available && totals.total_bytes > 0 {
+        match locale {
+            Locale::English => format!(
+                "{} file(s) pending - {} of {} uploaded",
+                totals.pending_files,
+                format_bytes(totals.transferred_bytes),
+                format_bytes(totals.total_bytes)
+            ),
+            Locale::Chinese => format!(
+                "{} 个文件待传 - 已上传 {} / {}",
+                totals.pending_files,
+                format_bytes(totals.transferred_bytes),
+                format_bytes(totals.total_bytes)
+            ),
+        }
+    } else {
+        match locale {
+            Locale::English => format!(
+                "{} file(s) pending across {connection_count} connection(s)",
+                totals.pending_files
+            ),
+            Locale::Chinese => {
+                format!(
+                    "{} 个文件待传，涉及 {connection_count} 个挂载",
+                    totals.pending_files
+                )
+            }
+        }
+    }
 }
 
 fn native_integration_smoke_enabled() -> bool {
@@ -4206,12 +4387,12 @@ fn main_window_settings() -> window::Settings {
 
 fn transfer_window_settings() -> window::Settings {
     let settings = window::Settings {
-        size: Size::new(380.0, 150.0),
+        size: transfer_popup_size(false),
         position: window::Position::SpecificWith(bottom_right_position),
         visible: !cfg!(windows),
         resizable: false,
         minimizable: false,
-        decorations: false,
+        decorations: true,
         level: window::Level::AlwaysOnTop,
         ..window::Settings::default()
     };
@@ -4224,6 +4405,14 @@ fn transfer_window_settings() -> window::Settings {
     settings
 }
 
+fn transfer_popup_size(expanded: bool) -> Size {
+    if expanded {
+        Size::new(560.0, 460.0)
+    } else {
+        Size::new(420.0, 180.0)
+    }
+}
+
 fn bottom_right_position(window: Size, monitor: Size) -> Point {
     Point::new(
         (monitor.width - window.width - 20.0).max(0.0),
@@ -4231,12 +4420,10 @@ fn bottom_right_position(window: Size, monitor: Size) -> Point {
     )
 }
 
-fn configure_popup_window(id: window::Id, index: usize) -> Task<Message> {
+fn configure_popup_window(id: window::Id, size: Size) -> Task<Message> {
     window::monitor_size(id).then(move |monitor| {
         let monitor = monitor.unwrap_or(Size::new(1920.0, 1080.0));
-        let size = Size::new(380.0, 150.0);
-        let mut position = bottom_right_position(size, monitor);
-        position.y = (position.y - index as f32 * (size.height + 12.0)).max(0.0);
+        let position = bottom_right_position(size, monitor);
         #[cfg(windows)]
         {
             window::run(id, move |window| {
@@ -4342,7 +4529,7 @@ fn configure_native_popup(window: &dyn window::Window, position: Point) {
         SetWindowLongPtrW(
             window,
             GWL_EXSTYLE,
-            style | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            (style & !WS_EX_NOACTIVATE) | WS_EX_TOOLWINDOW,
         );
         SetWindowPos(
             window,
@@ -4471,6 +4658,83 @@ mod localization_tests {
         assert_eq!(loaded.path, path);
         assert!(loaded.truncated);
         assert_eq!(loaded.content, "final log line\n");
+    }
+
+    #[test]
+    fn log_editor_allows_navigation_but_rejects_edits() {
+        let mut content = text_editor::Content::with_text("first\nsecond");
+        apply_read_only_log_action(
+            &mut content,
+            text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        );
+        assert_eq!(content.text(), "first\nsecond");
+
+        apply_read_only_log_action(&mut content, text_editor::Action::SelectAll);
+        assert_eq!(content.selection().as_deref(), Some("first\nsecond"));
+    }
+
+    #[test]
+    fn shared_transfer_popup_expands_and_summarizes_all_connections() {
+        let compact = transfer_popup_size(false);
+        let expanded = transfer_popup_size(true);
+        assert!(expanded.width > compact.width);
+        assert!(expanded.height > compact.height);
+        let settings = transfer_window_settings();
+        assert!(settings.decorations);
+        assert!(!settings.resizable);
+
+        let totals = TransferTotals {
+            pending_files: 3,
+            total_bytes: 400,
+            transferred_bytes: 100,
+            progress_available: true,
+            percentage: 25.0,
+            ..TransferTotals::default()
+        };
+        assert_eq!(
+            popup_transfer_summary(Locale::English, &totals, 2),
+            "3 file(s) pending - 100 B of 400 B uploaded"
+        );
+        assert_eq!(
+            popup_transfer_summary(Locale::Chinese, &totals, 2),
+            "3 个文件待传 - 已上传 100 B / 400 B"
+        );
+    }
+
+    #[test]
+    fn dismissed_popup_survives_a_transient_empty_queue_until_confirmation() {
+        let mut dismissed = HashSet::from(["alpha".to_owned()]);
+        retain_dismissed_transfers(
+            &mut dismissed,
+            &HashSet::new(),
+            &HashSet::from(["alpha".to_owned()]),
+        );
+        assert!(dismissed.contains("alpha"));
+
+        retain_dismissed_transfers(&mut dismissed, &HashSet::new(), &HashSet::new());
+        assert!(dismissed.is_empty());
+    }
+
+    #[test]
+    fn capacity_progress_is_persistent_for_known_checking_and_unknown_states() {
+        let capacity = CapacityInfo {
+            used: 256 * 1024,
+            total: 1024 * 1024,
+            percent: 25,
+            source: mountmate_core::capacity::CapacitySource::RemoteFilesystem,
+        };
+        assert_eq!(
+            capacity_progress_state(Some(&capacity), false, Locale::English),
+            (25.0, "Capacity: 256.0 KB / 1.0 MB used (25%)".into())
+        );
+        assert_eq!(
+            capacity_progress_state(None, true, Locale::Chinese),
+            (0.0, "容量：查询中...".into())
+        );
+        assert_eq!(
+            capacity_progress_state(None, false, Locale::Chinese),
+            (0.0, "容量：未知".into())
+        );
     }
 
     #[test]

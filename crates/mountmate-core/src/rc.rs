@@ -2,7 +2,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use reqwest::blocking::Client;
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use thiserror::Error;
 
@@ -131,7 +131,13 @@ pub fn quit(api: &impl RcApi) -> Result<(), RcError> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RefreshResult {
     pub pending_uploads: usize,
+    pub relative_dir: String,
     pub entries: Vec<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListResponse {
+    list: Vec<Value>,
 }
 
 pub fn refresh_remote_snapshot(
@@ -152,18 +158,17 @@ pub fn refresh_remote_snapshot(
         refresh_params["recursive"] = Value::Bool(true);
     }
     api.call("vfs/refresh", refresh_params)?;
-    let listing = api.call(
+    let listing: ListResponse = decode(
         "operations/list",
-        json!({"fs": remote, "remote": relative_dir}),
+        api.call(
+            "operations/list",
+            json!({"fs": remote, "remote": relative_dir}),
+        )?,
     )?;
-    let entries = listing
-        .get("list")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
     Ok(RefreshResult {
         pending_uploads: queue.queue.len(),
-        entries,
+        relative_dir: relative_dir.into(),
+        entries: listing.list,
     })
 }
 
@@ -214,6 +219,7 @@ mod tests {
         ]);
         let result = refresh_remote_snapshot(&api, "alpha:folder", "subdir", false).unwrap();
         assert_eq!(result.pending_uploads, 1);
+        assert_eq!(result.relative_dir, "subdir");
         assert_eq!(result.entries.len(), 1);
         let calls = api.calls.borrow();
         assert_eq!(
@@ -237,10 +243,21 @@ mod tests {
             json!({}),
             json!({"list": []}),
         ]);
-        refresh_remote_snapshot(&api, "alpha:", "", false).unwrap();
+        let result = refresh_remote_snapshot(&api, "alpha:", "", false).unwrap();
+        assert_eq!(result.relative_dir, "");
         let calls = api.calls.borrow();
         assert_eq!(calls[3].1["remote"], "");
         assert_ne!(calls[3].1["remote"], "\"");
+    }
+
+    #[test]
+    fn refresh_does_not_report_zero_entries_when_listing_is_missing() {
+        let api = FakeRc::new([json!({"queue": []}), json!({}), json!({}), json!({})]);
+        let error = refresh_remote_snapshot(&api, "alpha:", "subdir", false).unwrap_err();
+        assert!(matches!(
+            error,
+            RcError::InvalidResponse { method, .. } if method == "operations/list"
+        ));
     }
 
     #[test]

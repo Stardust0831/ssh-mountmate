@@ -12,6 +12,7 @@ pub(crate) struct TransferTotals {
     pub(crate) uploading: usize,
     pub(crate) queued: usize,
     pub(crate) errors: usize,
+    pub(crate) out_of_space: bool,
     pub(crate) total_bytes: u64,
     pub(crate) transferred_bytes: u64,
     pub(crate) unknown_connections: usize,
@@ -34,6 +35,7 @@ pub(crate) fn totals<'a>(
         totals.uploading += snapshot.uploading;
         totals.queued += snapshot.queued.saturating_sub(snapshot.uploading);
         totals.errors += snapshot.errors;
+        totals.out_of_space |= snapshot.out_of_space;
         totals.total_bytes = totals.total_bytes.saturating_add(snapshot.queued_bytes);
         totals.transferred_bytes = totals
             .transferred_bytes
@@ -44,17 +46,21 @@ pub(crate) fn totals<'a>(
             has_unknown_work = true;
         }
     }
-    totals.progress_available = totals.unknown_connections == 0
+    totals.progress_available = !totals.out_of_space
+        && totals.unknown_connections == 0
         && !has_unknown_work
         && (totals.pending_files == 0 || totals.total_bytes > 0);
-    totals.percentage =
-        if totals.pending_files == 0 && totals.errors == 0 && totals.unknown_connections == 0 {
-            100.0
-        } else if totals.progress_available && totals.total_bytes > 0 {
-            (totals.transferred_bytes as f64 * 100.0 / totals.total_bytes as f64).clamp(0.0, 100.0)
-        } else {
-            0.0
-        };
+    totals.percentage = if totals.pending_files == 0
+        && totals.errors == 0
+        && totals.unknown_connections == 0
+        && !totals.out_of_space
+    {
+        100.0
+    } else if totals.progress_available && totals.total_bytes > 0 {
+        (totals.transferred_bytes as f64 * 100.0 / totals.total_bytes as f64).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
     totals
 }
 
@@ -70,9 +76,10 @@ pub(crate) fn connection_view<'a>(
             .push(text(locale.text(TextKey::TransferStateUnavailable)).size(14))
             .push(text(error).size(12));
     } else if let Some(snapshot) = snapshot {
-        content = content
-            .push(text(transfer_label(locale, snapshot)).size(14))
-            .push(progress_bar(0.0..=100.0, snapshot.percentage as f32));
+        content = content.push(text(transfer_label(locale, snapshot)).size(14));
+        if transfer_is_active(snapshot) {
+            content = content.push(progress_bar(0.0..=100.0, snapshot.percentage as f32));
+        }
         if snapshot.out_of_space {
             content = content.push(
                 text(match locale {
@@ -292,6 +299,26 @@ mod tests {
 
         assert_eq!(totals.percentage, 100.0);
         assert!(totals.progress_available);
+    }
+
+    #[test]
+    fn exhausted_cache_is_preserved_in_aggregate_state() {
+        let exhausted = TransferSnapshot {
+            files: Vec::new(),
+            queued: 0,
+            uploading: 0,
+            queued_bytes: 0,
+            transferred_bytes: 0,
+            percentage: 0.0,
+            errors: 0,
+            out_of_space: true,
+            synced: false,
+        };
+        let totals = totals([Some(&exhausted)]);
+
+        assert!(totals.out_of_space);
+        assert_eq!(totals.percentage, 0.0);
+        assert!(!totals.progress_available);
     }
 
     #[test]

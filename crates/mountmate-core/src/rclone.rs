@@ -358,7 +358,11 @@ pub fn normalize_refresh_relative_path(value: &str) -> String {
     if matches!(normalized, "" | "." | "\"") {
         String::new()
     } else {
-        normalized.to_owned()
+        normalized
+            .split('/')
+            .filter(|component| !component.is_empty() && *component != ".")
+            .collect::<Vec<_>>()
+            .join("/")
     }
 }
 
@@ -443,6 +447,10 @@ mod tests {
             "C:\\Mount Folder\\"
         );
         assert_eq!(normalize_refresh_relative_path("\""), "");
+        assert_eq!(
+            normalize_refresh_relative_path("Folder\\Child\\."),
+            "Folder/Child"
+        );
     }
 
     #[test]

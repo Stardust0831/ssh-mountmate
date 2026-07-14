@@ -502,7 +502,7 @@ mod tests {
             Some(String::new())
         );
         assert_eq!(
-            relative_refresh_dir("y:\\Folder\\Child", "Y:", true),
+            relative_refresh_dir("y:\\Folder\\Child\\.", "Y:", true),
             Some("Folder/Child".into())
         );
         assert_eq!(relative_refresh_dir("Z:\\Folder", "Y:", true), None);

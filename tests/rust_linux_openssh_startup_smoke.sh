@@ -245,51 +245,36 @@ for _ in $(seq 1 150); do
   mapfile -t popup_windows < <(
     xdotool search --onlyvisible --name '^File transfer$' 2>/dev/null || true
   )
-  if [[ "${#popup_windows[@]}" -eq 2 ]] \
-    && grep -Fq 'transfer popup opened: native-a ' "${test_root}/gui.trace" 2>/dev/null \
-    && grep -Fq 'transfer popup opened: openssh-a ' "${test_root}/gui.trace" 2>/dev/null; then
+  if [[ "${#popup_windows[@]}" -eq 1 ]] \
+    && grep -Fq 'shared transfer popup opened for 2 connection(s)' "${test_root}/gui.trace" 2>/dev/null; then
     break
   fi
   sleep 0.1
 done
-if [[ "${#popup_windows[@]}" -ne 2 ]]; then
-  echo "expected two simultaneous transfer popup windows, found ${#popup_windows[@]}" >&2
+if [[ "${#popup_windows[@]}" -ne 1 ]]; then
+  echo "expected one shared transfer popup window, found ${#popup_windows[@]}" >&2
   exit 1
 fi
-grep -F 'transfer popup opened: native-a ' "${test_root}/gui.trace"
-grep -F 'transfer popup opened: openssh-a ' "${test_root}/gui.trace"
+grep -F 'shared transfer popup opened for 2 connection(s)' "${test_root}/gui.trace"
 
-popup_x=()
-popup_y=()
-popup_geometry_ready=false
-for _ in $(seq 1 50); do
-  popup_x=()
-  popup_y=()
-  for popup in "${popup_windows[@]}"; do
-    popup_x+=("$(xdotool getwindowgeometry --shell "${popup}" | awk -F= '$1 == "X" { print $2 }')")
-    popup_y+=("$(xdotool getwindowgeometry --shell "${popup}" | awk -F= '$1 == "Y" { print $2 }')")
-  done
-  if (( popup_x[0] - popup_x[1] <= 10 && popup_x[1] - popup_x[0] <= 10 )) \
-    && [[ "${popup_y[0]}" -ne "${popup_y[1]}" ]]; then
-    popup_geometry_ready=true
-    break
-  fi
-  sleep 0.1
-done
-if [[ "${popup_geometry_ready}" != true ]]; then
-  echo 'transfer popup windows are not aligned at the right edge' >&2
-  exit 1
-fi
+popup="${popup_windows[0]}"
+popup_x_before="$(xdotool getwindowgeometry --shell "${popup}" | awk -F= '$1 == "X" { print $2 }')"
+popup_y_before="$(xdotool getwindowgeometry --shell "${popup}" | awk -F= '$1 == "Y" { print $2 }')"
+xdotool windowmove "${popup}" $((popup_x_before - 40)) $((popup_y_before - 40))
+popup_x_after="$(xdotool getwindowgeometry --shell "${popup}" | awk -F= '$1 == "X" { print $2 }')"
+popup_y_after="$(xdotool getwindowgeometry --shell "${popup}" | awk -F= '$1 == "Y" { print $2 }')"
+test "${popup_x_after}" -ne "${popup_x_before}"
+test "${popup_y_after}" -ne "${popup_y_before}"
 
 "${binary}" --show-transfers
 for _ in $(seq 1 50); do
-  if grep -Fq 'transfer center shown with 2 popup(s)' "${test_root}/gui.trace" 2>/dev/null; then
+  if grep -Fq 'transfer center shown with 1 popup(s)' "${test_root}/gui.trace" 2>/dev/null; then
     break
   fi
   sleep 0.1
 done
 grep -F 'ipc-server received ShowTransfers' "${test_root}/gui.trace"
-grep -F 'transfer center shown with 2 popup(s)' "${test_root}/gui.trace"
+grep -F 'transfer center shown with 1 popup(s)' "${test_root}/gui.trace"
 mapfile -t main_windows < <(
   xdotool search --onlyvisible --name '^SSH MountMate ' 2>/dev/null || true
 )
@@ -312,15 +297,13 @@ for _ in $(seq 1 100); do
     xdotool search --onlyvisible --name '^File transfer$' 2>/dev/null || true
   )
   if [[ "${#popup_windows[@]}" -eq 0 ]] \
-    && grep -Fq 'transfer popup completed: native-a ' "${test_root}/gui.trace" 2>/dev/null \
-    && grep -Fq 'transfer popup completed: openssh-a ' "${test_root}/gui.trace" 2>/dev/null; then
+    && grep -Fq 'shared transfer popup completed' "${test_root}/gui.trace" 2>/dev/null; then
     break
   fi
   sleep 0.1
 done
 test "${#popup_windows[@]}" -eq 0
-grep -F 'transfer popup completed: native-a ' "${test_root}/gui.trace"
-grep -F 'transfer popup completed: openssh-a ' "${test_root}/gui.trace"
+grep -F 'shared transfer popup completed' "${test_root}/gui.trace"
 kill "${gui_pid}"
 wait "${gui_pid}" || true
 gui_pid=""
