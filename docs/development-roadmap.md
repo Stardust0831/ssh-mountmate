@@ -6,9 +6,8 @@ until its stated evidence exists.
 
 ## Current sequence
 
-1. Keep the verified post-alpha.4 refresh, shared-transfer-window, selectable-log, and
-   persistent-capacity changes ready for the next explicit release decision.
-2. Keep published prerelease `v0.4.0-alpha.4` available as the verified six-platform baseline.
+1. Publish `v0.4.0-alpha.5` only after its quality and six native release jobs pass.
+2. Keep published prerelease `v0.4.0-alpha.4` available until alpha.5 publication completes.
 3. Keep the completed merge-readiness audit intact without changing mount backends or server code.
 4. Review remaining risks and decide whether draft PR #11 is ready for merge; do not merge solely
    because a prerelease exists.
@@ -19,7 +18,7 @@ until its stated evidence exists.
 8. Do not promote NFS to the default or publish another NFS-related release until real macOS x64 and ARM64
    FUSE/NFS lifecycle evidence has been reviewed.
 
-## Prerelease scope: `v0.4.0-alpha.4`
+## Prerelease scope: `v0.4.0-alpha.5`
 
 Included work:
 
@@ -37,6 +36,10 @@ Included work:
 - User-facing operation status based on connection display names rather than stable internal IDs.
 - Prerelease-aware update selection, with strict stable-channel exclusion of preview releases.
 - Target-aware known-hosts fallback that can use an existing matching user SSH host key.
+- Correct Explorer subdirectory refresh normalization and truthful post-refresh direct-child counts.
+- One shared, draggable, expandable transfer window for concurrent files and mounts.
+- Selectable read-only mount logs with selection-aware copying.
+- Persistent capacity bars with checking and unknown states, while transfer bars remain conditional.
 
 Explicitly excluded:
 
