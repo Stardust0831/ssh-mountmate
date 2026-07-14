@@ -121,7 +121,8 @@ Cross-platform considerations:
   prereleases and tags with prerelease suffixes. Alpha.3 requires one manual update because its old
   updater cannot discover prereleases.
 - Focused update-channel and known-hosts regression tests passed. Core warnings-denied Clippy, all
-  157 core tests, and the legacy migration test passed for alpha.4. Full local workspace Clippy was
+  158 non-network core tests, the live GitHub channel test, and the legacy migration test passed for
+  alpha.4. Full local workspace Clippy was
   blocked before compiling the application because this workspace lacks `pkg-config` and GTK system
   development packages; the native CI quality and six-platform jobs remain the authoritative gate.
 - Rewrite run [29323451133](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29323451133)
@@ -132,6 +133,16 @@ Cross-platform considerations:
   [29325382751](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29325382751) passed quality,
   all six native build/lifecycle jobs, exact six-ZIP aggregation, and SHA-256 verification without
   creating a GitHub Release.
+- The first tag publishing run
+  [29326692099](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29326692099) was cancelled
+  and its unpublished tag removed after Linux X11 smoke exposed an update-list response decoding
+  failure. No alpha.4 Release was created. The stable channel now retains the single latest-stable
+  endpoint, while prereleases request only the most recent 20 releases with one retry and a 15-second
+  timeout. Both channels are exercised against the live GitHub API in authoritative CI.
+- The live API test then identified the exact decoding defect: GitHub asset objects contain both an
+  API `url` and `browser_download_url`, while the old Serde alias mapped both into one field and
+  rejected the object as a duplicate. Asset decoding now explicitly consumes `browser_download_url`,
+  which is also the only URL shape accepted by automatic download validation.
 
 - Audited the settings page for merge readiness. Cache mode and language already use typed dropdown
   choices; connection source, authentication, and transport also remain typed selectors.

@@ -39,6 +39,8 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
+      - name: Verify live stable and prerelease update channels
+        run: cargo test --package mountmate-core live_release_channels_decode_and_select_expected_versions --all-features -- --ignored --test-threads=1
       - name: Install stable Cargo for cross-target license metadata
         run: rustup toolchain install 1.88.0 --profile minimal
       - name: Verify generated Rust license inventory

@@ -17,7 +17,9 @@ use zip::ZipArchive;
 
 const REPOSITORY: &str = "Stardust0831/ssh-mountmate";
 const RELEASES_API: &str =
-    "https://api.github.com/repos/Stardust0831/ssh-mountmate/releases?per_page=100";
+    "https://api.github.com/repos/Stardust0831/ssh-mountmate/releases?per_page=20";
+const LATEST_RELEASE_API: &str =
+    "https://api.github.com/repos/Stardust0831/ssh-mountmate/releases/latest";
 const LATEST_RELEASE_PAGE: &str = "https://github.com/Stardust0831/ssh-mountmate/releases/latest";
 const DEFAULT_DOWNLOAD_LIMIT: u64 = 512 * 1024 * 1024;
 const MAX_ARCHIVE_FILES: usize = 20_000;
@@ -27,7 +29,7 @@ const MAX_EXTRACTED_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 pub struct ReleaseAsset {
     #[serde(default)]
     pub name: String,
-    #[serde(default, alias = "browser_download_url")]
+    #[serde(default, rename = "browser_download_url")]
     pub url: String,
     #[serde(default)]
     pub digest: String,
@@ -205,19 +207,22 @@ fn parse_version(value: &str) -> Result<Version, UpdateError> {
 }
 
 pub fn check_for_updates(current_version: &str) -> Result<UpdateInfo, UpdateError> {
-    let client = update_client(Duration::from_secs(8))?;
-    match fetch_releases(&client).and_then(|releases| {
-        select_release_for_channel(current_version, releases).map_err(|error| error.to_string())
-    }) {
-        Ok(release) => update_info_from_release(current_version, release),
-        Err(api_error) if !current_is_prerelease(current_version)? => {
-            fetch_latest_release_redirect(&client, current_version).map_err(|error| {
-                UpdateError::Request(format!(
-                    "{api_error}; latest-release fallback failed: {error}"
-                ))
-            })
+    let client = update_client(Duration::from_secs(15))?;
+    if current_is_prerelease(current_version)? {
+        let releases = fetch_releases_retry(&client).map_err(UpdateError::Request)?;
+        let release = select_release_for_channel(current_version, releases)?;
+        update_info_from_release(current_version, release)
+    } else {
+        match fetch_latest_release(&client) {
+            Ok(release) => update_info_from_release(current_version, release),
+            Err(api_error) => {
+                fetch_latest_release_redirect(&client, current_version).map_err(|error| {
+                    UpdateError::Request(format!(
+                        "{api_error}; latest-release fallback failed: {error}"
+                    ))
+                })
+            }
         }
-        Err(api_error) => Err(UpdateError::Request(api_error)),
     }
 }
 
@@ -258,7 +263,29 @@ fn fetch_releases(client: &Client) -> Result<Vec<GithubRelease>, String> {
         .map_err(|error| error.to_string())?
         .error_for_status()
         .map_err(|error| error.to_string())?;
-    response.json().map_err(|error| error.to_string())
+    let body = response.bytes().map_err(|error| error.to_string())?;
+    serde_json::from_slice(&body).map_err(|error| format!("release list JSON is invalid: {error}"))
+}
+
+fn fetch_releases_retry(client: &Client) -> Result<Vec<GithubRelease>, String> {
+    fetch_releases(client).or_else(|first_error| {
+        fetch_releases(client)
+            .map_err(|second_error| format!("{first_error}; retry failed: {second_error}"))
+    })
+}
+
+fn fetch_latest_release(client: &Client) -> Result<GithubRelease, String> {
+    let response = client
+        .get(LATEST_RELEASE_API)
+        .header(ACCEPT, "application/vnd.github+json")
+        .header(USER_AGENT, "SSHMountMate-update-check")
+        .send()
+        .map_err(|error| error.to_string())?
+        .error_for_status()
+        .map_err(|error| error.to_string())?;
+    let body = response.bytes().map_err(|error| error.to_string())?;
+    serde_json::from_slice(&body)
+        .map_err(|error| format!("latest release JSON is invalid: {error}"))
 }
 
 fn current_is_prerelease(current_version: &str) -> Result<bool, UpdateError> {
@@ -670,6 +697,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn github_asset_uses_browser_download_url_not_api_url() {
+        let asset: ReleaseAsset = serde_json::from_str(
+            r#"{
+                "name": "SSHMountMate-windows-x64.zip",
+                "url": "https://api.github.com/repos/example/releases/assets/1",
+                "browser_download_url": "https://github.com/Stardust0831/ssh-mountmate/releases/download/v1/file.zip",
+                "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "size": 1
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            asset.url,
+            "https://github.com/Stardust0831/ssh-mountmate/releases/download/v1/file.zip"
+        );
+    }
+
     fn release(tag: &str, prerelease: bool, draft: bool) -> GithubRelease {
         GithubRelease {
             tag_name: tag.into(),
@@ -756,6 +801,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selected.tag_name, "v0.4.0");
+    }
+
+    #[test]
+    #[ignore = "requires the live GitHub releases API"]
+    fn live_release_channels_decode_and_select_expected_versions() {
+        let client = update_client(Duration::from_secs(30)).unwrap();
+        let releases = fetch_releases_retry(&client).unwrap();
+        let preview = select_release_for_channel("v0.4.0-alpha.1", releases).unwrap();
+        assert!(
+            compare_versions("v0.4.0-alpha.1", &preview.tag_name)
+                .unwrap()
+                .is_lt()
+        );
+
+        let stable = fetch_latest_release(&client).unwrap();
+        assert!(parse_version(&stable.tag_name).unwrap().pre.is_empty());
+        assert!(!stable.prerelease);
+        assert!(!stable.draft);
     }
 
     #[test]
