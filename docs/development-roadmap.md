@@ -100,7 +100,7 @@ Cross-platform considerations:
   or package-manager-specific installers separately.
 - Installer choice, signing, update ownership, downgrade behavior, repair, uninstall cleanup, and
   migration from the alpha portable packages require a dedicated design and CI matrix. They are not
-  part of `v0.4.0-alpha.2`.
+  part of `v0.4.0-alpha.3`.
 
 ## Work log
 
@@ -124,13 +124,27 @@ Cross-platform considerations:
 - Fixed operation status text to use the connection display name instead of its stable internal ID.
   Renaming a configuration from `NAS` to `jzj`, for example, now reports `jzj` while preserving the
   existing ID, state filename, and backward compatibility.
+- Prepared `v0.4.0-alpha.3` on commit `4cacae5`. Local Rust 1.97 format checks, core
+  warnings-denied Clippy, all 151 core tests, the legacy migration test, workflow YAML parsing, and
+  diff checks passed. The three packaged GUI update tests remained intentionally ignored locally and
+  were exercised by native CI.
+- Rewrite run [29315522929](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29315522929)
+  passed quality and all six native Windows, Linux, and macOS x64/ARM64 build and lifecycle jobs on
+  `4cacae5`.
+- Non-publishing release run
+  [29316640097](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29316640097) passed quality,
+  all six native build/lifecycle jobs, exact six-ZIP aggregation, and SHA-256 verification. It
+  retained exactly six non-empty canonical artifacts and did not create a GitHub Release.
+- Preserved the user-owned untracked issue reply and five screenshots; none were staged. The
+  prerelease still excludes an installer and macOS NFS, does not alter mount backends or server code,
+  and does not merge Draft PR #11.
 
 - Recorded installation as a post-alpha design task. The main benefit is stable application path
   and desktop identity for self-update, login startup, Explorer commands, Windows Toast/AUMID, and
   complete uninstall cleanup; mounting itself remains available without installation.
 - Chose Windows per-user installation as the first design target while retaining the portable
   onefile. macOS continues to use the native `.app`, and Linux installer formats remain a separate
-  evaluation. No installer was added to the in-progress six-asset alpha.2 release.
+  evaluation. No installer was added to the in-progress six-asset alpha.3 release.
 - Rewrite run [29276353414](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29276353414)
   passed the quality gate and all six native Windows, Linux, and macOS x64/ARM64 jobs on commit
   `6838b61`, including canonical artifact upload and real mount lifecycles.
