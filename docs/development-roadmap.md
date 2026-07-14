@@ -6,8 +6,8 @@ until its stated evidence exists.
 
 ## Current sequence
 
-1. Publish `v0.4.0-alpha.6` only after its Windows manifest, update-helper, quality, and six native
-   release jobs pass; keep `v0.4.0-alpha.5` available until then.
+1. Keep published prerelease `v0.4.0-alpha.6` as the verified six-platform baseline; alpha.4 and
+   alpha.5 users require one manual installation before later self-updates can use the fixed helper.
 2. Keep the completed merge-readiness audit intact without changing mount backends or server code.
 3. Review remaining risks and decide whether draft PR #11 is ready for merge; do not merge solely
    because a prerelease exists.
@@ -119,6 +119,19 @@ Cross-platform considerations:
   and both native workflows extract the PE manifest and reject missing or elevated execution levels.
   Alpha.4 and alpha.5 cannot apply this fix before launching their old helper, so one manual install
   of alpha.6 is required before later prerelease self-updates can use the corrected path.
+- The first branch run
+  [29362847093](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29362847093)
+  built the manifest successfully but exposed that `mt.exe` was not on the Windows ARM64 runner PATH.
+  Both workflows now locate the architecture-matching tool in Windows Kits. Replacement branch run
+  [29363444018](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29363444018) passed quality
+  and all six native targets; Windows x64 and ARM64 both extracted and verified the real PE manifest,
+  and their packaged update, rollback, active-mount, and real SFTP lifecycle tests passed.
+- Release run
+  [29364542721](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29364542721) passed quality,
+  both Windows PE manifest gates, all six release builds and real-mount lifecycles, exact six-ZIP
+  aggregation, and SHA-256 manifest verification. It published
+  [`v0.4.0-alpha.6`](https://github.com/Stardust0831/ssh-mountmate/releases/tag/v0.4.0-alpha.6)
+  as a non-draft prerelease. PR #11 remains Draft; no macOS NFS or server change is included.
 - Prepared `v0.4.0-alpha.5` and passed branch run
   [29356803971](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29356803971)
   on quality and all six native targets. The first tag run
