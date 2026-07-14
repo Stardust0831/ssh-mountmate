@@ -6,19 +6,15 @@ until its stated evidence exists.
 
 ## Current sequence
 
-1. Publish `v0.4.0-alpha.4` after the update-channel and host-key selection fixes pass six-platform
-   and six-asset gates.
+1. Keep published prerelease `v0.4.0-alpha.4` available as the verified six-platform baseline.
 2. Keep the completed merge-readiness audit intact without changing mount backends or server code.
-3. Verify settings UI semantics: enums use selectors, booleans use switches, values show units, and
-   platform-specific controls are hidden where unsupported.
-4. Re-run format, warnings-denied Clippy, workspace tests, and all six native lifecycle jobs.
-5. Review remaining risks and decide whether draft PR #11 is ready for merge; do not merge solely
+3. Review remaining risks and decide whether draft PR #11 is ready for merge; do not merge solely
    because a prerelease exists.
-6. Design an optional installed distribution later, with Windows as the first target and portable
+4. Design an optional installed distribution later, with Windows as the first target and portable
    execution retained.
-7. Implement optional macOS `rclone nfsmount` later as an explicit Experimental backend.
-8. Keep macOS FUSE as the migration and UI default; keep Windows WinFsp and Linux FUSE3 unchanged.
-9. Do not promote NFS to the default or publish another NFS-related release until real macOS x64 and ARM64
+5. Implement optional macOS `rclone nfsmount` later as an explicit Experimental backend.
+6. Keep macOS FUSE as the migration and UI default; keep Windows WinFsp and Linux FUSE3 unchanged.
+7. Do not promote NFS to the default or publish another NFS-related release until real macOS x64 and ARM64
    FUSE/NFS lifecycle evidence has been reviewed.
 
 ## Prerelease scope: `v0.4.0-alpha.4`
@@ -148,6 +144,16 @@ Cross-platform considerations:
   quality and all six native build/lifecycle jobs on commit `86f1220`. Final non-publishing release
   run [29329263951](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29329263951)
   passed the same live API, six-platform, exact six-ZIP, and SHA-256 gates.
+- Final tag release run
+  [29331507919](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29331507919) passed quality,
+  the live stable/prerelease API check, all six Windows/Linux/macOS x64/ARM64 package and real-mount
+  lifecycle jobs, and the release aggregation gate. It published
+  [`v0.4.0-alpha.4`](https://github.com/Stardust0831/ssh-mountmate/releases/tag/v0.4.0-alpha.4)
+  as a non-draft prerelease with six platform ZIPs plus `SHA256SUMS.txt`; the downloaded checksum
+  manifest contains exactly six entries. The annotated tag resolves to product commit `86f1220`.
+  PR #11 remains open and Draft. Alpha.3 users require this one manual download because alpha.3 only
+  queried GitHub's latest stable endpoint; alpha.4 and later prereleases can discover newer preview
+  or stable versions through the prerelease channel.
 
 - Audited the settings page for merge readiness. Cache mode and language already use typed dropdown
   choices; connection source, authentication, and transport also remain typed selectors.
