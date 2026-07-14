@@ -6,16 +6,15 @@ until its stated evidence exists.
 
 ## Current sequence
 
-1. Publish `v0.4.0-alpha.5` only after its quality and six native release jobs pass.
-2. Keep published prerelease `v0.4.0-alpha.4` available until alpha.5 publication completes.
-3. Keep the completed merge-readiness audit intact without changing mount backends or server code.
-4. Review remaining risks and decide whether draft PR #11 is ready for merge; do not merge solely
+1. Keep published prerelease `v0.4.0-alpha.5` as the verified six-platform baseline.
+2. Keep the completed merge-readiness audit intact without changing mount backends or server code.
+3. Review remaining risks and decide whether draft PR #11 is ready for merge; do not merge solely
    because a prerelease exists.
-5. Design an optional installed distribution later, with Windows as the first target and portable
+4. Design an optional installed distribution later, with Windows as the first target and portable
    execution retained.
-6. Implement optional macOS `rclone nfsmount` later as an explicit Experimental backend.
-7. Keep macOS FUSE as the migration and UI default; keep Windows WinFsp and Linux FUSE3 unchanged.
-8. Do not promote NFS to the default or publish another NFS-related release until real macOS x64 and ARM64
+5. Implement optional macOS `rclone nfsmount` later as an explicit Experimental backend.
+6. Keep macOS FUSE as the migration and UI default; keep Windows WinFsp and Linux FUSE3 unchanged.
+7. Do not promote NFS to the default or publish another NFS-related release until real macOS x64 and ARM64
    FUSE/NFS lifecycle evidence has been reviewed.
 
 ## Prerelease scope: `v0.4.0-alpha.5`
@@ -120,6 +119,16 @@ Cross-platform considerations:
   reject the child after it executed rclone. Mount state now records the already resolved executable
   passed to `Command::new`, with a regression test for the pre-`exec` snapshot race. The unpublished
   tag must not be reused until the corrected commit passes native CI.
+- Corrected commit `c01d452` passed quality and all six native targets in branch run
+  [29359712727](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29359712727), including
+  the Linux x64/ARM64 four-mount OpenSSH and shared-transfer-window lifecycle. The unpublished tag
+  was then rebuilt on that commit. Release run
+  [29360849241](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29360849241) passed quality,
+  all six release builds and real-mount lifecycles, exact six-ZIP aggregation, and SHA-256 manifest
+  verification. It published
+  [`v0.4.0-alpha.5`](https://github.com/Stardust0831/ssh-mountmate/releases/tag/v0.4.0-alpha.5)
+  as a non-draft prerelease with Windows, Linux, and macOS x64/ARM64 packages plus
+  `SHA256SUMS.txt`. PR #11 remains Draft; no macOS NFS or server change is included.
 - Investigated reports that refreshing a mounted subdirectory displayed `0` refreshed entries.
   The RC client did execute `vfs/forget` and `vfs/refresh`; the number came from the subsequent
   `operations/list` verification and represented the directory's current direct children, not the
