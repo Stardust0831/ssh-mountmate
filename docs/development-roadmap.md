@@ -6,9 +6,8 @@ until its stated evidence exists.
 
 ## Current sequence
 
-1. Verify the post-alpha.4 refresh, shared-transfer-window, selectable-log, and persistent-capacity
-   changes on all six native targets; do not publish a release from this work without a separate
-   release decision.
+1. Keep the verified post-alpha.4 refresh, shared-transfer-window, selectable-log, and
+   persistent-capacity changes ready for the next explicit release decision.
 2. Keep published prerelease `v0.4.0-alpha.4` available as the verified six-platform baseline.
 3. Keep the completed merge-readiness audit intact without changing mount backends or server code.
 4. Review remaining risks and decide whether draft PR #11 is ready for merge; do not merge solely
@@ -143,7 +142,13 @@ Cross-platform considerations:
   an outer frame, so the searched client window keeps the same parent-relative coordinates when the
   frame moves; the assertion did not measure user-visible movement. The invalid coordinate check was
   removed. Windows tests now verify that popup styling removes `WS_EX_NOACTIVATE`, retains
-  `WS_EX_TOOLWINDOW`, and enables standard window decorations. A replacement run is required.
+  `WS_EX_TOOLWINDOW`, and enables standard window decorations.
+- Replacement run
+  [29354948232](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29354948232)
+  passed quality plus all six native build and lifecycle jobs: Windows x64/ARM64, Linux x64/ARM64,
+  and macOS x64/ARM64. Windows x64 completed the real SFTP mount, quoted-root refresh, queued
+  write-back/upload, and unmount lifecycle. Linux x64 also recorded one shared transfer popup for
+  two concurrent connections and its automatic completion. No Release was published.
 
 ### 2026-07-14
 
