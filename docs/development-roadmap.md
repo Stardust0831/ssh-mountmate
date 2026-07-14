@@ -6,17 +6,58 @@ until its stated evidence exists.
 
 ## Current sequence
 
-1. Keep published prerelease `v0.4.0-alpha.6` as the verified six-platform baseline; alpha.4 and
-   alpha.5 users require one manual installation before later self-updates can use the fixed helper.
-2. Keep the completed merge-readiness audit intact without changing mount backends or server code.
-3. Review remaining risks and decide whether draft PR #11 is ready for merge; do not merge solely
+1. Prepare `v0.4.0-alpha.7` with safer pending-upload UX, compact settings, a dedicated log window,
+   and verified replacement of an older tray instance.
+2. Keep published prerelease `v0.4.0-alpha.6` as the last verified six-platform baseline until the
+   alpha.7 release workflow and package smoke tests pass.
+3. Keep the completed merge-readiness audit intact without changing mount backends or server code.
+4. Review remaining risks and decide whether draft PR #11 is ready for merge; do not merge solely
    because a prerelease exists.
-4. Design an optional installed distribution later, with Windows as the first target and portable
+5. Design an optional installed distribution later, with Windows as the first target and portable
    execution retained.
-5. Implement optional macOS `rclone nfsmount` later as an explicit Experimental backend.
-6. Keep macOS FUSE as the migration and UI default; keep Windows WinFsp and Linux FUSE3 unchanged.
-7. Do not promote NFS to the default or publish another NFS-related release until real macOS x64 and ARM64
+6. Implement optional macOS `rclone nfsmount` later as an explicit Experimental backend.
+7. Keep macOS FUSE as the migration and UI default; keep Windows WinFsp and Linux FUSE3 unchanged.
+8. Do not promote NFS to the default or publish another NFS-related release until real macOS x64 and ARM64
    FUSE/NFS lifecycle evidence has been reviewed.
+
+## Prerelease scope: `v0.4.0-alpha.7`
+
+Planned and implemented locally:
+
+- Move mount logs into a dedicated selectable window, retain partial-text copy, and open at the
+  newest line.
+- Restore four connection-card actions and old-style structured remote-path and mountpoint choices.
+- Replace free-form cache setting fields with compact presets plus numeric custom values and unit
+  selectors; retain unknown legacy values unchanged until explicitly edited.
+- Keep the last successful transfer snapshot across isolated RC failures and show unavailable only
+  after three consecutive failures.
+- Label queued files as local write-back/upload-slot waits instead of reporting misleading zero
+  transfer speed.
+- Make transfer-window closure non-destructive and warn before hiding active transfer views or
+  disabling automatic popups.
+- Guard unmount while uploads are pending or state is unknown, with wait-for-sync as the preferred
+  path and an explicit high-risk immediate option.
+- Detect a different executable/version behind the single-instance lock and offer an authenticated,
+  graceful GUI replacement without unmounting rclone processes.
+
+Still excluded: macOS NFS, server changes, installer work, and merging draft PR #11.
+
+Local verification on 2026-07-15:
+
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: passed.
+- `cargo test --workspace --all-features`: 162 core unit tests passed with one live-network test
+  ignored, legacy migration passed, five platform tests passed, and 35 application tests passed;
+  three packaged-GUI tests remained ignored because they require release artifacts and a graphical
+  session.
+- Focused application tests for compact settings, structured paths, transfer failure grace,
+  pending-unmount safety, log selection/copy behavior, and transfer aggregation passed.
+- The local container has runtime GTK libraries but not development metadata. Type checking and
+  tests used verification-only pkg-config metadata and temporary linker aliases outside the
+  repository; authoritative native linking remains a release CI requirement.
+- The configured independent `sol_reviewer` role was unavailable in the current collaboration tool,
+  so no generic substitute was used. The primary agent reviewed the working-tree diff and retained
+  six-platform release CI as the external acceptance gate.
 
 ## Prerelease scope: `v0.4.0-alpha.6`
 

@@ -40,6 +40,14 @@ pub enum AppCommand {
     Refresh { id: String, relative_dir: String },
     MountAll,
     UnmountAll,
+    ExitForReplacement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningInstance {
+    pub pid: u32,
+    pub executable: PathBuf,
+    pub version: String,
 }
 
 #[derive(Debug, Error)]
@@ -142,6 +150,8 @@ struct CommandState {
     pid: u32,
     started_at: u64,
     executable: PathBuf,
+    #[serde(default)]
+    version: String,
     port: u16,
     token: String,
 }
@@ -201,6 +211,15 @@ impl AppCommandServer {
         permissions: &dyn SshPermissionControl,
         callback: impl Fn(AppCommand) + Send + Sync + 'static,
     ) -> Result<Self, AppCommandError> {
+        Self::start_with_version(state_path, permissions, env!("CARGO_PKG_VERSION"), callback)
+    }
+
+    pub fn start_with_version(
+        state_path: PathBuf,
+        permissions: &dyn SshPermissionControl,
+        version: &str,
+        callback: impl Fn(AppCommand) + Send + Sync + 'static,
+    ) -> Result<Self, AppCommandError> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
@@ -212,6 +231,7 @@ impl AppCommandServer {
             pid: std::process::id(),
             started_at: identity.started_at,
             executable: identity.executable,
+            version: version.to_owned(),
             port,
             token: token.clone(),
         };
@@ -243,6 +263,35 @@ impl AppCommandServer {
             thread: Some(thread),
         })
     }
+}
+
+pub fn running_instance(state_path: &Path) -> Result<RunningInstance, AppCommandError> {
+    running_instance_with_probe(state_path, &SystemProcessProbe)
+}
+
+fn running_instance_with_probe(
+    state_path: &Path,
+    probe: &dyn ProcessProbe,
+) -> Result<RunningInstance, AppCommandError> {
+    let state: CommandState = match read_json(state_path) {
+        Ok(state) => state,
+        Err(_) if !state_path.exists() => return Err(AppCommandError::NotRunning),
+        Err(error) => return Err(AppCommandError::InvalidState(error.to_string())),
+    };
+    validate_state(&state, probe)?;
+    Ok(RunningInstance {
+        pid: state.pid,
+        executable: state.executable,
+        version: state.version,
+    })
+}
+
+pub fn same_instance_build(
+    running: &RunningInstance,
+    current_executable: &Path,
+    current_version: &str,
+) -> bool {
+    same_executable(&running.executable, current_executable) && running.version == current_version
 }
 
 impl Drop for AppCommandServer {
@@ -531,6 +580,7 @@ mod tests {
             pid: 42,
             started_at: 100,
             executable: PathBuf::from("/app/SSHMountMate"),
+            version: "0.4.0-alpha.7".into(),
             port: 1234,
             token: "a".repeat(64),
         };
@@ -554,6 +604,39 @@ mod tests {
             ),
             Err(AppCommandError::IdentityMismatch)
         ));
+    }
+
+    #[test]
+    fn build_identity_requires_both_version_and_executable() {
+        let running = RunningInstance {
+            pid: 42,
+            executable: PathBuf::from("/app/SSHMountMate"),
+            version: "0.4.0-alpha.7".into(),
+        };
+        assert!(same_instance_build(
+            &running,
+            Path::new("/app/SSHMountMate"),
+            "0.4.0-alpha.7"
+        ));
+        assert!(!same_instance_build(
+            &running,
+            Path::new("/downloads/SSHMountMate"),
+            "0.4.0-alpha.7"
+        ));
+        assert!(!same_instance_build(
+            &running,
+            Path::new("/app/SSHMountMate"),
+            "0.4.0-alpha.8"
+        ));
+    }
+
+    #[test]
+    fn legacy_command_state_without_version_remains_readable() {
+        let state: CommandState = serde_json::from_str(
+            r#"{"pid":42,"started_at":100,"executable":"/app/SSHMountMate","port":1234,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+        )
+        .unwrap();
+        assert!(state.version.is_empty());
     }
 
     #[test]

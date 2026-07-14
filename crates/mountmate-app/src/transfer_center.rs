@@ -157,8 +157,8 @@ fn file_view(file: &TransferFile, locale: Locale) -> Element<'_, Message> {
         format!("{}/s - {eta}", format_bytes(file.speed.max(0.0) as u64))
     } else {
         match locale {
-            Locale::English => "Waiting for upload slot".into(),
-            Locale::Chinese => "等待上传队列".into(),
+            Locale::English => "Queued locally; waiting for write-back delay or upload slot".into(),
+            Locale::Chinese => "已在本地排队，等待写回延迟或上传槽位".into(),
         }
     };
     let retries = if file.tries > 0 {

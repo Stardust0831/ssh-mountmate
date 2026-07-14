@@ -7,17 +7,18 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use iced::widget::{
     Space, button, checkbox, column, container, pick_list, progress_bar, row, scrollable, stack,
-    text, text_editor, text_input, toggler,
+    text, text_editor, text_input, toggler, tooltip,
 };
 use iced::{
     Center, Element, Fill, Length, Point, Size, Subscription, Task, Theme, clipboard, window,
 };
 use mountmate_core::app_command::{
-    AppCommand, AppCommandError, AppCommandServer, InstanceLock, send_command_retry,
+    AppCommand, AppCommandError, AppCommandServer, InstanceLock, running_instance,
+    same_instance_build, send_command_retry,
 };
 use mountmate_core::capacity::CapacityInfo;
 use mountmate_core::connection::{
@@ -25,6 +26,7 @@ use mountmate_core::connection::{
     SshImportPlan,
 };
 use mountmate_core::dependency::{DependencyStatus, check_dependencies};
+use mountmate_core::mountpoint::HOME_MOUNTPOINT_VALUE;
 use mountmate_core::paths::AppPaths;
 use mountmate_core::process::MountStatus;
 use mountmate_core::rclone_binary::resolve_rclone;
@@ -53,6 +55,8 @@ mod cli;
 mod i18n;
 mod transfer_center;
 mod tray;
+
+const CUSTOM_MOUNTPOINT_PENDING: &str = "__ui_custom_mountpoint_pending__";
 
 use cli::LaunchAction;
 use i18n::{Choice, LanguagePreference as Language, Locale, TextKey};
@@ -153,13 +157,72 @@ fn run() -> Result<(), String> {
     let instance_lock = match InstanceLock::try_acquire(&paths.app_instance_lock()) {
         Ok(lock) => Arc::new(lock),
         Err(AppCommandError::AlreadyRunning) => {
-            let command = match action {
-                LaunchAction::Gui { command, .. } | LaunchAction::Headless(command) => command,
+            let command = match &action {
+                LaunchAction::Gui { command, .. } | LaunchAction::Headless(command) => {
+                    command.clone()
+                }
                 _ => unreachable!(),
             };
-            send_command_retry(&paths.app_command_state(), &command, Duration::from_secs(2))
-                .map_err(|error| format!("Could not contact the running instance: {error}"))?;
-            return Ok(());
+            let current_executable = std::env::current_exe()
+                .map_err(|error| format!("Could not locate this executable: {error}"))?;
+            let running = running_instance(&paths.app_command_state())
+                .map_err(|error| format!("Could not verify the running instance: {error}"))?;
+            let gui_launch = matches!(&action, LaunchAction::Gui { .. });
+            if gui_launch && !same_instance_build(&running, &current_executable, VERSION) {
+                let version = if running.version.is_empty() {
+                    "unknown / 未知"
+                } else {
+                    &running.version
+                };
+                let confirmed = rfd::MessageDialog::new()
+                    .set_title(APP_NAME)
+                    .set_description(format!(
+                        "A different SSH MountMate instance is already running.\n\nRunning: {version}\n{}\n\nCurrent: {VERSION}\n{}\n\nExit the running interface and start this version? Mounted drives and background rclone transfers will remain active.\n\n检测到托盘中运行的是另一个版本或路径。是否退出旧界面并启动当前版本？现有挂载和后台 rclone 传输会继续。",
+                        running.executable.display(),
+                        current_executable.display()
+                    ))
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show();
+                if confirmed != rfd::MessageDialogResult::Yes {
+                    return Ok(());
+                }
+                if let Err(error) = send_command_retry(
+                    &paths.app_command_state(),
+                    &AppCommand::ExitForReplacement,
+                    Duration::from_secs(2),
+                ) {
+                    rfd::MessageDialog::new()
+                        .set_title(APP_NAME)
+                        .set_description(format!(
+                            "The running build cannot close itself for replacement ({error}). Exit it from the system tray, then open this version again.\n\n当前托盘版本不支持自动退出替换。请先从系统托盘退出旧版本，再重新打开当前版本。"
+                        ))
+                        .set_buttons(rfd::MessageButtons::Ok)
+                        .show();
+                    return Ok(());
+                }
+                let deadline = Instant::now() + Duration::from_secs(8);
+                loop {
+                    match InstanceLock::try_acquire(&paths.app_instance_lock()) {
+                        Ok(lock) => break Arc::new(lock),
+                        Err(AppCommandError::AlreadyRunning) if Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                        Err(AppCommandError::AlreadyRunning) => {
+                            rfd::MessageDialog::new()
+                                .set_title(APP_NAME)
+                                .set_description("The running interface did not exit. It may still be completing a mount operation. Wait for that operation, exit the tray instance, and open this version again.\n\n旧界面未能退出，可能仍在执行挂载操作。请等待操作完成，从托盘退出旧实例后重新打开当前版本。")
+                                .set_buttons(rfd::MessageButtons::Ok)
+                                .show();
+                            return Ok(());
+                        }
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
+            } else {
+                send_command_retry(&paths.app_command_state(), &command, Duration::from_secs(2))
+                    .map_err(|error| format!("Could not contact the running instance: {error}"))?;
+                return Ok(());
+            }
         }
         Err(error) => return Err(error.to_string()),
     };
@@ -172,10 +235,15 @@ fn run() -> Result<(), String> {
         } => {
             let (command_sender, command_receiver) = async_channel::unbounded();
             let command_server = Arc::new(
-                AppCommandServer::start(paths.app_command_state(), &Platform, move |command| {
-                    diagnostic_trace(&format!("ipc-server received {command:?}"));
-                    let _ = command_sender.send_blocking(command);
-                })
+                AppCommandServer::start_with_version(
+                    paths.app_command_state(),
+                    &Platform,
+                    VERSION,
+                    move |command| {
+                        diagnostic_trace(&format!("ipc-server received {command:?}"));
+                        let _ = command_sender.send_blocking(command);
+                    },
+                )
                 .map_err(|error| error.to_string())?,
             );
             let bootstrap = Bootstrap {
@@ -289,6 +357,9 @@ fn run_headless(paths: &AppPaths, command: AppCommand) -> Result<(), String> {
         AppCommand::ShowMain | AppCommand::ShowTransfers => {
             return Err("a window command requires the GUI".into());
         }
+        AppCommand::ExitForReplacement => {
+            return Err("instance replacement requires the GUI".into());
+        }
     }
     Ok(())
 }
@@ -359,6 +430,7 @@ struct App {
     busy: HashSet<String>,
     transfers: HashMap<String, TransferSnapshot>,
     transfer_errors: HashMap<String, String>,
+    transfer_failures: HashMap<String, u8>,
     transfer_refreshing: bool,
     main_window: window::Id,
     main_window_ready: bool,
@@ -374,10 +446,16 @@ struct App {
     dismissed_popups: HashSet<String>,
     synced_polls: HashMap<String, u8>,
     notification_tracker: TransferNotificationTracker,
+    pending_unmount_after_sync: HashSet<String>,
+    confirmed_unmounts: HashSet<String>,
+    popup_close_notice_shown: bool,
     screen: Screen,
     connection_draft: Option<ConnectionDraft>,
+    connection_custom_mountpoint: String,
     settings_draft: Option<SettingsDraft>,
     log_view: Option<MountLogView>,
+    log_window: Option<window::Id>,
+    custom_setting: Option<CustomSettingDraft>,
     editor_saving: bool,
     ssh_import_loading: bool,
     ssh_import_plan: Option<SshImportPlan>,
@@ -461,7 +539,6 @@ enum Screen {
     TransferCenter,
     ConnectionEditor,
     Settings,
-    LogViewer,
 }
 
 #[derive(Debug, Clone)]
@@ -479,7 +556,18 @@ struct MountLogView {
     content: text_editor::Content,
     truncated: bool,
     loading: bool,
-    return_screen: Screen,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LogChoice {
+    id: String,
+    label: String,
+}
+
+impl std::fmt::Display for LogChoice {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.label)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -490,8 +578,6 @@ enum ConnectionField {
     User,
     Port,
     KeyFile,
-    RemotePath,
-    Mountpoint,
     SshConfigPath,
 }
 
@@ -507,12 +593,37 @@ impl std::fmt::Debug for SecretInput {
 #[derive(Debug, Clone, Copy)]
 enum SettingsField {
     CacheRoot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingKind {
     MaxSize,
     MaxAge,
     MinFreeSpace,
     WriteBack,
     DirCacheTime,
     BufferSize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SettingOption {
+    kind: SettingKind,
+    value: String,
+    label: String,
+    custom: bool,
+}
+
+impl std::fmt::Display for SettingOption {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.label)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CustomSettingDraft {
+    kind: SettingKind,
+    digits: String,
+    unit: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -648,7 +759,10 @@ enum Message {
     AddConnection,
     OpenTransfers,
     CloseTransfers,
+    CloseTransfersDecision(rfd::MessageDialogResult),
     OpenSettings,
+    OpenLogChooser,
+    LogWindowOpened(window::Id),
     OpenLog(String),
     ReloadLog,
     LogLoaded {
@@ -661,6 +775,12 @@ enum Message {
     CancelEditor,
     ConnectionSourceChanged(ConnectionSource),
     ConnectionFieldChanged(ConnectionField, String),
+    RemoteBaseChanged(String),
+    RemoteSuffixChanged(String),
+    MountpointChoiceChanged(String),
+    CustomMountpointChanged(String),
+    BrowseMountpoint,
+    MountpointPicked(Option<PathBuf>),
     ConnectionAuthChanged(AuthMethod),
     ConnectionMethodChanged(ConnectionMethod),
     PasswordChanged(SecretInput),
@@ -684,8 +804,14 @@ enum Message {
     BrowseCacheRoot,
     CacheRootPicked(Option<PathBuf>),
     CacheModeChanged(CacheMode),
+    SettingOptionChanged(SettingOption),
+    CustomSettingDigitsChanged(String),
+    CustomSettingUnitChanged(String),
+    SaveCustomSetting,
+    CancelCustomSetting,
     StartupAllChanged(bool),
     AutoTransfersChanged(bool),
+    AutoTransfersDecision(rfd::MessageDialogResult),
     AutoUpdatesChanged(bool),
     CheckForUpdates,
     UpdateChecked {
@@ -707,6 +833,15 @@ enum Message {
     SettingsSaved(Result<Settings, String>),
     StartupReconciled(Result<(), String>),
     Mount(String),
+    CancelPendingUnmount(String),
+    UnmountWaitDecision {
+        ids: Vec<String>,
+        result: rfd::MessageDialogResult,
+    },
+    UnmountNowDecision {
+        ids: Vec<String>,
+        result: rfd::MessageDialogResult,
+    },
     MountFinished {
         id: String,
         operation: MountOperation,
@@ -731,6 +866,8 @@ impl App {
     fn title(&self, window: window::Id) -> String {
         if window == self.main_window {
             format!("{APP_NAME} {VERSION}")
+        } else if self.log_window == Some(window) {
+            format!("{} - {APP_NAME}", self.locale().text(TextKey::Logs))
         } else {
             self.locale().text(TextKey::FileTransfer).into()
         }
@@ -807,6 +944,7 @@ impl App {
             busy: HashSet::new(),
             transfers: HashMap::new(),
             transfer_errors: HashMap::new(),
+            transfer_failures: HashMap::new(),
             transfer_refreshing: false,
             main_window,
             main_window_ready: false,
@@ -822,10 +960,16 @@ impl App {
             dismissed_popups: HashSet::new(),
             synced_polls: HashMap::new(),
             notification_tracker: TransferNotificationTracker::default(),
+            pending_unmount_after_sync: HashSet::new(),
+            confirmed_unmounts: HashSet::new(),
+            popup_close_notice_shown: false,
             screen,
             connection_draft: None,
+            connection_custom_mountpoint: String::new(),
             settings_draft: None,
             log_view: None,
+            log_window: None,
+            custom_setting: None,
             editor_saving: false,
             ssh_import_loading: false,
             ssh_import_plan: None,
@@ -989,6 +1133,7 @@ impl App {
                 for (id, result) in results {
                     match result {
                         Ok(snapshot) => {
+                            self.transfer_failures.remove(&id);
                             let synced_polls = if snapshot.synced {
                                 let polls = self.synced_polls.entry(id.clone()).or_default();
                                 *polls = polls.saturating_add(1);
@@ -1014,14 +1159,38 @@ impl App {
                             self.transfer_errors.remove(&id);
                         }
                         Err(error) => {
-                            self.transfer_errors.insert(id, error);
+                            let failures = self.transfer_failures.entry(id.clone()).or_default();
+                            *failures = failures.saturating_add(1);
+                            if transfer_failure_is_visible(*failures) {
+                                self.transfer_errors.insert(id, error);
+                            }
                         }
                     }
+                }
+                let ready_unmounts = self
+                    .pending_unmount_after_sync
+                    .iter()
+                    .filter(|id| {
+                        self.transfers
+                            .get(*id)
+                            .is_some_and(|snapshot| snapshot.synced)
+                            && !self.transfer_errors.contains_key(*id)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for id in &ready_unmounts {
+                    self.pending_unmount_after_sync.remove(id);
+                    self.confirmed_unmounts.insert(id.clone());
                 }
                 let mut tasks = vec![
                     self.reconcile_transfer_popups(),
                     set_native_global_progress(self.main_window, self.global_progress_state()),
                 ];
+                tasks.extend(
+                    ready_unmounts
+                        .into_iter()
+                        .map(|id| self.start_mount_operation(id, Some(MountOperation::Unmount))),
+                );
                 tasks.extend(notifications.into_iter().map(show_native_notification));
                 return Task::batch(tasks);
             }
@@ -1039,12 +1208,25 @@ impl App {
                 return configure_popup_window(id, transfer_popup_size(false));
             }
             Message::ClosePopup(id) => {
+                let mut tasks = vec![window::close(id)];
                 if self.transfer_popup == Some(id) {
                     self.dismissed_popups.extend(self.active_transfer_ids());
                     self.transfer_popup = None;
                     self.transfer_popup_expanded = false;
+                    if !self.popup_close_notice_shown {
+                        self.popup_close_notice_shown = true;
+                        self.status = match locale {
+                            Locale::English => {
+                                "Transfer window hidden; uploads continue in the background".into()
+                            }
+                            Locale::Chinese => "传输窗口已隐藏；上传仍在后台继续".into(),
+                        };
+                        tasks.push(show_native_notification(background_transfer_notification(
+                            locale,
+                        )));
+                    }
                 }
-                return window::close(id);
+                return Task::batch(tasks);
             }
             Message::TogglePopupDetails => {
                 let Some(id) = self.transfer_popup else {
@@ -1061,6 +1243,24 @@ impl App {
                 self.dismissed_popups.extend(self.active_transfer_ids());
                 self.transfer_popup = None;
                 self.transfer_popup_expanded = false;
+                if !self.popup_close_notice_shown {
+                    self.popup_close_notice_shown = true;
+                    self.status = match locale {
+                        Locale::English => {
+                            "Transfer window hidden; uploads continue in the background".into()
+                        }
+                        Locale::Chinese => "传输窗口已隐藏；上传仍在后台继续".into(),
+                    };
+                    return Task::batch([
+                        window::close(id),
+                        show_native_notification(background_transfer_notification(locale)),
+                    ]);
+                }
+                return window::close(id);
+            }
+            Message::CloseRequested(id) if self.log_window == Some(id) => {
+                self.log_window = None;
+                self.log_view = None;
                 return window::close(id);
             }
             Message::CloseRequested(_) => {}
@@ -1083,12 +1283,16 @@ impl App {
                     self.dismissed_popups.extend(self.active_transfer_ids());
                     self.transfer_popup = None;
                     self.transfer_popup_expanded = false;
+                } else if self.log_window == Some(id) {
+                    self.log_window = None;
+                    self.log_view = None;
                 }
             }
             Message::AddConnection => {
                 let mut draft = ConnectionDraft::default();
                 draft.ssh_config_path = default_ssh_config_path().display().to_string();
                 self.connection_draft = Some(draft);
+                self.connection_custom_mountpoint.clear();
                 self.ssh_import_plan = None;
                 self.ssh_import_actions.clear();
                 self.screen = Screen::ConnectionEditor;
@@ -1100,8 +1304,40 @@ impl App {
                 return self.transfer_task();
             }
             Message::CloseTransfers => {
+                if !self.active_transfer_ids().is_empty() {
+                    let description = match locale {
+                        Locale::English => {
+                            "Uploads are still pending. Closing the transfer center only hides this view; transfers continue in the background and mounted drives must remain available. Close the view?"
+                        }
+                        Locale::Chinese => {
+                            "仍有待上传任务。关闭传输中心只会隐藏此页面，传输仍在后台继续，挂载必须保持可用。是否关闭此页面？"
+                        }
+                    };
+                    return Task::perform(
+                        async move {
+                            rfd::AsyncMessageDialog::new()
+                                .set_title(APP_NAME)
+                                .set_description(description)
+                                .set_buttons(rfd::MessageButtons::YesNo)
+                                .show()
+                                .await
+                        },
+                        Message::CloseTransfersDecision,
+                    );
+                }
                 self.screen = Screen::Connections;
                 self.status = locale.text(TextKey::Ready).into();
+            }
+            Message::CloseTransfersDecision(result) => {
+                if result == rfd::MessageDialogResult::Yes {
+                    self.screen = Screen::Connections;
+                    self.status = match locale {
+                        Locale::English => {
+                            "Transfer center hidden; uploads continue in the background".into()
+                        }
+                        Locale::Chinese => "传输中心已隐藏；上传仍在后台继续".into(),
+                    };
+                }
             }
             Message::OpenSettings => {
                 self.settings_draft = Some(SettingsDraft::from_settings(&self.settings));
@@ -1109,6 +1345,12 @@ impl App {
                 self.status = locale.text(TextKey::Settings).into();
                 self.dependency_checking = true;
                 return self.dependency_check_task();
+            }
+            Message::OpenLogChooser => return self.open_log_window(None),
+            Message::LogWindowOpened(id) => {
+                if self.log_window == Some(id) {
+                    return window::gain_focus(id);
+                }
             }
             Message::OpenLog(id) => return self.open_log(id),
             Message::ReloadLog => {
@@ -1131,6 +1373,9 @@ impl App {
                     Ok(log) => {
                         log_view.path = log.path;
                         log_view.content = text_editor::Content::with_text(&log.content);
+                        log_view
+                            .content
+                            .perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
                         log_view.truncated = log.truncated;
                         self.status = locale.text(TextKey::Logs).into();
                     }
@@ -1160,13 +1405,9 @@ impl App {
                 }
             }
             Message::CloseLog => {
-                if let Some(log_view) = self.log_view.take() {
-                    self.screen = log_view.return_screen;
-                    self.status = match self.screen {
-                        Screen::Settings => locale.text(TextKey::Settings),
-                        _ => locale.text(TextKey::Ready),
-                    }
-                    .into();
+                self.log_view = None;
+                if let Some(id) = self.log_window.take() {
+                    return window::close(id);
                 }
             }
             Message::CancelEditor => {
@@ -1209,8 +1450,6 @@ impl App {
                         }
                         ConnectionField::Port => draft.port = value,
                         ConnectionField::KeyFile => draft.key_file = value,
-                        ConnectionField::RemotePath => draft.remote_path = value,
-                        ConnectionField::Mountpoint => draft.mountpoint = value,
                         ConnectionField::SshConfigPath => {
                             draft.ssh_config_path = value;
                             self.ssh_import_plan = None;
@@ -1219,6 +1458,72 @@ impl App {
                     }
                 }
             }
+            Message::RemoteBaseChanged(base) => {
+                if let Some(draft) = &mut self.connection_draft {
+                    let (_, suffix) = split_remote_path(&draft.remote_path);
+                    draft.remote_path = compose_remote_path(&base, &suffix);
+                }
+            }
+            Message::RemoteSuffixChanged(suffix) => {
+                if let Some(draft) = &mut self.connection_draft {
+                    let (base, _) = split_remote_path(&draft.remote_path);
+                    draft.remote_path = compose_remote_path(&base, &suffix);
+                }
+            }
+            Message::MountpointChoiceChanged(choice) => {
+                if let Some(draft) = &mut self.connection_draft {
+                    if mountpoint_choice(&draft.mountpoint) == "custom" {
+                        self.connection_custom_mountpoint = draft.mountpoint.clone();
+                    }
+                    draft.mountpoint = match choice.as_str() {
+                        "auto" => String::new(),
+                        "home" => HOME_MOUNTPOINT_VALUE.into(),
+                        "custom" => {
+                            if self.connection_custom_mountpoint.is_empty() {
+                                CUSTOM_MOUNTPOINT_PENDING.into()
+                            } else {
+                                self.connection_custom_mountpoint.clone()
+                            }
+                        }
+                        drive => drive.to_owned(),
+                    };
+                }
+            }
+            Message::CustomMountpointChanged(value) => {
+                self.connection_custom_mountpoint = value.clone();
+                if let Some(draft) = &mut self.connection_draft {
+                    draft.mountpoint = value;
+                }
+            }
+            Message::BrowseMountpoint => {
+                let title = match locale {
+                    Locale::English => "Select the parent folder for this mount",
+                    Locale::Chinese => "选择挂载点的父文件夹",
+                };
+                return Task::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new()
+                            .set_title(title)
+                            .pick_folder()
+                            .await
+                            .map(|folder| folder.path().to_owned())
+                    },
+                    Message::MountpointPicked,
+                );
+            }
+            Message::MountpointPicked(Some(parent)) => {
+                let name = self
+                    .connection_draft
+                    .as_ref()
+                    .map(|draft| draft.name.as_str())
+                    .unwrap_or("mount");
+                let path = suggested_mountpoint(&parent, name).display().to_string();
+                self.connection_custom_mountpoint = path.clone();
+                if let Some(draft) = &mut self.connection_draft {
+                    draft.mountpoint = path;
+                }
+            }
+            Message::MountpointPicked(None) => {}
             Message::ConnectionAuthChanged(auth) => {
                 if let Some(draft) = &mut self.connection_draft {
                     draft.auth = auth;
@@ -1395,12 +1700,6 @@ impl App {
                 if let Some(draft) = &mut self.settings_draft {
                     match field {
                         SettingsField::CacheRoot => draft.cache_root = value,
-                        SettingsField::MaxSize => draft.max_size = value,
-                        SettingsField::MaxAge => draft.max_age = value,
-                        SettingsField::MinFreeSpace => draft.min_free_space = value,
-                        SettingsField::WriteBack => draft.write_back = value,
-                        SettingsField::DirCacheTime => draft.dir_cache_time = value,
-                        SettingsField::BufferSize => draft.buffer_size = value,
                     }
                 }
             }
@@ -1428,14 +1727,95 @@ impl App {
                     draft.cache_mode = mode;
                 }
             }
+            Message::SettingOptionChanged(option) => {
+                if option.custom {
+                    let current = self
+                        .settings_draft
+                        .as_ref()
+                        .map(|draft| setting_value(draft, option.kind))
+                        .unwrap_or_default();
+                    let (digits, unit) = split_custom_setting(option.kind, current);
+                    self.custom_setting = Some(CustomSettingDraft {
+                        kind: option.kind,
+                        digits,
+                        unit,
+                    });
+                } else if let Some(draft) = &mut self.settings_draft {
+                    set_setting_value(draft, option.kind, option.value);
+                }
+            }
+            Message::CustomSettingDigitsChanged(value) => {
+                if let Some(custom) = &mut self.custom_setting {
+                    custom.digits = value
+                        .chars()
+                        .filter(|character| character.is_ascii_digit())
+                        .collect();
+                }
+            }
+            Message::CustomSettingUnitChanged(unit) => {
+                if let Some(custom) = &mut self.custom_setting
+                    && custom_units(custom.kind)
+                        .iter()
+                        .any(|allowed| *allowed == unit)
+                {
+                    custom.unit = unit;
+                }
+            }
+            Message::SaveCustomSetting => {
+                if let Some(custom) = self.custom_setting.take() {
+                    if custom.digits.is_empty() {
+                        self.status = match locale {
+                            Locale::English => "Custom value must contain digits".into(),
+                            Locale::Chinese => "自定义数值必须填写数字".into(),
+                        };
+                        self.custom_setting = Some(custom);
+                    } else if let Some(draft) = &mut self.settings_draft {
+                        set_setting_value(
+                            draft,
+                            custom.kind,
+                            format!("{}{}", custom.digits, custom.unit),
+                        );
+                    }
+                }
+            }
+            Message::CancelCustomSetting => self.custom_setting = None,
             Message::StartupAllChanged(value) => {
                 if let Some(draft) = &mut self.settings_draft {
                     draft.startup_all = value;
                 }
             }
             Message::AutoTransfersChanged(value) => {
-                if let Some(draft) = &mut self.settings_draft {
-                    draft.auto_show_transfers = value;
+                if value {
+                    if let Some(draft) = &mut self.settings_draft {
+                        draft.auto_show_transfers = true;
+                    }
+                } else {
+                    let description = match locale {
+                        Locale::English => {
+                            "Uploads will continue in the background, but the transfer popup will no longer appear automatically. Files may still be waiting in the local cache after the file manager reports a copy as complete. Disable automatic transfer popups?"
+                        }
+                        Locale::Chinese => {
+                            "上传仍会在后台继续，但传输弹窗将不再自动出现。文件管理器显示复制完成后，文件仍可能留在本地缓存等待上传。是否关闭自动显示传输弹窗？"
+                        }
+                    };
+                    return Task::perform(
+                        async move {
+                            rfd::AsyncMessageDialog::new()
+                                .set_title(APP_NAME)
+                                .set_description(description)
+                                .set_buttons(rfd::MessageButtons::YesNo)
+                                .show()
+                                .await
+                        },
+                        Message::AutoTransfersDecision,
+                    );
+                }
+            }
+            Message::AutoTransfersDecision(result) => {
+                if result == rfd::MessageDialogResult::Yes
+                    && let Some(draft) = &mut self.settings_draft
+                {
+                    draft.auto_show_transfers = false;
                 }
             }
             Message::AutoUpdatesChanged(value) => {
@@ -1581,6 +1961,35 @@ impl App {
                 }
             }
             Message::Mount(id) => return self.start_mount_operation(id, None),
+            Message::CancelPendingUnmount(id) => {
+                self.pending_unmount_after_sync.remove(&id);
+                self.status = match locale {
+                    Locale::English => "Automatic unmount cancelled".into(),
+                    Locale::Chinese => "已取消同步后自动卸载".into(),
+                };
+            }
+            Message::UnmountWaitDecision { ids, result } => match result {
+                rfd::MessageDialogResult::Yes => {
+                    self.pending_unmount_after_sync.extend(ids);
+                    self.status = match locale {
+                        Locale::English => "Waiting for uploads to finish before unmounting".into(),
+                        Locale::Chinese => "正在等待上传完成后自动取消挂载".into(),
+                    };
+                    return self.transfer_task();
+                }
+                rfd::MessageDialogResult::No => return self.confirm_immediate_unmount(ids),
+                _ => {}
+            },
+            Message::UnmountNowDecision { ids, result } => {
+                if result == rfd::MessageDialogResult::Yes {
+                    self.confirmed_unmounts.extend(ids.iter().cloned());
+                    return Task::batch(
+                        ids.into_iter().map(|id| {
+                            self.start_mount_operation(id, Some(MountOperation::Unmount))
+                        }),
+                    );
+                }
+            }
             Message::MountFinished {
                 id,
                 operation,
@@ -1599,6 +2008,8 @@ impl App {
                         );
                         self.status = message;
                         if matches!(operation, MountOperation::Unmount) {
+                            self.pending_unmount_after_sync.remove(&id);
+                            self.confirmed_unmounts.remove(&id);
                             tasks.push(self.close_popups_for_server(&id));
                         } else {
                             tasks.push(self.capacity_task());
@@ -1629,6 +2040,7 @@ impl App {
                     && let Some(server) = self.servers.iter().find(|server| server.id == id)
                 {
                     self.connection_draft = Some(ConnectionDraft::from_server(server));
+                    self.connection_custom_mountpoint = custom_mountpoint_value(&server.mountpoint);
                     if let Some(draft) = &mut self.connection_draft
                         && draft.ssh_config_path.trim().is_empty()
                     {
@@ -1808,10 +2220,33 @@ impl App {
                     .filter(|server| self.paths.state_file(&server.id).exists())
                     .map(|server| server.id.clone())
                     .collect::<Vec<_>>();
-                Task::batch(
-                    ids.into_iter()
-                        .map(|id| self.handle_mount_command(id, MountOperation::Unmount)),
-                )
+                let (unsafe_ids, safe_ids): (Vec<_>, Vec<_>) = ids.into_iter().partition(|id| {
+                    unmount_needs_confirmation(
+                        self.transfers.get(id),
+                        self.transfer_errors.contains_key(id),
+                    )
+                });
+                let mut tasks = safe_ids
+                    .into_iter()
+                    .map(|id| self.handle_mount_command(id, MountOperation::Unmount))
+                    .collect::<Vec<_>>();
+                if !unsafe_ids.is_empty() {
+                    tasks.push(self.confirm_waiting_unmount(unsafe_ids));
+                }
+                Task::batch(tasks)
+            }
+            AppCommand::ExitForReplacement => {
+                if self.busy.is_empty() {
+                    iced::exit()
+                } else {
+                    self.status = match self.locale() {
+                        Locale::English => {
+                            "Finish the active mount operation before replacing this version".into()
+                        }
+                        Locale::Chinese => "请等待当前挂载操作完成后再替换版本".into(),
+                    };
+                    Task::none()
+                }
             }
         }
     }
@@ -2479,6 +2914,7 @@ impl App {
         self.dismissed_popups.remove(server_id);
         self.transfers.remove(server_id);
         self.transfer_errors.remove(server_id);
+        self.transfer_failures.remove(server_id);
         self.synced_polls.remove(server_id);
         self.notification_tracker.forget(server_id);
         self.reconcile_transfer_popups()
@@ -2508,9 +2944,6 @@ impl App {
         id: String,
         requested: Option<MountOperation>,
     ) -> Task<Message> {
-        if !self.busy.insert(id.clone()) {
-            return Task::none();
-        }
         let current_status = self.mount_statuses.get(&id).copied();
         let mounted = matches!(
             current_status,
@@ -2521,6 +2954,18 @@ impl App {
         } else {
             MountOperation::Mount
         });
+        if operation == MountOperation::Unmount
+            && !self.confirmed_unmounts.remove(&id)
+            && unmount_needs_confirmation(
+                self.transfers.get(&id),
+                self.transfer_errors.contains_key(&id),
+            )
+        {
+            return self.confirm_waiting_unmount(vec![id]);
+        }
+        if !self.busy.insert(id.clone()) {
+            return Task::none();
+        }
         if (operation == MountOperation::Mount && mounted)
             || (operation == MountOperation::Unmount
                 && current_status == Some(MountStatus::Unmounted))
@@ -2581,6 +3026,66 @@ impl App {
         )
     }
 
+    fn confirm_waiting_unmount(&self, ids: Vec<String>) -> Task<Message> {
+        let locale = self.locale();
+        let names = ids
+            .iter()
+            .map(|id| {
+                operation_display_name(self.servers.iter().find(|server| server.id == *id), id)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let description = match locale {
+            Locale::English => format!(
+                "Uploads are pending or their state is unknown for: {names}.\n\nChoose Yes to wait and unmount automatically after synchronization. Choose No to review the immediate-unmount warning."
+            ),
+            Locale::Chinese => format!(
+                "以下挂载仍有待上传内容，或传输状态未知：{names}。\n\n选择“是”将在同步完成后自动取消挂载；选择“否”可继续查看立即取消挂载的风险提示。"
+            ),
+        };
+        let result_ids = ids.clone();
+        Task::perform(
+            async move {
+                rfd::AsyncMessageDialog::new()
+                    .set_title(APP_NAME)
+                    .set_description(description)
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show()
+                    .await
+            },
+            move |result| Message::UnmountWaitDecision {
+                ids: result_ids.clone(),
+                result,
+            },
+        )
+    }
+
+    fn confirm_immediate_unmount(&self, ids: Vec<String>) -> Task<Message> {
+        let description = match self.locale() {
+            Locale::English => {
+                "Unmounting now can leave files only in the local VFS cache. A later remount may resume them, but that is not guaranteed after cache cleanup, configuration changes, or disk failure. Unmount now?"
+            }
+            Locale::Chinese => {
+                "立即取消挂载可能使文件只留在本地 VFS 缓存中。之后重新挂载有时能够续传，但缓存清理、配置变化或磁盘故障后无法保证恢复。是否立即取消挂载？"
+            }
+        };
+        let result_ids = ids.clone();
+        Task::perform(
+            async move {
+                rfd::AsyncMessageDialog::new()
+                    .set_title(APP_NAME)
+                    .set_description(description)
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show()
+                    .await
+            },
+            move |result| Message::UnmountNowDecision {
+                ids: result_ids.clone(),
+                result,
+            },
+        )
+    }
+
     fn open_mountpoint(&mut self, id: String) -> Task<Message> {
         let state_file = self.paths.state_file(&id);
         let locale = self.locale();
@@ -2606,7 +3111,6 @@ impl App {
             self.status = self.locale().text(TextKey::ConnectionGone).into();
             return Task::none();
         };
-        let return_screen = self.screen;
         let display_name = server.display_name().to_owned();
         let path = self.paths.mount_log(server.remote_name());
         self.log_view = Some(MountLogView {
@@ -2616,11 +3120,28 @@ impl App {
             content: text_editor::Content::new(),
             truncated: false,
             loading: true,
-            return_screen,
         });
-        self.screen = Screen::LogViewer;
         self.status = self.locale().text(TextKey::LoadingLog).into();
-        load_log_task(id, path)
+        let load = load_log_task(id, path);
+        if let Some(window) = self.log_window {
+            Task::batch([load, window::gain_focus(window)])
+        } else {
+            let (window, open) = window::open(log_window_settings());
+            self.log_window = Some(window);
+            Task::batch([load, open.map(Message::LogWindowOpened)])
+        }
+    }
+
+    fn open_log_window(&mut self, initial: Option<String>) -> Task<Message> {
+        if let Some(id) = initial {
+            return self.open_log(id);
+        }
+        if let Some(window) = self.log_window {
+            return window::gain_focus(window);
+        }
+        let (window, open) = window::open(log_window_settings());
+        self.log_window = Some(window);
+        open.map(Message::LogWindowOpened)
     }
 
     fn view(&self, window: window::Id) -> Element<'_, Message> {
@@ -2630,8 +3151,9 @@ impl App {
                 Screen::TransferCenter => self.transfer_center_view(),
                 Screen::ConnectionEditor => self.connection_editor_view(),
                 Screen::Settings => self.settings_view(),
-                Screen::LogViewer => self.log_viewer_view(),
             }
+        } else if self.log_window == Some(window) {
+            self.log_viewer_view()
         } else {
             self.transfer_popup_view(window)
         }
@@ -2715,6 +3237,7 @@ impl App {
                             && !self.capacity_errors.contains(&server.id),
                         can_modify: self.can_modify(&server.id),
                         confirming_remove: self.pending_delete.as_deref() == Some(&server.id),
+                        waiting_unmount: self.pending_unmount_after_sync.contains(&server.id),
                     },
                     locale,
                 ));
@@ -3186,19 +3709,60 @@ impl App {
                 );
             }
         }
-        let paths = row![
-            connection_input(
-                locale.text(TextKey::RemotePath),
-                &draft.remote_path,
-                ConnectionField::RemotePath,
-            ),
-            connection_input(
-                locale.text(TextKey::Mountpoint),
-                &draft.mountpoint,
-                ConnectionField::Mountpoint,
-            ),
+        let (remote_base, remote_suffix) = split_remote_path(&draft.remote_path);
+        let remote_path = column![
+            text(locale.text(TextKey::RemotePath)).size(13),
+            row![
+                pick_list(
+                    vec!["$HOME".to_owned(), "/".to_owned()],
+                    Some(remote_base),
+                    Message::RemoteBaseChanged,
+                )
+                .width(Length::Fixed(120.0)),
+                text_input(locale.text(TextKey::RemotePath), &remote_suffix)
+                    .on_input(Message::RemoteSuffixChanged)
+                    .width(Fill),
+            ]
+            .spacing(8),
         ]
-        .spacing(12);
+        .spacing(5)
+        .width(Fill);
+        let mountpoint_choice = mountpoint_choice(&draft.mountpoint);
+        let custom_mountpoint = mountpoint_choice == "custom";
+        let mut mountpoint = column![
+            row![
+                text(locale.text(TextKey::Mountpoint)).size(13),
+                settings_help(mountpoint_help(locale)),
+            ]
+            .spacing(5),
+            pick_list(
+                mountpoint_options(locale),
+                Some(mountpoint_option_label(&mountpoint_choice, locale)),
+                move |label| Message::MountpointChoiceChanged(mountpoint_option_value(
+                    &label, locale
+                )),
+            )
+            .width(Fill),
+        ]
+        .spacing(5)
+        .width(Fill);
+        if custom_mountpoint {
+            let custom_value = if draft.mountpoint == CUSTOM_MOUNTPOINT_PENDING {
+                &self.connection_custom_mountpoint
+            } else {
+                &draft.mountpoint
+            };
+            mountpoint = mountpoint.push(
+                row![
+                    text_input(locale.text(TextKey::Mountpoint), custom_value,)
+                        .on_input(Message::CustomMountpointChanged)
+                        .width(Fill),
+                    button(locale.text(TextKey::Browse)).on_press(Message::BrowseMountpoint),
+                ]
+                .spacing(8),
+            );
+        }
+        let paths = row![remote_path, mountpoint].spacing(12);
         let content = column![
             source,
             ssh_config_controls,
@@ -3241,55 +3805,60 @@ impl App {
                 Message::BrowseCacheRoot,
                 locale.text(TextKey::Browse),
             ),
-            labeled_control(
-                locale.text(TextKey::VfsCacheMode),
+            column![
+                row![
+                    text(locale.text(TextKey::VfsCacheMode)).size(14),
+                    settings_help(vfs_cache_mode_help(locale)),
+                ]
+                .spacing(5),
                 pick_list(
                     localized_choices(CacheMode::ALL, locale, Locale::cache_mode),
                     Some(locale.choice(draft.cache_mode, locale.cache_mode(draft.cache_mode),)),
                     |mode| Message::CacheModeChanged(mode.value)
                 )
                 .width(Fill),
-            ),
+            ]
+            .spacing(5),
         ]
         .spacing(12);
         let cache_limits = row![
-            settings_input(
+            setting_picker(
+                SettingKind::MaxSize,
                 locale.text(TextKey::MaximumSize),
                 &draft.max_size,
-                SettingsField::MaxSize,
                 locale,
             ),
-            settings_input(
+            setting_picker(
+                SettingKind::MaxAge,
                 locale.text(TextKey::MaximumAge),
                 &draft.max_age,
-                SettingsField::MaxAge,
                 locale,
             ),
-            settings_input(
+            setting_picker(
+                SettingKind::MinFreeSpace,
                 locale.text(TextKey::MinimumFreeSpace),
                 &draft.min_free_space,
-                SettingsField::MinFreeSpace,
                 locale,
             ),
         ]
         .spacing(12);
         let cache_timing = row![
-            settings_input(
+            setting_picker(
+                SettingKind::WriteBack,
                 locale.text(TextKey::WriteBackDelay),
                 &draft.write_back,
-                SettingsField::WriteBack,
                 locale,
             ),
-            settings_input(
+            setting_picker(
+                SettingKind::DirCacheTime,
                 locale.text(TextKey::DirectoryCacheTime),
                 &draft.dir_cache_time,
-                SettingsField::DirCacheTime,
                 locale,
             ),
-            settings_input(
+            setting_picker(
+                SettingKind::BufferSize,
                 locale.text(TextKey::BufferSize),
                 &draft.buffer_size,
-                SettingsField::BufferSize,
                 locale,
             ),
         ]
@@ -3298,9 +3867,14 @@ impl App {
             toggler(draft.startup_all)
                 .label(locale.text(TextKey::MountAllAtLogin))
                 .on_toggle(Message::StartupAllChanged),
-            toggler(draft.auto_show_transfers)
-                .label(locale.text(TextKey::ShowTransferPopup))
-                .on_toggle(Message::AutoTransfersChanged),
+            row![
+                toggler(draft.auto_show_transfers)
+                    .label(locale.text(TextKey::ShowTransferPopup))
+                    .on_toggle(Message::AutoTransfersChanged),
+                settings_help(auto_transfer_help(locale)),
+            ]
+            .spacing(5)
+            .align_y(Center),
             toggler(draft.auto_check_updates)
                 .label(locale.text(TextKey::CheckUpdatesAutomatically))
                 .on_toggle(Message::AutoUpdatesChanged),
@@ -3336,27 +3910,20 @@ impl App {
         } else {
             column![]
         };
-        let mut logs = column![
-            text(locale.text(TextKey::Logs)).size(20),
-            text(locale.text(TextKey::LogsHelp)).size(14),
-        ]
-        .spacing(8)
+        let logs = container(
+            row![
+                column![
+                    text(locale.text(TextKey::Logs)).size(20),
+                    text(locale.text(TextKey::LogsHelp)).size(14),
+                ]
+                .spacing(4)
+                .width(Fill),
+                button(locale.text(TextKey::ViewLog)).on_press(Message::OpenLogChooser),
+            ]
+            .spacing(12)
+            .align_y(Center),
+        )
         .max_width(640);
-        if self.servers.is_empty() {
-            logs = logs.push(text(locale.text(TextKey::NoSavedConnections)).size(14));
-        } else {
-            for server in &self.servers {
-                logs = logs.push(
-                    row![
-                        text(server.display_name()).width(Fill),
-                        button(locale.text(TextKey::ViewLog))
-                            .on_press(Message::OpenLog(server.id.clone())),
-                    ]
-                    .spacing(10)
-                    .align_y(Center),
-                );
-            }
-        }
         let mut dependency_section = column![
             text(match locale {
                 Locale::English => "Mount dependencies",
@@ -3498,13 +4065,93 @@ impl App {
         ]
         .spacing(18)
         .max_width(900);
-        editor_shell(header, scrollable(content), &self.status)
+        let base = editor_shell(header, scrollable(content), &self.status);
+        if let Some(custom) = &self.custom_setting {
+            let units = custom_units(custom.kind)
+                .iter()
+                .map(|unit| (*unit).to_owned())
+                .collect::<Vec<_>>();
+            let title = match locale {
+                Locale::English => "Custom setting",
+                Locale::Chinese => "自定义设置",
+            };
+            let dialog = container(
+                column![
+                    text(title).size(22),
+                    row![
+                        text_input("0", &custom.digits)
+                            .on_input(Message::CustomSettingDigitsChanged)
+                            .width(Length::Fixed(180.0)),
+                        pick_list(
+                            units,
+                            Some(custom.unit.clone()),
+                            Message::CustomSettingUnitChanged,
+                        )
+                        .width(Length::Fixed(120.0)),
+                    ]
+                    .spacing(10),
+                    row![
+                        button(locale.text(TextKey::Cancel)).on_press(Message::CancelCustomSetting),
+                        button(locale.text(TextKey::Save)).on_press(Message::SaveCustomSetting),
+                    ]
+                    .spacing(10),
+                ]
+                .spacing(14),
+            )
+            .padding(20)
+            .width(Length::Fixed(380.0))
+            .style(container::rounded_box);
+            stack![
+                base,
+                container(dialog)
+                    .width(Fill)
+                    .height(Fill)
+                    .center_x(Fill)
+                    .center_y(Fill),
+            ]
+            .into()
+        } else {
+            base
+        }
     }
 
     fn log_viewer_view(&self) -> Element<'_, Message> {
         let locale = self.locale();
+        let selected = self.log_view.as_ref().map(|log| log.server_id.clone());
+        let choices = self
+            .servers
+            .iter()
+            .map(|server| LogChoice {
+                id: server.id.clone(),
+                label: server.display_name().to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let selected_choice = selected
+            .as_ref()
+            .and_then(|id| choices.iter().find(|choice| &choice.id == id).cloned());
+        let selector = pick_list(choices, selected_choice, |choice| {
+            Message::OpenLog(choice.id)
+        })
+        .placeholder(match locale {
+            Locale::English => "Select a mount log",
+            Locale::Chinese => "选择挂载日志",
+        })
+        .width(Length::Fixed(260.0));
         let Some(log_view) = &self.log_view else {
-            return container(text(locale.text(TextKey::NoLogContent))).into();
+            return editor_shell(
+                row![
+                    text(locale.text(TextKey::Logs)).size(28),
+                    Space::new().width(Fill),
+                    selector,
+                    button("x").on_press(Message::CloseLog),
+                ]
+                .spacing(10)
+                .align_y(Center),
+                container(text(locale.text(TextKey::NoLogContent)))
+                    .center_x(Fill)
+                    .center_y(Fill),
+                &self.status,
+            );
         };
         let header = row![
             text(format!(
@@ -3514,11 +4161,12 @@ impl App {
             ))
             .size(28),
             Space::new().width(Fill),
+            selector,
             button(locale.text(TextKey::Refresh))
                 .on_press_maybe((!log_view.loading).then_some(Message::ReloadLog)),
             button(locale.text(TextKey::CopyLog))
                 .on_press_maybe((!log_view.content.is_empty()).then_some(Message::CopyLog)),
-            button(locale.text(TextKey::Back)).on_press(Message::CloseLog),
+            button("x").on_press(Message::CloseLog),
         ]
         .spacing(10)
         .align_y(Center);
@@ -3591,7 +4239,22 @@ impl App {
                         })
                 })
             })
-            .unwrap_or_else(|| locale.text(TextKey::WaitingRemoteConfirmation).into());
+            .unwrap_or_else(|| {
+                if active.iter().any(|server| {
+                    self.transfers
+                        .get(&server.id)
+                        .is_some_and(|snapshot| snapshot.queued > 0 && snapshot.uploading == 0)
+                }) {
+                    match locale {
+                        Locale::English => {
+                            "Queued locally; waiting for write-back delay or upload slot".into()
+                        }
+                        Locale::Chinese => "已在本地排队，等待写回延迟或上传槽位".into(),
+                    }
+                } else {
+                    locale.text(TextKey::WaitingRemoteConfirmation).into()
+                }
+            });
 
         let header = row![
             text(locale.text(TextKey::FileTransfer)).size(18),
@@ -3644,6 +4307,7 @@ struct ConnectionCardState<'a> {
     capacity_checking: bool,
     can_modify: bool,
     confirming_remove: bool,
+    waiting_unmount: bool,
 }
 
 fn capacity_progress_view(
@@ -3721,6 +4385,7 @@ fn connection_card<'a>(
         capacity_checking,
         can_modify,
         confirming_remove,
+        waiting_unmount,
     } = state;
     let id = server.id.clone();
     let host = format!("{}@{}:{}", server.user, server.host, server.port);
@@ -3729,13 +4394,20 @@ fn connection_card<'a>(
     } else {
         server.remote_path.clone()
     };
-    let operation_label = if matches!(status, MountStatus::Mounted | MountStatus::Starting) {
+    let operation_label = if waiting_unmount {
+        match locale {
+            Locale::English => "Cancel pending unmount",
+            Locale::Chinese => "取消等待卸载",
+        }
+    } else if matches!(status, MountStatus::Mounted | MountStatus::Starting) {
         locale.text(TextKey::Unmount)
     } else {
         locale.text(TextKey::Mount)
     };
     let mut operation = button(operation_label);
-    if !busy {
+    if waiting_unmount {
+        operation = operation.on_press(Message::CancelPendingUnmount(id.clone()));
+    } else if !busy {
         operation = operation.on_press(Message::Mount(id.clone()));
     }
     let mut open = button(locale.text(TextKey::Open));
@@ -3767,10 +4439,8 @@ fn connection_card<'a>(
     }
     let edit = button(locale.text(TextKey::Edit))
         .on_press_maybe(can_modify.then(|| Message::Edit(id.clone())));
-    let log = button(locale.text(TextKey::ViewLog)).on_press(Message::OpenLog(id.clone()));
     let actions: Element<'_, Message> = if confirming_remove {
         row![
-            log,
             button(locale.text(TextKey::Cancel)).on_press(Message::CancelRemove),
             button(locale.text(TextKey::ConfirmRemove)).on_press(Message::ConfirmRemove),
         ]
@@ -3778,7 +4448,6 @@ fn connection_card<'a>(
         .into()
     } else {
         row![
-            log,
             edit,
             button(locale.text(TextKey::Remove))
                 .on_press_maybe(can_modify.then_some(Message::Remove(id))),
@@ -3829,52 +4498,305 @@ fn connection_file_input<'a>(
     )
 }
 
-fn settings_input<'a>(
+fn setting_picker<'a>(
+    kind: SettingKind,
     label: &'a str,
     value: &'a str,
-    field: SettingsField,
     locale: Locale,
 ) -> iced::widget::Column<'a, Message> {
+    let options = setting_options(kind, locale);
+    let selected = options
+        .iter()
+        .find(|option| !option.custom && option.value == value)
+        .cloned()
+        .or_else(|| options.iter().find(|option| option.custom).cloned());
     column![
-        text(label).size(13),
-        text_input(label, value)
-            .on_input(move |value| Message::SettingsFieldChanged(field, value))
-            .width(Fill),
-        text(settings_value_hint(field, locale)).size(12),
+        row![
+            text(label).size(13),
+            settings_help(setting_help(kind, locale))
+        ]
+        .spacing(5),
+        pick_list(options, selected, Message::SettingOptionChanged).width(Fill),
+        text(if setting_presets(kind).contains(&value) {
+            ""
+        } else {
+            value
+        })
+        .size(12),
     ]
     .spacing(5)
     .width(Fill)
 }
 
-fn settings_value_hint(field: SettingsField, locale: Locale) -> &'static str {
-    match (field, locale) {
-        (SettingsField::MaxSize, Locale::English) => {
-            "Size units: K, M, G, T (for example 10G); blank means no limit"
+fn setting_options(kind: SettingKind, locale: Locale) -> Vec<SettingOption> {
+    let mut options = setting_presets(kind)
+        .iter()
+        .map(|value| SettingOption {
+            kind,
+            value: (*value).to_owned(),
+            label: preset_label(kind, value, locale),
+            custom: false,
+        })
+        .collect::<Vec<_>>();
+    options.push(SettingOption {
+        kind,
+        value: String::new(),
+        label: match locale {
+            Locale::English => "Custom...".into(),
+            Locale::Chinese => "自定义...".into(),
+        },
+        custom: true,
+    });
+    options
+}
+
+fn setting_presets(kind: SettingKind) -> &'static [&'static str] {
+    match kind {
+        SettingKind::MaxSize => &["", "10G", "50G", "100G"],
+        SettingKind::MaxAge => &["30m", "1h", "6h", "24h"],
+        SettingKind::MinFreeSpace => &["", "5G", "10G", "20G"],
+        SettingKind::WriteBack => &["0s", "5s", "30s", "1m"],
+        SettingKind::DirCacheTime => &["30s", "5m", "15m", "1h"],
+        SettingKind::BufferSize => &["", "0", "16Mi", "64Mi"],
+    }
+}
+
+fn preset_label(kind: SettingKind, value: &str, locale: Locale) -> String {
+    if value.is_empty() {
+        return match (kind, locale) {
+            (SettingKind::MaxSize, Locale::English) => "No size limit".into(),
+            (SettingKind::MaxSize, Locale::Chinese) => "不限制大小".into(),
+            (SettingKind::MinFreeSpace, Locale::English) => "Off".into(),
+            (SettingKind::MinFreeSpace, Locale::Chinese) => "关闭".into(),
+            (_, Locale::English) => "rclone default".into(),
+            (_, Locale::Chinese) => "rclone 默认值".into(),
+        };
+    }
+    value.to_owned()
+}
+
+fn setting_value(draft: &SettingsDraft, kind: SettingKind) -> &str {
+    match kind {
+        SettingKind::MaxSize => &draft.max_size,
+        SettingKind::MaxAge => &draft.max_age,
+        SettingKind::MinFreeSpace => &draft.min_free_space,
+        SettingKind::WriteBack => &draft.write_back,
+        SettingKind::DirCacheTime => &draft.dir_cache_time,
+        SettingKind::BufferSize => &draft.buffer_size,
+    }
+}
+
+fn set_setting_value(draft: &mut SettingsDraft, kind: SettingKind, value: String) {
+    match kind {
+        SettingKind::MaxSize => draft.max_size = value,
+        SettingKind::MaxAge => draft.max_age = value,
+        SettingKind::MinFreeSpace => draft.min_free_space = value,
+        SettingKind::WriteBack => draft.write_back = value,
+        SettingKind::DirCacheTime => draft.dir_cache_time = value,
+        SettingKind::BufferSize => draft.buffer_size = value,
+    }
+}
+
+fn custom_units(kind: SettingKind) -> &'static [&'static str] {
+    match kind {
+        SettingKind::MaxSize | SettingKind::MinFreeSpace => &["Mi", "Gi", "Ti"],
+        SettingKind::BufferSize => &["Ki", "Mi", "Gi"],
+        SettingKind::MaxAge | SettingKind::WriteBack | SettingKind::DirCacheTime => {
+            &["s", "m", "h", "d"]
         }
-        (SettingsField::MaxSize, Locale::Chinese) => {
-            "大小单位：K、M、G、T（例如 10G）；留空表示不限制"
+    }
+}
+
+fn split_custom_setting(kind: SettingKind, value: &str) -> (String, String) {
+    let digits = value
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>();
+    let suffix = value.get(digits.len()..).unwrap_or_default();
+    let unit = custom_units(kind)
+        .iter()
+        .find(|unit| **unit == suffix)
+        .copied()
+        .unwrap_or(custom_units(kind)[0])
+        .to_owned();
+    (digits, unit)
+}
+
+fn setting_help(kind: SettingKind, locale: Locale) -> &'static str {
+    match (kind, locale) {
+        (SettingKind::MaxSize, Locale::English) => {
+            "Maximum local VFS cache usage. No limit leaves eviction to age and free-space rules."
         }
-        (SettingsField::MaxAge, Locale::English) => "Duration units: s, m, h, d (for example 30m)",
-        (SettingsField::MaxAge, Locale::Chinese) => "时间单位：s、m、h、d（例如 30m）",
-        (SettingsField::MinFreeSpace, Locale::English) => {
-            "Size units: K, M, G, T (for example 1G); blank disables the reserve"
+        (SettingKind::MaxSize, Locale::Chinese) => {
+            "限制本地 VFS 缓存占用；不限制时由寿命和剩余空间规则负责清理。"
         }
-        (SettingsField::MinFreeSpace, Locale::Chinese) => {
-            "大小单位：K、M、G、T（例如 1G）；留空表示不保留空间"
+        (SettingKind::MaxAge, Locale::English) => {
+            "How long cached objects may remain before rclone can evict them."
         }
-        (SettingsField::WriteBack, Locale::English) => "Duration units: s, m, h (for example 5s)",
-        (SettingsField::WriteBack, Locale::Chinese) => "时间单位：s、m、h（例如 5s）",
-        (SettingsField::DirCacheTime, Locale::English) => {
-            "Duration units: s, m, h (for example 5m)"
+        (SettingKind::MaxAge, Locale::Chinese) => "缓存对象保留多久后允许被 rclone 清理。",
+        (SettingKind::MinFreeSpace, Locale::English) => {
+            "Local disk space reserved for other applications."
         }
-        (SettingsField::DirCacheTime, Locale::Chinese) => "时间单位：s、m、h（例如 5m）",
-        (SettingsField::BufferSize, Locale::English) => {
-            "Size units: K, M, G (for example 16M); blank uses the rclone default"
+        (SettingKind::MinFreeSpace, Locale::Chinese) => "为其他程序保留的本地磁盘空间。",
+        (SettingKind::WriteBack, Locale::English) => {
+            "Delay after a file closes before it becomes eligible for upload."
         }
-        (SettingsField::BufferSize, Locale::Chinese) => {
-            "大小单位：K、M、G（例如 16M）；留空使用 rclone 默认值"
+        (SettingKind::WriteBack, Locale::Chinese) => "文件关闭后等待多久才进入可上传状态。",
+        (SettingKind::DirCacheTime, Locale::English) => {
+            "How long remote directory listings and metadata remain cached."
         }
-        (SettingsField::CacheRoot, _) => "",
+        (SettingKind::DirCacheTime, Locale::Chinese) => "远端目录列表和元数据的缓存时间。",
+        (SettingKind::BufferSize, Locale::English) => "Memory read buffer allocated per open file.",
+        (SettingKind::BufferSize, Locale::Chinese) => "每个打开文件使用的内存读取缓冲。",
+    }
+}
+
+fn settings_help<'a>(help: &'a str) -> Element<'a, Message> {
+    tooltip(
+        container(text("?").size(13)).padding([0, 5]),
+        container(text(help).size(12)).padding(8),
+        tooltip::Position::FollowCursor,
+    )
+    .into()
+}
+
+fn vfs_cache_mode_help(locale: Locale) -> &'static str {
+    match locale {
+        Locale::English => {
+            "Full is recommended: it supports read caching and compatible writes. Writes caches modified files only; minimal/off reduce compatibility."
+        }
+        Locale::Chinese => {
+            "推荐 full：支持读取缓存和完整写入兼容。writes 只缓存修改文件，minimal/off 的兼容性更低。"
+        }
+    }
+}
+
+fn auto_transfer_help(locale: Locale) -> &'static str {
+    match locale {
+        Locale::English => {
+            "Shows the shared transfer popup when uploads are queued. Hiding it does not stop uploads."
+        }
+        Locale::Chinese => "有待上传任务时显示共享传输弹窗。隐藏弹窗不会停止上传。",
+    }
+}
+
+fn split_remote_path(value: &str) -> (String, String) {
+    let path = value.trim();
+    if path.starts_with('/') {
+        ("/".into(), path.trim_start_matches('/').into())
+    } else {
+        ("$HOME".into(), path.trim_matches('/').into())
+    }
+}
+
+fn compose_remote_path(base: &str, suffix: &str) -> String {
+    let suffix = suffix.trim().replace('\\', "/");
+    let suffix = suffix.trim_matches('/');
+    if base == "/" {
+        if suffix.is_empty() {
+            "/".into()
+        } else {
+            format!("/{suffix}")
+        }
+    } else {
+        suffix.into()
+    }
+}
+
+fn is_drive_mountpoint(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+fn custom_mountpoint_value(value: &str) -> String {
+    if value.is_empty()
+        || value == HOME_MOUNTPOINT_VALUE
+        || value == CUSTOM_MOUNTPOINT_PENDING
+        || is_drive_mountpoint(value)
+    {
+        String::new()
+    } else {
+        value.into()
+    }
+}
+
+fn mountpoint_choice(value: &str) -> String {
+    if value.is_empty() || value.eq_ignore_ascii_case("auto") {
+        "auto".into()
+    } else if value == HOME_MOUNTPOINT_VALUE {
+        "home".into()
+    } else if is_drive_mountpoint(value) {
+        value.to_owned()
+    } else {
+        "custom".into()
+    }
+}
+
+fn mountpoint_option_label(value: &str, locale: Locale) -> String {
+    match (value, locale) {
+        ("auto", Locale::English) => "Auto".into(),
+        ("auto", Locale::Chinese) => "自动".into(),
+        ("home", Locale::English) => "User folder (~/mnt/name)".into(),
+        ("home", Locale::Chinese) => "用户文件夹 (~/mnt/名称)".into(),
+        ("custom", Locale::English) => "Custom folder...".into(),
+        ("custom", Locale::Chinese) => "自定义文件夹...".into(),
+        _ => value.into(),
+    }
+}
+
+fn mountpoint_option_value(label: &str, locale: Locale) -> String {
+    for value in ["auto", "home", "custom"] {
+        if label == mountpoint_option_label(value, locale) {
+            return value.into();
+        }
+    }
+    label.into()
+}
+
+fn mountpoint_options(locale: Locale) -> Vec<String> {
+    let mut options = vec![
+        mountpoint_option_label("auto", locale),
+        mountpoint_option_label("home", locale),
+    ];
+    if cfg!(windows) {
+        options.extend(
+            "ZYXWVUTSRQPONMLKJIHGFED"
+                .chars()
+                .map(|letter| format!("{letter}:"))
+                .filter(|drive| !PathBuf::from(format!("{drive}\\")).exists()),
+        );
+    }
+    options.push(mountpoint_option_label("custom", locale));
+    options
+}
+
+fn suggested_mountpoint(parent: &Path, name: &str) -> PathBuf {
+    let cleaned = name
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    parent.join(if cleaned.is_empty() {
+        "mount"
+    } else {
+        &cleaned
+    })
+}
+
+fn mountpoint_help(locale: Locale) -> &'static str {
+    match locale {
+        Locale::English => {
+            "Auto chooses a free drive or user folder. Custom folder selection creates a child mountpoint under the selected parent."
+        }
+        Locale::Chinese => {
+            "自动会选择可用盘符或用户目录。选择自定义文件夹时，会在所选父目录下生成子挂载点。"
+        }
     }
 }
 
@@ -4154,12 +5076,12 @@ fn transfer_label(locale: Locale, snapshot: &TransferSnapshot) -> String {
     } else if snapshot.queued > 0 {
         match locale {
             Locale::English => format!(
-                "{} file(s) queued - {}",
+                "{} file(s) queued locally - waiting for write-back delay or upload slot - {}",
                 snapshot.queued,
                 format_bytes(snapshot.queued_bytes)
             ),
             Locale::Chinese => format!(
-                "{} 个文件排队中 - {}",
+                "{} 个文件已进入本地队列，等待写回延迟或上传槽位 - {}",
                 snapshot.queued,
                 format_bytes(snapshot.queued_bytes)
             ),
@@ -4173,6 +5095,17 @@ fn transfer_label(locale: Locale, snapshot: &TransferSnapshot) -> String {
 
 fn transfer_is_active(snapshot: &TransferSnapshot) -> bool {
     snapshot.queued > 0 || snapshot.uploading > 0 || snapshot.errors > 0 || snapshot.out_of_space
+}
+
+fn transfer_failure_is_visible(consecutive_failures: u8) -> bool {
+    consecutive_failures >= 3
+}
+
+fn unmount_needs_confirmation(
+    snapshot: Option<&TransferSnapshot>,
+    transfer_unavailable: bool,
+) -> bool {
+    transfer_unavailable || !snapshot.is_some_and(|snapshot| snapshot.synced)
 }
 
 fn retain_dismissed_transfers(
@@ -4281,6 +5214,25 @@ fn transfer_complete_notification(
     }
 }
 
+fn background_transfer_notification(locale: Locale) -> NativeNotification {
+    NativeNotification {
+        id: "transfer-view-hidden".into(),
+        title: match locale {
+            Locale::English => "Transfers continue in the background".into(),
+            Locale::Chinese => "传输仍在后台继续".into(),
+        },
+        body: match locale {
+            Locale::English => {
+                "Keep the mount active until the transfer center reports cloud synchronization."
+                    .into()
+            }
+            Locale::Chinese => "请保持挂载，直到传输中心确认云端已同步。".into(),
+        },
+        progress: None,
+        level: NativeNotificationLevel::Info,
+    }
+}
+
 fn transfer_error_notification(
     locale: Locale,
     server_id: &str,
@@ -4379,6 +5331,15 @@ fn diagnostic_trace(message: &str) {
 fn main_window_settings() -> window::Settings {
     window::Settings {
         size: Size::new(980.0, 720.0),
+        position: window::Position::Centered,
+        exit_on_close_request: false,
+        ..window::Settings::default()
+    }
+}
+
+fn log_window_settings() -> window::Settings {
+    window::Settings {
+        size: Size::new(900.0, 620.0),
         position: window::Position::Centered,
         exit_on_close_request: false,
         ..window::Settings::default()
@@ -4604,21 +5565,21 @@ mod localization_tests {
     }
 
     #[test]
-    fn settings_value_hints_expose_units_in_both_languages() {
-        for field in [
-            SettingsField::MaxSize,
-            SettingsField::MaxAge,
-            SettingsField::MinFreeSpace,
-            SettingsField::WriteBack,
-            SettingsField::DirCacheTime,
-            SettingsField::BufferSize,
+    fn settings_help_and_custom_units_cover_all_compact_fields() {
+        for kind in [
+            SettingKind::MaxSize,
+            SettingKind::MaxAge,
+            SettingKind::MinFreeSpace,
+            SettingKind::WriteBack,
+            SettingKind::DirCacheTime,
+            SettingKind::BufferSize,
         ] {
-            assert!(!settings_value_hint(field, Locale::English).is_empty());
-            assert!(!settings_value_hint(field, Locale::Chinese).is_empty());
+            assert!(!setting_help(kind, Locale::English).is_empty());
+            assert!(!setting_help(kind, Locale::Chinese).is_empty());
+            assert!(!custom_units(kind).is_empty());
         }
-        assert!(settings_value_hint(SettingsField::MaxSize, Locale::English).contains("G"));
-        assert!(settings_value_hint(SettingsField::MaxAge, Locale::English).contains("m"));
-        assert!(settings_value_hint(SettingsField::WriteBack, Locale::Chinese).contains("s"));
+        assert!(custom_units(SettingKind::MaxSize).contains(&"Gi"));
+        assert!(custom_units(SettingKind::MaxAge).contains(&"m"));
     }
 
     #[test]
@@ -4808,6 +5769,80 @@ mod localization_tests {
         };
 
         assert!(transfer_is_active(&snapshot));
+    }
+
+    #[test]
+    fn transfer_error_requires_three_consecutive_failures() {
+        assert!(!transfer_failure_is_visible(1));
+        assert!(!transfer_failure_is_visible(2));
+        assert!(transfer_failure_is_visible(3));
+        assert!(transfer_failure_is_visible(u8::MAX));
+    }
+
+    #[test]
+    fn compact_setting_presets_preserve_custom_values() {
+        assert_eq!(
+            setting_presets(SettingKind::MaxSize),
+            &["", "10G", "50G", "100G"]
+        );
+        assert_eq!(
+            setting_presets(SettingKind::WriteBack),
+            &["0s", "5s", "30s", "1m"]
+        );
+        assert_eq!(
+            split_custom_setting(SettingKind::MaxSize, "250Gi"),
+            ("250".into(), "Gi".into())
+        );
+        assert_eq!(
+            split_custom_setting(SettingKind::MaxAge, "1h30m"),
+            ("1".into(), "s".into())
+        );
+    }
+
+    #[test]
+    fn structured_remote_path_round_trips_home_and_root() {
+        assert_eq!(
+            split_remote_path("project/data"),
+            ("$HOME".into(), "project/data".into())
+        );
+        assert_eq!(compose_remote_path("$HOME", "project/data"), "project/data");
+        assert_eq!(
+            split_remote_path("/srv/data"),
+            ("/".into(), "srv/data".into())
+        );
+        assert_eq!(compose_remote_path("/", "srv/data"), "/srv/data");
+        assert_eq!(compose_remote_path("/", ""), "/");
+    }
+
+    #[test]
+    fn mountpoint_presets_do_not_misclassify_paths_containing_drive_text() {
+        assert_eq!(mountpoint_choice(""), "auto");
+        assert_eq!(mountpoint_choice(HOME_MOUNTPOINT_VALUE), "home");
+        assert_eq!(mountpoint_choice("Z:"), "Z:");
+        assert_eq!(mountpoint_choice(CUSTOM_MOUNTPOINT_PENDING), "custom");
+        assert_eq!(mountpoint_choice("/data/Z:/folder"), "custom");
+    }
+
+    #[test]
+    fn unmount_is_immediate_only_after_confirmed_sync() {
+        let synced = TransferSnapshot {
+            files: Vec::new(),
+            queued: 0,
+            uploading: 0,
+            queued_bytes: 0,
+            transferred_bytes: 0,
+            percentage: 100.0,
+            errors: 0,
+            out_of_space: false,
+            synced: true,
+        };
+        assert!(!unmount_needs_confirmation(Some(&synced), false));
+        assert!(unmount_needs_confirmation(Some(&synced), true));
+        assert!(unmount_needs_confirmation(None, false));
+        let mut pending = synced.clone();
+        pending.synced = false;
+        pending.queued = 1;
+        assert!(unmount_needs_confirmation(Some(&pending), false));
     }
 
     #[test]
