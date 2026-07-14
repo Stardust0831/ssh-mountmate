@@ -143,6 +143,11 @@ Cross-platform considerations:
   API `url` and `browser_download_url`, while the old Serde alias mapped both into one field and
   rejected the object as a duplicate. Asset decoding now explicitly consumes `browser_download_url`,
   which is also the only URL shape accepted by automatic download validation.
+- Final rewrite run
+  [29328212476](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29328212476) passed live API
+  quality and all six native build/lifecycle jobs on commit `86f1220`. Final non-publishing release
+  run [29329263951](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29329263951)
+  passed the same live API, six-platform, exact six-ZIP, and SHA-256 gates.
 
 - Audited the settings page for merge readiness. Cache mode and language already use typed dropdown
   choices; connection source, authentication, and transport also remain typed selectors.
