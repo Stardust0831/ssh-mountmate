@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
@@ -49,6 +49,10 @@ pub struct InteractiveSshSession {
     check_program: PathBuf,
     check_arguments: Vec<String>,
     login: LoginCommand,
+    #[cfg(unix)]
+    control_dir: PathBuf,
+    #[cfg(unix)]
+    control_socket: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +73,44 @@ enum LoginCommand {
     },
 }
 
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnixPathMetadata {
+    is_symlink: bool,
+    is_directory: bool,
+    is_socket: bool,
+    uid: u32,
+    mode: u32,
+}
+
+#[cfg(unix)]
+trait UnixMetadataProvider {
+    fn symlink_metadata(&self, path: &Path) -> std::io::Result<UnixPathMetadata>;
+    fn current_uid(&self) -> u32;
+}
+
+#[cfg(unix)]
+struct SystemUnixMetadata;
+
+#[cfg(unix)]
+impl UnixMetadataProvider for SystemUnixMetadata {
+    fn symlink_metadata(&self, path: &Path) -> std::io::Result<UnixPathMetadata> {
+        let metadata = fs::symlink_metadata(path)?;
+        let file_type = metadata.file_type();
+        Ok(UnixPathMetadata {
+            is_symlink: file_type.is_symlink(),
+            is_directory: file_type.is_dir(),
+            is_socket: file_type.is_socket(),
+            uid: metadata.uid(),
+            mode: metadata.mode(),
+        })
+    }
+
+    fn current_uid(&self) -> u32 {
+        rustix::process::geteuid().as_raw()
+    }
+}
+
 impl InteractiveSshSession {
     pub fn for_server(
         paths: &AppPaths,
@@ -85,17 +127,57 @@ impl InteractiveSshSession {
         &self.connector
     }
 
+    /// Return connector arguments only after revalidating the control paths.
+    /// Existing callers can retain the infallible accessor while code that is
+    /// about to spawn a connector can use this checked form.
+    pub fn verified_connector_arguments(&self) -> Result<&[String], InteractiveSshError> {
+        #[cfg(unix)]
+        self.validate_control_paths()?;
+        Ok(&self.connector)
+    }
+
+    #[cfg(unix)]
+    fn validate_control_paths(&self) -> Result<(), InteractiveSshError> {
+        validate_control_directory(&self.control_dir)?;
+        validate_optional_control_socket(&self.control_socket)?;
+        Ok(())
+    }
+
     pub fn is_ready(&self) -> bool {
-        Command::new(&self.check_program)
+        #[cfg(unix)]
+        if self.validate_control_paths().is_err() {
+            return false;
+        }
+        let ready = Command::new(&self.check_program)
             .args(&self.check_arguments)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .is_ok_and(|status| status.success())
+            .is_ok_and(|status| status.success());
+        #[cfg(unix)]
+        if !ready {
+            // A verified socket that no longer answers is stale. Never remove
+            // an object unless it passes the same identity checks used above.
+            let _ = cleanup_control_socket(&self.control_socket);
+        }
+        ready
+    }
+
+    /// Remove this server's stale OpenSSH control socket when it is safe to do
+    /// so. Invalid, replaced, or foreign-owned paths are left untouched.
+    pub fn cleanup(&self) -> Result<(), InteractiveSshError> {
+        #[cfg(unix)]
+        {
+            validate_control_directory(&self.control_dir)?;
+            cleanup_control_socket(&self.control_socket)?;
+        }
+        Ok(())
     }
 
     pub fn start_login(&self) -> Result<(), InteractiveSshError> {
+        #[cfg(unix)]
+        self.validate_control_paths()?;
         match &self.login {
             LoginCommand::Windows { program, arguments } => {
                 let mut command = Command::new(program);
@@ -135,12 +217,14 @@ impl InteractiveSshSession {
         let ssh = find_system_executable("ssh").ok_or(InteractiveSshError::OpenSshMissing)?;
         let id_hash = format!("{:x}", Sha256::digest(server.id.as_bytes()));
         let control_dir = control_directory(paths, &id_hash);
+        #[cfg(unix)]
+        ensure_control_directory(&control_dir)?;
+        #[cfg(not(unix))]
         fs::create_dir_all(&control_dir)
             .map_err(|error| InteractiveSshError::Process(error.to_string()))?;
-        #[cfg(unix)]
-        fs::set_permissions(&control_dir, fs::Permissions::from_mode(0o700))
-            .map_err(|error| InteractiveSshError::Process(error.to_string()))?;
         let control = control_dir.join(format!("{}.sock", &id_hash[..16]));
+        #[cfg(unix)]
+        validate_optional_control_socket(&control)?;
         let target = openssh_target_arguments(server);
         let mut connector = vec![
             ssh.display().to_string(),
@@ -185,6 +269,10 @@ impl InteractiveSshSession {
             check_program: ssh,
             check_arguments,
             login,
+            #[cfg(unix)]
+            control_dir,
+            #[cfg(unix)]
+            control_socket: control,
         })
     }
 
@@ -217,6 +305,10 @@ impl InteractiveSshSession {
                 program: plink.path,
                 arguments: login_arguments,
             },
+            #[cfg(unix)]
+            control_dir: PathBuf::new(),
+            #[cfg(unix)]
+            control_socket: PathBuf::new(),
         })
     }
 }
@@ -232,6 +324,164 @@ fn control_directory(paths: &AppPaths, id_hash: &str) -> PathBuf {
         );
         std::env::temp_dir().join(format!("ssh-mountmate-{}", &state_hash[..16]))
     }
+}
+
+#[cfg(unix)]
+fn ensure_control_directory(path: &Path) -> Result<(), InteractiveSshError> {
+    // Refuse to traverse an attacker-controlled symlink while creating the
+    // directory. The final directory is checked again after creation because
+    // the path can be replaced concurrently.
+    validate_existing_path_components(path.parent().unwrap_or_else(|| Path::new(".")))?;
+    let existed = match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                return Err(invalid_control_path(path, "is a symbolic link"));
+            }
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(control_path_io_error(path, error)),
+    };
+    if !existed {
+        fs::create_dir_all(path).map_err(|error| control_path_io_error(path, error))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .map_err(|error| control_path_io_error(path, error))?;
+    }
+    validate_control_directory(path)
+}
+
+#[cfg(unix)]
+fn validate_existing_path_components(path: &Path) -> Result<(), InteractiveSshError> {
+    let mut current = path.to_owned();
+    loop {
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                let file_type = metadata.file_type();
+                if file_type.is_symlink() {
+                    return Err(invalid_control_path(
+                        &current,
+                        "a parent is a symbolic link",
+                    ));
+                }
+                if !file_type.is_dir() {
+                    return Err(invalid_control_path(
+                        &current,
+                        "a parent is not a directory",
+                    ));
+                }
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(parent) = current.parent() else {
+                    break;
+                };
+                if parent == current {
+                    break;
+                }
+                current = parent.to_owned();
+            }
+            Err(error) => return Err(control_path_io_error(&current, error)),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_control_directory(path: &Path) -> Result<(), InteractiveSshError> {
+    validate_existing_path_components(path.parent().unwrap_or_else(|| Path::new(".")))?;
+    validate_control_directory_with(&SystemUnixMetadata, path)
+        .map_err(|reason| invalid_control_path(path, reason))
+}
+
+#[cfg(unix)]
+fn validate_control_directory_with(
+    metadata: &dyn UnixMetadataProvider,
+    path: &Path,
+) -> Result<(), &'static str> {
+    let observed = metadata
+        .symlink_metadata(path)
+        .map_err(|_| "could not inspect")?;
+    let uid = metadata.current_uid();
+    if observed.is_symlink {
+        return Err("is a symbolic link");
+    }
+    if !observed.is_directory {
+        return Err("is not a directory");
+    }
+    if observed.uid != uid {
+        return Err("is not owned by the current user");
+    }
+    if observed.mode & 0o7777 != 0o700 {
+        return Err("does not have owner-only permissions");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_optional_control_socket(path: &Path) -> Result<bool, InteractiveSshError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            validate_control_socket(path)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(control_path_io_error(path, error)),
+    }
+}
+
+#[cfg(unix)]
+fn validate_control_socket(path: &Path) -> Result<(), InteractiveSshError> {
+    validate_control_socket_with(&SystemUnixMetadata, path)
+        .map_err(|reason| invalid_control_path(path, reason))
+}
+
+#[cfg(unix)]
+fn validate_control_socket_with(
+    metadata: &dyn UnixMetadataProvider,
+    path: &Path,
+) -> Result<(), &'static str> {
+    let observed = metadata
+        .symlink_metadata(path)
+        .map_err(|_| "could not inspect")?;
+    let uid = metadata.current_uid();
+    if observed.is_symlink {
+        return Err("is a symbolic link");
+    }
+    if !observed.is_socket {
+        return Err("is not a Unix socket");
+    }
+    if observed.uid != uid {
+        return Err("is not owned by the current user");
+    }
+    if observed.mode & 0o077 != 0 {
+        return Err("has group or world permissions");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn cleanup_control_socket(path: &Path) -> Result<(), InteractiveSshError> {
+    match validate_optional_control_socket(path)? {
+        true => fs::remove_file(path).map_err(|error| control_path_io_error(path, error)),
+        false => Ok(()),
+    }
+}
+
+#[cfg(unix)]
+fn invalid_control_path(path: &Path, reason: &str) -> InteractiveSshError {
+    InteractiveSshError::Process(format!(
+        "unsafe OpenSSH control path {}: {reason}",
+        path.display()
+    ))
+}
+
+#[cfg(unix)]
+fn control_path_io_error(path: &Path, error: std::io::Error) -> InteractiveSshError {
+    InteractiveSshError::Process(format!(
+        "could not inspect OpenSSH control path {}: {error}",
+        path.display()
+    ))
 }
 
 fn openssh_target_arguments(server: &ServerConfig) -> Vec<String> {
@@ -351,6 +601,23 @@ fn write_login_script(path: &Path, arguments: &[String]) -> Result<(), Interacti
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    struct FakeUnixMetadata {
+        observed: UnixPathMetadata,
+        uid: u32,
+    }
+
+    #[cfg(unix)]
+    impl UnixMetadataProvider for FakeUnixMetadata {
+        fn symlink_metadata(&self, _path: &Path) -> std::io::Result<UnixPathMetadata> {
+            Ok(self.observed)
+        }
+
+        fn current_uid(&self) -> u32 {
+            self.uid
+        }
+    }
+
     fn server() -> ServerConfig {
         ServerConfig {
             id: "alpha".into(),
@@ -464,6 +731,175 @@ mod tests {
             first,
             std::env::temp_dir().join(format!("ssh-mountmate-{}", &state_hash[..16]))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_directory_rejects_a_malicious_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("outside");
+        fs::create_dir(&target).unwrap();
+        let control = temp.path().join("control");
+        symlink(&target, &control).unwrap();
+
+        assert!(ensure_control_directory(&control).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_directory_creation_is_owner_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let control = temp.path().join("control");
+
+        ensure_control_directory(&control).unwrap();
+        let metadata = fs::symlink_metadata(&control).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        assert!(validate_control_directory(&control).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_directory_rejects_wrong_owner_via_metadata_provider() {
+        let metadata = FakeUnixMetadata {
+            observed: UnixPathMetadata {
+                is_symlink: false,
+                is_directory: true,
+                is_socket: false,
+                uid: 2000,
+                mode: 0o700,
+            },
+            uid: 1000,
+        };
+
+        assert!(validate_control_directory_with(&metadata, Path::new("control")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_directory_rejects_wrong_type_and_permissive_mode() {
+        let wrong_type = FakeUnixMetadata {
+            observed: UnixPathMetadata {
+                is_symlink: false,
+                is_directory: false,
+                is_socket: false,
+                uid: 1000,
+                mode: 0o700,
+            },
+            uid: 1000,
+        };
+        assert!(validate_control_directory_with(&wrong_type, Path::new("control")).is_err());
+
+        let permissive = FakeUnixMetadata {
+            observed: UnixPathMetadata {
+                is_symlink: false,
+                is_directory: true,
+                is_socket: false,
+                uid: 1000,
+                mode: 0o755,
+            },
+            uid: 1000,
+        };
+        assert!(validate_control_directory_with(&permissive, Path::new("control")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_socket_rejects_symlink_wrong_type_and_permissive_mode() {
+        let symlink = FakeUnixMetadata {
+            observed: UnixPathMetadata {
+                is_symlink: true,
+                is_directory: false,
+                is_socket: false,
+                uid: 1000,
+                mode: 0o600,
+            },
+            uid: 1000,
+        };
+        assert!(validate_control_socket_with(&symlink, Path::new("socket")).is_err());
+
+        let regular_file = FakeUnixMetadata {
+            observed: UnixPathMetadata {
+                is_symlink: false,
+                is_directory: false,
+                is_socket: false,
+                uid: 1000,
+                mode: 0o600,
+            },
+            uid: 1000,
+        };
+        assert!(validate_control_socket_with(&regular_file, Path::new("socket")).is_err());
+
+        let permissive = FakeUnixMetadata {
+            observed: UnixPathMetadata {
+                is_symlink: false,
+                is_directory: false,
+                is_socket: true,
+                uid: 1000,
+                mode: 0o606,
+            },
+            uid: 1000,
+        };
+        assert!(validate_control_socket_with(&permissive, Path::new("socket")).is_err());
+
+        let wrong_owner = FakeUnixMetadata {
+            observed: UnixPathMetadata {
+                is_symlink: false,
+                is_directory: false,
+                is_socket: true,
+                uid: 2000,
+                mode: 0o600,
+            },
+            uid: 1000,
+        };
+        assert!(validate_control_socket_with(&wrong_owner, Path::new("socket")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_socket_rejects_a_malicious_symlink_on_disk() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("outside.sock");
+        let listener = UnixListener::bind(&target).unwrap();
+        let socket = temp.path().join("control.sock");
+        symlink(&target, &socket).unwrap();
+
+        assert!(validate_control_socket(&socket).is_err());
+        drop(listener);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_removes_only_a_verified_owned_stale_socket() {
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::tempdir().unwrap();
+        let control = temp.path().join("control");
+        fs::create_dir(&control).unwrap();
+        fs::set_permissions(&control, fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = control.join("stale.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        drop(listener);
+
+        assert!(validate_control_socket(&socket).is_ok());
+        cleanup_control_socket(&socket).unwrap();
+        assert!(!socket.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_leaves_an_unverified_object_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let object = temp.path().join("stale.sock");
+        fs::write(&object, b"not a socket").unwrap();
+
+        assert!(cleanup_control_socket(&object).is_err());
+        assert!(object.exists());
     }
 
     #[cfg(unix)]
