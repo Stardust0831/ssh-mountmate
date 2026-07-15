@@ -18,7 +18,7 @@ use mountmate_core::update_helper::{
     ParentProcessIdentity, materialize_update_helper, write_update_plan,
 };
 use mountmate_core::update_install::{
-    detect_install_layout, locate_directory_payload, plan_transaction_paths,
+    InstallKind, detect_install_layout, locate_update_payload, plan_transaction_paths,
     prepare_directory_payload,
 };
 use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System, UpdateKind};
@@ -58,6 +58,39 @@ fn packaged_update_preserves_real_active_mount() {
     run_active_mount_update().unwrap();
 }
 
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn standalone_update_fixture_uses_a_distinct_executable_payload() {
+    let temporary = tempfile::tempdir().unwrap();
+    let install_root = temporary.path().join("installed");
+    let payload_root = temporary.path().join("payload");
+    fs::create_dir(&install_root).unwrap();
+    fs::create_dir(&payload_root).unwrap();
+    fs::write(package_executable(&install_root), b"packaged executable").unwrap();
+    fs::write(package_executable(&payload_root), b"packaged executable").unwrap();
+
+    let original_sha256 = file_sha256(&package_executable(&install_root)).unwrap();
+    make_payload_distinct(
+        InstallKind::StandaloneExecutable,
+        &install_root,
+        &payload_root,
+    )
+    .unwrap();
+    let payload = locate_update_payload(
+        &payload_root,
+        InstallKind::StandaloneExecutable,
+        env::consts::OS,
+    )
+    .unwrap();
+
+    assert_eq!(
+        payload.executable,
+        package_executable(&payload_root).canonicalize().unwrap()
+    );
+    assert_ne!(file_sha256(&payload.executable).unwrap(), original_sha256);
+    assert!(!version_marker(&payload_root).exists());
+}
+
 #[derive(Clone, Copy)]
 enum Scenario {
     Commit,
@@ -90,10 +123,6 @@ fn run_scenario(scenario: Scenario) -> TestResult {
     let payload_root = temporary.path().join(format!("payload-{}", package_name()));
     copy_tree(&package_root, &install_root)?;
     copy_tree(&package_root, &payload_root)?;
-    fs::write(version_marker(&install_root), b"old\n")?;
-    fs::write(version_marker(&payload_root), b"new\n")?;
-    resign_macos_bundle(&install_root)?;
-    resign_macos_bundle(&payload_root)?;
 
     let environment = TestEnvironment::new(temporary.path())?;
     let settings = Settings {
@@ -105,8 +134,19 @@ fn run_scenario(scenario: Scenario) -> TestResult {
 
     let installed_executable = package_executable(&install_root);
     let layout = detect_install_layout(&installed_executable)?;
+    let install_kind = layout.kind;
+    make_payload_distinct(layout.kind, &install_root, &payload_root)?;
+    let old_executable_sha256 = file_sha256(&installed_executable)?;
+    let new_executable_sha256 = file_sha256(&package_executable(&payload_root))?;
+    if matches!(install_kind, InstallKind::StandaloneExecutable)
+        && old_executable_sha256 == new_executable_sha256
+    {
+        return Err(
+            io::Error::other("packaged update fixture did not create a distinct payload").into(),
+        );
+    }
     let transaction = plan_transaction_paths(&layout)?;
-    let payload = locate_directory_payload(&payload_root, env::consts::OS)?;
+    let payload = locate_update_payload(&payload_root, layout.kind, env::consts::OS)?;
     let prepared = prepare_directory_payload(&layout, &payload, &transaction, env::consts::OS)?;
     let helper = materialize_update_helper(
         &temporary.path().join("detached-updater"),
@@ -191,14 +231,31 @@ fn run_scenario(scenario: Scenario) -> TestResult {
             _ => {}
         }
 
-        let installed_marker = fs::read_to_string(version_marker(&install_root))?;
-        if installed_marker.trim() != scenario.expected_marker() {
-            return Err(io::Error::other(format!(
-                "installed bundle marker is {:?}, expected {:?}",
-                installed_marker.trim(),
-                scenario.expected_marker()
-            ))
-            .into());
+        match install_kind {
+            InstallKind::StandaloneExecutable => {
+                let expected_sha256 = match scenario {
+                    Scenario::Commit => &new_executable_sha256,
+                    Scenario::Rollback => &old_executable_sha256,
+                };
+                let installed_sha256 = file_sha256(&installed_executable)?;
+                if &installed_sha256 != expected_sha256 {
+                    return Err(io::Error::other(format!(
+                        "installed executable digest is {installed_sha256}, expected {expected_sha256}"
+                    ))
+                    .into());
+                }
+            }
+            InstallKind::DirectoryBundle | InstallKind::MacApplicationBundle => {
+                let installed_marker = fs::read_to_string(version_marker(&install_root))?;
+                if installed_marker.trim() != scenario.expected_marker() {
+                    return Err(io::Error::other(format!(
+                        "installed bundle marker is {:?}, expected {:?}",
+                        installed_marker.trim(),
+                        scenario.expected_marker()
+                    ))
+                    .into());
+                }
+            }
         }
         if transaction.backup.exists() || transaction.prepared.exists() {
             return Err(io::Error::other(
@@ -274,12 +331,13 @@ fn run_active_mount_update() -> TestResult {
         .path()
         .join(format!("active-payload-{}", package_name()));
     copy_tree(&install_root, &payload_root)?;
-    fs::write(version_marker(&payload_root), b"new\n")?;
-    resign_macos_bundle(&payload_root)?;
 
     let layout = detect_install_layout(&installed_executable)?;
+    let install_kind = layout.kind;
+    make_payload_distinct(layout.kind, &install_root, &payload_root)?;
+    let new_executable_sha256 = file_sha256(&package_executable(&payload_root))?;
     let transaction = plan_transaction_paths(&layout)?;
-    let payload = locate_directory_payload(&payload_root, env::consts::OS)?;
+    let payload = locate_update_payload(&payload_root, layout.kind, env::consts::OS)?;
     let prepared = prepare_directory_payload(&layout, &payload, &transaction, env::consts::OS)?;
     let helper = materialize_update_helper(
         &temporary.path().join("active-detached-updater"),
@@ -343,7 +401,15 @@ fn run_active_mount_update() -> TestResult {
             ))
             .into());
         }
-        if fs::read_to_string(version_marker(&install_root))?.trim() != "new" {
+        let payload_replaced = match install_kind {
+            InstallKind::StandaloneExecutable => {
+                file_sha256(&installed_executable)? == new_executable_sha256
+            }
+            InstallKind::DirectoryBundle | InstallKind::MacApplicationBundle => {
+                fs::read_to_string(version_marker(&install_root))?.trim() == "new"
+            }
+        };
+        if !payload_replaced {
             return Err(
                 io::Error::other("active package was not replaced by the new payload").into(),
             );
@@ -432,6 +498,31 @@ fn version_marker(root: &Path) -> PathBuf {
     } else {
         root.join(VERSION_MARKER)
     }
+}
+
+fn make_payload_distinct(
+    kind: InstallKind,
+    install_root: &Path,
+    payload_root: &Path,
+) -> TestResult {
+    match kind {
+        InstallKind::StandaloneExecutable => {
+            use std::io::Write;
+
+            let payload_executable = package_executable(payload_root);
+            fs::OpenOptions::new()
+                .append(true)
+                .open(payload_executable)?
+                .write_all(b"\nSSH MountMate packaged update e2e payload\n")?;
+        }
+        InstallKind::DirectoryBundle | InstallKind::MacApplicationBundle => {
+            fs::write(version_marker(install_root), b"old\n")?;
+            fs::write(version_marker(payload_root), b"new\n")?;
+        }
+    }
+    resign_macos_bundle(install_root)?;
+    resign_macos_bundle(payload_root)?;
+    Ok(())
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> io::Result<()> {
