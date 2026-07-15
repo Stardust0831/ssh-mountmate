@@ -68,6 +68,7 @@ See also:
 - `docs/development-roadmap.md`
 - `docs/rust-rewrite-audit.md`
 - `release-notes/v0.4.1-alpha.1.md`
+- Chinese handoff: `docs/codex-handoff-2026-07-16.zh-CN.md`
 
 ## User authorization for the next work
 
@@ -315,6 +316,19 @@ Recommended direction:
 - Windows: use ConPTY or another established Rust PTY integration and start Plink/OpenSSH without a
   new visible console.
 - macOS/Linux: use a PTY-backed child process and render its terminal in an SSH login window/panel.
+- Keep distribution to one executable by adding a hidden subcommand to the same binary, for example
+  `SSHMountMate.exe --ssh-session-broker <server-id>`. The broker owns the ConPTY/PTY and SSH child;
+  the main GUI connects through authenticated current-user-only local IPC. This is still one shipped
+  EXE even though an app-owned helper process exists at runtime.
+- Prefer the broker model when a shared SSH session must survive hiding/recreating the GUI. A strict
+  single-process implementation is possible, but closing or replacing the GUI would also close its
+  PTY unless substantially more lifecycle state is kept in the main process.
+- `CREATE_NO_WINDOW` plus ordinary stdin/stdout pipes is not a sufficient replacement. SSH, Plink,
+  password prompts, host-key confirmation, OAuth/device login, 2FA, and terminal control sequences
+  may require a real TTY/PTY. Do not ship a pipe-based prompt parser that guesses prompt text.
+- Render the PTY with a mature terminal parser/widget or a deliberately bounded terminal surface.
+  Handle ANSI/VT sequences, cursor movement, backspace, resize, Unicode, IME input, URLs, EOF, and
+  child exit without implementing a terminal emulator protocol from scratch.
 - Keep one app-managed login session per connection and display lifecycle state, output, retry, and
   close semantics without logging secrets.
 - Support prompts, device/OAuth URLs, 2FA codes, host-key questions, resize, EOF, and process exit.
@@ -322,6 +336,9 @@ Recommended direction:
   live shared session merely because the view is hidden unless the user explicitly requests it.
 - Do not make the process headless before an in-app interactive channel exists; that would strand
   password/OAuth/2FA prompts.
+- Authenticate IPC, restrict endpoints to the current user, bound any in-memory scrollback, and do
+  not persist terminal contents by default. Clipboard/export actions must be explicit because the
+  terminal may contain tokens, hostnames, usernames, or other sensitive material.
 
 ### P1 - Harden macOS/Linux per-connection OpenSSH sockets
 
@@ -509,8 +526,8 @@ The previous agent completed the following immediately before this handoff:
    verify actual public metadata, and restore draft state on failure.
 10. Removed the temporary Environment branch policy; only `v*` tags remain allowed.
 
-No product code for the newly reported issues was changed in this handoff turn. The only intended
-new artifact is this document.
+No product code for the newly reported issues was changed in these handoff turns. The only intended
+changes are the English and Chinese handoff documents.
 
 ## Known residual risks
 
