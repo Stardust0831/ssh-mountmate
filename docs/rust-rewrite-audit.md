@@ -32,6 +32,15 @@ This document maps every requirement in `docs/rust-rewrite.md` to current author
   non-interactive shared connector, and preserved separate interactive/OpenSSH rclone remotes.
   Windows x64/ARM64 verified fixed-key Plink sharing and completed the real mount lifecycle. Both
   macOS architectures also retained passing FUSE and loopback-only NFS lifecycle evidence.
+- [29435256461](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29435256461): final
+  embedded-production-key branch gate on `be1b917`; quality and all six native package, credential,
+  update/rollback, real mount, and macOS FUSE/NFS jobs passed.
+- [29442216176](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29442216176): exact-tag
+  production release gate. Every checkout used `v0.4.1-alpha.1`/`be1b917`; quality, six platform
+  jobs, and ephemeral signed release-set verification passed. The automated publish step safely
+  stopped on GitHub's draft lookup/URL semantics; the production manifest and signature were then
+  verified with rollback protection against actual public GitHub REST digests and canonical URLs
+  for Release `354659949` before completion.
 
 ## Product requirements
 
@@ -43,7 +52,7 @@ This document maps every requirement in `docs/rust-rewrite.md` to current author
 | Truthful rclone RC transfer state | Verified | Unit tests cover queued, active, errored, unknown, exhausted-cache, and remote-byte states. Windows/Linux/macOS real mounts prove queued writes are not presented as complete and later become remotely complete. |
 | Refresh order and Windows root quote repair | Verified | RC contract tests prove forget/refresh/list followed by a post-refresh queue snapshot and reject the legacy quote remote; real mount tests prove remotely created content appears after refresh. |
 | Safe process ownership and PID-reuse behavior | Verified | Process/runtime tests cover exact argv identity, start-time mismatch, unverifiable ownership, safe RC quit, stale state, and never terminating a reused PID. |
-| Verified update, extraction, staged replacement, health, and rollback | Ed25519 implementation pending new CI evidence | Existing packaged update/rollback runs on all six targets. The new client additionally requires a signed six-asset manifest plus matching GitHub REST digests, sizes, tag/channel and URLs before installation; tamper, missing-signature, wrong-key, rotation, and signing-tool tests run locally. Production key confirmation and a fresh six-platform run remain required. |
+| Verified update, extraction, staged replacement, health, and rollback | Verified with Ed25519 production evidence | Packaged update/rollback passes on all six targets. The client requires a signed six-asset manifest plus matching GitHub REST digests, sizes, tag/channel and canonical URLs before installation. Tamper, missing-signature, wrong-key, rotation, local signing-tool, ephemeral release-set, and actual published-Release verification all pass; `v0.4.1-alpha.1` is the first signed prerelease. |
 | Responsive bilingual GUI, shared transfer window, transfer center, tray/menu bar, notifications, global progress, and file-manager integration | Verified | Native tray/menu bar, notifications, Windows taskbar, macOS Dock, X11/Wayland capability reporting, authenticated IPC, and file-manager registration are exercised. The application now reuses one movable transfer window across mounts and expands it to per-connection details; unit tests verify aggregation, dismissal, unknown-size handling, and truthful completion. |
 | Native x64/ARM64 packages without Python | Verified for portable packages | Six native ZIP packages contain the Rust executable, verified rclone, and notices with no Python runtime. The approved v0.4.0 scope is portable and unsigned; native installers and production signing/notarization remain separate distribution work. |
 | Experimental macOS built-in NFS | Verified as opt-in, not default | Both macOS architectures completed real loopback NFS lifecycles in run 29398901355. Legacy settings and new defaults remain FUSE; Windows/Linux commands are unchanged. Evidence is not yet sufficient to promote NFS to the default. |
@@ -72,16 +81,16 @@ This document maps every requirement in `docs/rust-rewrite.md` to current author
 | `cargo fmt --all --check` | Verified in rewrite and release quality jobs. |
 | Zero-warning workspace Clippy | Verified in rewrite and release quality jobs. |
 | Complete workspace tests | Verified in rewrite and release quality jobs and on all six build targets. |
-| Six-platform packages and smoke tests | Verified at final branch run 29393569520 and complete non-publishing release workflow 29393569262. |
+| Six-platform packages and smoke tests | Verified at stable runs 29393569520/29393569262 and signed prerelease runs 29435256461/29442216176. |
 | Windows Explorer/ACL/IPC/Toast/tray/taskbar/mount/refresh/upload/update/rollback | Verified. |
 | macOS bundle/notifications/menu bar/Finder/mount/update/rollback | Verified on x64 and ARM64; signing-ready layout is verified with ad-hoc signatures, while production signing/notarization configuration remains a distribution task. |
 | Linux X11/Wayland/notifications/tray/file manager/mount/update/rollback | Verified on x64 and ARM64 where architecture-specific; X11 and Wayland desktop protocol checks run on Ubuntu x64. |
 
-## Current signed-prerelease gates
+## Signed-prerelease result
 
-1. Commit and push the Ed25519 implementation without merging the extension branch.
-2. Require quality and all six Windows, Linux, and macOS x64/ARM64 jobs to pass on the exact commit.
-3. Configure the protected production-signing Environment, generate the only production key, and
-   commit its public record without persisting the private key outside the GitHub secret.
-4. Show the production `key_id` and full public-key SHA-256 to the owner and obtain explicit
-   confirmation before creating the `v0.4.1-alpha.1` tag or publishing any Release.
+All `v0.4.1-alpha.1` gates are complete: the implementation remains unmerged on the extension
+branch, the exact tag commit passed quality and all six native jobs, the protected production key
+was used only after owner confirmation and Environment approval, and the public Release passed the
+same Ed25519/REST metadata verifier used by the client. Remaining distribution risks are the
+v0.4.0-to-v0.4.1 first-trust bootstrap, the intentionally unbacked-up single GitHub private-key
+secret, absence of Authenticode/Developer ID/notarization, and no Windows/Linux onedir update asset.

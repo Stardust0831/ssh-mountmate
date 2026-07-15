@@ -13,9 +13,11 @@ The active PKCS#8 private key is stored only as the protected GitHub Environment
 `UPDATE_ED25519_PRIVATE_KEY_PKCS8_B64` in `production-update-signing`. Its matching environment
 variable is `UPDATE_ED25519_KEY_ID`. The environment must require owner approval and restrict
 deployment to approved `v*` tags. The release workflow builds and tests the signing program before
-the private-key step, signs through stdin, creates a draft Release, verifies the REST metadata and
-all published digests, and publishes only after every check succeeds. A failed check leaves the
-Release as a draft.
+the private-key step, signs through stdin, and creates a draft Release. GitHub gives draft assets an
+`untagged-*` download URL, so the workflow first verifies the real draft sizes and REST digests with
+the deterministic canonical URL each asset will receive on publication. It then publishes, verifies
+the actual public REST metadata with the same client-side verifier, and automatically restores the
+Release to draft if that post-publication check fails.
 
 The chosen custody policy deliberately has **one GitHub secret and no offline backup**. This avoids
 copy proliferation but is high risk: accidental deletion or loss of Environment access destroys

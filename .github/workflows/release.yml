@@ -673,18 +673,51 @@ jobs:
             *-rc*|*-pre*|*-beta*|*-alpha*) prerelease=(--prerelease); prerelease_value=true ;;
           esac
           mapfile -t files < <(find release-assets -maxdepth 1 -type f | sort)
-          if gh api "repos/${GH_REPO}/releases/tags/${tag}" >/dev/null 2>&1; then
+          drafts="${RUNNER_TEMP}/github-draft-releases.tsv"
+          gh api --paginate "repos/${GH_REPO}/releases?per_page=100" \
+            --jq '.[] | select(.draft) | [.id, .tag_name] | @tsv' >"${drafts}"
+          draft_count="$(awk -F '\t' -v tag="${tag}" '$2 == tag { count++ } END { print count + 0 }' \
+            "${drafts}")"
+          if gh api "repos/${GH_REPO}/releases/tags/${tag}" >/dev/null 2>&1 \
+            || [ "${draft_count}" -ne 0 ]; then
             echo "refusing to replace existing GitHub Release ${tag}" >&2
             exit 1
           fi
+          release_id=""
+          published=false
+          rollback() {
+            status=$?
+            trap - ERR
+            set +e
+            if [ -z "${release_id}" ]; then
+              gh api --paginate "repos/${GH_REPO}/releases?per_page=100" \
+                --jq '.[] | select(.draft) | [.id, .tag_name] | @tsv' >"${drafts}"
+              release_id="$(awk -F '\t' -v tag="${tag}" \
+                '$2 == tag { count++; id = $1 } END { if (count == 1) print id }' "${drafts}")"
+            fi
+            if [ -n "${release_id}" ]; then
+              if [ "${published}" = true ]; then
+                gh api -X PATCH "repos/${GH_REPO}/releases/${release_id}" \
+                  -F draft=true -F prerelease="${prerelease_value}" >/dev/null
+              else
+                gh api -X DELETE "repos/${GH_REPO}/releases/${release_id}" >/dev/null
+              fi
+            fi
+            exit "${status}"
+          }
+          trap rollback ERR
           gh release create "${tag}" "${files[@]}" --repo "${GH_REPO}" --draft \
             --title "SSH MountMate ${tag}" "${prerelease[@]}" "${notes[@]}"
           metadata="${RUNNER_TEMP}/github-release.json"
-          release_id=""
           for _ in $(seq 1 30); do
-            gh api "repos/${GH_REPO}/releases/tags/${tag}" >"${metadata}"
-            release_id="$(jq -r .id "${metadata}")"
-            if jq -e '
+            gh api --paginate "repos/${GH_REPO}/releases?per_page=100" \
+              --jq '.[] | select(.draft) | [.id, .tag_name] | @tsv' >"${drafts}"
+            release_id="$(awk -F '\t' -v tag="${tag}" \
+              '$2 == tag { count++; id = $1 } END { if (count == 1) print id }' "${drafts}")"
+            if [ -n "${release_id}" ]; then
+              gh api "repos/${GH_REPO}/releases/${release_id}" >"${metadata}"
+            fi
+            if [ -n "${release_id}" ] && jq -e '
               [.assets[] | select(.name | startswith("SSHMountMate-") and endswith(".zip"))]
               | length == 6 and all(.[]; (.digest // "") | startswith("sha256:"))
             ' "${metadata}" >/dev/null; then
@@ -694,9 +727,30 @@ jobs:
             sleep 2
           done
           test -n "${release_id}"
+          expected_metadata="${RUNNER_TEMP}/expected-published-release.json"
+          canonical_base="https://github.com/${GH_REPO}/releases/download/${tag}/"
+          jq --arg canonical_base "${canonical_base}" \
+            '.assets |= map(.browser_download_url = ($canonical_base + .name))' \
+            "${metadata}" >"${expected_metadata}"
           target/release/update-signing verify-published \
             release-assets/SSHMountMate-update-manifest-v1.json \
             release-assets/SSHMountMate-update-manifest-v1.sig \
-            distribution/update-public-keys.json "${metadata}"
+            distribution/update-public-keys.json "${expected_metadata}"
+          published=true
           gh api -X PATCH "repos/${GH_REPO}/releases/${release_id}" \
             -F draft=false -F prerelease="${prerelease_value}" >/dev/null
+          verified=false
+          for _ in $(seq 1 30); do
+            gh api "repos/${GH_REPO}/releases/${release_id}" >"${metadata}"
+            if target/release/update-signing verify-published \
+              release-assets/SSHMountMate-update-manifest-v1.json \
+              release-assets/SSHMountMate-update-manifest-v1.sig \
+              distribution/update-public-keys.json "${metadata}"; then
+              verified=true
+              break
+            fi
+            sleep 2
+          done
+          test "${verified}" = true
+          test "$(gh api "repos/${GH_REPO}/releases/tags/${tag}" --jq .id)" = "${release_id}"
+          trap - ERR

@@ -14,8 +14,8 @@ until its stated evidence exists.
 4. Reusable interactive SSH authentication is implemented. Linux and Windows real lifecycle
    evidence is complete; macOS shares the tested OpenSSH implementation but does not yet have a
    dedicated interactive-login lifecycle.
-5. Add Ed25519 verification to self-update, publish no build until the production public key and
-   full fingerprint are explicitly confirmed, and require all six authoritative CI jobs.
+5. Ed25519 verification is complete and `v0.4.1-alpha.1` is published from the explicitly
+   confirmed production key after all six authoritative CI jobs.
 6. Review the completed six-platform and real Linux/Windows shared-session evidence. Do not merge
    this extension branch until that separate decision is made.
 7. Keep installer work, Explorer navigation-triggered refresh, complex Windows ProxyJump
@@ -23,7 +23,7 @@ until its stated evidence exists.
 
 ## Prerelease scope: `v0.4.1-alpha.1`
 
-Implemented locally, pending production key and CI evidence:
+Published with production signing and six-platform evidence:
 
 - A strict versioned update manifest signed with Ed25519, covering one release version/channel and
   all six canonical ZIP asset names, sizes, and SHA-256 digests.
@@ -38,13 +38,13 @@ Implemented locally, pending production key and CI evidence:
   canonical onefile/macOS application assets.
 
 Security and operations are documented in `docs/update-signing.md`. The selected single-secret,
-no-offline-backup custody policy is intentionally recorded as high risk. No production private key
-may enter the repository, application, command line, logs, or build artifacts. The release remains
-blocked until the generated production `key_id` and full public-key SHA-256 are confirmed by the
-owner, then the exact green commit is tagged and the signed draft passes published REST metadata
-verification.
+no-offline-backup custody policy remains intentionally recorded as high risk. The production
+private key did not enter the repository, application, command line, logs, or build artifacts. The
+owner confirmed the generated `key_id` and full public-key SHA-256; the exact green commit was
+tagged, and the signed Release passed both expected-publication and actual published REST metadata
+verification before the release task was closed.
 
-Local verification on 2026-07-15:
+Local and CI verification on 2026-07-15 and 2026-07-16:
 
 - `cargo fmt --all -- --check`: passed.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`: passed.
@@ -98,6 +98,29 @@ Local verification on 2026-07-15:
   jobs now replace only that source with the reachable HTTPS Leaseweb Ubuntu Ports mirror; apt's
   normal Ubuntu archive signature verification remains mandatory. x64 sources and application
   networking are unchanged.
+- Final embedded-key run
+  [29435256461](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29435256461)
+  passed quality and all six platforms on exact product commit `be1b917`, including packaged
+  update/rollback, real Windows/Linux SFTP, and both macOS FUSE/NFS lifecycle records.
+- The initial tag run
+  [29438369051](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29438369051)
+  safely stopped before production signing because its clean release aggregation runner lacked the
+  Linux Secret Service build dependency. The release and publish jobs now install that dependency
+  explicitly; non-publishing recovery run
+  [29440339655](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29440339655)
+  passed all six platforms and the ephemeral signed release-set exercise.
+- Production run
+  [29442216176](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29442216176)
+  checked out the immutable `v0.4.1-alpha.1` tag for every build and passed quality, all six
+  platform jobs, and the signed release-set exercise. GitHub's draft Release lookup and draft asset
+  URL semantics required controlled recovery: the production manifest and signature were verified
+  against real draft sizes/digests plus canonical post-publication URLs, publication was protected
+  by an automatic draft rollback trap, and the actual public REST metadata then passed the same
+  `update-signing verify-published` verifier. Release
+  [v0.4.1-alpha.1](https://github.com/Stardust0831/ssh-mountmate/releases/tag/v0.4.1-alpha.1)
+  is prerelease ID `354659949` with six canonical ZIPs, checksums, manifest, and signature. The
+  temporary exact-branch Environment policy used for recovery was removed; only the `v*` tag
+  policy remains.
 
 ## Prerelease scope: `v0.4.0-alpha.7`
 
