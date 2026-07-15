@@ -116,6 +116,10 @@ impl RcloneRemote {
                 resolved.and_then(|config| config.first_existing_path("identityfile"))
             {
                 options.push(("key_file".into(), key_file.display().to_string()));
+                if !server.key_pass_obscured.is_empty() {
+                    validate_scalar(&server.key_pass_obscured, "key passphrase")?;
+                    options.push(("key_file_pass".into(), server.key_pass_obscured.clone()));
+                }
             } else {
                 options.push(("key_use_agent".into(), "true".into()));
             }
@@ -779,6 +783,34 @@ mod tests {
                 .contains(&("key_file".into(), identity.display().to_string()))
         );
         assert!(!remote.options.iter().any(|(key, _)| key == "key_use_agent"));
+    }
+
+    #[test]
+    fn ssh_config_remote_keeps_key_passphrase_after_server_json_round_trip() {
+        let temp = tempdir().unwrap();
+        let identity = temp.path().join("id key");
+        fs::write(&identity, "PRIVATE KEY").unwrap();
+        let resolved = ResolvedSshConfig::parse(&format!(
+            "hostname c1.example\nuser researcher\nport 12022\nidentityfile \"{}\"\n",
+            identity.display()
+        ));
+        let server = ServerConfig {
+            id: "internal-id".into(),
+            mode: "ssh_config".into(),
+            host_alias: "cluster".into(),
+            key_pass_obscured: "obscured-key-passphrase".into(),
+            ..ServerConfig::default()
+        };
+        let server: ServerConfig =
+            serde_json::from_value(serde_json::to_value(server).unwrap()).unwrap();
+
+        let remote = RcloneRemote::for_server(&server, Some(&resolved), None, false).unwrap();
+
+        assert!(
+            remote
+                .options
+                .contains(&("key_file_pass".into(), "obscured-key-passphrase".into()))
+        );
     }
 
     #[test]

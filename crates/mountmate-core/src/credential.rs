@@ -283,14 +283,10 @@ impl CredentialMigration {
         persisted: &ServerConfig,
     ) -> Result<ServerConfig, CredentialError> {
         self.ensure_persisted_candidate(persisted, CredentialMigrationKind::ToSystem)?;
-        let mut finalized = persisted.clone();
-        if !self.candidate.password_credential.is_empty() {
-            finalized.password_obscured.clear();
-        }
-        if !self.candidate.key_pass_credential.is_empty() {
-            finalized.key_pass_obscured.clear();
-        }
-        Ok(finalized)
+        // Keep the verified rclone-obscured values alongside system references.
+        // They are a compatibility copy for older readers and future recovery;
+        // system hydration still takes precedence whenever a reference exists.
+        Ok(persisted.clone())
     }
 
     pub fn finalize_to_obscure(
@@ -584,9 +580,14 @@ pub fn delete_server_credentials(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::fs;
     use std::sync::Mutex;
 
+    use tempfile::tempdir;
+
     use super::*;
+    use crate::rclone::RcloneRemote;
+    use crate::ssh::ResolvedSshConfig;
 
     #[derive(Default)]
     struct MemoryStore {
@@ -665,14 +666,14 @@ mod tests {
     }
 
     #[test]
-    fn migration_verifies_every_secret_before_clearing_obscured_values() {
+    fn migration_verifies_every_secret_before_retaining_compatibility_copies() {
         let store = MemoryStore::default();
         let migrated = migrate_server_to_system(&server(), &store, |value| {
             Ok(value.replace("obscured-", "plain-"))
         })
         .unwrap();
-        assert!(migrated.password_obscured.is_empty());
-        assert!(migrated.key_pass_obscured.is_empty());
+        assert_eq!(migrated.password_obscured, "obscured-password");
+        assert_eq!(migrated.key_pass_obscured, "obscured-passphrase");
         assert!(has_value(
             &store,
             &migrated.password_credential,
@@ -798,8 +799,8 @@ mod tests {
         assert!(!migration.candidate().password_obscured.is_empty());
         assert!(!migration.candidate().key_pass_obscured.is_empty());
         let finalized = migration.finalize_to_system(migration.candidate()).unwrap();
-        assert!(finalized.password_obscured.is_empty());
-        assert!(finalized.key_pass_obscured.is_empty());
+        assert_eq!(finalized.password_obscured, "obscured-password");
+        assert_eq!(finalized.key_pass_obscured, "obscured-passphrase");
     }
 
     #[test]
@@ -889,6 +890,98 @@ mod tests {
             hydrate_server_from_system(&persisted, &store, |value| Ok(format!("obscured-{value}")))
                 .unwrap();
         assert_eq!(hydrated.password_obscured, "obscured-plain-password");
+    }
+
+    #[test]
+    fn hydration_refreshes_key_passphrase_while_retaining_compatibility_copy() {
+        let store = MemoryStore::default();
+        let reference = credential_reference("alpha", CredentialKind::KeyPassphrase);
+        store_verified(&store, &reference, "plain-passphrase").unwrap();
+        let persisted = ServerConfig {
+            id: "alpha".into(),
+            key_pass_obscured: "obscured-compatibility-copy".into(),
+            key_pass_credential: reference,
+            ..ServerConfig::default()
+        };
+
+        let hydrated = hydrate_server_from_system(&persisted, &store, |value| {
+            Ok(format!("obscured-{value}"))
+        })
+        .unwrap();
+
+        assert_eq!(hydrated.key_pass_obscured, "obscured-plain-passphrase");
+        assert_eq!(persisted.key_pass_obscured, "obscured-compatibility-copy");
+    }
+
+    #[test]
+    fn hydration_does_not_fallback_when_system_key_passphrase_read_fails() {
+        let store = MemoryStore::default();
+        let reference = credential_reference("alpha", CredentialKind::KeyPassphrase);
+        store_verified(&store, &reference, "plain-passphrase").unwrap();
+        *store.fail_get_reference.lock().unwrap() = Some(reference.clone());
+        let persisted = ServerConfig {
+            id: "alpha".into(),
+            key_pass_obscured: "obscured-compatibility-copy".into(),
+            key_pass_credential: reference,
+            ..ServerConfig::default()
+        };
+
+        assert!(matches!(
+            hydrate_server_from_system(&persisted, &store, |value| {
+                Ok(format!("obscured-{value}"))
+            }),
+            Err(CredentialError::Unavailable(_))
+        ));
+    }
+
+    #[test]
+    fn hydrated_system_key_passphrase_reaches_ssh_config_remote() {
+        let store = MemoryStore::default();
+        let reference = credential_reference("alpha", CredentialKind::KeyPassphrase);
+        store_verified(&store, &reference, "plain-passphrase").unwrap();
+        let persisted = ServerConfig {
+            id: "alpha".into(),
+            mode: "ssh_config".into(),
+            host_alias: "cluster".into(),
+            key_pass_obscured: "obscured-compatibility-copy".into(),
+            key_pass_credential: reference,
+            ..ServerConfig::default()
+        };
+        let hydrated = hydrate_server_from_system(&persisted, &store, |value| {
+            Ok(format!("obscured-{value}"))
+        })
+        .unwrap();
+        let temp = tempdir().unwrap();
+        let identity = temp.path().join("id key");
+        fs::write(&identity, "PRIVATE KEY").unwrap();
+        let resolved = ResolvedSshConfig::parse(&format!(
+            "hostname c1.example\nuser researcher\nport 12022\nidentityfile \"{}\"\n",
+            identity.display()
+        ));
+
+        let remote = RcloneRemote::for_server(&hydrated, Some(&resolved), None, false).unwrap();
+
+        assert!(
+            remote
+                .options
+                .contains(&("key_file_pass".into(), "obscured-plain-passphrase".into()))
+        );
+    }
+
+    #[test]
+    fn system_migration_round_trip_retains_obscured_key_passphrase_copy() {
+        let store = MemoryStore::default();
+        let migrated = migrate_server_to_system(&server(), &store, |value| {
+            Ok(value.replace("obscured-", "plain-"))
+        })
+        .unwrap();
+        let reloaded: ServerConfig = serde_json::from_value(
+            serde_json::to_value(&migrated).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(reloaded.key_pass_obscured, "obscured-passphrase");
+        assert!(!reloaded.key_pass_credential.is_empty());
     }
 
     #[test]
