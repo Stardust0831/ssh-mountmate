@@ -322,27 +322,26 @@ impl CredentialMigration {
         if self.kind != expected_kind || persisted.id != self.candidate.id {
             return Err(CredentialError::Persistence("server".into()));
         }
-        for (field, staged_reference, persisted_reference, persisted_obscured) in [
+        for (field, staged_reference, persisted_reference, staged_obscured, persisted_obscured) in [
             (
                 "password",
                 &self.candidate.password_credential,
                 &persisted.password_credential,
+                &self.candidate.password_obscured,
                 &persisted.password_obscured,
             ),
             (
                 "key passphrase",
                 &self.candidate.key_pass_credential,
                 &persisted.key_pass_credential,
+                &self.candidate.key_pass_obscured,
                 &persisted.key_pass_obscured,
             ),
         ] {
             if staged_reference != persisted_reference {
                 return Err(CredentialError::Persistence(field.into()));
             }
-            if expected_kind == CredentialMigrationKind::ToObscure
-                && !staged_reference.is_empty()
-                && persisted_obscured.is_empty()
-            {
+            if !staged_obscured.is_empty() && staged_obscured != persisted_obscured {
                 return Err(CredentialError::Persistence(field.into()));
             }
         }
@@ -794,6 +793,22 @@ mod tests {
         let finalized = migration.finalize_to_system(migration.candidate()).unwrap();
         assert!(finalized.password_obscured.is_empty());
         assert!(finalized.key_pass_obscured.is_empty());
+    }
+
+    #[test]
+    fn finalization_rejects_a_persisted_record_that_lost_the_old_representation() {
+        let store = MemoryStore::default();
+        let original = server();
+        let migration = prepare_server_to_system(&original, &store, |value| {
+            Ok(value.replace("obscured-", "plain-"))
+        })
+        .unwrap();
+        let mut persisted = migration.candidate().clone();
+        persisted.password_obscured.clear();
+        assert!(matches!(
+            migration.finalize_to_system(&persisted),
+            Err(CredentialError::Persistence(_))
+        ));
     }
 
     #[test]

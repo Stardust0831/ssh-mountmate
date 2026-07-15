@@ -26,9 +26,10 @@ use mountmate_core::connection::{
     PreservedSecretState, SecretAction, SshImportPlan,
 };
 use mountmate_core::credential::{
-    CredentialChange, CredentialError, CredentialKind, CredentialStore, SystemCredentialStore,
-    credential_reference, delete_server_credentials, migrate_server_to_obscure,
-    migrate_server_to_system, replace_verified, rollback_change,
+    CredentialChange, CredentialError, CredentialKind, CredentialMigration, CredentialStore,
+    SystemCredentialStore, credential_reference, delete_credential_references,
+    delete_server_credentials, prepare_server_to_obscure, prepare_server_to_system,
+    replace_verified, rollback_change,
 };
 use mountmate_core::dependency::{DependencyStatus, check_dependencies};
 use mountmate_core::interactive_ssh::InteractiveSshError;
@@ -2890,71 +2891,40 @@ impl App {
                 tokio::task::spawn_blocking(move || {
                     let storage_changed =
                         settings.credential_storage != previous_settings.credential_storage;
-                    let migrated_servers = if storage_changed {
-                        migrate_servers_for_storage(
+                    let credential_migration = if storage_changed {
+                        Some(migrate_servers_for_storage(
+                            &paths,
                             &service,
                             &previous_servers,
                             settings.credential_storage,
-                        )?
+                        )?)
                     } else {
-                        previous_servers.clone()
+                        None
                     };
-                    if storage_changed
-                        && let Err(error) = storage::save_servers(&paths, &migrated_servers)
-                    {
-                        if settings.credential_storage == CredentialStorage::System {
-                            let _ = cleanup_new_system_credentials(
-                                &previous_servers,
-                                &migrated_servers,
-                            );
-                        }
-                        return Err(error.to_string());
-                    }
+                    let migrated_servers = credential_migration
+                        .as_ref()
+                        .map_or_else(|| previous_servers.clone(), |migration| migration.servers.clone());
                     if storage_changed && settings.credential_storage == CredentialStorage::System {
                         for server in &migrated_servers {
                             if let Err(error) =
                                 clear_rclone_remote_secrets(&paths, server.remote_name())
                             {
-                                let server_rollback =
-                                    storage::save_servers(&paths, &previous_servers);
-                                let credential_rollback = server_rollback.as_ref().ok().map(|()| {
-                                    cleanup_new_system_credentials(
-                                        &previous_servers,
-                                        &migrated_servers,
-                                    )
-                                });
-                                let mut message = error.to_string();
-                                if let Err(rollback) = server_rollback {
-                                    message
-                                        .push_str(&format!("; server rollback failed: {rollback}"));
-                                }
-                                if let Some(Err(rollback)) = credential_rollback {
-                                    message.push_str(&format!(
-                                        "; credential rollback failed: {rollback}"
-                                    ));
-                                }
-                                return Err(message);
+                                return Err(rollback_credential_storage_change(
+                                    &paths,
+                                    &previous_servers,
+                                    credential_migration.as_ref(),
+                                    error.to_string(),
+                                ));
                             }
                         }
                     }
                     if let Err(error) = storage::save_settings(&paths, &settings) {
-                        let server_rollback = storage_changed
-                            .then(|| storage::save_servers(&paths, &previous_servers));
-                        if settings.credential_storage == CredentialStorage::System
-                            && server_rollback
-                                .as_ref()
-                                .is_none_or(|rollback| rollback.is_ok())
-                        {
-                            let _ = cleanup_new_system_credentials(
-                                &previous_servers,
-                                &migrated_servers,
-                            );
-                        }
-                        let mut message = error.to_string();
-                        if let Some(Err(rollback)) = server_rollback {
-                            message.push_str(&format!("; server rollback failed: {rollback}"));
-                        }
-                        return Err(message);
+                        return Err(rollback_credential_storage_change(
+                            &paths,
+                            &previous_servers,
+                            credential_migration.as_ref(),
+                            error.to_string(),
+                        ));
                     }
                     if let Err(error) =
                         Platform.set_login_startup(&executable, settings.startup_all)
@@ -2964,34 +2934,33 @@ impl App {
                         let startup_rollback = Platform
                             .set_login_startup(&executable, previous_settings.startup_all)
                             .map_err(|rollback| rollback.to_string());
-                        let server_rollback = storage_changed
-                            .then(|| storage::save_servers(&paths, &previous_servers));
-                        if settings.credential_storage == CredentialStorage::System
-                            && server_rollback
-                                .as_ref()
-                                .is_none_or(|rollback| rollback.is_ok())
-                        {
-                            let _ = cleanup_new_system_credentials(
-                                &previous_servers,
-                                &migrated_servers,
-                            );
-                        }
-                        let mut message = error.to_string();
+                        let mut message = rollback_credential_storage_change(
+                            &paths,
+                            &previous_servers,
+                            credential_migration.as_ref(),
+                            error.to_string(),
+                        );
                         if let Err(rollback) = settings_rollback {
                             message.push_str(&format!("; settings rollback failed: {rollback}"));
                         }
                         if let Err(rollback) = startup_rollback {
                             message.push_str(&format!("; startup rollback failed: {rollback}"));
                         }
-                        if let Some(Err(rollback)) = server_rollback {
-                            message.push_str(&format!("; server rollback failed: {rollback}"));
-                        }
                         return Err(message);
                     }
                     let warning = if storage_changed
                         && settings.credential_storage == CredentialStorage::Obscure
                     {
-                        cleanup_retired_system_credentials(&previous_servers, locale)
+                        credential_migration.as_ref().and_then(|migration| {
+                            migration.retire_system_references().err().map(|error| match locale {
+                                Locale::English => format!(
+                                    "Settings saved, but some retired vault entries could not be removed: {error}"
+                                ),
+                                Locale::Chinese => format!(
+                                    "设置已保存，但部分旧系统凭据无法删除：{error}"
+                                ),
+                            })
+                        })
                     } else {
                         None
                     };
@@ -5941,23 +5910,78 @@ fn rollback_prepared_secrets<'a>(
     }
 }
 
+struct CredentialStorageMigration {
+    servers: Vec<ServerConfig>,
+    migrations: Vec<CredentialMigration>,
+    retired_references: Vec<String>,
+}
+
+impl CredentialStorageMigration {
+    fn retire_system_references(&self) -> Result<(), String> {
+        delete_credential_references(&SystemCredentialStore, &self.retired_references)
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn rollback_credential_storage_change(
+    paths: &AppPaths,
+    previous_servers: &[ServerConfig],
+    migration: Option<&CredentialStorageMigration>,
+    message: String,
+) -> String {
+    let Some(migration) = migration else {
+        return message;
+    };
+    rollback_migrations_after_persistence(
+        paths,
+        previous_servers,
+        &migration.migrations,
+        message,
+    )
+}
+
+fn rollback_migrations_after_persistence(
+    paths: &AppPaths,
+    previous_servers: &[ServerConfig],
+    migrations: &[CredentialMigration],
+    mut message: String,
+) -> String {
+    match storage::save_servers(paths, previous_servers) {
+        Ok(()) => {
+            for migration in migrations.iter().rev() {
+                if let Err(rollback) = migration.rollback(&SystemCredentialStore) {
+                    message.push_str(&format!("; credential rollback failed: {rollback}"));
+                }
+            }
+        }
+        Err(rollback) => {
+            // Keep the verified system representation when the server record
+            // could not be restored; deleting it here could remove the last
+            // usable copy referenced by the persisted record.
+            message.push_str(&format!("; server rollback failed: {rollback}"));
+        }
+    }
+    message
+}
+
 fn migrate_servers_for_storage(
+    paths: &AppPaths,
     service: &MountService,
     servers: &[ServerConfig],
     target: CredentialStorage,
-) -> Result<Vec<ServerConfig>, String> {
-    let mut migrated = Vec::with_capacity(servers.len());
+) -> Result<CredentialStorageMigration, String> {
+    let mut migrations = Vec::with_capacity(servers.len());
     for server in servers {
         let result = match target {
             CredentialStorage::System => {
-                migrate_server_to_system(server, &SystemCredentialStore, |obscured| {
+                prepare_server_to_system(server, &SystemCredentialStore, |obscured| {
                     service
                         .reveal_secret(obscured)
                         .map_err(|error| CredentialError::Reveal(error.to_string()))
                 })
             }
             CredentialStorage::Obscure => {
-                migrate_server_to_obscure(server, &SystemCredentialStore, |secret| {
+                prepare_server_to_obscure(server, &SystemCredentialStore, |secret| {
                     service
                         .obscure_secret(secret)
                         .map_err(|error| CredentialError::Obscure(error.to_string()))
@@ -5965,69 +5989,95 @@ fn migrate_servers_for_storage(
             }
         };
         match result {
-            Ok(server) => migrated.push(server),
+            Ok(migration) => migrations.push(migration),
             Err(error) => {
-                if target == CredentialStorage::System {
-                    let _ = cleanup_new_system_credentials(servers, &migrated);
+                let mut message = error.to_string();
+                for migration in migrations.iter().rev() {
+                    if let Err(rollback) = migration.rollback(&SystemCredentialStore) {
+                        message.push_str(&format!("; credential rollback failed: {rollback}"));
+                    }
                 }
-                return Err(error.to_string());
+                return Err(message);
             }
         }
     }
-    Ok(migrated)
-}
-
-fn cleanup_new_system_credentials(
-    original: &[ServerConfig],
-    migrated: &[ServerConfig],
-) -> Result<(), String> {
-    let mut errors = Vec::new();
-    for server in migrated {
-        let old = original.iter().find(|candidate| candidate.id == server.id);
-        for (reference, old_reference) in [
-            (
-                &server.password_credential,
-                old.map(|server| server.password_credential.as_str()),
-            ),
-            (
-                &server.key_pass_credential,
-                old.map(|server| server.key_pass_credential.as_str()),
-            ),
-        ] {
-            if !reference.is_empty()
-                && old_reference.is_none_or(|old_reference| old_reference != reference)
-                && let Err(error) = SystemCredentialStore.delete(reference)
-            {
-                errors.push(error.to_string());
-            }
-        }
-    }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("; "))
-    }
-}
-
-fn cleanup_retired_system_credentials(previous: &[ServerConfig], locale: Locale) -> Option<String> {
-    let errors: Vec<_> = previous
+    let candidates = migrations
         .iter()
-        .filter_map(|server| {
-            delete_server_credentials(server, &SystemCredentialStore)
-                .err()
-                .map(|error| format!("{}: {error}", server.display_name()))
-        })
-        .collect();
-    (!errors.is_empty()).then(|| match locale {
-        Locale::English => format!(
-            "Settings saved, but some retired vault entries could not be removed: {}",
-            errors.join("; ")
-        ),
-        Locale::Chinese => format!(
-            "设置已保存，但部分旧系统凭据无法删除：{}",
-            errors.join("；")
-        ),
+        .map(|migration| migration.candidate().clone())
+        .collect::<Vec<_>>();
+    let persisted_candidates =
+        persist_and_reload_servers(paths, &candidates, servers, &migrations)?;
+    let mut finalized = Vec::with_capacity(migrations.len());
+    let mut retired_references = Vec::new();
+    for migration in &migrations {
+        let Some(persisted) = persisted_candidates
+            .iter()
+            .find(|server| server.id == migration.candidate().id)
+        else {
+            return Err(rollback_migrations_after_persistence(
+                paths,
+                servers,
+                &migrations,
+                "credential migration persistence verification failed".into(),
+            ));
+        };
+        let finalized_server = match target {
+            CredentialStorage::System => {
+                migration.finalize_to_system(persisted).map(|server| (server, Vec::new()))
+            }
+            CredentialStorage::Obscure => {
+                migration.finalize_to_obscure(persisted).map(|commit| {
+                    let retired = commit.retired_references().to_vec();
+                    (commit.into_server(), retired)
+                })
+            }
+        };
+        match finalized_server {
+            Ok((server, retired)) => {
+                finalized.push(server);
+                retired_references.extend(retired);
+            }
+            Err(error) => {
+                return Err(rollback_migrations_after_persistence(
+                    paths,
+                    servers,
+                    &migrations,
+                    error.to_string(),
+                ));
+            }
+        }
+    }
+    let servers = persist_and_reload_servers(paths, &finalized, servers, &migrations)?;
+    Ok(CredentialStorageMigration {
+        servers,
+        migrations,
+        retired_references,
     })
+}
+
+fn persist_and_reload_servers(
+    paths: &AppPaths,
+    candidate: &[ServerConfig],
+    original: &[ServerConfig],
+    migrations: &[CredentialMigration],
+) -> Result<Vec<ServerConfig>, String> {
+    let result = storage::save_servers(paths, candidate)
+        .map_err(|error| error.to_string())
+        .and_then(|_| storage::load_servers(paths).map_err(|error| error.to_string()))
+        .and_then(|persisted| {
+            (persisted == candidate)
+                .then_some(persisted)
+                .ok_or_else(|| "credential migration persistence verification failed".to_owned())
+        });
+    match result {
+        Ok(persisted) => Ok(persisted),
+        Err(error) => Err(rollback_migrations_after_persistence(
+            paths,
+            original,
+            migrations,
+            error,
+        )),
+    }
 }
 
 fn delete_retired_connection_credentials(
