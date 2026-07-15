@@ -25,11 +25,17 @@ use mountmate_core::connection::{
     ConnectionDraft, ConnectionSource, DraftError, ImportAction, ImportStatus, SecretAction,
     SshImportPlan,
 };
+use mountmate_core::credential::{
+    CredentialChange, CredentialError, CredentialKind, CredentialStore, SystemCredentialStore,
+    credential_reference, delete_server_credentials, migrate_server_to_obscure,
+    migrate_server_to_system, replace_verified, rollback_change,
+};
 use mountmate_core::dependency::{DependencyStatus, check_dependencies};
 use mountmate_core::model::{MAX_VFS_UPLOAD_TRANSFERS, MIN_VFS_UPLOAD_TRANSFERS};
 use mountmate_core::mountpoint::HOME_MOUNTPOINT_VALUE;
 use mountmate_core::paths::AppPaths;
 use mountmate_core::process::MountStatus;
+use mountmate_core::rclone::clear_rclone_remote_secrets;
 use mountmate_core::rclone_binary::resolve_rclone;
 use mountmate_core::service::MountService;
 use mountmate_core::ssh::{
@@ -43,8 +49,8 @@ use mountmate_core::update_helper::{
 };
 use mountmate_core::update_workflow::{PreparedUpdateLaunch, prepare_update_install};
 use mountmate_core::{
-    APP_NAME, AuthMethod, ConnectionMethod, MountBackend, MountState, ServerConfig, Settings,
-    VERSION,
+    APP_NAME, AuthMethod, ConnectionMethod, CredentialStorage, MountBackend, MountState,
+    ServerConfig, Settings, VERSION,
 };
 #[cfg(windows)]
 use mountmate_platform::NativeWindowHandle;
@@ -680,6 +686,7 @@ struct SettingsDraft {
     buffer_size: String,
     upload_transfers: String,
     mount_backend: MountBackend,
+    credential_storage: CredentialStorage,
     startup_all: bool,
     auto_show_transfers: bool,
     auto_check_updates: bool,
@@ -699,6 +706,7 @@ impl SettingsDraft {
             buffer_size: settings.buffer_size.clone(),
             upload_transfers: settings.vfs_upload_transfers.to_string(),
             mount_backend: settings.macos_mount_backend,
+            credential_storage: settings.credential_storage,
             startup_all: settings.startup_all,
             auto_show_transfers: settings.auto_show_transfers,
             auto_check_updates: settings.auto_check_updates,
@@ -749,6 +757,7 @@ impl SettingsDraft {
         settings.buffer_size = self.buffer_size.trim().into();
         settings.vfs_upload_transfers = upload_transfers;
         settings.macos_mount_backend = self.mount_backend;
+        settings.credential_storage = self.credential_storage;
         settings.startup_all = self.startup_all;
         settings.auto_show_transfers = self.auto_show_transfers;
         settings.auto_check_updates = self.auto_check_updates;
@@ -824,6 +833,11 @@ enum Message {
     CacheRootPicked(Option<PathBuf>),
     CacheModeChanged(CacheMode),
     MountBackendChanged(MountBackend),
+    CredentialStorageChanged(CredentialStorage),
+    CredentialStorageDecision {
+        target: CredentialStorage,
+        result: rfd::MessageDialogResult,
+    },
     SettingOptionChanged(SettingOption),
     CustomSettingDigitsChanged(String),
     CustomSettingUnitChanged(String),
@@ -850,7 +864,7 @@ enum Message {
     UnregisterFileManagerMenu,
     FileManagerMenuFinished(Result<bool, String>),
     SaveSettings,
-    SettingsSaved(Result<Settings, String>),
+    SettingsSaved(Result<SettingsMutation, String>),
     StartupReconciled(Result<(), String>),
     Mount(String),
     CancelPendingUnmount(String),
@@ -881,6 +895,13 @@ enum Message {
 
 #[derive(Debug, Clone)]
 struct ServerMutation {
+    servers: Vec<ServerConfig>,
+    warning: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SettingsMutation {
+    settings: Settings,
     servers: Vec<ServerConfig>,
     warning: Option<String>,
 }
@@ -1783,6 +1804,36 @@ impl App {
                     draft.mount_backend = backend;
                 }
             }
+            Message::CredentialStorageChanged(target) => {
+                let current = self
+                    .settings_draft
+                    .as_ref()
+                    .map_or(self.settings.credential_storage, |draft| {
+                        draft.credential_storage
+                    });
+                if target == current {
+                    return Task::none();
+                }
+                let description = credential_storage_confirmation(locale, target);
+                return Task::perform(
+                    async move {
+                        rfd::AsyncMessageDialog::new()
+                            .set_title(APP_NAME)
+                            .set_description(description)
+                            .set_buttons(rfd::MessageButtons::YesNo)
+                            .show()
+                            .await
+                    },
+                    move |result| Message::CredentialStorageDecision { target, result },
+                );
+            }
+            Message::CredentialStorageDecision { target, result } => {
+                if result == rfd::MessageDialogResult::Yes
+                    && let Some(draft) = &mut self.settings_draft
+                {
+                    draft.credential_storage = target;
+                }
+            }
             Message::SettingOptionChanged(option) => {
                 if option.custom {
                     let current = self
@@ -2010,11 +2061,14 @@ impl App {
             Message::SettingsSaved(result) => {
                 self.editor_saving = false;
                 match result {
-                    Ok(settings) => {
-                        self.settings = settings;
+                    Ok(outcome) => {
+                        self.settings = outcome.settings;
+                        self.servers = outcome.servers;
                         self.settings_draft = None;
                         self.screen = Screen::Connections;
-                        self.status = locale.text(TextKey::SettingsSaved).into();
+                        self.status = outcome
+                            .warning
+                            .unwrap_or_else(|| locale.text(TextKey::SettingsSaved).into());
                     }
                     Err(error) => self.status = error,
                 }
@@ -2143,24 +2197,44 @@ impl App {
                         tokio::task::spawn_blocking(move || {
                             let servers = storage::remove_server(&paths, &id)
                                 .map_err(|error| error.to_string())?;
-                            let warning = if let Some(server) = server
-                                && server.ssh_config_managed
-                                && let Err(error) = remove_managed_ssh_server(&server)
-                            {
-                                diagnostic_trace(&format!(
-                                    "connection removed but managed SSH cleanup failed: {error}"
-                                ));
-                                Some(match locale {
-                                    Locale::English => format!(
-                                        "Connection removed; managed SSH cleanup failed: {error}"
-                                    ),
-                                    Locale::Chinese => {
-                                        format!("连接已删除，但托管 SSH 配置清理失败：{error}")
-                                    }
-                                })
-                            } else {
-                                None
-                            };
+                            let mut cleanup_errors = Vec::new();
+                            if let Some(server) = &server {
+                                if server.ssh_config_managed
+                                    && let Err(error) = remove_managed_ssh_server(server)
+                                {
+                                    cleanup_errors.push(match locale {
+                                        Locale::English => {
+                                            format!("managed SSH cleanup failed: {error}")
+                                        }
+                                        Locale::Chinese => {
+                                            format!("托管 SSH 配置清理失败：{error}")
+                                        }
+                                    });
+                                }
+                                if let Err(error) =
+                                    delete_server_credentials(server, &SystemCredentialStore)
+                                {
+                                    cleanup_errors.push(match locale {
+                                        Locale::English => {
+                                            format!("credential cleanup failed: {error}")
+                                        }
+                                        Locale::Chinese => {
+                                            format!("系统凭据清理失败：{error}")
+                                        }
+                                    });
+                                }
+                            }
+                            let warning = (!cleanup_errors.is_empty()).then(|| match locale {
+                                Locale::English => {
+                                    format!("Connection removed; {}", cleanup_errors.join("; "))
+                                }
+                                Locale::Chinese => {
+                                    format!("连接已删除，但{}", cleanup_errors.join("；"))
+                                }
+                            });
+                            if let Some(warning) = &warning {
+                                diagnostic_trace(warning);
+                            }
                             Ok(ServerMutation { servers, warning })
                         })
                         .await
@@ -2500,52 +2574,125 @@ impl App {
             .as_deref()
             .and_then(|id| self.servers.iter().find(|server| server.id == id))
             .cloned();
+        let credential_storage = self.settings.credential_storage;
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    let password = obscure_action(&service, &validated.password)?;
-                    let key_passphrase = obscure_action(&service, &validated.key_passphrase)?;
-                    let mut server = validated
-                        .apply_secrets(password, key_passphrase)
-                        .map_err(|error| localize_draft_error(locale, &error))?;
-                    let managed_snapshot = capture_managed_profile(previous.as_ref())?;
-                    prepare_managed_ssh_server(&mut server, &Platform)
-                        .map_err(|error| error.to_string())?;
-                    let servers = match storage::upsert_server(&paths, server.clone()) {
-                        Ok(servers) => servers,
+                    let server_id = validated.server.id.clone();
+                    let password = prepare_secret_action(
+                        &service,
+                        credential_storage,
+                        &server_id,
+                        CredentialKind::Password,
+                        &validated.password,
+                    )?;
+                    let key_passphrase = match prepare_secret_action(
+                        &service,
+                        credential_storage,
+                        &server_id,
+                        CredentialKind::KeyPassphrase,
+                        &validated.key_passphrase,
+                    ) {
+                        Ok(prepared) => prepared,
                         Err(error) => {
-                            let rollback = rollback_prepared_managed_profile(
-                                &server,
-                                managed_snapshot.as_ref(),
-                            );
+                            let _ = rollback_prepared_secret(&password);
+                            return Err(error);
+                        }
+                    };
+                    let mut server = match validated
+                        .apply_secrets(password.obscured.clone(), key_passphrase.obscured.clone())
+                    {
+                        Ok(server) => server,
+                        Err(error) => {
+                            let _ = rollback_prepared_secrets([&password, &key_passphrase]);
+                            return Err(localize_draft_error(locale, &error));
+                        }
+                    };
+                    password.apply(&mut server);
+                    key_passphrase.apply(&mut server);
+                    let managed_snapshot = match capture_managed_profile(previous.as_ref()) {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            let rollback = rollback_prepared_secrets([&password, &key_passphrase]);
                             return Err(match rollback {
-                                Ok(()) => error.to_string(),
+                                Ok(()) => error,
                                 Err(rollback) => {
-                                    format!("{error}; managed SSH rollback failed: {rollback}")
+                                    format!("{error}; credential rollback failed: {rollback}")
                                 }
                             });
                         }
                     };
-                    let warning = if let Some(previous) = previous
-                        && previous.ssh_config_managed
-                        && (!server.ssh_config_managed
-                            || previous.managed_ssh_config_path != server.managed_ssh_config_path)
-                        && let Err(error) = remove_managed_ssh_server(&previous)
-                    {
-                        diagnostic_trace(&format!(
-                            "connection saved but old managed SSH cleanup failed: {error}"
-                        ));
-                        Some(match locale {
-                            Locale::English => {
-                                format!("Connection saved; old managed SSH cleanup failed: {error}")
+                    if let Err(error) = prepare_managed_ssh_server(&mut server, &Platform) {
+                        let rollback = rollback_prepared_secrets([&password, &key_passphrase]);
+                        return Err(match rollback {
+                            Ok(()) => error.to_string(),
+                            Err(rollback) => {
+                                format!("{error}; credential rollback failed: {rollback}")
                             }
-                            Locale::Chinese => {
-                                format!("连接已保存，但旧托管 SSH 配置清理失败：{error}")
+                        });
+                    }
+                    let servers = match storage::upsert_server(&paths, server.clone()) {
+                        Ok(servers) => servers,
+                        Err(error) => {
+                            let managed_rollback = rollback_prepared_managed_profile(
+                                &server,
+                                managed_snapshot.as_ref(),
+                            );
+                            let credential_rollback =
+                                rollback_prepared_secrets([&password, &key_passphrase]);
+                            let mut message = error.to_string();
+                            if let Err(rollback) = managed_rollback {
+                                message.push_str(&format!(
+                                    "; managed SSH rollback failed: {rollback}"
+                                ));
                             }
-                        })
-                    } else {
-                        None
+                            if let Err(rollback) = credential_rollback {
+                                message
+                                    .push_str(&format!("; credential rollback failed: {rollback}"));
+                            }
+                            return Err(message);
+                        }
                     };
+                    let mut cleanup_errors = Vec::new();
+                    if let Some(previous) = &previous {
+                        if previous.ssh_config_managed
+                            && (!server.ssh_config_managed
+                                || previous.managed_ssh_config_path
+                                    != server.managed_ssh_config_path)
+                            && let Err(error) = remove_managed_ssh_server(previous)
+                        {
+                            cleanup_errors.push(match locale {
+                                Locale::English => {
+                                    format!("old managed SSH cleanup failed: {error}")
+                                }
+                                Locale::Chinese => {
+                                    format!("旧托管 SSH 配置清理失败：{error}")
+                                }
+                            });
+                        }
+                        if let Err(error) = delete_retired_connection_credentials(previous, &server)
+                        {
+                            cleanup_errors.push(match locale {
+                                Locale::English => {
+                                    format!("retired credential cleanup failed: {error}")
+                                }
+                                Locale::Chinese => {
+                                    format!("旧系统凭据清理失败：{error}")
+                                }
+                            });
+                        }
+                    }
+                    let warning = (!cleanup_errors.is_empty()).then(|| match locale {
+                        Locale::English => {
+                            format!("Connection saved; {}", cleanup_errors.join("; "))
+                        }
+                        Locale::Chinese => {
+                            format!("连接已保存，但{}", cleanup_errors.join("；"))
+                        }
+                    });
+                    if let Some(warning) = &warning {
+                        diagnostic_trace(warning);
+                    }
                     Ok(ServerMutation { servers, warning })
                 })
                 .await
@@ -2615,13 +2762,36 @@ impl App {
         self.editor_saving = true;
         self.status = self.locale().saving_connections(updates.len());
         let paths = self.paths.clone();
+        let previous_servers = self.servers.clone();
+        let locale = self.locale();
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
                     storage::upsert_servers(&paths, updates)
-                        .map(|servers| ServerMutation {
-                            servers,
-                            warning: None,
+                        .map(|servers| {
+                            let errors: Vec<_> = previous_servers
+                                .iter()
+                                .filter_map(|previous| {
+                                    let current =
+                                        servers.iter().find(|server| server.id == previous.id)?;
+                                    delete_retired_connection_credentials(previous, current)
+                                        .err()
+                                        .map(|error| {
+                                            format!("{}: {error}", previous.display_name())
+                                        })
+                                })
+                                .collect();
+                            let warning = (!errors.is_empty()).then(|| match locale {
+                                Locale::English => format!(
+                                    "Connections saved; retired credential cleanup failed: {}",
+                                    errors.join("; ")
+                                ),
+                                Locale::Chinese => format!(
+                                    "连接已保存，但旧系统凭据清理失败：{}",
+                                    errors.join("；")
+                                ),
+                            });
+                            ServerMutation { servers, warning }
                         })
                         .map_err(|error| error.to_string())
                 })
@@ -2655,6 +2825,9 @@ impl App {
         let paths = self.paths.clone();
         let result_settings = settings.clone();
         let previous_settings = self.settings.clone();
+        let previous_servers = self.servers.clone();
+        let service = self.service.clone();
+        let locale = self.locale();
         let executable = match std::env::current_exe() {
             Ok(executable) => executable,
             Err(error) => {
@@ -2666,7 +2839,74 @@ impl App {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    storage::save_settings(&paths, &settings).map_err(|error| error.to_string())?;
+                    let storage_changed =
+                        settings.credential_storage != previous_settings.credential_storage;
+                    let migrated_servers = if storage_changed {
+                        migrate_servers_for_storage(
+                            &service,
+                            &previous_servers,
+                            settings.credential_storage,
+                        )?
+                    } else {
+                        previous_servers.clone()
+                    };
+                    if storage_changed
+                        && let Err(error) = storage::save_servers(&paths, &migrated_servers)
+                    {
+                        if settings.credential_storage == CredentialStorage::System {
+                            let _ = cleanup_new_system_credentials(
+                                &previous_servers,
+                                &migrated_servers,
+                            );
+                        }
+                        return Err(error.to_string());
+                    }
+                    if storage_changed && settings.credential_storage == CredentialStorage::System {
+                        for server in &migrated_servers {
+                            if let Err(error) =
+                                clear_rclone_remote_secrets(&paths, server.remote_name())
+                            {
+                                let server_rollback =
+                                    storage::save_servers(&paths, &previous_servers);
+                                let credential_rollback = server_rollback.as_ref().ok().map(|()| {
+                                    cleanup_new_system_credentials(
+                                        &previous_servers,
+                                        &migrated_servers,
+                                    )
+                                });
+                                let mut message = error.to_string();
+                                if let Err(rollback) = server_rollback {
+                                    message
+                                        .push_str(&format!("; server rollback failed: {rollback}"));
+                                }
+                                if let Some(Err(rollback)) = credential_rollback {
+                                    message.push_str(&format!(
+                                        "; credential rollback failed: {rollback}"
+                                    ));
+                                }
+                                return Err(message);
+                            }
+                        }
+                    }
+                    if let Err(error) = storage::save_settings(&paths, &settings) {
+                        let server_rollback = storage_changed
+                            .then(|| storage::save_servers(&paths, &previous_servers));
+                        if settings.credential_storage == CredentialStorage::System
+                            && server_rollback
+                                .as_ref()
+                                .is_none_or(|rollback| rollback.is_ok())
+                        {
+                            let _ = cleanup_new_system_credentials(
+                                &previous_servers,
+                                &migrated_servers,
+                            );
+                        }
+                        let mut message = error.to_string();
+                        if let Some(Err(rollback)) = server_rollback {
+                            message.push_str(&format!("; server rollback failed: {rollback}"));
+                        }
+                        return Err(message);
+                    }
                     if let Err(error) =
                         Platform.set_login_startup(&executable, settings.startup_all)
                     {
@@ -2675,6 +2915,18 @@ impl App {
                         let startup_rollback = Platform
                             .set_login_startup(&executable, previous_settings.startup_all)
                             .map_err(|rollback| rollback.to_string());
+                        let server_rollback = storage_changed
+                            .then(|| storage::save_servers(&paths, &previous_servers));
+                        if settings.credential_storage == CredentialStorage::System
+                            && server_rollback
+                                .as_ref()
+                                .is_none_or(|rollback| rollback.is_ok())
+                        {
+                            let _ = cleanup_new_system_credentials(
+                                &previous_servers,
+                                &migrated_servers,
+                            );
+                        }
                         let mut message = error.to_string();
                         if let Err(rollback) = settings_rollback {
                             message.push_str(&format!("; settings rollback failed: {rollback}"));
@@ -2682,9 +2934,23 @@ impl App {
                         if let Err(rollback) = startup_rollback {
                             message.push_str(&format!("; startup rollback failed: {rollback}"));
                         }
+                        if let Some(Err(rollback)) = server_rollback {
+                            message.push_str(&format!("; server rollback failed: {rollback}"));
+                        }
                         return Err(message);
                     }
-                    Ok(result_settings)
+                    let warning = if storage_changed
+                        && settings.credential_storage == CredentialStorage::Obscure
+                    {
+                        cleanup_retired_system_credentials(&previous_servers, locale)
+                    } else {
+                        None
+                    };
+                    Ok(SettingsMutation {
+                        settings: result_settings,
+                        servers: migrated_servers,
+                        warning,
+                    })
                 })
                 .await
                 .unwrap_or_else(|error| Err(error.to_string()))
@@ -4024,6 +4290,25 @@ impl App {
         } else {
             column![]
         };
+        let credential_storage = column![
+            text(match locale {
+                Locale::English => "Credential storage",
+                Locale::Chinese => "凭据存储",
+            })
+            .size(20),
+            pick_list(
+                localized_choices(CredentialStorage::ALL, locale, Locale::credential_storage,),
+                Some(locale.choice(
+                    draft.credential_storage,
+                    locale.credential_storage(draft.credential_storage),
+                )),
+                |storage| Message::CredentialStorageChanged(storage.value)
+            )
+            .width(Fill),
+            text(credential_storage_help(locale)).size(14),
+        ]
+        .spacing(8)
+        .max_width(640);
         let cache_limits = row![
             setting_picker(
                 SettingKind::MaxSize,
@@ -4263,6 +4548,7 @@ impl App {
         update_section = update_section.push(row![check, install].spacing(10));
         let content = column![
             mount_backend,
+            credential_storage,
             cache_profile,
             cache_limits,
             cache_timing,
@@ -5065,6 +5351,34 @@ fn mount_backend_help(locale: Locale) -> &'static str {
     }
 }
 
+fn credential_storage_help(locale: Locale) -> &'static str {
+    match locale {
+        Locale::English => {
+            "The compatible default uses reversible rclone obscure and is not strong encryption. The system store is opt-in and migrates passwords and private-key passphrases only after write-and-read verification. Private key files remain ordinary files."
+        }
+        Locale::Chinese => {
+            "兼容默认使用可逆的 rclone obscure，并非强加密。系统凭据库需要手动启用；密码和私钥短语只有在写入并回读验证后才会迁移。私钥文件仍作为普通文件保存。"
+        }
+    }
+}
+
+fn credential_storage_confirmation(locale: Locale, target: CredentialStorage) -> &'static str {
+    match (locale, target) {
+        (Locale::English, CredentialStorage::System) => {
+            "Enable the system credential store? Existing passwords and private-key passphrases will be revealed locally, written to the OS store, read back for verification, and removed from SSH MountMate files only after migration succeeds. One-time codes are never stored."
+        }
+        (Locale::Chinese, CredentialStorage::System) => {
+            "是否启用系统凭据库？现有密码和私钥短语会在本机解开，写入系统凭据库并回读验证；只有迁移成功后才会从 SSH MountMate 文件中移除。一次性验证码永远不会保存。"
+        }
+        (Locale::English, CredentialStorage::Obscure) => {
+            "Return to rclone obscure storage? Vault secrets will be converted locally and saved in SSH MountMate's private configuration before vault entries are removed. This is less secure but more compatible."
+        }
+        (Locale::Chinese, CredentialStorage::Obscure) => {
+            "是否恢复为 rclone obscure 存储？系统凭据会先在本机转换并保存到 SSH MountMate 私有配置，之后才删除凭据库条目。这种方式安全性较低但兼容性更好。"
+        }
+    }
+}
+
 fn settings_folder_input<'a>(
     label: &'a str,
     value: &'a str,
@@ -5304,13 +5618,201 @@ fn rollback_prepared_managed_profile(
     remove_managed_ssh_server(prepared).map_err(|error| error.to_string())
 }
 
-fn obscure_action(service: &MountService, action: &SecretAction) -> Result<Option<String>, String> {
-    match action {
-        SecretAction::Obscure(secret) => service
-            .obscure_secret(secret)
-            .map(Some)
-            .map_err(|error| error.to_string()),
-        SecretAction::Clear | SecretAction::Keep(_) => Ok(None),
+struct PreparedSecret {
+    kind: CredentialKind,
+    obscured: Option<String>,
+    credential: Option<String>,
+    change: Option<CredentialChange>,
+}
+
+impl PreparedSecret {
+    fn apply(&self, server: &mut ServerConfig) {
+        let Some(reference) = &self.credential else {
+            return;
+        };
+        match self.kind {
+            CredentialKind::Password => {
+                server.password_obscured.clear();
+                server.password_credential.clone_from(reference);
+            }
+            CredentialKind::KeyPassphrase => {
+                server.key_pass_obscured.clear();
+                server.key_pass_credential.clone_from(reference);
+            }
+        }
+    }
+}
+
+fn prepare_secret_action(
+    service: &MountService,
+    storage: CredentialStorage,
+    server_id: &str,
+    kind: CredentialKind,
+    action: &SecretAction,
+) -> Result<PreparedSecret, String> {
+    let SecretAction::Obscure(secret) = action else {
+        return Ok(PreparedSecret {
+            kind,
+            obscured: None,
+            credential: None,
+            change: None,
+        });
+    };
+    let obscured = service
+        .obscure_secret(secret)
+        .map_err(|error| error.to_string())?;
+    if storage == CredentialStorage::Obscure {
+        return Ok(PreparedSecret {
+            kind,
+            obscured: Some(obscured),
+            credential: None,
+            change: None,
+        });
+    }
+    let reference = credential_reference(server_id, kind);
+    let change = replace_verified(&SystemCredentialStore, &reference, secret)
+        .map_err(|error| error.to_string())?;
+    Ok(PreparedSecret {
+        kind,
+        obscured: Some(obscured),
+        credential: Some(reference),
+        change: Some(change),
+    })
+}
+
+fn rollback_prepared_secret(secret: &PreparedSecret) -> Result<(), String> {
+    if let Some(change) = &secret.change {
+        rollback_change(&SystemCredentialStore, change).map_err(|error| error.to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn rollback_prepared_secrets<'a>(
+    secrets: impl IntoIterator<Item = &'a PreparedSecret>,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for secret in secrets {
+        if let Err(error) = rollback_prepared_secret(secret) {
+            errors.push(error);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn migrate_servers_for_storage(
+    service: &MountService,
+    servers: &[ServerConfig],
+    target: CredentialStorage,
+) -> Result<Vec<ServerConfig>, String> {
+    let mut migrated = Vec::with_capacity(servers.len());
+    for server in servers {
+        let result = match target {
+            CredentialStorage::System => {
+                migrate_server_to_system(server, &SystemCredentialStore, |obscured| {
+                    service
+                        .reveal_secret(obscured)
+                        .map_err(|error| CredentialError::Reveal(error.to_string()))
+                })
+            }
+            CredentialStorage::Obscure => {
+                migrate_server_to_obscure(server, &SystemCredentialStore, |secret| {
+                    service
+                        .obscure_secret(secret)
+                        .map_err(|error| CredentialError::Obscure(error.to_string()))
+                })
+            }
+        };
+        match result {
+            Ok(server) => migrated.push(server),
+            Err(error) => {
+                if target == CredentialStorage::System {
+                    let _ = cleanup_new_system_credentials(servers, &migrated);
+                }
+                return Err(error.to_string());
+            }
+        }
+    }
+    Ok(migrated)
+}
+
+fn cleanup_new_system_credentials(
+    original: &[ServerConfig],
+    migrated: &[ServerConfig],
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for server in migrated {
+        let old = original.iter().find(|candidate| candidate.id == server.id);
+        for (reference, old_reference) in [
+            (
+                &server.password_credential,
+                old.map(|server| server.password_credential.as_str()),
+            ),
+            (
+                &server.key_pass_credential,
+                old.map(|server| server.key_pass_credential.as_str()),
+            ),
+        ] {
+            if !reference.is_empty()
+                && old_reference.is_none_or(|old_reference| old_reference != reference)
+                && let Err(error) = SystemCredentialStore.delete(reference)
+            {
+                errors.push(error.to_string());
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn cleanup_retired_system_credentials(previous: &[ServerConfig], locale: Locale) -> Option<String> {
+    let errors: Vec<_> = previous
+        .iter()
+        .filter_map(|server| {
+            delete_server_credentials(server, &SystemCredentialStore)
+                .err()
+                .map(|error| format!("{}: {error}", server.display_name()))
+        })
+        .collect();
+    (!errors.is_empty()).then(|| match locale {
+        Locale::English => format!(
+            "Settings saved, but some retired vault entries could not be removed: {}",
+            errors.join("; ")
+        ),
+        Locale::Chinese => format!(
+            "设置已保存，但部分旧系统凭据无法删除：{}",
+            errors.join("；")
+        ),
+    })
+}
+
+fn delete_retired_connection_credentials(
+    previous: &ServerConfig,
+    current: &ServerConfig,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for (old_reference, new_reference) in [
+        (&previous.password_credential, &current.password_credential),
+        (&previous.key_pass_credential, &current.key_pass_credential),
+    ] {
+        if !old_reference.is_empty()
+            && old_reference != new_reference
+            && let Err(error) = SystemCredentialStore.delete(old_reference)
+        {
+            errors.push(error.to_string());
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
     }
 }
 
@@ -5929,6 +6431,22 @@ mod localization_tests {
     }
 
     #[test]
+    fn credential_ui_keeps_obscure_as_default_and_explains_verified_opt_in() {
+        assert_eq!(
+            Settings::default().credential_storage,
+            CredentialStorage::Obscure
+        );
+        for locale in [Locale::English, Locale::Chinese] {
+            let help = credential_storage_help(locale);
+            let confirmation = credential_storage_confirmation(locale, CredentialStorage::System);
+            assert!(help.contains("rclone obscure"));
+            assert!(confirmation.contains("SSH MountMate"));
+        }
+        assert!(credential_storage_help(Locale::English).contains("write-and-read verification"));
+        assert!(credential_storage_help(Locale::Chinese).contains("回读验证"));
+    }
+
+    #[test]
     fn mount_status_messages_use_the_display_name_not_the_internal_id() {
         let server = ServerConfig {
             id: "NAS".into(),
@@ -6182,14 +6700,17 @@ mod localization_tests {
             cache_root: PathBuf::from("cache"),
             vfs_upload_transfers: 12,
             macos_mount_backend: MountBackend::Nfs,
+            credential_storage: CredentialStorage::System,
             ..Settings::default()
         };
         let draft = SettingsDraft::from_settings(&original);
         assert_eq!(draft.upload_transfers, "12");
         assert_eq!(draft.mount_backend, MountBackend::Nfs);
+        assert_eq!(draft.credential_storage, CredentialStorage::System);
         let rebuilt = draft.build(&original, Locale::English).unwrap();
         assert_eq!(rebuilt.vfs_upload_transfers, 12);
         assert_eq!(rebuilt.macos_mount_backend, MountBackend::Nfs);
+        assert_eq!(rebuilt.credential_storage, CredentialStorage::System);
     }
 
     #[test]

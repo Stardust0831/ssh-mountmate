@@ -143,6 +143,36 @@ pub fn write_rclone_remote(
     Ok(())
 }
 
+pub fn clear_rclone_remote_secrets(
+    paths: &AppPaths,
+    remote_name: &str,
+) -> Result<(), RcloneConfigError> {
+    validate_remote_name(remote_name)?;
+    let _lock = FileLock::acquire(&paths.rclone_config_lock(), Duration::from_secs(180))?;
+    let path = paths.rclone_config();
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut defaults = Ini::new_cs().defaults();
+    defaults.enable_inline_comments = false;
+    let mut config = Ini::new_from_defaults(defaults);
+    let content = fs::read_to_string(&path).map_err(|source| StorageError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    config
+        .read(content)
+        .map_err(|message| RcloneConfigError::InvalidConfig {
+            path: path.clone(),
+            message,
+        })?;
+    config.remove_key(remote_name, "pass");
+    config.remove_key(remote_name, "key_file_pass");
+    let write_options = WriteOptions::new_with_params(true, 4, 1);
+    atomic_write(&path, config.pretty_writes(&write_options).as_bytes())?;
+    Ok(())
+}
+
 fn validate_remote_name(value: &str) -> Result<(), RcloneConfigError> {
     if !value.is_empty()
         && value
@@ -789,5 +819,25 @@ mod tests {
             parsed.get("alpha", "ssh"),
             Some("ssh -o BatchMode=yes alpha".into())
         );
+    }
+
+    #[test]
+    fn credential_cleanup_removes_only_persisted_remote_secrets() {
+        let temp = tempdir().unwrap();
+        let paths = app_paths(temp.path());
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        fs::write(
+            paths.rclone_config(),
+            "[alpha]\ntype = sftp\nhost = example.test\npass = obscured\nkey_file_pass = obscured-key\n\n[other]\ntype = sftp\npass = keep-me\n",
+        )
+        .unwrap();
+        clear_rclone_remote_secrets(&paths, "alpha").unwrap();
+        let content = fs::read_to_string(paths.rclone_config()).unwrap();
+        let mut config = Ini::new_cs();
+        config.read(content).unwrap();
+        assert_eq!(config.get("alpha", "host").as_deref(), Some("example.test"));
+        assert_eq!(config.get("alpha", "pass"), None);
+        assert_eq!(config.get("alpha", "key_file_pass"), None);
+        assert_eq!(config.get("other", "pass").as_deref(), Some("keep-me"));
     }
 }

@@ -183,8 +183,22 @@ Cross-platform considerations:
   write-back, directory cache, logs, links, volume name, and upload concurrency. The suite now also
   checks mount source, refresh, queued 8 MiB upload and digest, rename/delete, Chinese and spaced
   names, 500-file enumeration, clean unmount, failed-start cleanup, and non-blocking timing output.
-  Real x64/ARM64 NFS evidence is still pending; this branch must not be merged or released before
-  both architectures pass genuine NFS mounts.
+  The branch remained blocked from merge or release until both architectures produced genuine NFS
+  evidence in the following run.
+- Branch run [29398901355](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29398901355)
+  passed quality and all six Windows/Linux/macOS x64/ARM64 jobs on `e901b8a`. Both macOS jobs ran
+  FUSE and built-in NFS as separate real lifecycles. NFS logs explicitly reported
+  `NFS Server running at 127.0.0.1:<port>`; ARM64 and x64 both verified refresh, queued upload,
+  remote digest, rename/delete, Chinese/spaced names, 500-file enumeration, active-mount package
+  replacement, clean unmount/state removal, and failed-start cleanup. Upload completion took 91s
+  on both architectures under the intentional 90s write-back test setting. This is genuine
+  dual-architecture Experimental evidence, not evidence to make NFS the default.
+- Implemented the local system-credential-store slice behind an explicit confirmed setting. Schema
+  12 still defaults old and new users to `rclone obscure`. The opt-in mode uses the OS credential
+  provider for passwords and private-key passphrases only, verifies every write by reading it back,
+  rolls back overwritten credentials when connection persistence fails, and scrubs old and
+  temporary rclone config secrets. Private keys and one-time authentication codes are excluded.
+  Native Keychain/Credential Manager CI and complete six-platform regression evidence are pending.
 
 - Began stable `v0.4.0` preparation after explicit approval to merge PR #11 and publish a formal
   release. The stable scope is the verified Rust rewrite plus configurable upload concurrency;

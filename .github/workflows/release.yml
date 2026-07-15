@@ -154,6 +154,9 @@ jobs:
           sudo installer -pkg "${RUNNER_TEMP}/${package}" -target /
           test -e /usr/local/lib/libfuse-t.dylib
       - run: cargo test --workspace --all-features
+      - name: Exercise native system credential store
+        if: runner.os == 'Windows' || runner.os == 'macOS'
+        run: cargo test --package mountmate-core live_system_credential_roundtrip --all-features -- --ignored --exact --test-threads=1
       - run: cargo build --release --package ssh-mountmate
 
       - name: Verify Windows execution manifest

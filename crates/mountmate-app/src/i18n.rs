@@ -2,7 +2,7 @@ use std::fmt;
 
 use mountmate_core::connection::{ConnectionSource, ImportAction, ImportStatus};
 use mountmate_core::rc::RefreshResult;
-use mountmate_core::{AuthMethod, ConnectionMethod, MountBackend};
+use mountmate_core::{AuthMethod, ConnectionMethod, CredentialStorage, MountBackend};
 
 use super::CacheMode;
 
@@ -92,6 +92,15 @@ impl Locale {
             (Self::English, MountBackend::Nfs) => "rclone built-in NFS (Experimental)",
             (Self::Chinese, MountBackend::Fuse) => "FUSE（macFUSE / FUSE-T，默认）",
             (Self::Chinese, MountBackend::Nfs) => "rclone 内置 NFS（实验性）",
+        }
+    }
+
+    pub(crate) fn credential_storage(self, value: CredentialStorage) -> &'static str {
+        match (self, value) {
+            (Self::English, CredentialStorage::Obscure) => "rclone obscure (compatible default)",
+            (Self::English, CredentialStorage::System) => "System credential store",
+            (Self::Chinese, CredentialStorage::Obscure) => "rclone obscure（兼容默认）",
+            (Self::Chinese, CredentialStorage::System) => "系统凭据库",
         }
     }
 

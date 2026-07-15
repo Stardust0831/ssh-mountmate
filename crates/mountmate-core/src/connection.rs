@@ -251,6 +251,14 @@ impl ConnectionDraft {
             key_file,
             password_obscured: String::new(),
             key_pass_obscured: String::new(),
+            password_credential: self
+                .existing
+                .as_ref()
+                .map_or_else(String::new, |server| server.password_credential.clone()),
+            key_pass_credential: self
+                .existing
+                .as_ref()
+                .map_or_else(String::new, |server| server.key_pass_credential.clone()),
             connection_method,
             remote_path,
             mountpoint,
@@ -297,7 +305,12 @@ impl ConnectionDraft {
                 .as_ref()
                 .filter(|existing| same_password_target(existing, &server))
                 .map(|existing| SecretAction::Keep(existing.password_obscured.clone()))
-                .filter(|action| !matches!(action, SecretAction::Keep(value) if value.is_empty()))
+                .filter(|_| {
+                    self.existing.as_ref().is_some_and(|existing| {
+                        !existing.password_obscured.is_empty()
+                            || !existing.password_credential.is_empty()
+                    })
+                })
                 .ok_or(DraftError::PasswordRequired)?,
             AuthMethod::Key => SecretAction::Clear,
         };
@@ -310,7 +323,9 @@ impl ConnectionDraft {
                         .as_ref()
                         .filter(|existing| same_key_target(existing, &server))
                         .map_or(SecretAction::Clear, |existing| {
-                            if existing.key_pass_obscured.is_empty() {
+                            if existing.key_pass_obscured.is_empty()
+                                && existing.key_pass_credential.is_empty()
+                            {
                                 SecretAction::Clear
                             } else {
                                 SecretAction::Keep(existing.key_pass_obscured.clone())
@@ -358,6 +373,12 @@ impl ValidatedConnection {
         password: Option<String>,
         key_passphrase: Option<String>,
     ) -> Result<ServerConfig, DraftError> {
+        if !matches!(self.password, SecretAction::Keep(_)) {
+            self.server.password_credential.clear();
+        }
+        if !matches!(self.key_passphrase, SecretAction::Keep(_)) {
+            self.server.key_pass_credential.clear();
+        }
         self.server.password_obscured = resolved_secret(self.password, password)?;
         self.server.key_pass_obscured = resolved_secret(self.key_passphrase, key_passphrase)?;
         Ok(self.server)
@@ -774,9 +795,11 @@ fn merge_imported_connection(existing: &ServerConfig, imported: &ServerConfig) -
     };
     if merged.auth != AuthMethod::Password || !same_password_target(existing, &merged) {
         merged.password_obscured.clear();
+        merged.password_credential.clear();
     }
     if merged.auth != AuthMethod::Key || !same_key_target(existing, &merged) {
         merged.key_pass_obscured.clear();
+        merged.key_pass_credential.clear();
     }
     merged
 }
@@ -829,6 +852,19 @@ mod tests {
                 .password_obscured,
             "kept-secret"
         );
+    }
+
+    #[test]
+    fn unchanged_password_target_preserves_system_credential_reference() {
+        let mut existing = password_server();
+        existing.password_obscured.clear();
+        existing.password_credential = "ssh-mountmate:alpha:password".into();
+        let draft = ConnectionDraft::from_server(&existing);
+        let validated = draft.validate(std::slice::from_ref(&existing)).unwrap();
+        assert_eq!(validated.password, SecretAction::Keep(String::new()));
+        let saved = validated.apply_secrets(None, None).unwrap();
+        assert!(saved.password_obscured.is_empty());
+        assert_eq!(saved.password_credential, "ssh-mountmate:alpha:password");
     }
 
     #[test]
@@ -1040,6 +1076,8 @@ mod tests {
             auth: AuthMethod::Password,
             password_obscured: "old-password".into(),
             key_pass_obscured: "old-passphrase".into(),
+            password_credential: "old-password-reference".into(),
+            key_pass_credential: "old-passphrase-reference".into(),
             host: "old.example".into(),
             user: "alice".into(),
             ..password_server()
@@ -1056,5 +1094,7 @@ mod tests {
 
         assert!(merged.password_obscured.is_empty());
         assert!(merged.key_pass_obscured.is_empty());
+        assert!(merged.password_credential.is_empty());
+        assert!(merged.key_pass_credential.is_empty());
     }
 }

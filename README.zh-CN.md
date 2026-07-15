@@ -255,7 +255,17 @@ ssh-add --apple-use-keychain ~/.ssh/id_ed25519
 rclone obscure
 ```
 
-转换后写入 SSH MountMate 私有的 rclone 配置。这样可以避免明文保存，但这不是强加密。在 macOS 和 Linux 上，SSH MountMate 会把配置文件权限限制为仅文件所有者可读写。本机用户账号和配置目录仍应视为敏感数据。
+转换后写入 SSH MountMate 的私有配置。这样可以避免明文保存，但该值可以逆向还原，并非强加密；
+为了兼容性，这仍是默认方式。在 macOS 和 Linux 上，SSH MountMate 会把配置文件权限限制为仅
+文件所有者可读写。本机用户账号和配置目录仍应视为敏感数据。
+
+设置页还提供需要用户手动启用的“系统凭据库”模式。它通过平台原生提供者使用 Windows
+Credential Manager、macOS Keychain 或 Linux Secret Service。启用时会先要求确认，在本机
+解开已有的 rclone-obscured 值，把密码和私钥短语写入系统凭据库，再逐项回读验证；只有全部
+成功后才会从 SSH MountMate 文件中移除这些值。私钥文件本身和一次性 2FA/OAuth token 永远
+不会存入凭据库。挂载时只会短暂为 rclone 填充秘密，启动后立即从持久配置清除；清理失败会
+停止新挂载，而不会显示一个虚假的“已保护”状态。恢复为 `rclone obscure` 也需要再次明确
+确认并执行反向迁移。
 
 ## 主机指纹校验
 

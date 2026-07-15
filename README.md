@@ -257,7 +257,20 @@ Passwords and key passphrases are passed through:
 rclone obscure
 ```
 
-The obscured value is stored in SSH MountMate's private rclone config. This avoids plain-text storage, but it is not strong encryption. On macOS and Linux, SSH MountMate writes configuration files with owner-only permissions. Treat the local user account and its config directory as sensitive.
+The obscured value is stored in SSH MountMate's private configuration. This avoids plain-text
+storage, but it is reversible and is not strong encryption. It remains the default for compatibility.
+On macOS and Linux, SSH MountMate writes configuration files with owner-only permissions. Treat the
+local user account and its config directory as sensitive.
+
+The Settings page also offers a manually enabled `System credential store` mode. It uses Windows
+Credential Manager, macOS Keychain, or the Linux Secret Service through the platform's native
+credential provider. Enabling it asks for confirmation, reveals existing rclone-obscured values
+locally, writes passwords and private-key passphrases to the OS store, reads every value back for
+verification, and only then removes those values from SSH MountMate's files. Private key files and
+one-time 2FA/OAuth tokens are never stored in the vault. Mounts temporarily hydrate the rclone
+configuration and remove its secret fields immediately after startup; a cleanup failure stops the
+new mount instead of leaving a misleading protected state. Returning to `rclone obscure` is an
+explicit confirmed migration in the other direction.
 
 ## Host Key Validation
 

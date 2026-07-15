@@ -1,6 +1,7 @@
 pub mod app_command;
 pub mod capacity;
 pub mod connection;
+pub mod credential;
 pub mod dependency;
 pub mod model;
 pub mod mountpoint;
@@ -20,7 +21,8 @@ pub mod update_install;
 pub mod update_workflow;
 
 pub use model::{
-    AuthMethod, ConnectionMethod, MountBackend, MountPhase, MountState, ServerConfig, Settings,
+    AuthMethod, ConnectionMethod, CredentialStorage, MountBackend, MountPhase, MountState,
+    ServerConfig, Settings,
 };
 
 pub const APP_NAME: &str = "SSH MountMate";

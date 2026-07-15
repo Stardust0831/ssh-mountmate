@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const SETTINGS_SCHEMA_VERSION: u32 = 11;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 12;
 pub const DEFAULT_VFS_UPLOAD_TRANSFERS: u16 = 4;
 pub const MIN_VFS_UPLOAD_TRANSFERS: u16 = 1;
 pub const MAX_VFS_UPLOAD_TRANSFERS: u16 = 32;
@@ -43,6 +43,10 @@ fn default_vfs_upload_transfers() -> u16 {
 
 fn default_mount_backend() -> MountBackend {
     MountBackend::Fuse
+}
+
+fn default_credential_storage() -> CredentialStorage {
+    CredentialStorage::Obscure
 }
 
 fn default_true() -> bool {
@@ -112,6 +116,18 @@ impl fmt::Display for MountBackend {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialStorage {
+    #[default]
+    Obscure,
+    System,
+}
+
+impl CredentialStorage {
+    pub const ALL: [Self; 2] = [Self::Obscure, Self::System];
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerConfig {
     #[serde(default)]
@@ -138,6 +154,10 @@ pub struct ServerConfig {
     pub password_obscured: String,
     #[serde(default)]
     pub key_pass_obscured: String,
+    #[serde(default)]
+    pub password_credential: String,
+    #[serde(default)]
+    pub key_pass_credential: String,
     #[serde(default = "default_connection_method")]
     pub connection_method: ConnectionMethod,
     #[serde(default)]
@@ -181,6 +201,8 @@ impl Default for ServerConfig {
             key_file: String::new(),
             password_obscured: String::new(),
             key_pass_obscured: String::new(),
+            password_credential: String::new(),
+            key_pass_credential: String::new(),
             connection_method: default_connection_method(),
             remote_path: String::new(),
             mountpoint: String::new(),
@@ -294,6 +316,8 @@ pub struct Settings {
     pub vfs_upload_transfers: u16,
     #[serde(default = "default_mount_backend")]
     pub macos_mount_backend: MountBackend,
+    #[serde(default = "default_credential_storage")]
+    pub credential_storage: CredentialStorage,
     #[serde(default)]
     pub startup_all: bool,
     #[serde(default = "default_true")]
@@ -326,6 +350,7 @@ impl Default for Settings {
             buffer_size: String::new(),
             vfs_upload_transfers: default_vfs_upload_transfers(),
             macos_mount_backend: default_mount_backend(),
+            credential_storage: default_credential_storage(),
             startup_all: false,
             auto_show_transfers: true,
             auto_check_updates: true,
@@ -540,6 +565,26 @@ mod tests {
                 .macos_mount_backend,
             MountBackend::Nfs
         );
+    }
+
+    #[test]
+    fn credential_storage_is_opt_in_and_legacy_settings_remain_obscured() {
+        let legacy: Settings = serde_json::from_str(r#"{"settings_schema_version":11}"#).unwrap();
+        assert_eq!(
+            legacy.migrate().credential_storage,
+            CredentialStorage::Obscure
+        );
+        assert_eq!(
+            Settings::default().credential_storage,
+            CredentialStorage::Obscure
+        );
+
+        let settings = Settings {
+            credential_storage: CredentialStorage::System,
+            ..Settings::default()
+        };
+        let json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(json["credential_storage"], "system");
     }
 
     #[test]
