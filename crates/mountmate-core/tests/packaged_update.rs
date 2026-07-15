@@ -336,6 +336,14 @@ fn run_active_mount_update() -> TestResult {
     let install_kind = layout.kind;
     make_payload_distinct(layout.kind, &install_root, &payload_root)?;
     let new_executable_sha256 = file_sha256(&package_executable(&payload_root))?;
+    if matches!(install_kind, InstallKind::StandaloneExecutable)
+        && file_sha256(&installed_executable)? == new_executable_sha256
+    {
+        return Err(io::Error::other(
+            "active-mount update fixture did not create a distinct payload",
+        )
+        .into());
+    }
     let transaction = plan_transaction_paths(&layout)?;
     let payload = locate_update_payload(&payload_root, layout.kind, env::consts::OS)?;
     let prepared = prepare_directory_payload(&layout, &payload, &transaction, env::consts::OS)?;
