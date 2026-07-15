@@ -6073,11 +6073,9 @@ impl PreparedSecret {
         };
         match self.kind {
             CredentialKind::Password => {
-                server.password_obscured.clear();
                 server.password_credential.clone_from(reference);
             }
             CredentialKind::KeyPassphrase => {
-                server.key_pass_obscured.clear();
                 server.key_pass_credential.clone_from(reference);
             }
         }
@@ -7053,6 +7051,34 @@ mod localization_tests {
         assert!(summary.contains("key_pass_reference=true"));
         assert!(!summary.contains("password-secret-sentinel"));
         assert!(!summary.contains("credential-secret-sentinel"));
+    }
+
+    #[test]
+    fn system_secret_replacement_retains_the_obscured_compatibility_copy() {
+        let mut server = ServerConfig {
+            password_obscured: "obscured-password".into(),
+            key_pass_obscured: "obscured-passphrase".into(),
+            ..ServerConfig::default()
+        };
+        PreparedSecret {
+            kind: CredentialKind::Password,
+            obscured: Some("obscured-password".into()),
+            credential: Some("password-reference".into()),
+            change: None,
+        }
+        .apply(&mut server);
+        PreparedSecret {
+            kind: CredentialKind::KeyPassphrase,
+            obscured: Some("obscured-passphrase".into()),
+            credential: Some("passphrase-reference".into()),
+            change: None,
+        }
+        .apply(&mut server);
+
+        assert_eq!(server.password_obscured, "obscured-password");
+        assert_eq!(server.key_pass_obscured, "obscured-passphrase");
+        assert_eq!(server.password_credential, "password-reference");
+        assert_eq!(server.key_pass_credential, "passphrase-reference");
     }
 
     #[test]
