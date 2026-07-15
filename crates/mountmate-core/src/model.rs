@@ -244,7 +244,10 @@ impl ServerConfig {
     }
 
     pub fn remote_name(&self) -> &str {
-        if self.mode == "ssh_config" && !self.host_alias.is_empty() {
+        if self.connection_method != ConnectionMethod::Interactive
+            && self.mode == "ssh_config"
+            && !self.host_alias.is_empty()
+        {
             &self.host_alias
         } else {
             &self.id
@@ -607,6 +610,32 @@ mod tests {
                 .connection_method,
             ConnectionMethod::Interactive
         );
+    }
+
+    #[test]
+    fn openssh_ssh_config_remote_keeps_host_alias() {
+        let server = ServerConfig {
+            id: "openssh-profile".into(),
+            mode: "ssh_config".into(),
+            host_alias: "cluster-login".into(),
+            connection_method: ConnectionMethod::Openssh,
+            ..ServerConfig::default()
+        };
+
+        assert_eq!(server.remote_name(), "cluster-login");
+    }
+
+    #[test]
+    fn interactive_ssh_config_remote_uses_unique_server_id() {
+        let server = ServerConfig {
+            id: "interactive-profile".into(),
+            mode: "ssh_config".into(),
+            host_alias: "cluster-login".into(),
+            connection_method: ConnectionMethod::Interactive,
+            ..ServerConfig::default()
+        };
+
+        assert_eq!(server.remote_name(), "interactive-profile");
     }
 
     #[test]

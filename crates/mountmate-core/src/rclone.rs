@@ -860,6 +860,41 @@ mod tests {
     }
 
     #[test]
+    fn interactive_ssh_config_remote_does_not_collide_with_openssh_remote() {
+        let openssh = ServerConfig {
+            id: "openssh-profile".into(),
+            mode: "ssh_config".into(),
+            source: "ssh_config".into(),
+            host_alias: "cluster-login".into(),
+            connection_method: ConnectionMethod::Openssh,
+            ..ServerConfig::default()
+        };
+        let interactive = ServerConfig {
+            id: "interactive-profile".into(),
+            mode: "ssh_config".into(),
+            source: "ssh_config".into(),
+            host_alias: "cluster-login".into(),
+            connection_method: ConnectionMethod::Interactive,
+            ..ServerConfig::default()
+        };
+        let connector = vec!["ssh".into(), "-o".into(), "ControlMaster=no".into()];
+
+        let openssh_remote = RcloneRemote::for_server(&openssh, None, None, false).unwrap();
+        let interactive_remote = RcloneRemote::for_server_with_external_ssh(
+            &interactive,
+            None,
+            None,
+            false,
+            Some(&connector),
+        )
+        .unwrap();
+
+        assert_eq!(openssh_remote.name, "cluster-login");
+        assert_eq!(interactive_remote.name, "interactive-profile");
+        assert_ne!(openssh_remote.name, interactive_remote.name);
+    }
+
+    #[test]
     fn interactive_remote_never_falls_back_to_a_normal_ssh_process() {
         let server = ServerConfig {
             id: "interactive".into(),
