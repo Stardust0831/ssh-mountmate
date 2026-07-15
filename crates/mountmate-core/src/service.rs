@@ -1,6 +1,7 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 #[cfg(windows)]
@@ -131,7 +132,13 @@ impl MountService {
 
     pub fn transfer_snapshot(&self, server_id: &str) -> Result<TransferSnapshot, ServiceError> {
         let state: MountState = read_json(&self.paths.state_file(server_id))?;
-        Ok(HttpRcClient::new(&state.rc_addr, Duration::from_millis(750))?.transfer_snapshot()?)
+        Ok(HttpRcClient::with_credentials(
+            &state.rc_addr,
+            &state.rc_user,
+            &state.rc_pass,
+            Duration::from_millis(750),
+        )?
+        .transfer_snapshot()?)
     }
 
     pub fn capacity(&self, server: &ServerConfig) -> Result<Option<CapacityInfo>, ServiceError> {
@@ -149,13 +156,17 @@ impl MountService {
         recursive: bool,
     ) -> Result<RefreshResult, ServiceError> {
         let state: MountState = read_json(&self.paths.state_file(server_id))?;
-        Ok(
-            HttpRcClient::new(&state.rc_addr, Duration::from_secs(3))?.refresh_remote(
-                &state.remote,
-                &normalize_refresh_relative_path(relative_dir),
-                recursive,
-            )?,
-        )
+        Ok(HttpRcClient::with_credentials(
+            &state.rc_addr,
+            &state.rc_user,
+            &state.rc_pass,
+            Duration::from_secs(3),
+        )?
+        .refresh_remote(
+            &state.remote,
+            &normalize_refresh_relative_path(relative_dir),
+            recursive,
+        )?)
     }
 
     pub fn refresh_path(
@@ -179,13 +190,13 @@ impl MountService {
             ) else {
                 continue;
             };
-            return Ok(
-                HttpRcClient::new(&state.rc_addr, Duration::from_secs(3))?.refresh_remote(
-                    &state.remote,
-                    &relative_dir,
-                    false,
-                )?,
-            );
+            return Ok(HttpRcClient::with_credentials(
+                &state.rc_addr,
+                &state.rc_user,
+                &state.rc_pass,
+                Duration::from_secs(3),
+            )?
+            .refresh_remote(&state.remote, &relative_dir, false)?);
         }
         Err(ServiceError::PathOutsideMount(local_path.into()))
     }
@@ -197,11 +208,24 @@ impl MountService {
         let rclone = resolve_rclone(&self.paths, &self.app_root, None)?
             .ok_or(ServiceError::RcloneMissing)?;
         let mut command = Command::new(&rclone.path);
-        command.args(["obscure", secret]);
+        command
+            .args(["obscure", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         #[cfg(windows)]
         command.creation_flags(0x0800_0000);
-        let output = command
-            .output()
+        let mut child = command
+            .spawn()
+            .map_err(|error| ServiceError::Obscure(error.to_string()))?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| ServiceError::Obscure("rclone stdin was unavailable".into()))?
+            .write_all(secret.as_bytes())
+            .map_err(|error| ServiceError::Obscure(error.to_string()))?;
+        let output = child
+            .wait_with_output()
             .map_err(|error| ServiceError::Obscure(error.to_string()))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -447,7 +471,42 @@ fn expand_home_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(unix)]
+    use tempfile::tempdir;
+
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn obscure_secret_is_delivered_over_stdin_not_argv() {
+        let temp = tempdir().unwrap();
+        let app_root = temp.path().join("app");
+        let binary = app_root.join("bin/rclone");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(
+            &binary,
+            b"#!/bin/sh\n[ \"$1\" = obscure ]\n[ \"$2\" = - ]\nIFS= read -r secret || true\n[ \"$secret\" = 'top secret' ]\nprintf 'obscured-value\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let digest = crate::rclone_binary::file_sha256(&binary).unwrap();
+        fs::write(binary.with_file_name("rclone.sha256"), digest).unwrap();
+        let paths = AppPaths {
+            config_dir: temp.path().join("config"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            data_dir: temp.path().join("data"),
+        };
+        let service = MountService::new(paths, app_root);
+
+        assert_eq!(
+            service.obscure_secret("top secret").unwrap(),
+            "obscured-value"
+        );
+    }
 
     #[test]
     fn resolved_ssh_host_becomes_a_self_contained_import_profile() {

@@ -49,9 +49,16 @@ fn complete_python_layout_migrates_without_losing_user_data() {
         .find(|server| server.id == "legacy-password")
         .unwrap();
     assert_eq!(password.auth, AuthMethod::Password);
+    assert_eq!(password.name, "Legacy Password");
+    assert_eq!(password.mode, "manual");
+    assert_eq!(password.source, "manual");
+    assert_eq!(password.host, "password.example");
+    assert_eq!(password.user, "alice");
     assert_eq!(password.password_obscured, "obscured-password-secret");
     assert_eq!(password.port, "2202");
     assert_eq!(password.cache_mode, "minimal");
+    assert_eq!(password.remote_path, "/project/data");
+    assert_eq!(password.mountpoint, "/legacy/password-mount");
     assert!(password.network_mode);
 
     let sai = servers
@@ -59,6 +66,15 @@ fn complete_python_layout_migrates_without_losing_user_data() {
         .find(|server| server.id == "legacy-sai")
         .unwrap();
     assert_eq!(sai.key_pass_obscured, "obscured-key-passphrase");
+    assert_eq!(sai.name, "SAI-alice");
+    assert_eq!(sai.source, "sai_cluster");
+    assert_eq!(sai.host_alias, "SAI-alice");
+    assert_eq!(sai.host, "sai.example");
+    assert_eq!(sai.user, "alice");
+    assert_eq!(sai.port, "12022");
+    assert_eq!(sai.key_file, "/legacy/keys/id_ed25519");
+    assert_eq!(sai.remote_path, "$HOME/work");
+    assert_eq!(sai.mountpoint, "__home_mnt__");
     assert!(sai.ssh_config_managed);
     assert!(sai.copy_key_to_ssh_dir);
     assert_eq!(sai.managed_ssh_config_path, "/legacy/.ssh/ssh-mountmate.d");
@@ -68,6 +84,14 @@ fn complete_python_layout_migrates_without_losing_user_data() {
         .find(|server| server.id == "legacy-openssh")
         .unwrap();
     assert_eq!(openssh.connection_method, ConnectionMethod::Openssh);
+    assert_eq!(openssh.name, "Legacy OpenSSH");
+    assert_eq!(openssh.mode, "ssh_config");
+    assert_eq!(openssh.source, "ssh_config");
+    assert_eq!(openssh.host_alias, "legacy-cluster");
+    assert_eq!(openssh.host, "resolved.example");
+    assert_eq!(openssh.user, "bob");
+    assert_eq!(openssh.remote_path, "/shared");
+    assert_eq!(openssh.mountpoint, "/legacy/openssh-mount");
     assert_eq!(openssh.ssh_config_path, "/legacy/.ssh/config");
 
     let settings = load_settings(&paths).unwrap();
@@ -91,6 +115,11 @@ fn complete_python_layout_migrates_without_losing_user_data() {
     assert_eq!(state.server_id, "legacy-password");
     assert_eq!(state.phase, MountPhase::Mounted);
     assert_eq!(state.rc_addr, "127.0.0.1:45321");
+    assert_eq!(state.remote, "legacy-password:project/data");
+    assert_eq!(state.mountpoint, Path::new("/legacy/password-mount"));
+    assert_eq!(state.log, Path::new("/legacy/state/legacy-password.log"));
+    assert!(state.rc_user.is_empty());
+    assert!(state.rc_pass.is_empty());
 
     let remote = RcloneRemote::for_server(password, None, None, false).unwrap();
     write_rclone_remote(&paths, &remote).unwrap();

@@ -92,7 +92,7 @@ pub struct TransferSnapshot {
 }
 
 pub fn normalized_transfer_name(value: &str) -> String {
-    value.replace('\\', "/").trim_matches('/').to_lowercase()
+    value.replace('\\', "/").trim_matches('/').to_owned()
 }
 
 pub fn transfer_matches(queued: &str, active: &str) -> bool {
@@ -120,7 +120,9 @@ pub fn build_transfer_snapshot(
             .transferring
             .iter()
             .enumerate()
-            .find(|(_, candidate)| transfer_matches(&item.name, &candidate.name));
+            .find(|(index, candidate)| {
+                !matched_active[*index] && transfer_matches(&item.name, &candidate.name)
+            });
         if let Some((index, _)) = active {
             matched_active[index] = true;
         }
@@ -260,6 +262,40 @@ mod tests {
         assert_eq!(snapshot.transferred_bytes, 40);
         assert_eq!(snapshot.percentage, 40.0);
         assert!(!snapshot.synced);
+    }
+
+    #[test]
+    fn active_transfers_match_case_sensitively_and_only_once() {
+        let snapshot = build_transfer_snapshot(
+            QueueResponse {
+                queue: vec![
+                    QueueItem {
+                        name: "File.bin".into(),
+                        size: 100,
+                        uploading: true,
+                        ..QueueItem::default()
+                    },
+                    QueueItem {
+                        name: "file.bin".into(),
+                        size: 100,
+                        uploading: true,
+                        ..QueueItem::default()
+                    },
+                ],
+            },
+            VfsStatsResponse::default(),
+            CoreStatsResponse {
+                transferring: vec![ActiveTransfer {
+                    name: "File.bin".into(),
+                    bytes: 40,
+                    ..ActiveTransfer::default()
+                }],
+            },
+        );
+
+        assert_eq!(snapshot.files[0].bytes, 40);
+        assert_eq!(snapshot.files[1].bytes, 0);
+        assert_eq!(snapshot.transferred_bytes, 40);
     }
 
     #[test]

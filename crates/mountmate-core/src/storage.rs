@@ -215,13 +215,29 @@ impl FileLock {
         loop {
             match file.try_lock_exclusive() {
                 Ok(()) => return Ok(Self { file }),
-                Err(_) if started.elapsed() < timeout => {
+                Err(error) if lock_is_contended(&error) && started.elapsed() < timeout => {
                     std::thread::sleep(Duration::from_millis(100))
                 }
-                Err(_) => return Err(StorageError::LockTimeout(path.to_owned())),
+                Err(error) if lock_is_contended(&error) => {
+                    return Err(StorageError::LockTimeout(path.to_owned()));
+                }
+                Err(source) => {
+                    return Err(StorageError::Io {
+                        path: path.to_owned(),
+                        source,
+                    });
+                }
             }
         }
     }
+}
+
+fn lock_is_contended(error: &std::io::Error) -> bool {
+    let expected = fs2::lock_contended_error();
+    error.kind() == expected.kind()
+        && expected
+            .raw_os_error()
+            .is_none_or(|code| error.raw_os_error() == Some(code))
 }
 
 impl Drop for FileLock {

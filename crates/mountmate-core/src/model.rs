@@ -171,14 +171,18 @@ impl Default for ServerConfig {
 
 impl ServerConfig {
     pub fn normalize(&mut self) {
+        let display_name = self.display_name().to_owned();
         let id_source = if self.id.trim().is_empty() {
-            self.display_name()
+            [&self.name, &self.host_alias, &self.host]
+                .into_iter()
+                .find(|value| !value.trim().is_empty())
+                .map_or("", String::as_str)
         } else {
             &self.id
         };
         self.id = sanitize_id(id_source);
         if self.name.trim().is_empty() {
-            self.name = self.display_name().to_owned();
+            self.name = display_name;
         }
         self.port = normalize_port(&self.port).unwrap_or_else(|| "22".into());
     }
@@ -203,7 +207,7 @@ impl ServerConfig {
         if path.is_empty() {
             format!("{}:", self.remote_name())
         } else {
-            format!("{}:{}", self.remote_name(), path.trim_start_matches('/'))
+            format!("{}:{path}", self.remote_name())
         }
     }
 
@@ -380,6 +384,10 @@ pub struct MountState {
     pub log: PathBuf,
     pub rc_addr: String,
     #[serde(default)]
+    pub rc_user: String,
+    #[serde(default)]
+    pub rc_pass: String,
+    #[serde(default)]
     pub phase: MountPhase,
     #[serde(default)]
     pub process_started_at: Option<u64>,
@@ -488,6 +496,29 @@ mod tests {
     }
 
     #[test]
+    fn remote_spec_preserves_relative_and_absolute_paths() {
+        let mut server = ServerConfig {
+            id: "alpha".into(),
+            remote_path: "relative/path".into(),
+            ..ServerConfig::default()
+        };
+        assert_eq!(server.remote_spec(), "alpha:relative/path");
+        server.remote_path = "/absolute/path".into();
+        assert_eq!(server.remote_spec(), "alpha:/absolute/path");
+    }
+
+    #[test]
+    fn blank_servers_receive_unique_generated_ids() {
+        let mut first = ServerConfig::default();
+        let mut second = ServerConfig::default();
+        first.normalize();
+        second.normalize();
+        assert_ne!(first.id, second.id);
+        assert_eq!(first.name, "Server");
+        assert_eq!(second.name, "Server");
+    }
+
+    #[test]
     fn invalid_ports_do_not_survive_normalization() {
         assert_eq!(normalize_port("65535"), Some("65535".into()));
         assert_eq!(normalize_port("0"), None);
@@ -505,5 +536,7 @@ mod tests {
         assert_eq!(state.phase, MountPhase::Mounted);
         assert_eq!(state.process_started_at, None);
         assert!(state.rclone.as_os_str().is_empty());
+        assert!(state.rc_user.is_empty());
+        assert!(state.rc_pass.is_empty());
     }
 }

@@ -385,17 +385,20 @@ fn materialized_digest_prefix(path: &Path, windows: bool) -> Option<String> {
     if !path.is_file() {
         return None;
     }
-    let mut name = path.file_name()?.to_str()?;
-    if windows {
-        if name.len() < 4 || !name[name.len() - 4..].eq_ignore_ascii_case(".exe") {
-            return None;
-        }
-        name = &name[..name.len() - 4];
-    }
-    if name.len() < 7 || !name[..7].eq_ignore_ascii_case("rclone-") {
+    let name = path.file_name()?.to_str()?;
+    let name = if windows {
+        let suffix = name.get(name.len().checked_sub(4)?..)?;
+        suffix
+            .eq_ignore_ascii_case(".exe")
+            .then(|| &name[..name.len() - 4])?
+    } else {
+        name
+    };
+    let prefix = name.get(..7)?;
+    if !prefix.eq_ignore_ascii_case("rclone-") {
         return None;
     }
-    let token = &name[7..];
+    let token = name.get(7..)?;
     (token.len() == HASH_PREFIX_LENGTH && token.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .then(|| token.to_ascii_lowercase())
 }
@@ -617,5 +620,13 @@ mod tests {
         .unwrap();
         assert_eq!(resolved.path, configured);
         assert_eq!(resolved.source, RcloneSource::Configured);
+    }
+
+    #[test]
+    fn materialized_filename_parsing_rejects_non_ascii_boundaries_without_panicking() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("éééé.exe");
+        fs::write(&path, b"not rclone").unwrap();
+        assert_eq!(materialized_digest_prefix(&path, true), None);
     }
 }

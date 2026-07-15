@@ -102,6 +102,8 @@ mod tests {
             mountpoint: PathBuf::from("R:"),
             log: PathBuf::from("C:/State/alpha.log"),
             rc_addr: "127.0.0.1:1234".into(),
+            rc_user: String::new(),
+            rc_pass: String::new(),
             phase: crate::MountPhase::Mounted,
             process_started_at: Some(100),
             rclone: PathBuf::from("rclone"),

@@ -169,25 +169,24 @@ fn file_view(file: &TransferFile, locale: Locale) -> Element<'_, Message> {
     } else {
         String::new()
     };
-    container(
-        column![
-            row![
-                text(&file.name).size(14).width(Fill),
-                text(format!("{state}{retries}")).size(12),
-            ]
-            .spacing(10)
-            .align_y(Center),
-            progress_bar(0.0..=100.0, file.percentage as f32),
-            row![
-                text(amount).size(12),
-                Space::new().width(Fill),
-                text(activity).size(12)
-            ],
+    let mut details = column![
+        row![
+            text(&file.name).size(14).width(Fill),
+            text(format!("{state}{retries}")).size(12),
         ]
-        .spacing(5),
-    )
-    .padding([8, 0])
-    .into()
+        .spacing(10)
+        .align_y(Center),
+    ]
+    .spacing(5);
+    if file.size > 0 {
+        details = details.push(progress_bar(0.0..=100.0, file.percentage as f32));
+    }
+    details = details.push(row![
+        text(amount).size(12),
+        Space::new().width(Fill),
+        text(activity).size(12)
+    ]);
+    container(details).padding([8, 0]).into()
 }
 
 fn format_eta(locale: Locale, seconds: f64) -> String {

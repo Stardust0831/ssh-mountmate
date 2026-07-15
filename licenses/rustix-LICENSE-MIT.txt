@@ -1,3 +1,9 @@
+Copyrights in the rustix project are retained by their contributors.
+No copyright assignment is required to contribute to the rustix project.
+
+Some files include code derived from Rust's libstd; see the comments in the
+code for details.
+
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
 documentation files (the "Software"), to deal in the

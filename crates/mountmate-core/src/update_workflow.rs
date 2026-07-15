@@ -147,6 +147,7 @@ mod tests {
             replace_path: unrelated.clone(),
             executable: unrelated.clone(),
             executable_sha256: "a".repeat(64),
+            tree_sha256: "b".repeat(64),
         };
         let transaction = TransactionPaths {
             prepared: owned.clone(),

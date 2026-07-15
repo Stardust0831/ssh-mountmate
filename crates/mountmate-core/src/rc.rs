@@ -27,10 +27,21 @@ pub trait RcApi {
 pub struct HttpRcClient {
     base_url: String,
     client: Client,
+    user: String,
+    password: String,
 }
 
 impl HttpRcClient {
     pub fn new(rc_addr: &str, timeout: Duration) -> Result<Self, RcError> {
+        Self::with_credentials(rc_addr, "", "", timeout)
+    }
+
+    pub fn with_credentials(
+        rc_addr: &str,
+        user: &str,
+        password: &str,
+        timeout: Duration,
+    ) -> Result<Self, RcError> {
         let address: SocketAddr = rc_addr
             .parse()
             .map_err(|_| RcError::InvalidAddress(rc_addr.into()))?;
@@ -47,6 +58,8 @@ impl HttpRcClient {
         Ok(Self {
             base_url: format!("http://{address}"),
             client,
+            user: user.into(),
+            password: password.into(),
         })
     }
 
@@ -75,10 +88,11 @@ impl HttpRcClient {
 impl RcApi for HttpRcClient {
     fn call(&self, method: &str, params: Value) -> Result<Value, RcError> {
         let url = format!("{}/{method}", self.base_url);
-        let response = self
-            .client
-            .post(url)
-            .json(&params)
+        let mut request = self.client.post(url).json(&params);
+        if !self.user.is_empty() || !self.password.is_empty() {
+            request = request.basic_auth(&self.user, Some(&self.password));
+        }
+        let response = request
             .send()
             .and_then(reqwest::blocking::Response::error_for_status)
             .map_err(|error| RcError::Request {
@@ -146,7 +160,6 @@ pub fn refresh_remote_snapshot(
     relative_dir: &str,
     recursive: bool,
 ) -> Result<RefreshResult, RcError> {
-    let queue: QueueResponse = decode("vfs/queue", api.call("vfs/queue", json!({}))?)?;
     let path_params = if relative_dir.is_empty() {
         json!({})
     } else {
@@ -165,6 +178,7 @@ pub fn refresh_remote_snapshot(
             json!({"fs": remote, "remote": relative_dir}),
         )?,
     )?;
+    let queue: QueueResponse = decode("vfs/queue", api.call("vfs/queue", json!({}))?)?;
     Ok(RefreshResult {
         pending_uploads: queue.queue.len(),
         relative_dir: relative_dir.into(),
@@ -176,6 +190,8 @@ pub fn refresh_remote_snapshot(
 mod tests {
     use std::cell::RefCell;
     use std::collections::VecDeque;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
 
     use super::*;
 
@@ -210,12 +226,51 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_rc_requests_send_basic_auth() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                headers.push_str(&line);
+            }
+            assert!(headers.lines().any(|line| {
+                line.to_ascii_lowercase()
+                    .starts_with("authorization: basic ")
+                    && line.ends_with("bW91bnRtYXRlOnNlY3JldA==")
+            }));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 10\r\nConnection: close\r\n\r\n{\"pid\":42}",
+                )
+                .unwrap();
+        });
+
+        let client = HttpRcClient::with_credentials(
+            &address.to_string(),
+            "mountmate",
+            "secret",
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(client.process_id().unwrap(), 42);
+        server.join().unwrap();
+    }
+
+    #[test]
     fn refresh_forgets_refreshes_then_verifies_remote_listing() {
         let api = FakeRc::new([
-            json!({"queue": [{"name": "pending.bin"}]}),
             json!({}),
             json!({}),
             json!({"list": [{"Name": "remote.bin"}]}),
+            json!({"queue": [{"name": "pending.bin"}]}),
         ]);
         let result = refresh_remote_snapshot(&api, "alpha:folder", "subdir", false).unwrap();
         assert_eq!(result.pending_uploads, 1);
@@ -227,10 +282,10 @@ mod tests {
                 .iter()
                 .map(|(method, _)| method.as_str())
                 .collect::<Vec<_>>(),
-            ["vfs/queue", "vfs/forget", "vfs/refresh", "operations/list"]
+            ["vfs/forget", "vfs/refresh", "operations/list", "vfs/queue"]
         );
         assert_eq!(
-            calls[3].1,
+            calls[2].1,
             json!({"fs": "alpha:folder", "remote": "subdir"})
         );
     }
@@ -238,21 +293,21 @@ mod tests {
     #[test]
     fn root_refresh_never_sends_the_legacy_quote_remote() {
         let api = FakeRc::new([
-            json!({"queue": []}),
             json!({}),
             json!({}),
             json!({"list": []}),
+            json!({"queue": []}),
         ]);
         let result = refresh_remote_snapshot(&api, "alpha:", "", false).unwrap();
         assert_eq!(result.relative_dir, "");
         let calls = api.calls.borrow();
-        assert_eq!(calls[3].1["remote"], "");
-        assert_ne!(calls[3].1["remote"], "\"");
+        assert_eq!(calls[2].1["remote"], "");
+        assert_ne!(calls[2].1["remote"], "\"");
     }
 
     #[test]
     fn refresh_does_not_report_zero_entries_when_listing_is_missing() {
-        let api = FakeRc::new([json!({"queue": []}), json!({}), json!({}), json!({})]);
+        let api = FakeRc::new([json!({}), json!({}), json!({}), json!({"queue": []})]);
         let error = refresh_remote_snapshot(&api, "alpha:", "subdir", false).unwrap_err();
         assert!(matches!(
             error,

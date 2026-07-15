@@ -219,7 +219,9 @@ try {
   if ($mounted) {
     try {
       Invoke-SSHMountMate -Arguments @('--unmount-id', 'local-sftp') -NoCapture | Out-Null
-    } catch {}
+    } catch {
+      Write-Warning "Failed to unmount local-sftp during cleanup: $($_.Exception.Message)"
+    }
   }
   if ($server -and -not $server.HasExited) {
     $server.Kill($true)

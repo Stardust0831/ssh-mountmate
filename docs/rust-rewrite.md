@@ -8,10 +8,10 @@ The `rust-rewrite` branch replaces the Python/PyInstaller application with one R
 - Preserve manual, SSH config, batch SSH config, and SAI connection creation; key, password, passphrase, native SFTP, and OpenSSH transports.
 - Preserve automatic drive letters, user mount folders, custom mountpoints, duplicate detection, local capacity, Lustre project capacity, dependency checks, login mounting, and concurrent batch operations.
 - Preserve truthful rclone RC transfer state from `vfs/queue`, `vfs/stats`, and `core/stats`; never present a queued local write as remotely complete.
-- Preserve verified refresh order: `vfs/queue`, `vfs/forget`, `vfs/refresh`, then `operations/list`, including the Windows drive-root quote repair.
+- Preserve verified refresh order: `vfs/forget`, `vfs/refresh`, `operations/list`, then a post-refresh `vfs/queue` snapshot, including the Windows drive-root quote repair.
 - Preserve safe process ownership checks before status reporting or termination. PID reuse must never terminate an unrelated process.
 - Preserve verified GitHub updates with platform/architecture selection, SHA-256 and size verification, safe archive extraction, staged replacement, startup health checks, and rollback.
-- Provide a responsive bilingual GUI, one non-activating transfer popup per active connection, a complete transfer center, tray controls, native notifications, taskbar or dock progress where supported, and file-manager integration.
+- Provide a responsive bilingual GUI, one shared movable transfer window that expands across active connections, a complete transfer center, tray controls, native notifications, taskbar or dock progress where supported, and file-manager integration.
 - Build native packages for Windows, macOS, and Linux on x64 and arm64. No PyInstaller onefile extraction or Python interpreter is shipped.
 
 ## Historical regressions that must remain fixed

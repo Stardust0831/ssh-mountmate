@@ -1093,7 +1093,8 @@ fn desktop_exec_argument(value: &str) -> String {
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('`', "\\`")
-        .replace('$', "\\$");
+        .replace('$', "\\$")
+        .replace('%', "%%");
     format!("\"{escaped}\"")
 }
 
@@ -1180,6 +1181,10 @@ mod tests {
         assert_eq!(
             desktop_exec_argument("/home/user/SSH MountMate/bin/$current"),
             r#""/home/user/SSH MountMate/bin/\$current""#
+        );
+        assert_eq!(
+            desktop_exec_argument("/opt/100%free/SSHMountMate"),
+            r#""/opt/100%%free/SSHMountMate""#
         );
     }
 

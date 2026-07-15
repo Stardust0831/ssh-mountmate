@@ -1,7 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::File;
+use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -64,7 +64,7 @@ use i18n::{Choice, LanguagePreference as Language, Locale, TextKey};
 use transfer_center::{
     TransferTotals, connection_view as transfer_connection_view, totals as transfer_totals,
 };
-use tray::{TrayAction, TrayController};
+use tray::{TrayAction, TrayController, TrayError};
 
 fn main() {
     if let Err(error) = run() {
@@ -375,16 +375,22 @@ fn run_headless_batch(
             .iter()
             .map(|server| {
                 let operation = &operation;
-                scope.spawn(move || {
-                    operation(service, server)
-                        .err()
-                        .map(|error| format!("{}: {error}", server.display_name()))
-                })
+                (
+                    server.display_name().to_owned(),
+                    scope.spawn(move || {
+                        operation(service, server)
+                            .err()
+                            .map(|error| format!("{}: {error}", server.display_name()))
+                    }),
+                )
             })
             .collect();
         tasks
             .into_iter()
-            .filter_map(|task| task.join().ok().flatten())
+            .filter_map(|(name, task)| match task.join() {
+                Ok(failure) => failure,
+                Err(_) => Some(format!("{name}: batch worker panicked")),
+            })
             .collect::<Vec<_>>()
     });
     if failures.is_empty() {
@@ -424,6 +430,7 @@ struct App {
     command_receiver: CommandSubscription,
     pending_commands: VecDeque<AppCommand>,
     settings: Settings,
+    settings_load_error: Option<String>,
     system_locale: Locale,
     servers: Vec<ServerConfig>,
     service: MountService,
@@ -441,6 +448,8 @@ struct App {
     tray_action_sender: async_channel::Sender<TrayAction>,
     tray_actions: TraySubscription,
     tray_error: Option<String>,
+    tray_retry_at: Option<Instant>,
+    tray_retry_delay: Duration,
     exit_confirmation_open: bool,
     transfer_popup: Option<window::Id>,
     transfer_popup_expanded: bool,
@@ -805,7 +814,7 @@ enum Message {
     SshHostSelected(String),
     SshImportActionChanged(usize, ImportAction),
     SaveConnection,
-    ConnectionSaved(Result<Vec<ServerConfig>, String>),
+    ConnectionSaved(Result<ServerMutation, String>),
     SettingsFieldChanged(SettingsField, String),
     BrowseCacheRoot,
     CacheRootPicked(Option<PathBuf>),
@@ -859,7 +868,16 @@ enum Message {
     Remove(String),
     CancelRemove,
     ConfirmRemove,
-    RemoveFinished(Result<Vec<ServerConfig>, String>),
+    RemoveFinished {
+        id: String,
+        result: Result<ServerMutation, String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct ServerMutation {
+    servers: Vec<ServerConfig>,
+    warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -914,12 +932,25 @@ impl App {
             initial_command,
             update_health,
         } = bootstrap;
-        let service = MountService::new(paths.clone(), application_root());
-        let settings = storage::load_settings(&paths).unwrap_or_default();
         let system_locale = Locale::system();
+        let service = MountService::new(paths.clone(), application_root());
+        let (settings, settings_load_error) = match storage::load_settings(&paths) {
+            Ok(settings) => (settings, None),
+            Err(error) => (
+                Settings::default(),
+                Some(match system_locale {
+                    Locale::English => format!(
+                        "Could not load settings; saving is disabled until this is fixed: {error}"
+                    ),
+                    Locale::Chinese => {
+                        format!("无法加载设置；修复前已禁用保存：{error}")
+                    }
+                }),
+            ),
+        };
         let locale =
             Locale::from_preference(Language::from_value(&settings.language), system_locale);
-        let (servers, status) = match storage::load_servers(&paths) {
+        let (servers, server_status) = match storage::load_servers(&paths) {
             Ok(servers) => (servers, locale.text(TextKey::LoadingMountStatus).into()),
             Err(error) => (
                 Vec::new(),
@@ -929,6 +960,7 @@ impl App {
                 },
             ),
         };
+        let status = settings_load_error.clone().unwrap_or(server_status);
         let (main_window, open_window) = window::open(main_window_settings());
         let screen = if initial_command == AppCommand::ShowTransfers {
             Screen::TransferCenter
@@ -943,6 +975,7 @@ impl App {
             command_receiver,
             pending_commands: VecDeque::new(),
             settings,
+            settings_load_error,
             system_locale,
             servers,
             service,
@@ -960,6 +993,8 @@ impl App {
             tray_action_sender,
             tray_actions: TraySubscription(tray_actions),
             tray_error: None,
+            tray_retry_at: None,
+            tray_retry_delay: Duration::from_secs(1),
             exit_confirmation_open: false,
             transfer_popup: None,
             transfer_popup_expanded: false,
@@ -1026,6 +1061,8 @@ impl App {
                 if self.tray.is_some() {
                     TrayController::desktop_iteration();
                     self.sync_tray();
+                } else if self.main_window_ready {
+                    self.initialize_tray();
                 }
             }
             Message::MainWindowOpened(id) => {
@@ -1180,6 +1217,7 @@ impl App {
                         self.transfers
                             .get(*id)
                             .is_some_and(|snapshot| snapshot.synced)
+                            && self.synced_polls.get(*id).copied().unwrap_or(0) >= 2
                             && !self.transfer_errors.contains_key(*id)
                     })
                     .cloned()
@@ -1692,11 +1730,13 @@ impl App {
             Message::ConnectionSaved(result) => {
                 self.editor_saving = false;
                 match result {
-                    Ok(servers) => {
-                        self.servers = servers;
+                    Ok(outcome) => {
+                        self.servers = outcome.servers;
                         self.connection_draft = None;
                         self.screen = Screen::Connections;
-                        self.status = locale.text(TextKey::ConnectionSaved).into();
+                        self.status = outcome
+                            .warning
+                            .unwrap_or_else(|| locale.text(TextKey::ConnectionSaved).into());
                         return self.status_task();
                     }
                     Err(error) => self.status = error,
@@ -2080,33 +2120,57 @@ impl App {
                     self.status = locale.text(TextKey::UnmountBeforeRemove).into();
                     return Task::none();
                 }
+                if !self.busy.insert(id.clone()) {
+                    return Task::none();
+                }
                 self.editor_saving = true;
                 let paths = self.paths.clone();
                 let server = self.servers.iter().find(|server| server.id == id).cloned();
+                let result_id = id.clone();
                 self.status = locale.removing(&operation_display_name(server.as_ref(), &id));
                 return Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
-                            if let Some(server) = server
+                            let servers = storage::remove_server(&paths, &id)
+                                .map_err(|error| error.to_string())?;
+                            let warning = if let Some(server) = server
                                 && server.ssh_config_managed
+                                && let Err(error) = remove_managed_ssh_server(&server)
                             {
-                                remove_managed_ssh_server(&server)
-                                    .map_err(|error| error.to_string())?;
-                            }
-                            storage::remove_server(&paths, &id).map_err(|error| error.to_string())
+                                diagnostic_trace(&format!(
+                                    "connection removed but managed SSH cleanup failed: {error}"
+                                ));
+                                Some(match locale {
+                                    Locale::English => format!(
+                                        "Connection removed; managed SSH cleanup failed: {error}"
+                                    ),
+                                    Locale::Chinese => {
+                                        format!("连接已删除，但托管 SSH 配置清理失败：{error}")
+                                    }
+                                })
+                            } else {
+                                None
+                            };
+                            Ok(ServerMutation { servers, warning })
                         })
                         .await
                         .unwrap_or_else(|error| Err(error.to_string()))
                     },
-                    Message::RemoveFinished,
+                    move |result| Message::RemoveFinished {
+                        id: result_id.clone(),
+                        result,
+                    },
                 );
             }
-            Message::RemoveFinished(result) => {
+            Message::RemoveFinished { id, result } => {
                 self.editor_saving = false;
+                self.busy.remove(&id);
                 match result {
-                    Ok(servers) => {
-                        self.servers = servers;
-                        self.status = locale.text(TextKey::ConnectionRemoved).into();
+                    Ok(outcome) => {
+                        self.servers = outcome.servers;
+                        self.status = outcome
+                            .warning
+                            .unwrap_or_else(|| locale.text(TextKey::ConnectionRemoved).into());
                     }
                     Err(error) => self.status = error,
                 }
@@ -2116,19 +2180,36 @@ impl App {
     }
 
     fn initialize_tray(&mut self) {
-        if self.tray.is_some() || self.tray_error.is_some() {
+        if self.tray.is_some()
+            || self
+                .tray_retry_at
+                .is_some_and(|retry_at| Instant::now() < retry_at)
+            || (self.tray_error.is_some() && self.tray_retry_at.is_none())
+        {
             return;
         }
         match TrayController::new(self.locale(), self.tray_action_sender.clone()) {
             Ok(tray) => {
                 self.tray = Some(tray);
+                self.tray_error = None;
+                self.tray_retry_at = None;
+                self.tray_retry_delay = Duration::from_secs(1);
                 self.sync_tray();
                 diagnostic_trace("tray initialized");
             }
             Err(error) => {
                 diagnostic_trace(&format!("tray unavailable: {error}"));
-                self.tray_error = Some(error.clone());
-                self.status = self.locale().tray_unavailable(&error);
+                let message = error.to_string();
+                self.tray_error = Some(message.clone());
+                self.status = self.locale().tray_unavailable(&message);
+                match error {
+                    TrayError::Transient(_) => {
+                        self.tray_retry_at = Some(Instant::now() + self.tray_retry_delay);
+                        self.tray_retry_delay =
+                            (self.tray_retry_delay * 2).min(Duration::from_secs(30));
+                    }
+                    TrayError::Permanent(_) => self.tray_retry_at = None,
+                }
             }
         }
     }
@@ -2238,6 +2319,7 @@ impl App {
                     unmount_needs_confirmation(
                         self.transfers.get(id),
                         self.transfer_errors.contains_key(id),
+                        self.synced_polls.get(id).copied().unwrap_or(0),
                     )
                 });
                 let mut tasks = safe_ids
@@ -2416,18 +2498,45 @@ impl App {
                     let mut server = validated
                         .apply_secrets(password, key_passphrase)
                         .map_err(|error| localize_draft_error(locale, &error))?;
+                    let managed_snapshot = capture_managed_profile(previous.as_ref())?;
                     prepare_managed_ssh_server(&mut server, &Platform)
                         .map_err(|error| error.to_string())?;
-                    let servers = storage::upsert_server(&paths, server.clone())
-                        .map_err(|error| error.to_string())?;
-                    if let Some(previous) = previous
+                    let servers = match storage::upsert_server(&paths, server.clone()) {
+                        Ok(servers) => servers,
+                        Err(error) => {
+                            let rollback = rollback_prepared_managed_profile(
+                                &server,
+                                managed_snapshot.as_ref(),
+                            );
+                            return Err(match rollback {
+                                Ok(()) => error.to_string(),
+                                Err(rollback) => {
+                                    format!("{error}; managed SSH rollback failed: {rollback}")
+                                }
+                            });
+                        }
+                    };
+                    let warning = if let Some(previous) = previous
                         && previous.ssh_config_managed
                         && (!server.ssh_config_managed
                             || previous.managed_ssh_config_path != server.managed_ssh_config_path)
+                        && let Err(error) = remove_managed_ssh_server(&previous)
                     {
-                        remove_managed_ssh_server(&previous).map_err(|error| error.to_string())?;
-                    }
-                    Ok(servers)
+                        diagnostic_trace(&format!(
+                            "connection saved but old managed SSH cleanup failed: {error}"
+                        ));
+                        Some(match locale {
+                            Locale::English => {
+                                format!("Connection saved; old managed SSH cleanup failed: {error}")
+                            }
+                            Locale::Chinese => {
+                                format!("连接已保存，但旧托管 SSH 配置清理失败：{error}")
+                            }
+                        })
+                    } else {
+                        None
+                    };
+                    Ok(ServerMutation { servers, warning })
                 })
                 .await
                 .unwrap_or_else(|error| Err(error.to_string()))
@@ -2499,7 +2608,12 @@ impl App {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    storage::upsert_servers(&paths, updates).map_err(|error| error.to_string())
+                    storage::upsert_servers(&paths, updates)
+                        .map(|servers| ServerMutation {
+                            servers,
+                            warning: None,
+                        })
+                        .map_err(|error| error.to_string())
                 })
                 .await
                 .unwrap_or_else(|error| Err(error.to_string()))
@@ -2510,6 +2624,10 @@ impl App {
 
     fn save_settings(&mut self) -> Task<Message> {
         if self.editor_saving {
+            return Task::none();
+        }
+        if let Some(error) = &self.settings_load_error {
+            self.status = error.clone();
             return Task::none();
         }
         let Some(draft) = &self.settings_draft else {
@@ -2542,10 +2660,19 @@ impl App {
                     if let Err(error) =
                         Platform.set_login_startup(&executable, settings.startup_all)
                     {
-                        let _ = storage::save_settings(&paths, &previous_settings);
-                        let _ =
-                            Platform.set_login_startup(&executable, previous_settings.startup_all);
-                        return Err(error.to_string());
+                        let settings_rollback = storage::save_settings(&paths, &previous_settings)
+                            .map_err(|rollback| rollback.to_string());
+                        let startup_rollback = Platform
+                            .set_login_startup(&executable, previous_settings.startup_all)
+                            .map_err(|rollback| rollback.to_string());
+                        let mut message = error.to_string();
+                        if let Err(rollback) = settings_rollback {
+                            message.push_str(&format!("; settings rollback failed: {rollback}"));
+                        }
+                        if let Err(rollback) = startup_rollback {
+                            message.push_str(&format!("; startup rollback failed: {rollback}"));
+                        }
+                        return Err(message);
                     }
                     Ok(result_settings)
                 })
@@ -2798,6 +2925,10 @@ impl App {
         }
         self.capacity_refreshing = true;
         let service = self.service.clone();
+        let failed_ids = servers
+            .iter()
+            .map(|server| server.id.clone())
+            .collect::<Vec<_>>();
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
@@ -2806,23 +2937,30 @@ impl App {
                             .into_iter()
                             .map(|server| {
                                 let service = service.clone();
-                                scope.spawn(move || {
-                                    let id = server.id.clone();
-                                    let result = service
-                                        .capacity(&server)
-                                        .map_err(|error| error.to_string());
-                                    (id, result)
-                                })
+                                let id = server.id.clone();
+                                let task_id = id.clone();
+                                let task = scope.spawn(move || {
+                                    service.capacity(&server).map_err(|error| error.to_string())
+                                });
+                                (task_id, task)
                             })
                             .collect();
                         tasks
                             .into_iter()
-                            .filter_map(|task| task.join().ok())
+                            .map(|(id, task)| match task.join() {
+                                Ok(result) => (id, result),
+                                Err(_) => (id, Err("capacity worker panicked".into())),
+                            })
                             .collect()
                     })
                 })
                 .await
-                .unwrap_or_else(|error| vec![(String::new(), Err(error.to_string()))])
+                .unwrap_or_else(|error| {
+                    failed_ids
+                        .into_iter()
+                        .map(|id| (id, Err(error.to_string())))
+                        .collect()
+                })
             },
             Message::CapacitiesLoaded,
         )
@@ -2846,6 +2984,7 @@ impl App {
         }
         self.transfer_refreshing = true;
         let service = self.service.clone();
+        let failed_ids = ids.clone();
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
@@ -2854,22 +2993,31 @@ impl App {
                             .into_iter()
                             .map(|id| {
                                 let service = service.clone();
-                                scope.spawn(move || {
-                                    let result = service
+                                let task_id = id.clone();
+                                let task = scope.spawn(move || {
+                                    service
                                         .transfer_snapshot(&id)
-                                        .map_err(|error| error.to_string());
-                                    (id, result)
-                                })
+                                        .map_err(|error| error.to_string())
+                                });
+                                (task_id, task)
                             })
                             .collect();
                         tasks
                             .into_iter()
-                            .filter_map(|task| task.join().ok())
+                            .map(|(id, task)| match task.join() {
+                                Ok(result) => (id, result),
+                                Err(_) => (id, Err("transfer worker panicked".into())),
+                            })
                             .collect()
                     })
                 })
                 .await
-                .unwrap_or_default()
+                .unwrap_or_else(|error| {
+                    failed_ids
+                        .into_iter()
+                        .map(|id| (id, Err(error.to_string())))
+                        .collect()
+                })
             },
             Message::TransfersLoaded,
         )
@@ -2973,6 +3121,7 @@ impl App {
             && unmount_needs_confirmation(
                 self.transfers.get(&id),
                 self.transfer_errors.contains_key(&id),
+                self.synced_polls.get(&id).copied().unwrap_or(0),
             )
         {
             return self.confirm_waiting_unmount(vec![id]);
@@ -4930,6 +5079,7 @@ fn localize_draft_error(locale: Locale, error: &DraftError) -> String {
         DraftError::InvalidScalar(field) => {
             format!("{}不能包含空白字符或控制字符", localized_draft_field(field))
         }
+        DraftError::InvalidName => "名称不能包含控制字符".into(),
         DraftError::InvalidPort => "端口必须是 1 到 65535 之间的数字".into(),
         DraftError::KeyRequired => "请选择私钥文件".into(),
         DraftError::KeyMissing(path) => format!("找不到私钥文件：{path}"),
@@ -5013,7 +5163,8 @@ fn read_mount_log(path: PathBuf) -> Result<LoadedMountLog, String> {
             .map_err(|error| format!("{}: {error}", path.display()))?;
     }
     let mut bytes = Vec::with_capacity((length - start).min(LOG_VIEW_LIMIT) as usize);
-    file.read_to_end(&mut bytes)
+    file.take(LOG_VIEW_LIMIT)
+        .read_to_end(&mut bytes)
         .map_err(|error| format!("{}: {error}", path.display()))?;
     if start > 0
         && let Some(newline) = bytes.iter().position(|byte| *byte == b'\n')
@@ -5056,6 +5207,45 @@ fn validate_setting_value(
         });
     }
     Ok(())
+}
+
+struct ManagedProfileSnapshot {
+    path: PathBuf,
+    content: Option<Vec<u8>>,
+}
+
+fn capture_managed_profile(
+    previous: Option<&ServerConfig>,
+) -> Result<Option<ManagedProfileSnapshot>, String> {
+    let Some(previous) = previous.filter(|server| server.ssh_config_managed) else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(previous.managed_ssh_config_path.trim());
+    if path.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    let content = match fs::read(&path) {
+        Ok(content) => Some(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    Ok(Some(ManagedProfileSnapshot { path, content }))
+}
+
+fn rollback_prepared_managed_profile(
+    prepared: &ServerConfig,
+    previous: Option<&ManagedProfileSnapshot>,
+) -> Result<(), String> {
+    if !prepared.ssh_config_managed {
+        return Ok(());
+    }
+    let prepared_path = PathBuf::from(prepared.managed_ssh_config_path.trim());
+    if let Some(previous) = previous.filter(|snapshot| snapshot.path == prepared_path)
+        && let Some(content) = &previous.content
+    {
+        return storage::atomic_write(&previous.path, content).map_err(|error| error.to_string());
+    }
+    remove_managed_ssh_server(prepared).map_err(|error| error.to_string())
 }
 
 fn obscure_action(service: &MountService, action: &SecretAction) -> Result<Option<String>, String> {
@@ -5160,8 +5350,9 @@ fn transfer_failure_is_visible(consecutive_failures: u8) -> bool {
 fn unmount_needs_confirmation(
     snapshot: Option<&TransferSnapshot>,
     transfer_unavailable: bool,
+    synced_polls: u8,
 ) -> bool {
-    transfer_unavailable || !snapshot.is_some_and(|snapshot| snapshot.synced)
+    transfer_unavailable || !snapshot.is_some_and(|snapshot| snapshot.synced) || synced_polls < 2
 }
 
 fn retain_dismissed_transfers(
@@ -5579,10 +5770,21 @@ fn open_path(path: &Path, locale: Locale) -> Result<(), String> {
         command.arg(path);
         command
     };
-    command.spawn().map(|_| ()).map_err(|error| match locale {
+    let child = command.spawn().map_err(|error| match locale {
         Locale::English => format!("Could not open {}: {error}", path.display()),
         Locale::Chinese => format!("无法打开 {}：{error}", path.display()),
-    })
+    })?;
+    #[cfg(not(windows))]
+    {
+        let mut child = child;
+        child.wait().map_err(|error| match locale {
+            Locale::English => format!("Could not finish opening {}: {error}", path.display()),
+            Locale::Chinese => format!("无法完成打开 {}：{error}", path.display()),
+        })?;
+    }
+    #[cfg(windows)]
+    drop(child);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -5693,6 +5895,27 @@ mod localization_tests {
 
         apply_read_only_log_action(&mut content, text_editor::Action::SelectAll);
         assert_eq!(content.selection().as_deref(), Some("first\nsecond"));
+    }
+
+    #[test]
+    fn managed_profile_rollback_restores_the_previous_contents() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("alpha.conf");
+        fs::write(&path, b"old profile").unwrap();
+        let prepared = ServerConfig {
+            ssh_config_managed: true,
+            managed_ssh_config_path: path.display().to_string(),
+            ..ServerConfig::default()
+        };
+        let snapshot = ManagedProfileSnapshot {
+            path: path.clone(),
+            content: Some(b"old profile".to_vec()),
+        };
+        fs::write(&path, b"new profile").unwrap();
+
+        rollback_prepared_managed_profile(&prepared, Some(&snapshot)).unwrap();
+
+        assert_eq!(fs::read(path).unwrap(), b"old profile");
     }
 
     #[test]
@@ -5930,13 +6153,14 @@ mod localization_tests {
             out_of_space: false,
             synced: true,
         };
-        assert!(!unmount_needs_confirmation(Some(&synced), false));
-        assert!(unmount_needs_confirmation(Some(&synced), true));
-        assert!(unmount_needs_confirmation(None, false));
+        assert!(unmount_needs_confirmation(Some(&synced), false, 1));
+        assert!(!unmount_needs_confirmation(Some(&synced), false, 2));
+        assert!(unmount_needs_confirmation(Some(&synced), true, 2));
+        assert!(unmount_needs_confirmation(None, false, 2));
         let mut pending = synced.clone();
         pending.synced = false;
         pending.queued = 1;
-        assert!(unmount_needs_confirmation(Some(&pending), false));
+        assert!(unmount_needs_confirmation(Some(&pending), false, 2));
     }
 
     #[test]

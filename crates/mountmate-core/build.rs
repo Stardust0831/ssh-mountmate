@@ -14,6 +14,9 @@ fn main() {
     let output =
         PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is required")).join("embedded-rclone");
     let path = env::var_os(PATH_ENV).map(PathBuf::from);
+    if let Some(path) = &path {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
     let expected = env::var(SHA256_ENV).ok();
     let digest = match (path, expected) {
         (None, None) => {

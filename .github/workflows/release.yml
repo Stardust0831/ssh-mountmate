@@ -17,14 +17,16 @@ on:
         type: boolean
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   quality:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: 1.97.0
           components: rustfmt, clippy
@@ -113,7 +115,9 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
       - name: Validate release version
         shell: bash
         env:
@@ -128,7 +132,7 @@ jobs:
           fi
           version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
           test "${RELEASE_TAG}" = "v${version}"
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: 1.97.0
       - name: Install Linux GUI dependencies
@@ -382,20 +386,38 @@ jobs:
           $rclone = Start-Process -FilePath $rclonePath -ArgumentList 'version' -Wait -PassThru
           if ($rclone.ExitCode -ne 0) { throw "materialized onefile rclone failed" }
 
+      - name: Extract final Unix release artifact for integration tests
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shipping="${RUNNER_TEMP}/shipping-package"
+          rm -rf "${shipping}"
+          mkdir -p "${shipping}"
+          unzip -q "release/${{ matrix.asset }}.zip" -d "${shipping}"
+
+      - name: Extract final Windows release artifact for integration tests
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $shipping = Join-Path $env:RUNNER_TEMP 'shipping-package'
+          Remove-Item $shipping -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive "release/${{ matrix.asset }}.zip" $shipping
+
       - name: Exercise packaged update and rollback
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
           xvfb-run -a dbus-run-session -- \
-            bash tests/rust_packaged_update_smoke.sh target/package/SSHMountMate
+            bash tests/rust_packaged_update_smoke.sh "${RUNNER_TEMP}/shipping-package"
 
       - name: Exercise real SFTP mount, refresh, upload, and unmount
         if: runner.os == 'Linux'
         shell: bash
         run: |
           xvfb-run -a dbus-run-session -- \
-            bash tests/rust_linux_mount_smoke.sh target/package/SSHMountMate
+            bash tests/rust_linux_mount_smoke.sh "${RUNNER_TEMP}/shipping-package"
 
       - name: Exercise OpenSSH, concurrent login mounts, and transfer windows
         if: runner.os == 'Linux'
@@ -403,20 +425,20 @@ jobs:
         shell: bash
         run: |
           xvfb-run -a dbus-run-session -- \
-            bash tests/rust_linux_openssh_startup_smoke.sh target/package/SSHMountMate
+            bash tests/rust_linux_openssh_startup_smoke.sh "${RUNNER_TEMP}/shipping-package"
 
       - name: Exercise packaged update and rollback
         if: runner.os == 'macOS'
         shell: bash
         env:
-          SSH_MOUNTMATE_PACKAGE_ROOT: ${{ github.workspace }}/target/package/SSH MountMate.app
+          SSH_MOUNTMATE_PACKAGE_ROOT: ${{ runner.temp }}/shipping-package/SSH MountMate.app
         run: cargo test --package mountmate-core --test packaged_update --all-features -- --ignored --test-threads=1
 
       - name: Exercise packaged update and rollback
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $env:SSH_MOUNTMATE_PACKAGE_ROOT = (Resolve-Path 'target/package/SSHMountMate').Path
+          $env:SSH_MOUNTMATE_PACKAGE_ROOT = (Resolve-Path (Join-Path $env:RUNNER_TEMP 'shipping-package')).Path
           cargo test --package mountmate-core --test packaged_update --all-features -- --ignored --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "packaged update integration test failed" }
 
@@ -424,15 +446,15 @@ jobs:
         if: runner.os == 'Windows'
         timeout-minutes: 5
         shell: pwsh
-        run: ./tests/rust_windows_mount_smoke.ps1 -PackageRoot target/package/SSHMountMate
+        run: ./tests/rust_windows_mount_smoke.ps1 -PackageRoot (Join-Path $env:RUNNER_TEMP 'shipping-package')
 
       - name: Exercise real SFTP mount, refresh, upload, and unmount
         if: runner.os == 'macOS'
         timeout-minutes: 5
         shell: bash
-        run: bash tests/rust_macos_mount_smoke.sh "target/package/SSH MountMate.app"
+        run: bash tests/rust_macos_mount_smoke.sh "${RUNNER_TEMP}/shipping-package/SSH MountMate.app"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.asset }}
           path: release/${{ matrix.asset }}.zip
@@ -441,10 +463,14 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: release-assets
           merge-multiple: true

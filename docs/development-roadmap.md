@@ -533,3 +533,23 @@ Cross-platform considerations:
   alpha exceptions.
 - macOS NFS, system credential protection, reusable interactive SSH, installers, and server changes
   are not part of `v0.4.0`.
+
+### 2026-07-15
+
+- Preserved `issue-1-reply.md` and the five user-owned screenshots as untracked files.
+- Completed the first stable branch and non-publishing release gates on all six native targets, then
+  held the merge after the requested full CodeRabbit review reported 24 major and 13 minor items.
+- Accepted and implemented the findings that reproduced in this codebase: authenticated per-mount
+  loopback RC, full staged-update tree binding, safe update-helper relaunch rules, atomic private
+  plan creation, stdin-only secret obscuring, absolute remote paths, one-to-one case-sensitive
+  transfer matching, post-refresh queue sampling, stable-sync unmount gating, settings load
+  protection, worker-panic propagation, transient tray retries, and cross-resource persistence
+  compensation or explicit partial-success warnings.
+- Hardened GitHub workflows with immutable action SHAs, read-only default tokens, non-persisted
+  checkout credentials, and integration tests that run against the exact final ZIP payloads.
+- Local Rust 1.97 verification after the review fixes: zero-warning workspace Clippy passed; all
+  workspace tests passed with 176 core tests, one live-network test ignored, legacy migration,
+  five platform tests, and 38 application tests. Three packaged-GUI tests remain CI-only.
+- A replacement six-platform branch run and non-publishing release run are required before merge
+  and `v0.4.0` publication. Experimental macOS NFS remains the next post-release feature and has
+  not been implemented in this review cycle.

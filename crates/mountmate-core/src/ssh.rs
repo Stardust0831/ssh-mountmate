@@ -198,9 +198,25 @@ pub fn resolve_ssh_config(
 }
 
 pub fn list_ssh_config_hosts(config_path: &Path) -> Result<Vec<SshHostEntry>, SshError> {
+    let system_base = Path::new("/etc/ssh");
+    let include_base = if config_path.starts_with(system_base) {
+        system_base.to_owned()
+    } else {
+        default_ssh_config_path()
+            .parent()
+            .unwrap_or_else(|| Path::new(".ssh"))
+            .to_owned()
+    };
+    list_ssh_config_hosts_with_base(config_path, &include_base)
+}
+
+fn list_ssh_config_hosts_with_base(
+    config_path: &Path,
+    include_base: &Path,
+) -> Result<Vec<SshHostEntry>, SshError> {
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
-    visit_ssh_config(config_path, &mut seen, &mut entries)?;
+    visit_ssh_config(config_path, include_base, &mut seen, &mut entries)?;
     Ok(entries)
 }
 
@@ -452,6 +468,7 @@ fn home_relative_ssh_path(path: &Path) -> String {
 
 fn visit_ssh_config(
     config_path: &Path,
+    include_base: &Path,
     seen: &mut HashSet<PathBuf>,
     entries: &mut Vec<SshHostEntry>,
 ) -> Result<(), SshError> {
@@ -470,7 +487,7 @@ fn visit_ssh_config(
         };
         if keyword.eq_ignore_ascii_case("include") {
             for pattern in &words[1..] {
-                let pattern = resolve_include_pattern(config_path, pattern);
+                let pattern = resolve_include_pattern(include_base, pattern);
                 let pattern_text = pattern.to_string_lossy().into_owned();
                 let matches = glob(&pattern_text).map_err(|error| SshError::IncludePattern {
                     pattern: pattern_text.clone(),
@@ -478,7 +495,7 @@ fn visit_ssh_config(
                 })?;
                 for included in matches.flatten() {
                     if included.is_file() {
-                        visit_ssh_config(&included, seen, entries)?;
+                        visit_ssh_config(&included, include_base, seen, entries)?;
                     }
                 }
             }
@@ -498,15 +515,12 @@ fn visit_ssh_config(
     Ok(())
 }
 
-fn resolve_include_pattern(config_path: &Path, pattern: &str) -> PathBuf {
+fn resolve_include_pattern(include_base: &Path, pattern: &str) -> PathBuf {
     let expanded = expand_home(pattern);
     if expanded.is_absolute() {
         expanded
     } else {
-        config_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(expanded)
+        include_base.join(expanded)
     }
 }
 
@@ -890,11 +904,11 @@ mod tests {
         .unwrap();
         fs::write(
             includes.join("cluster.conf"),
-            "Include ../config\nHost cluster other\n",
+            "Include config\nHost cluster other\n",
         )
         .unwrap();
 
-        let entries = list_ssh_config_hosts(&root).unwrap();
+        let entries = list_ssh_config_hosts_with_base(&root, temp.path()).unwrap();
         let hosts: Vec<_> = entries.iter().map(|entry| entry.host.as_str()).collect();
 
         assert_eq!(hosts, ["cluster", "other", "direct"]);

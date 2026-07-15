@@ -24,10 +24,10 @@ This document maps every requirement in `docs/rust-rewrite.md` to current author
 | Manual, SSH config, batch SSH config, SAI, password/key/passphrase, native SFTP, and OpenSSH creation paths | Verified | Connection-draft validation, import planning, duplicate protection, secret preservation, proxy/OpenSSH selection, and generated rclone remotes cover every creation path. Real mounts exercise native password/key authentication and external OpenSSH transport; the OpenSSH remotes contain no native-auth fallback. |
 | Drive/folder allocation, duplicate detection, capacity, dependency checks, login mounts, and concurrent batches | Verified | Unit coverage verifies allocation, duplicates, local/Lustre capacity parsing, dependency discovery, and registration. Run 29251143444 executes the exact registered `--mount-startup-all` command, mounts four connections concurrently with a 0-second process-start spread on x64/ARM64, and unmounts all without stale state. |
 | Truthful rclone RC transfer state | Verified | Unit tests cover queued, active, errored, unknown, exhausted-cache, and remote-byte states. Windows/Linux/macOS real mounts prove queued writes are not presented as complete and later become remotely complete. |
-| Refresh order and Windows root quote repair | Verified | RC contract tests prove queue/forget/refresh/list order and reject the legacy quote remote; real mount tests prove remotely created content appears after refresh. |
+| Refresh order and Windows root quote repair | Verified | RC contract tests prove forget/refresh/list followed by a post-refresh queue snapshot and reject the legacy quote remote; real mount tests prove remotely created content appears after refresh. |
 | Safe process ownership and PID-reuse behavior | Verified | Process/runtime tests cover exact argv identity, start-time mismatch, unverifiable ownership, safe RC quit, stale state, and never terminating a reused PID. |
 | Verified update, extraction, staged replacement, health, and rollback | Verified | Unit tests cover URL/digest/size trust, redirect restrictions, archive safety, transaction containment, authenticated health, and rollback. Packaged update/rollback runs on all six targets. |
-| Responsive bilingual GUI, per-connection popup, transfer center, tray/menu bar, notifications, global progress, and file-manager integration | Verified | Native tray/menu bar, notifications, Windows taskbar, macOS Dock, X11/Wayland capability reporting, authenticated IPC, and file-manager registration are exercised. Run 29251143444 creates two real queued uploads, observes two separately stacked `File transfer` windows, activates the transfer center through a second-instance command while both remain open, and verifies both popups close only after remote completion. |
+| Responsive bilingual GUI, shared transfer window, transfer center, tray/menu bar, notifications, global progress, and file-manager integration | Verified | Native tray/menu bar, notifications, Windows taskbar, macOS Dock, X11/Wayland capability reporting, authenticated IPC, and file-manager registration are exercised. The application now reuses one movable transfer window across mounts and expands it to per-connection details; unit tests verify aggregation, dismissal, unknown-size handling, and truthful completion. |
 | Native x64/ARM64 packages without Python | Verified for portable packages | Six native ZIP packages contain the Rust executable, verified rclone, and notices with no Python runtime. The approved v0.4.0 scope is portable and unsigned; native installers and production signing/notarization remain separate distribution work. |
 
 ## Historical regressions
@@ -59,4 +59,7 @@ This document maps every requirement in `docs/rust-rewrite.md` to current author
 
 ## Remaining stable release gates
 
-1. Complete the final diff review, refresh PR #11, remove Draft status, and merge the verified commit into `main`.
+1. Pass the replacement six-platform branch workflow and non-publishing release workflow for the
+   post-review hardening commit.
+2. Complete the refreshed PR #11 review, merge the verified commit into `main`, and publish the
+   formal non-prerelease `v0.4.0` from the exact merge commit.

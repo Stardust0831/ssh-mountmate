@@ -263,6 +263,8 @@ pub struct MountCommand<'a> {
     pub cache_dir: &'a Path,
     pub log_path: &'a Path,
     pub rc_addr: &'a str,
+    pub rc_user: &'a str,
+    pub rc_pass: &'a str,
     pub windows: bool,
 }
 
@@ -274,9 +276,12 @@ impl MountCommand<'_> {
             "--config".into(),
             self.config.display().to_string(),
             "--rc".into(),
-            "--rc-no-auth".into(),
             "--rc-addr".into(),
             self.rc_addr.into(),
+            "--rc-user".into(),
+            self.rc_user.into(),
+            "--rc-pass".into(),
+            self.rc_pass.into(),
             "mount".into(),
             self.remote.into(),
             self.mountpoint.display().to_string(),
@@ -404,6 +409,8 @@ mod tests {
             cache_dir: Path::new("cache"),
             log_path: Path::new("alpha.log"),
             rc_addr: "127.0.0.1:1234",
+            rc_user: "mountmate",
+            rc_pass: "secret",
             windows: true,
         }
         .build()
@@ -413,6 +420,17 @@ mod tests {
     fn mount_command_keeps_reliability_flags_and_defaults() {
         let command = command("");
         assert!(command.contains(&"--links".into()));
+        assert!(!command.contains(&"--rc-no-auth".into()));
+        assert!(
+            command
+                .windows(2)
+                .any(|item| item == ["--rc-user", "mountmate"])
+        );
+        assert!(
+            command
+                .windows(2)
+                .any(|item| item == ["--rc-pass", "secret"])
+        );
         assert!(
             command
                 .windows(2)
@@ -458,6 +476,8 @@ mod tests {
                 cache_dir: Path::new("cache"),
                 log_path: Path::new("alpha.log"),
                 rc_addr: "127.0.0.1:1234",
+                rc_user: "mountmate",
+                rc_pass: "secret",
                 windows,
             }
             .build();

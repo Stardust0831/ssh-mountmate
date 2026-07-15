@@ -4,6 +4,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -47,6 +48,7 @@ pub struct PreparedPayload {
     pub replace_path: PathBuf,
     pub executable: PathBuf,
     pub executable_sha256: String,
+    pub tree_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,10 +390,13 @@ pub fn prepare_directory_payload(
     match layout.kind {
         InstallKind::StandaloneExecutable => {
             let executable_sha256 = copy_standalone_payload(payload, &transaction.prepared)?;
+            let tree_sha256 = prepared_tree_sha256(&transaction.prepared)
+                .map_err(PreparePayloadError::Verification)?;
             Ok(PreparedPayload {
                 replace_path: transaction.prepared.clone(),
                 executable: transaction.prepared.clone(),
                 executable_sha256,
+                tree_sha256,
             })
         }
         InstallKind::DirectoryBundle | InstallKind::MacApplicationBundle => {
@@ -417,10 +422,13 @@ pub fn prepare_directory_payload(
                 }
                 let executable_sha256 =
                     verify_copied_executable(&payload.executable, &verified.executable)?;
+                let tree_sha256 = prepared_tree_sha256(&transaction.prepared)
+                    .map_err(PreparePayloadError::Verification)?;
                 Ok(PreparedPayload {
                     replace_path: transaction.prepared.clone(),
                     executable: verified.executable,
                     executable_sha256,
+                    tree_sha256,
                 })
             })();
             if result.is_err() {
@@ -675,6 +683,13 @@ fn validate_prepared_payload(
             prepared.executable.clone(),
         ));
     }
+    let tree_sha256 =
+        prepared_tree_sha256(&prepared.replace_path).map_err(ApplyUpdateError::Verification)?;
+    if tree_sha256 != prepared.tree_sha256 {
+        return Err(ApplyUpdateError::InvalidPreparedPayload(
+            prepared.replace_path.clone(),
+        ));
+    }
     if matches!(
         kind,
         InstallKind::DirectoryBundle | InstallKind::MacApplicationBundle
@@ -688,6 +703,123 @@ fn validate_prepared_payload(
         }
     }
     Ok(())
+}
+
+pub(crate) fn prepared_tree_sha256(root: &Path) -> Result<String, String> {
+    let root_metadata = fs::symlink_metadata(root).map_err(|error| error.to_string())?;
+    if root_metadata.file_type().is_symlink() {
+        return Err(format!(
+            "symbolic link in prepared payload: {}",
+            root.display()
+        ));
+    }
+    let mut entries = Vec::new();
+    if root_metadata.is_file() {
+        entries.push((PathBuf::new(), root.to_owned(), root_metadata));
+    } else if root_metadata.is_dir() {
+        collect_prepared_entries(root, root, &mut entries)?;
+    } else {
+        return Err(format!(
+            "special file in prepared payload: {}",
+            root.display()
+        ));
+    }
+    if entries.len() > MAX_PREPARED_ENTRIES {
+        return Err("prepared payload contains too many entries".into());
+    }
+    entries.sort_by_key(|entry| path_identity_bytes(&entry.0));
+
+    let mut hasher = Sha256::new();
+    let mut total_bytes = 0_u64;
+    for (relative, path, metadata) in entries {
+        hash_field(&mut hasher, &path_identity_bytes(&relative));
+        hasher.update(prepared_permissions(&metadata).to_le_bytes());
+        if metadata.is_dir() {
+            hasher.update(b"d");
+            continue;
+        }
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(format!(
+                "unsafe entry in prepared payload: {}",
+                path.display()
+            ));
+        }
+        hasher.update(b"f");
+        hasher.update(metadata.len().to_le_bytes());
+        total_bytes = total_bytes
+            .checked_add(metadata.len())
+            .ok_or_else(|| "prepared payload size overflow".to_owned())?;
+        if total_bytes > MAX_PREPARED_BYTES {
+            return Err("prepared payload exceeds the extracted-size safety limit".into());
+        }
+        let digest = file_sha256(&path).map_err(|error| error.to_string())?;
+        hash_field(&mut hasher, digest.as_bytes());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn collect_prepared_entries(
+    root: &Path,
+    directory: &Path,
+    entries: &mut Vec<(PathBuf, PathBuf, fs::Metadata)>,
+) -> Result<(), String> {
+    for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        if metadata.file_type().is_symlink() || (!metadata.is_file() && !metadata.is_dir()) {
+            return Err(format!(
+                "unsafe entry in prepared payload: {}",
+                path.display()
+            ));
+        }
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|error| error.to_string())?
+            .to_owned();
+        entries.push((relative, path.clone(), metadata));
+        if path.is_dir() {
+            collect_prepared_entries(root, &path, entries)?;
+        }
+        if entries.len() > MAX_PREPARED_ENTRIES {
+            return Err("prepared payload contains too many entries".into());
+        }
+    }
+    Ok(())
+}
+
+fn hash_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+#[cfg(unix)]
+fn path_identity_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(windows)]
+fn path_identity_bytes(path: &Path) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+
+    path.as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+#[cfg(unix)]
+fn prepared_permissions(metadata: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.permissions().mode() & 0o7777
+}
+
+#[cfg(windows)]
+fn prepared_permissions(metadata: &fs::Metadata) -> u32 {
+    u32::from(metadata.permissions().readonly())
 }
 
 fn swap_paths(
@@ -1503,6 +1635,20 @@ mod tests {
                 .executable,
             prepared.executable
         );
+
+        fs::write(transaction.prepared.join("release-notes.txt"), b"tampered").unwrap();
+        assert!(matches!(
+            apply_prepared_update_for(
+                &layout,
+                &prepared,
+                &transaction,
+                "linux",
+                &temp.path().join("unrelated-temp"),
+            ),
+            Err(ApplyUpdateError::InvalidPreparedPayload(_))
+        ));
+        assert!(layout.replace_path.exists());
+        assert!(!transaction.backup.exists());
     }
 
     #[cfg(unix)]

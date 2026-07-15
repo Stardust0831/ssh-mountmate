@@ -29,8 +29,15 @@ impl Locale {
     }
 
     fn from_locale_name(locale: &str) -> Self {
-        let locale = locale.to_ascii_lowercase();
-        if locale == "zh" || locale.starts_with("zh-") || locale.starts_with("zh_") {
+        let locale = locale.to_ascii_lowercase().replace('_', "-");
+        if locale == "zh"
+            || locale == "zh-cn"
+            || locale.starts_with("zh-cn-")
+            || locale == "zh-sg"
+            || locale.starts_with("zh-sg-")
+            || locale == "zh-hans"
+            || locale.starts_with("zh-hans-")
+        {
             Self::Chinese
         } else {
             Self::English
@@ -636,6 +643,9 @@ mod tests {
         assert_eq!(Locale::from_locale_name("zh-CN"), Locale::Chinese);
         assert_eq!(Locale::from_locale_name("zh_Hans_CN"), Locale::Chinese);
         assert_eq!(Locale::from_locale_name("en-US"), Locale::English);
+        assert_eq!(Locale::from_locale_name("zh-TW"), Locale::English);
+        assert_eq!(Locale::from_locale_name("zh-HK"), Locale::English);
+        assert_eq!(Locale::from_locale_name("zh-Hant"), Locale::English);
     }
 
     #[test]

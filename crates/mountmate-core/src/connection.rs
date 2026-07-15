@@ -188,7 +188,7 @@ impl ConnectionDraft {
     }
 
     pub fn validate(&self, servers: &[ServerConfig]) -> Result<ValidatedConnection, DraftError> {
-        let name = required_scalar(&self.name, "Name")?;
+        let name = required_display_name(&self.name)?;
         let host = required_scalar(&self.host, "IP/Host")?;
         let user = required_scalar(&self.user, "User")?;
         let port = normalize_port(&self.port).ok_or(DraftError::InvalidPort)?;
@@ -380,6 +380,8 @@ pub enum DraftError {
     Required(&'static str),
     #[error("{0} must not contain whitespace or control characters")]
     InvalidScalar(&'static str),
+    #[error("Name must not contain control characters")]
+    InvalidName,
     #[error("Port must be a number from 1 to 65535")]
     InvalidPort,
     #[error("Select a private key file")]
@@ -414,6 +416,17 @@ fn required_scalar(value: &str, field: &'static str) -> Result<String, DraftErro
         .any(|character| character.is_whitespace() || character.is_control())
     {
         return Err(DraftError::InvalidScalar(field));
+    }
+    Ok(value.into())
+}
+
+fn required_display_name(value: &str) -> Result<String, DraftError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(DraftError::Required("Name"));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(DraftError::InvalidName);
     }
     Ok(value.into())
 }
@@ -497,7 +510,7 @@ fn windows_drive(value: &str) -> Option<char> {
 
 fn connection_fingerprint(server: &ServerConfig) -> (String, String, String, String, String) {
     (
-        server.host.trim().into(),
+        server.host.trim().to_ascii_lowercase(),
         server.user.trim().into(),
         normalize_port(&server.port).unwrap_or_else(|| server.port.trim().into()),
         normalize_remote_path(&server.remote_path),
@@ -744,7 +757,7 @@ fn import_reason(status: ImportStatus, protected: bool) -> &'static str {
 }
 
 fn merge_imported_connection(existing: &ServerConfig, imported: &ServerConfig) -> ServerConfig {
-    ServerConfig {
+    let mut merged = ServerConfig {
         id: existing.id.clone(),
         name: imported.name.clone(),
         mode: imported.mode.clone(),
@@ -758,7 +771,14 @@ fn merge_imported_connection(existing: &ServerConfig, imported: &ServerConfig) -
         connection_method: imported.connection_method,
         ssh_config_path: imported.ssh_config_path.clone(),
         ..existing.clone()
+    };
+    if merged.auth != AuthMethod::Password || !same_password_target(existing, &merged) {
+        merged.password_obscured.clear();
     }
+    if merged.auth != AuthMethod::Key || !same_key_target(existing, &merged) {
+        merged.key_pass_obscured.clear();
+    }
+    merged
 }
 
 fn expand_home(path: &Path) -> PathBuf {
@@ -844,6 +864,37 @@ mod tests {
         let mut draft = ConnectionDraft::from_server(&existing);
         draft.editing_id = None;
         draft.existing = None;
+        draft.password = "new".into();
+        assert_eq!(
+            draft.validate(&[existing]),
+            Err(DraftError::Duplicate("Alpha".into()))
+        );
+    }
+
+    #[test]
+    fn display_names_allow_spaces_but_reject_control_characters() {
+        let draft = ConnectionDraft {
+            name: "Existing Alpha".into(),
+            host: "host.example".into(),
+            user: "alice".into(),
+            auth: AuthMethod::Password,
+            password: "secret".into(),
+            ..ConnectionDraft::default()
+        };
+        assert_eq!(draft.validate(&[]).unwrap().server.name, "Existing Alpha");
+
+        let mut invalid = draft;
+        invalid.name = "Alpha\nBeta".into();
+        assert_eq!(invalid.validate(&[]), Err(DraftError::InvalidName));
+    }
+
+    #[test]
+    fn duplicate_targets_compare_hostnames_case_insensitively() {
+        let existing = password_server();
+        let mut draft = ConnectionDraft::from_server(&existing);
+        draft.editing_id = None;
+        draft.existing = None;
+        draft.host = "HOST.EXAMPLE".into();
         draft.password = "new".into();
         assert_eq!(
             draft.validate(&[existing]),
@@ -981,5 +1032,29 @@ mod tests {
         assert_eq!(merged.mountpoint, "Z:");
         assert_eq!(merged.cache_mode, "writes");
         assert_eq!(merged.ssh_config_path, "/tmp/custom-config");
+    }
+
+    #[test]
+    fn ssh_import_overwrite_drops_secrets_bound_to_the_old_target() {
+        let existing = ServerConfig {
+            auth: AuthMethod::Password,
+            password_obscured: "old-password".into(),
+            key_pass_obscured: "old-passphrase".into(),
+            host: "old.example".into(),
+            user: "alice".into(),
+            ..password_server()
+        };
+        let imported = ServerConfig {
+            auth: AuthMethod::Key,
+            host: "new.example".into(),
+            user: "alice".into(),
+            key_file: "/keys/new".into(),
+            ..ServerConfig::default()
+        };
+
+        let merged = merge_imported_connection(&existing, &imported);
+
+        assert!(merged.password_obscured.is_empty());
+        assert!(merged.key_pass_obscured.is_empty());
     }
 }

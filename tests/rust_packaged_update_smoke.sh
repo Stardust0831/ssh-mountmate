@@ -2,7 +2,8 @@
 set -euo pipefail
 
 package_root="${1:?packaged SSH MountMate root is required}"
-export SSH_MOUNTMATE_PACKAGE_ROOT="$(realpath "$package_root")"
+SSH_MOUNTMATE_PACKAGE_ROOT="$(realpath "$package_root")"
+export SSH_MOUNTMATE_PACKAGE_ROOT
 
 openbox >"${RUNNER_TEMP:-/tmp}/update-e2e-openbox.stdout" \
   2>"${RUNNER_TEMP:-/tmp}/update-e2e-openbox.stderr" &

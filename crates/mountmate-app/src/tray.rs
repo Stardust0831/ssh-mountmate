@@ -4,6 +4,20 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use crate::i18n::{Locale, TextKey};
 use mountmate_core::APP_NAME;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TrayError {
+    Transient(String),
+    Permanent(String),
+}
+
+impl std::fmt::Display for TrayError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transient(message) | Self::Permanent(message) => formatter.write_str(message),
+        }
+    }
+}
+
 const SHOW_MAIN_ID: &str = "ssh-mountmate.show-main";
 const SHOW_TRANSFERS_ID: &str = "ssh-mountmate.show-transfers";
 const MOUNT_ALL_ID: &str = "ssh-mountmate.mount-all";
@@ -35,7 +49,7 @@ impl TrayController {
     pub(crate) fn new(
         locale: Locale,
         action_sender: async_channel::Sender<TrayAction>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, TrayError> {
         initialize_desktop_menu_runtime()?;
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             if let Some(action) = action_for_id(event.id.as_ref()) {
@@ -70,15 +84,15 @@ impl TrayController {
             &second_separator,
             &exit,
         ])
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| TrayError::Permanent(error.to_string()))?;
         let icon = TrayIconBuilder::new()
             .with_tooltip(APP_NAME)
-            .with_icon(application_icon()?)
+            .with_icon(application_icon().map_err(TrayError::Permanent)?)
             .with_menu(Box::new(menu))
             .with_menu_on_left_click(true)
             .with_menu_on_right_click(true)
             .build()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| TrayError::Permanent(error.to_string()))?;
 
         Ok(Self {
             _icon: icon,
@@ -166,9 +180,11 @@ fn set_pixel(rgba: &mut [u8], width: u32, x: u32, y: u32, color: [u8; 4]) {
 }
 
 #[cfg(target_os = "linux")]
-fn initialize_desktop_menu_runtime() -> Result<(), String> {
-    if !status_notifier_watcher_available()? {
-        return Err("No StatusNotifierWatcher tray host is available on this desktop".into());
+fn initialize_desktop_menu_runtime() -> Result<(), TrayError> {
+    if !status_notifier_watcher_available().map_err(TrayError::Transient)? {
+        return Err(TrayError::Transient(
+            "No StatusNotifierWatcher tray host is available on this desktop".into(),
+        ));
     }
     let appindicator_available = [
         "libayatana-appindicator3.so.1",
@@ -179,14 +195,16 @@ fn initialize_desktop_menu_runtime() -> Result<(), String> {
     .iter()
     .any(|name| unsafe { libloading::Library::new(name).is_ok() });
     if !appindicator_available {
-        return Err(
+        return Err(TrayError::Permanent(
             "Ayatana AppIndicator or AppIndicator 3 is not installed on this desktop".into(),
-        );
+        ));
     }
     if gtk::is_initialized() || gtk::init().is_ok() {
         Ok(())
     } else {
-        Err("GTK could not be initialized for the system tray".into())
+        Err(TrayError::Transient(
+            "GTK could not be initialized for the system tray".into(),
+        ))
     }
 }
 
@@ -222,7 +240,7 @@ fn status_notifier_watcher_available() -> Result<bool, String> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn initialize_desktop_menu_runtime() -> Result<(), String> {
+fn initialize_desktop_menu_runtime() -> Result<(), TrayError> {
     Ok(())
 }
 

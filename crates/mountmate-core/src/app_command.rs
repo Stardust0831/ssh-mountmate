@@ -62,6 +62,8 @@ pub enum AppCommandError {
     InvalidState(String),
     #[error("app command was rejected: {0}")]
     Rejected(String),
+    #[error("could not connect to the running SSH MountMate instance: {0}")]
+    Connect(#[source] std::io::Error),
     #[error("app command I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("app command JSON failed: {0}")]
@@ -325,14 +327,19 @@ pub fn send_command_retry(
     loop {
         match send_command(state_path, command, Duration::from_millis(500)) {
             Ok(()) => return Ok(()),
-            Err(AppCommandError::NotRunning | AppCommandError::Io(_))
-                if started.elapsed() < timeout =>
-            {
+            Err(error) if retryable_before_delivery(&error) && started.elapsed() < timeout => {
                 thread::sleep(Duration::from_millis(50));
             }
             Err(error) => return Err(error),
         }
     }
+}
+
+fn retryable_before_delivery(error: &AppCommandError) -> bool {
+    matches!(
+        error,
+        AppCommandError::NotRunning | AppCommandError::Connect(_)
+    )
 }
 
 fn send_command_with_probe(
@@ -350,7 +357,8 @@ fn send_command_with_probe(
     let mut stream = TcpStream::connect_timeout(
         &SocketAddr::from((Ipv4Addr::LOCALHOST, state.port)),
         timeout,
-    )?;
+    )
+    .map_err(AppCommandError::Connect)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     let request = CommandRequest {
@@ -644,5 +652,16 @@ mod tests {
         assert!(constant_time_eq(b"secret", b"secret"));
         assert!(!constant_time_eq(b"secret", b"public"));
         assert!(!constant_time_eq(b"short", b"longer"));
+    }
+
+    #[test]
+    fn retries_stop_once_command_delivery_may_have_started() {
+        assert!(retryable_before_delivery(&AppCommandError::NotRunning));
+        assert!(retryable_before_delivery(&AppCommandError::Connect(
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "not listening")
+        )));
+        assert!(!retryable_before_delivery(&AppCommandError::Io(
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "response timed out")
+        )));
     }
 }

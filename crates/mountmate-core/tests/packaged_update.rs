@@ -627,7 +627,23 @@ fn run_inherited_output<A: AsRef<OsStr>>(
     executable: &Path,
     arguments: &[A],
 ) -> io::Result<std::process::Output> {
-    Command::new(executable).args(arguments).output()
+    let mut child = Command::new(executable)
+        .args(arguments)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if child.wait_timeout(PROCESS_TIMEOUT)?.is_none() {
+        child.kill()?;
+        let output = child.wait_with_output()?;
+        return Err(io::Error::other(format!(
+            "{} timed out after {:?}\nstdout:\n{}\nstderr:\n{}",
+            executable.display(),
+            PROCESS_TIMEOUT,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    child.wait_with_output()
 }
 
 fn wait_for_parent_identity(

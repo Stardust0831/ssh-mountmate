@@ -14,6 +14,7 @@ use sysinfo::{
     Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, Signal, System, UpdateKind,
 };
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::mountpoint::{path_key, system_mountpoint_ready};
 use crate::paths::AppPaths;
@@ -175,8 +176,8 @@ fn signal_verified_process(state: &MountState, windows: bool, force: bool) -> Re
 }
 
 pub trait RcControl {
-    fn process_id(&self, address: &str) -> Result<u32, String>;
-    fn quit(&self, address: &str) -> Result<(), String>;
+    fn process_id(&self, state: &MountState) -> Result<u32, String>;
+    fn quit(&self, state: &MountState) -> Result<(), String>;
 }
 
 pub struct HttpRcControl {
@@ -190,14 +191,14 @@ impl HttpRcControl {
 }
 
 impl RcControl for HttpRcControl {
-    fn process_id(&self, address: &str) -> Result<u32, String> {
-        HttpRcClient::new(address, self.timeout)
+    fn process_id(&self, state: &MountState) -> Result<u32, String> {
+        HttpRcClient::with_credentials(&state.rc_addr, &state.rc_user, &state.rc_pass, self.timeout)
             .and_then(|client| client.process_id())
             .map_err(|error| error.to_string())
     }
 
-    fn quit(&self, address: &str) -> Result<(), String> {
-        HttpRcClient::new(address, self.timeout)
+    fn quit(&self, state: &MountState) -> Result<(), String> {
+        HttpRcClient::with_credentials(&state.rc_addr, &state.rc_user, &state.rc_pass, self.timeout)
             .and_then(|client| client.quit())
             .map_err(|error| error.to_string())
     }
@@ -342,6 +343,8 @@ impl<'a> MountRuntime<'a> {
         let remote = server.remote_spec();
         let log = self.paths.mount_log(server.remote_name());
         let rc_addr = allocate_loopback_address()?;
+        let rc_user = "mountmate".to_owned();
+        let rc_pass = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
         let command = MountCommand {
             rclone: request.rclone,
             config: &self.paths.rclone_config(),
@@ -352,6 +355,8 @@ impl<'a> MountRuntime<'a> {
             cache_dir: request.cache_dir,
             log_path: &log,
             rc_addr: &rc_addr,
+            rc_user: &rc_user,
+            rc_pass: &rc_pass,
             windows: self.windows,
         }
         .build();
@@ -371,6 +376,8 @@ impl<'a> MountRuntime<'a> {
             mountpoint: request.mountpoint.to_owned(),
             log,
             rc_addr,
+            rc_user,
+            rc_pass,
             phase: MountPhase::Starting,
             process_started_at,
             rclone: request.rclone.to_owned(),
@@ -423,7 +430,7 @@ impl<'a> MountRuntime<'a> {
             .arguments
             .as_ref()
             .is_some_and(|arguments| argv_matches_state(arguments, &state, self.windows));
-        let rc_matches = self.rc.process_id(&state.rc_addr) == Ok(state.pid);
+        let rc_matches = self.rc.process_id(&state) == Ok(state.pid);
         if !command_matches && !rc_matches {
             if snapshot.arguments.is_some() {
                 self.remove_state(server_id)?;
@@ -433,7 +440,7 @@ impl<'a> MountRuntime<'a> {
         }
 
         if rc_matches {
-            let _ = self.rc.quit(&state.rc_addr);
+            let _ = self.rc.quit(&state);
         }
         self.wait_for_exit(&state, self.options.stop_timeout);
         if self.processes.snapshot(state.pid).is_some() {
@@ -488,7 +495,7 @@ impl<'a> MountRuntime<'a> {
         if mountpoint_ready && command == Some(true) {
             return MountStatus::Mounted;
         }
-        let rc_verified = self.rc.process_id(&state.rc_addr) == Ok(state.pid);
+        let rc_verified = self.rc.process_id(state) == Ok(state.pid);
         if mountpoint_ready && rc_verified {
             MountStatus::Mounted
         } else if state.phase == MountPhase::Starting || command != Some(false) {
@@ -505,15 +512,22 @@ impl<'a> MountRuntime<'a> {
             let Some(snapshot) = self.processes.snapshot(state.pid) else {
                 return false;
             };
-            if !start_time_matches(state, &snapshot)
-                || snapshot
-                    .arguments
-                    .as_ref()
-                    .is_some_and(|arguments| !argv_matches_state(arguments, state, self.windows))
-            {
+            if !start_time_matches(state, &snapshot) {
                 return false;
             }
-            let ready = self.rc.process_id(&state.rc_addr) == Ok(state.pid)
+            let arguments_match = snapshot
+                .arguments
+                .as_ref()
+                .is_some_and(|arguments| argv_matches_state(arguments, state, self.windows));
+            if !arguments_match {
+                ready_since = None;
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(self.options.poll_interval);
+                continue;
+            }
+            let ready = self.rc.process_id(state) == Ok(state.pid)
                 && self.mountpoints.is_ready(&state.mountpoint);
             if ready {
                 let since = ready_since.get_or_insert_with(Instant::now);
@@ -541,12 +555,12 @@ impl<'a> MountRuntime<'a> {
             .arguments
             .as_ref()
             .is_some_and(|arguments| argv_matches_state(arguments, state, self.windows));
-        let rc_matches = self.rc.process_id(&state.rc_addr) == Ok(state.pid);
+        let rc_matches = self.rc.process_id(state) == Ok(state.pid);
         if !command_matches && !rc_matches {
             return false;
         }
         if rc_matches {
-            let _ = self.rc.quit(&state.rc_addr);
+            let _ = self.rc.quit(state);
         }
         let _ = self.processes.signal_verified(state, self.windows, false);
         self.wait_for_exit(state, Duration::from_millis(500));
@@ -752,11 +766,11 @@ mod tests {
     }
 
     impl RcControl for FakeRc {
-        fn process_id(&self, _address: &str) -> Result<u32, String> {
+        fn process_id(&self, _state: &MountState) -> Result<u32, String> {
             self.pid.clone()
         }
 
-        fn quit(&self, _address: &str) -> Result<(), String> {
+        fn quit(&self, _state: &MountState) -> Result<(), String> {
             *self.quit_calls.borrow_mut() += 1;
             Ok(())
         }
@@ -769,11 +783,11 @@ mod tests {
     struct PanicRc;
 
     impl RcControl for PanicRc {
-        fn process_id(&self, _address: &str) -> Result<u32, String> {
+        fn process_id(&self, _state: &MountState) -> Result<u32, String> {
             panic!("RC must not be queried when local evidence is conclusive")
         }
 
-        fn quit(&self, _address: &str) -> Result<(), String> {
+        fn quit(&self, _state: &MountState) -> Result<(), String> {
             unreachable!()
         }
     }
@@ -813,6 +827,8 @@ mod tests {
             mountpoint: root.join("mnt"),
             log: root.join("state/alpha.log"),
             rc_addr: "127.0.0.1:1234".into(),
+            rc_user: "mountmate".into(),
+            rc_pass: "secret".into(),
             phase: MountPhase::Mounted,
             process_started_at: Some(100),
             rclone: PathBuf::from("rclone"),
@@ -890,7 +906,7 @@ mod tests {
         );
         pre_exec.started_at = 100;
         let (_, mounted) = state(temp.path(), Some(matching_arguments(temp.path())));
-        let processes = FakeProcesses::new([Some(pre_exec), Some(mounted)]);
+        let processes = FakeProcesses::new([Some(pre_exec.clone()), Some(pre_exec), Some(mounted)]);
         let rc = FakeRc {
             pid: Ok(42),
             quit_calls: RefCell::new(0),

@@ -18,6 +18,8 @@ use uuid::Uuid;
 
 use crate::rclone_binary::file_sha256;
 use crate::storage::{StorageError, read_json};
+#[cfg(test)]
+use crate::update_install::prepared_tree_sha256;
 use crate::update_install::{
     AppliedUpdate, InstallLayout, PreparedPayload, TransactionPaths, apply_prepared_update,
     commit_applied_update, rename_no_replace, rollback_applied_update, transaction_shape_is_valid,
@@ -150,6 +152,10 @@ pub enum UpdateHelperError {
     RollbackFailed { update: String, rollback: String },
     #[error("the previous version was restored but could not be restarted: {0}")]
     RestoredRelaunchFailed(String),
+    #[error(
+        "the update failed ({update}) and the existing version could not be restarted: {relaunch}"
+    )]
+    ExistingRelaunchFailed { update: String, relaunch: String },
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error("update helper I/O failed at {path}: {source}")]
@@ -233,18 +239,43 @@ pub fn run_update_helper(
     fs::remove_file(plan_path).map_err(|_| UpdateHelperError::PlanCleanup)?;
     e2e_update_trace("waiting for parent exit");
     wait_for_parent_exit(&plan.parent, DEFAULT_PARENT_EXIT_TIMEOUT)?;
+    let mut launcher = SystemUpdateLauncher;
     e2e_update_trace("verifying authorized installation");
-    verify_authorized_installation(&plan)?;
+    if let Err(error) = verify_authorized_installation(&plan) {
+        return relaunch_after_preapply_failure(&plan, error.to_string(), &mut launcher);
+    }
     e2e_update_trace("applying prepared update");
-    let applied = apply_prepared_update(&plan.layout, &plan.prepared, &plan.transaction)
-        .map_err(|error| UpdateHelperError::InstallFailed(error.to_string()))?;
+    let applied = match apply_prepared_update(&plan.layout, &plan.prepared, &plan.transaction) {
+        Ok(applied) => applied,
+        Err(error) => {
+            return relaunch_after_preapply_failure(
+                &plan,
+                UpdateHelperError::InstallFailed(error.to_string()).to_string(),
+                &mut launcher,
+            );
+        }
+    };
     e2e_update_trace("waiting for updated application health");
-    complete_applied_update(
-        &plan,
-        &applied,
-        DEFAULT_HEALTH_TIMEOUT,
-        &mut SystemUpdateLauncher,
-    )
+    complete_applied_update(&plan, &applied, DEFAULT_HEALTH_TIMEOUT, &mut launcher)
+}
+
+fn relaunch_after_preapply_failure(
+    plan: &UpdateHelperPlan,
+    update_error: String,
+    launcher: &mut dyn UpdateLauncher,
+) -> Result<(), UpdateHelperError> {
+    if !regular_file_digest_matches(&plan.layout.executable, &plan.parent.executable_sha256) {
+        return Err(UpdateHelperError::InstallFailed(format!(
+            "{update_error}; the existing application identity could not be verified for relaunch"
+        )));
+    }
+    match launcher.launch(&plan.layout.executable, &plan.relaunch_arguments) {
+        Ok(_) => Err(UpdateHelperError::UpdateRolledBack(update_error)),
+        Err(relaunch) => Err(UpdateHelperError::ExistingRelaunchFailed {
+            update: update_error,
+            relaunch: relaunch.to_string(),
+        }),
+    }
 }
 
 fn e2e_update_trace(message: &str) {
@@ -457,6 +488,7 @@ fn validate_plan_fields(plan: &UpdateHelperPlan) -> Result<(), UpdateHelperError
     if !valid_sha256(&plan.token_sha256)
         || !valid_sha256(&plan.parent.executable_sha256)
         || !valid_sha256(&plan.prepared.executable_sha256)
+        || !valid_sha256(&plan.prepared.tree_sha256)
         || !valid_token(&plan.health_token)
         || plan.parent.pid == 0
         || plan.parent.executable.as_os_str().is_empty()
@@ -518,21 +550,21 @@ fn write_private_new_file(
         path.file_name().unwrap_or_default().to_string_lossy(),
         Uuid::new_v4().simple()
     ));
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600);
+    }
+    let mut file = options
         .open(&temporary)
         .map_err(|source| UpdateHelperError::Io {
             path: temporary.clone(),
             source,
         })?;
     let result = (|| {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        }
         write(&mut file)?;
         file.flush()?;
         file.sync_all()
@@ -983,6 +1015,7 @@ mod tests {
             executable: replace_path.clone(),
             replace_path,
             executable_sha256: "b".repeat(64),
+            tree_sha256: "c".repeat(64),
         }
     }
 
@@ -1022,6 +1055,7 @@ mod tests {
             replace_path: transaction.prepared.clone(),
             executable: transaction.prepared.clone(),
             executable_sha256: file_sha256(&transaction.prepared).unwrap(),
+            tree_sha256: prepared_tree_sha256(&transaction.prepared).unwrap(),
         };
         let health_marker = temp.path().join("health-update.json");
         let plan = UpdateHelperPlan {
@@ -1275,6 +1309,50 @@ mod tests {
             verify_running_helper(&plan, &source),
             Err(UpdateHelperError::HelperNotDetached)
         ));
+    }
+
+    #[test]
+    fn preapply_failure_relaunches_the_existing_application() {
+        let temp = tempdir().unwrap();
+        let executable = temp.path().join(if cfg!(windows) {
+            "SSHMountMate.exe"
+        } else {
+            "SSHMountMate"
+        });
+        create_test_executable(&executable, b"existing application");
+        let launches = Rc::new(RefCell::new(Vec::new()));
+        let mut launcher = FakeUpdateLauncher {
+            launches: launches.clone(),
+            terminated: Rc::new(Cell::new(false)),
+            health: None,
+        };
+        let mut plan = UpdateHelperPlan {
+            schema: UPDATE_PLAN_SCHEMA,
+            token_sha256: "a".repeat(64),
+            parent: parent(),
+            layout: layout(),
+            prepared: prepared(),
+            transaction: transaction(),
+            health_marker: temp.path().join("health.json"),
+            health_token: "b".repeat(64),
+            relaunch_arguments: vec!["--show-main".into()],
+        };
+        plan.layout.executable = executable.clone();
+        plan.layout.replace_path = executable.clone();
+        plan.parent.executable = executable;
+        plan.parent.executable_sha256 = file_sha256(&plan.parent.executable).unwrap();
+
+        assert!(matches!(
+            relaunch_after_preapply_failure(&plan, "verification failed".into(), &mut launcher),
+            Err(UpdateHelperError::UpdateRolledBack(message)) if message == "verification failed"
+        ));
+        assert_eq!(
+            &*launches.borrow(),
+            &[(
+                plan.layout.executable.clone(),
+                plan.relaunch_arguments.clone()
+            )]
+        );
     }
 
     #[test]
