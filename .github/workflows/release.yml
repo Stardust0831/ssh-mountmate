@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, for example v0.4.0"
+        description: "Existing release tag, for example v0.4.1-alpha.1"
         required: true
         type: string
       publish:
@@ -500,11 +500,9 @@ jobs:
           path: release/${{ matrix.asset }}.zip
           if-no-files-found: error
 
-  release:
+  release-set:
     needs: build
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -533,8 +531,97 @@ jobs:
           (cd release-assets && sha256sum SSHMountMate-*.zip > SHA256SUMS.txt)
           (cd release-assets && sha256sum --check SHA256SUMS.txt)
 
-      - name: Create GitHub release
-        if: github.event_name == 'push' || inputs.publish
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: 1.97.0
+
+      - name: Exercise signed release set with an ephemeral test key
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          channel=stable
+          case "${version}" in
+            *-*) channel=prerelease ;;
+          esac
+          cargo build --release --package mountmate-core --bin update-signing
+          target/release/update-signing exercise-local release-assets "${version}" "${channel}"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: SSHMountMate-release-set
+          path: release-assets/
+          if-no-files-found: error
+
+  publish:
+    needs: release-set
+    if: github.event_name == 'push' || inputs.publish
+    runs-on: ubuntu-latest
+    environment: production-update-signing
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: 1.97.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: SSHMountMate-release-set
+          path: release-assets
+
+      - name: Verify the existing tag identifies this exact build
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          git fetch --force origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          tag_commit="$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")"
+          test "${tag_commit}" = "${GITHUB_SHA}"
+
+      - name: Build signing tool before exposing the private key
+        run: cargo build --release --package mountmate-core --bin update-signing
+
+      - name: Create and verify signed update manifest
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          UPDATE_ED25519_PRIVATE_KEY_PKCS8_B64: ${{ secrets.UPDATE_ED25519_PRIVATE_KEY_PKCS8_B64 }}
+          UPDATE_ED25519_KEY_ID: ${{ vars.UPDATE_ED25519_KEY_ID }}
+        run: |
+          set -euo pipefail
+          test -n "${UPDATE_ED25519_PRIVATE_KEY_PKCS8_B64}"
+          test -n "${UPDATE_ED25519_KEY_ID}"
+          version="${RELEASE_TAG#v}"
+          channel=stable
+          case "${version}" in
+            *-*) channel=prerelease ;;
+          esac
+          env -u UPDATE_ED25519_PRIVATE_KEY_PKCS8_B64 \
+            jq -e --arg key_id "${UPDATE_ED25519_KEY_ID}" \
+            '.keys | any(.key_id == $key_id)' distribution/update-public-keys.json >/dev/null
+          env -u UPDATE_ED25519_PRIVATE_KEY_PKCS8_B64 \
+            target/release/update-signing manifest \
+              release-assets "${version}" "${channel}" "${UPDATE_ED25519_KEY_ID}" \
+              release-assets/SSHMountMate-update-manifest-v1.json
+          printf '%s' "${UPDATE_ED25519_PRIVATE_KEY_PKCS8_B64}" \
+            | env -u UPDATE_ED25519_PRIVATE_KEY_PKCS8_B64 \
+                target/release/update-signing sign \
+                  release-assets/SSHMountMate-update-manifest-v1.json \
+                  release-assets/SSHMountMate-update-manifest-v1.sig
+          unset UPDATE_ED25519_PRIVATE_KEY_PKCS8_B64
+          target/release/update-signing verify-local \
+            release-assets/SSHMountMate-update-manifest-v1.json \
+            release-assets/SSHMountMate-update-manifest-v1.sig \
+            distribution/update-public-keys.json release-assets
+
+      - name: Create draft, verify GitHub metadata, and publish
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -551,16 +638,35 @@ jobs:
             notes=(--notes-file "release-notes/${tag}.md")
           fi
           prerelease=()
+          prerelease_value=false
           case "${tag}" in
-            *-rc*|*-pre*|*-beta*|*-alpha*) prerelease=(--prerelease) ;;
+            *-rc*|*-pre*|*-beta*|*-alpha*) prerelease=(--prerelease); prerelease_value=true ;;
           esac
           mapfile -t files < <(find release-assets -maxdepth 1 -type f | sort)
-          if gh release view "${tag}" --repo "${GH_REPO}" >/dev/null 2>&1; then
-            gh release upload "${tag}" "${files[@]}" --clobber --repo "${GH_REPO}"
-            gh release edit "${tag}" "${notes[@]}" "${prerelease[@]}" --repo "${GH_REPO}"
-          else
-            gh release create "${tag}" "${files[@]}" --repo "${GH_REPO}" \
-              --title "SSH MountMate ${tag}" "${prerelease[@]}" "${notes[@]}"
+          if gh api "repos/${GH_REPO}/releases/tags/${tag}" >/dev/null 2>&1; then
+            echo "refusing to replace existing GitHub Release ${tag}" >&2
+            exit 1
           fi
-          release_id="$(gh release view "${tag}" --repo "${GH_REPO}" --json databaseId --jq .databaseId)"
-          gh api -X PATCH "repos/${GH_REPO}/releases/${release_id}" -f draft=false >/dev/null
+          gh release create "${tag}" "${files[@]}" --repo "${GH_REPO}" --draft \
+            --title "SSH MountMate ${tag}" "${prerelease[@]}" "${notes[@]}"
+          metadata="${RUNNER_TEMP}/github-release.json"
+          release_id=""
+          for _ in $(seq 1 30); do
+            gh api "repos/${GH_REPO}/releases/tags/${tag}" >"${metadata}"
+            release_id="$(jq -r .id "${metadata}")"
+            if jq -e '
+              [.assets[] | select(.name | startswith("SSHMountMate-") and endswith(".zip"))]
+              | length == 6 and all(.[]; (.digest // "") | startswith("sha256:"))
+            ' "${metadata}" >/dev/null; then
+              break
+            fi
+            release_id=""
+            sleep 2
+          done
+          test -n "${release_id}"
+          target/release/update-signing verify-published \
+            release-assets/SSHMountMate-update-manifest-v1.json \
+            release-assets/SSHMountMate-update-manifest-v1.sig \
+            distribution/update-public-keys.json "${metadata}"
+          gh api -X PATCH "repos/${GH_REPO}/releases/${release_id}" \
+            -F draft=false -F prerelease="${prerelease_value}" >/dev/null

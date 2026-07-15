@@ -49,6 +49,7 @@ use mountmate_core::update::{UpdateInfo, check_for_updates};
 use mountmate_core::update_helper::{
     UpdateHealthAuthorization, run_update_helper, write_update_health_marker,
 };
+use mountmate_core::update_manifest::UpdateTrustError;
 use mountmate_core::update_workflow::{PreparedUpdateLaunch, prepare_update_install};
 use mountmate_core::{
     APP_NAME, AuthMethod, ConnectionMethod, CredentialStorage, MountBackend, MountState,
@@ -106,8 +107,11 @@ fn run() -> Result<(), String> {
                     "Verified asset: {}",
                     info.asset
                         .as_ref()
-                        .map_or("unavailable", |asset| asset.name.as_str())
+                        .map_or("unavailable", |asset| asset.name())
                 );
+                if let Some(error) = &info.trust_error {
+                    println!("Automatic installation blocked: {error}");
+                }
             } else {
                 println!("SSH MountMate {VERSION} is up to date");
             }
@@ -3060,10 +3064,19 @@ impl App {
             .as_ref()
             .and_then(|info| info.asset.clone())
         else {
-            self.status = match self.locale() {
-                Locale::English => "This release has no verified asset for this platform".into(),
-                Locale::Chinese => "此版本没有适用于当前平台的已验证安装包".into(),
-            };
+            self.status = self
+                .update_info
+                .as_ref()
+                .and_then(|info| info.trust_error.as_ref())
+                .map_or_else(
+                    || match self.locale() {
+                        Locale::English => {
+                            "This release has no verified asset for this platform".into()
+                        }
+                        Locale::Chinese => "此版本没有适用于当前平台的已验证安装包".into(),
+                    },
+                    |error| automatic_install_blocked_message(self.locale(), error),
+                );
             return Task::none();
         };
         let executable = match std::env::current_exe() {
@@ -4502,10 +4515,15 @@ impl App {
                 Locale::Chinese => format!("可更新至 {}", info.latest_version),
             }));
             if info.asset.is_none() {
-                update_section = update_section.push(text(match locale {
-                    Locale::English => "A verified package is not available for this platform",
-                    Locale::Chinese => "当前平台暂无已验证的安装包",
-                }));
+                update_section = update_section.push(text(info.trust_error.as_ref().map_or_else(
+                    || match locale {
+                        Locale::English => {
+                            "A verified package is not available for this platform".into()
+                        }
+                        Locale::Chinese => "当前平台暂无已验证的安装包".into(),
+                    },
+                    |error| automatic_install_blocked_message(locale, error),
+                )));
             }
         }
         if self.update_downloading {
@@ -6195,6 +6213,13 @@ fn diagnostic_trace(message: &str) {
     }
 }
 
+fn automatic_install_blocked_message(locale: Locale, error: &UpdateTrustError) -> String {
+    match locale {
+        Locale::English => format!("Automatic installation blocked: {error}"),
+        Locale::Chinese => format!("自动安装已被签名验证阻止：{error}"),
+    }
+}
+
 fn main_window_settings() -> window::Settings {
     window::Settings {
         size: Size::new(980.0, 720.0),
@@ -6410,6 +6435,17 @@ fn open_path(path: &Path, locale: Locale) -> Result<(), String> {
 #[cfg(test)]
 mod localization_tests {
     use super::*;
+
+    #[test]
+    fn unsigned_updates_have_explicit_bilingual_block_reasons() {
+        let error = UpdateTrustError::MissingSignature;
+        let english = automatic_install_blocked_message(Locale::English, &error);
+        let chinese = automatic_install_blocked_message(Locale::Chinese, &error);
+        assert!(english.contains("Automatic installation blocked"));
+        assert!(english.contains("signature is missing"));
+        assert!(chinese.contains("自动安装已被签名验证阻止"));
+        assert!(chinese.contains("signature is missing"));
+    }
 
     #[test]
     fn draft_errors_are_localized_structurally() {

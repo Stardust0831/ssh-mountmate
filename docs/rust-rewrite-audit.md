@@ -43,7 +43,7 @@ This document maps every requirement in `docs/rust-rewrite.md` to current author
 | Truthful rclone RC transfer state | Verified | Unit tests cover queued, active, errored, unknown, exhausted-cache, and remote-byte states. Windows/Linux/macOS real mounts prove queued writes are not presented as complete and later become remotely complete. |
 | Refresh order and Windows root quote repair | Verified | RC contract tests prove forget/refresh/list followed by a post-refresh queue snapshot and reject the legacy quote remote; real mount tests prove remotely created content appears after refresh. |
 | Safe process ownership and PID-reuse behavior | Verified | Process/runtime tests cover exact argv identity, start-time mismatch, unverifiable ownership, safe RC quit, stale state, and never terminating a reused PID. |
-| Verified update, extraction, staged replacement, health, and rollback | Verified | Unit tests cover URL/digest/size trust, redirect restrictions, archive safety, transaction containment, authenticated health, and rollback. Packaged update/rollback runs on all six targets. |
+| Verified update, extraction, staged replacement, health, and rollback | Ed25519 implementation pending new CI evidence | Existing packaged update/rollback runs on all six targets. The new client additionally requires a signed six-asset manifest plus matching GitHub REST digests, sizes, tag/channel and URLs before installation; tamper, missing-signature, wrong-key, rotation, and signing-tool tests run locally. Production key confirmation and a fresh six-platform run remain required. |
 | Responsive bilingual GUI, shared transfer window, transfer center, tray/menu bar, notifications, global progress, and file-manager integration | Verified | Native tray/menu bar, notifications, Windows taskbar, macOS Dock, X11/Wayland capability reporting, authenticated IPC, and file-manager registration are exercised. The application now reuses one movable transfer window across mounts and expands it to per-connection details; unit tests verify aggregation, dismissal, unknown-size handling, and truthful completion. |
 | Native x64/ARM64 packages without Python | Verified for portable packages | Six native ZIP packages contain the Rust executable, verified rclone, and notices with no Python runtime. The approved v0.4.0 scope is portable and unsigned; native installers and production signing/notarization remain separate distribution work. |
 | Experimental macOS built-in NFS | Verified as opt-in, not default | Both macOS architectures completed real loopback NFS lifecycles in run 29398901355. Legacy settings and new defaults remain FUSE; Windows/Linux commands are unchanged. Evidence is not yet sufficient to promote NFS to the default. |
@@ -77,7 +77,11 @@ This document maps every requirement in `docs/rust-rewrite.md` to current author
 | macOS bundle/notifications/menu bar/Finder/mount/update/rollback | Verified on x64 and ARM64; signing-ready layout is verified with ad-hoc signatures, while production signing/notarization configuration remains a distribution task. |
 | Linux X11/Wayland/notifications/tray/file manager/mount/update/rollback | Verified on x64 and ARM64 where architecture-specific; X11 and Wayland desktop protocol checks run on Ubuntu x64. |
 
-## Remaining stable release gates
+## Current signed-prerelease gates
 
-1. Complete the refreshed PR #11 review, merge the verified commit into `main`, and publish the
-   formal non-prerelease `v0.4.0` from the exact merge commit.
+1. Commit and push the Ed25519 implementation without merging the extension branch.
+2. Require quality and all six Windows, Linux, and macOS x64/ARM64 jobs to pass on the exact commit.
+3. Configure the protected production-signing Environment, generate the only production key, and
+   commit its public record without persisting the private key outside the GitHub secret.
+4. Show the production `key_id` and full public-key SHA-256 to the owner and obtain explicit
+   confirmation before creating the `v0.4.1-alpha.1` tag or publishing any Release.

@@ -156,9 +156,24 @@ Program updates can be checked from Settings -> Check for updates, or from the c
 SSHMountMate --check-update
 ```
 
-The in-app updater downloads the single matching native GitHub Release asset, verifies its size and SHA-256 digest, rejects unsafe ZIP paths, stages the new executable or macOS application beside the current installation, and restarts SSH MountMate after confirmation. A startup health handshake commits the update; timeout or failure restores and relaunches the previous build. Existing rclone mounts and uploads continue while the GUI restarts.
+The in-app updater first verifies an Ed25519-signed manifest embedded in the application trust
+root. The signature binds the release version, stable/prerelease channel, all six canonical asset
+names, sizes, and SHA-256 digests. GitHub's published asset digest and metadata must independently
+match that signed manifest before the matching ZIP can be installed. Missing signatures, unknown
+keys, mismatched release metadata, or changed ZIPs remain visible in the update view but disable
+automatic installation with an explicit reason.
 
-Automatic installation requires SSH MountMate to be extracted to a permanent, user-writable folder. Builds launched directly from a ZIP temporary directory and assets without a trusted SHA-256 digest remain manual-update only. Automatic background checks can be disabled in Settings.
+After verification, the updater rejects unsafe ZIP paths, stages the new executable or macOS
+application beside the current installation, and restarts SSH MountMate after confirmation. A
+startup health handshake commits the update; timeout or failure restores and relaunches the
+previous build. Existing rclone mounts and uploads continue while the GUI restarts.
+
+Automatic installation requires SSH MountMate to be extracted to a permanent, user-writable
+folder. Builds launched directly from a ZIP temporary directory and releases that fail any signed
+manifest, platform, size, or digest check remain manual-update only. Current Releases intentionally
+contain no Windows/Linux onedir update assets, so automatic replacement of those legacy directory
+layouts is explicitly unsupported; canonical onefile packages and macOS `.app` updates remain the
+supported paths. Automatic background checks can be disabled in Settings.
 
 Check CPU architecture:
 
