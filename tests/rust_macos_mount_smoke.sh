@@ -96,6 +96,8 @@ for _ in {1..100}; do
 done
 [[ "$server_ready" == true ]]
 
+export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
 export HOME="$test_root/home"
 export XDG_CONFIG_HOME="$test_root/config"
 export XDG_CACHE_HOME="$test_root/cache"

@@ -57,6 +57,8 @@ function Wait-Until([scriptblock] $Condition, [int] $Attempts = 100) {
 }
 
 try {
+  if (-not $env:CARGO_HOME) { $env:CARGO_HOME = Join-Path $env:USERPROFILE '.cargo' }
+  if (-not $env:RUSTUP_HOME) { $env:RUSTUP_HOME = Join-Path $env:USERPROFILE '.rustup' }
   $env:HOME = Join-Path $testRoot 'home'
   $env:USERPROFILE = $env:HOME
   $env:APPDATA = Join-Path $testRoot 'roaming'
