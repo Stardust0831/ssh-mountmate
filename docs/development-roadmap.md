@@ -6,19 +6,18 @@ until its stated evidence exists.
 
 ## Current sequence
 
-1. Keep published prerelease `v0.4.0-alpha.7` as the current verified six-platform baseline for
-   safer pending-upload UX, compact settings, a dedicated log window, and verified replacement of
-   an older tray instance.
-2. Collect user feedback on alpha.7 before changing mount backends or promoting the rewrite.
-3. Keep the completed merge-readiness audit intact without changing mount backends or server code.
-4. Review remaining risks and decide whether draft PR #11 is ready for merge; do not merge solely
-   because a prerelease exists.
-5. Design an optional installed distribution later, with Windows as the first target and portable
-   execution retained.
-6. Implement optional macOS `rclone nfsmount` later as an explicit Experimental backend.
-7. Keep macOS FUSE as the migration and UI default; keep Windows WinFsp and Linux FUSE3 unchanged.
-8. Do not promote NFS to the default or publish another NFS-related release until real macOS x64 and ARM64
-   FUSE/NFS lifecycle evidence has been reviewed.
+1. Prepare the verified Rust rewrite and configurable upload concurrency for stable `v0.4.0`.
+2. Remove the macOS ARM64 release exception, complete a blocking six-platform release dry run,
+   refresh PR #11 evidence, review the final diff, and merge the PR into `main`.
+3. Publish `v0.4.0` from the merge commit as six portable ZIPs plus `SHA256SUMS.txt`.
+4. Implement optional macOS `rclone nfsmount` as an explicit Experimental backend. Keep FUSE as
+   the migration and UI default and keep Windows WinFsp and Linux FUSE3 unchanged.
+5. Add user-enabled system credential protection. The default remains the compatible
+   `rclone obscure` storage until the user confirms migration.
+6. Add reusable interactive SSH authentication: OpenSSH ControlMaster on macOS/Linux and verified
+   official Plink connection sharing for direct Windows connections.
+7. Keep installer work, Explorer navigation-triggered refresh, complex Windows ProxyJump
+   translation, server changes, and production signing/notarization as separate later work.
 
 ## Prerelease scope: `v0.4.0-alpha.7`
 
@@ -168,6 +167,26 @@ Cross-platform considerations:
 ## Work log
 
 ### 2026-07-15
+
+- Began stable `v0.4.0` preparation after explicit approval to merge PR #11 and publish a formal
+  release. The stable scope is the verified Rust rewrite plus configurable upload concurrency;
+  macOS NFS, system credential protection, interactive SSH reuse, installer work, and server
+  changes remain outside this release.
+- Raised the workspace version to `0.4.0`, added bilingual stable release notes, and removed the
+  macOS ARM64 `continue-on-error` release exception so all six native lifecycle jobs are blocking.
+- Fresh Rust 1.97 local verification for `v0.4.0` passed `cargo fmt --all -- --check`, full
+  workspace Clippy with all targets/features and warnings denied, and the complete workspace test
+  suite: 165 core tests passed with one live-network test ignored, legacy migration passed, five
+  platform tests passed, and 37 application tests passed. Three packaged-GUI tests remain ignored
+  locally because they require release artifacts and a graphical session. The local WSL check used
+  verification-only GTK pkg-config metadata and linker aliases under `/tmp`; native CI remains the
+  authoritative linking and integration gate.
+- Confirmed user-owned untracked files (`issue-1-reply.md` and five screenshots) remain untouched.
+- Accepted the post-release order: Experimental macOS NFS, opt-in system credential protection,
+  then reusable interactive SSH. System credential protection remains off by default; enabling it
+  confirms and verifies migration of all existing passwords and key passphrases. Interactive
+  one-time codes are never stored. Windows interactive reuse initially supports direct connections
+  through packaged official Plink, not complex ProxyJump/ProxyCommand translation.
 
 - Researched and implemented rclone VFS upload concurrency. `--transfers` limits simultaneous
   uploads of different modified cache files and defaults to 4; zero or negative values are
@@ -492,11 +511,9 @@ Cross-platform considerations:
 
 ## Release decisions
 
-- The Rust rewrite PR remains Draft.
-- No merge is authorized by this document.
-- `v0.4.0-alpha.7` is a prerelease, not a stable release.
-- The macOS ARM64 active-upload package-replacement timing race is an explicit alpha exception, not
-  evidence that the scenario passed. It must be resolved before a stable release.
-- A failed or incomplete architecture gate blocks publication unless it is replaced by successful
-  authoritative evidence or recorded above as a narrowly scoped, user-approved prerelease
-  exception. Stable releases do not inherit alpha exceptions automatically.
+- PR #11 is authorized for final review, Ready status, and merge after all stable gates pass.
+- `v0.4.0` is the approved stable version and remains a portable, unsigned distribution.
+- Every Windows, Linux, and macOS x64/ARM64 release job is blocking. Stable releases do not inherit
+  alpha exceptions.
+- macOS NFS, system credential protection, reusable interactive SSH, installers, and server changes
+  are not part of `v0.4.0`.

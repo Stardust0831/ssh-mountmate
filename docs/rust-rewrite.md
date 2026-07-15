@@ -23,7 +23,7 @@ The `rust-rewrite` branch replaces the Python/PyInstaller application with one R
 - Parent log handles close immediately after spawning rclone.
 - Windows status checks use RC and native process APIs, not routine PowerShell CIM scans.
 - Folder mount targets follow platform rules and do not accidentally pre-create forbidden Windows targets.
-- Cache defaults remain `full`, `30m`, `0s`, and `5m`; custom values survive migrations.
+- Cache defaults remain `full`, `30m`, `5s`, and `5m`; custom values survive migrations.
 - Upload warnings distinguish queued, active, errored, unknown, and remotely confirmed empty states.
 - GUI restart or self-update leaves rclone mounts and uploads running.
 
