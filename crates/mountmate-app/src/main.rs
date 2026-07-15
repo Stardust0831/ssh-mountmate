@@ -2891,6 +2891,12 @@ impl App {
                 tokio::task::spawn_blocking(move || {
                     let storage_changed =
                         settings.credential_storage != previous_settings.credential_storage;
+                    if storage_changed {
+                        diagnostic_trace(&credential_presence_summary(
+                            "before",
+                            &previous_servers,
+                        ));
+                    }
                     let credential_migration = if storage_changed {
                         Some(migrate_servers_for_storage(
                             &paths,
@@ -2904,6 +2910,9 @@ impl App {
                     let migrated_servers = credential_migration
                         .as_ref()
                         .map_or_else(|| previous_servers.clone(), |migration| migration.servers.clone());
+                    if storage_changed {
+                        diagnostic_trace(&credential_presence_summary("after", &migrated_servers));
+                    }
                     if storage_changed && settings.credential_storage == CredentialStorage::System {
                         for server in &migrated_servers {
                             if let Err(error) =
@@ -5938,6 +5947,24 @@ fn rollback_credential_storage_change(
     rollback_migrations_after_persistence(paths, previous_servers, &migration.migrations, message)
 }
 
+fn credential_presence_summary(stage: &str, servers: &[ServerConfig]) -> String {
+    let records = servers
+        .iter()
+        .map(|server| {
+            format!(
+                "{}[password_obscured={},password_reference={},key_pass_obscured={},key_pass_reference={}]",
+                server.id,
+                !server.password_obscured.is_empty(),
+                !server.password_credential.is_empty(),
+                !server.key_pass_obscured.is_empty(),
+                !server.key_pass_credential.is_empty(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("credential migration {stage}: {records}")
+}
+
 fn rollback_migrations_after_persistence(
     paths: &AppPaths,
     previous_servers: &[ServerConfig],
@@ -6742,6 +6769,22 @@ mod localization_tests {
         }
         assert!(credential_storage_help(Locale::English).contains("write-and-read verification"));
         assert!(credential_storage_help(Locale::Chinese).contains("回读验证"));
+    }
+
+    #[test]
+    fn credential_migration_diagnostics_include_only_presence_state() {
+        let server = ServerConfig {
+            id: "alpha".into(),
+            password_obscured: "password-secret-sentinel".into(),
+            key_pass_credential: "credential-secret-sentinel".into(),
+            ..ServerConfig::default()
+        };
+        let summary = credential_presence_summary("before", &[server]);
+        assert!(summary.contains("password_obscured=true"));
+        assert!(summary.contains("password_reference=false"));
+        assert!(summary.contains("key_pass_reference=true"));
+        assert!(!summary.contains("password-secret-sentinel"));
+        assert!(!summary.contains("credential-secret-sentinel"));
     }
 
     #[test]

@@ -389,7 +389,7 @@ pub fn prepare_server_to_system(
     let mut changes = Vec::new();
     let result = (|| -> Result<(), CredentialError> {
         migrate_obscured_field(
-            &mut candidate.password_obscured,
+            &candidate.password_obscured,
             &mut candidate.password_credential,
             &server.id,
             CredentialKind::Password,
@@ -398,7 +398,7 @@ pub fn prepare_server_to_system(
             &mut changes,
         )?;
         migrate_obscured_field(
-            &mut candidate.key_pass_obscured,
+            &candidate.key_pass_obscured,
             &mut candidate.key_pass_credential,
             &server.id,
             CredentialKind::KeyPassphrase,
