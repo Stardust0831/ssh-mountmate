@@ -286,6 +286,7 @@ mod tests {
         };
         let server = ServerConfig {
             id: "alpha".into(),
+            name: "alpha".into(),
             key_pass_obscured: "obscured-key-passphrase".into(),
             key_pass_credential: "ssh-mountmate:alpha:key-passphrase".into(),
             ..ServerConfig::default()
