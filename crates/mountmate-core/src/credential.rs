@@ -904,10 +904,9 @@ mod tests {
             ..ServerConfig::default()
         };
 
-        let hydrated = hydrate_server_from_system(&persisted, &store, |value| {
-            Ok(format!("obscured-{value}"))
-        })
-        .unwrap();
+        let hydrated =
+            hydrate_server_from_system(&persisted, &store, |value| Ok(format!("obscured-{value}")))
+                .unwrap();
 
         assert_eq!(hydrated.key_pass_obscured, "obscured-plain-passphrase");
         assert_eq!(persisted.key_pass_obscured, "obscured-compatibility-copy");
@@ -947,10 +946,9 @@ mod tests {
             key_pass_credential: reference,
             ..ServerConfig::default()
         };
-        let hydrated = hydrate_server_from_system(&persisted, &store, |value| {
-            Ok(format!("obscured-{value}"))
-        })
-        .unwrap();
+        let hydrated =
+            hydrate_server_from_system(&persisted, &store, |value| Ok(format!("obscured-{value}")))
+                .unwrap();
         let temp = tempdir().unwrap();
         let identity = temp.path().join("id key");
         fs::write(&identity, "PRIVATE KEY").unwrap();
@@ -975,10 +973,8 @@ mod tests {
             Ok(value.replace("obscured-", "plain-"))
         })
         .unwrap();
-        let reloaded: ServerConfig = serde_json::from_value(
-            serde_json::to_value(&migrated).unwrap(),
-        )
-        .unwrap();
+        let reloaded: ServerConfig =
+            serde_json::from_value(serde_json::to_value(&migrated).unwrap()).unwrap();
 
         assert_eq!(reloaded.key_pass_obscured, "obscured-passphrase");
         assert!(!reloaded.key_pass_credential.is_empty());

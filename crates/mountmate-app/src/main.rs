@@ -665,11 +665,7 @@ fn mount_error_summary(locale: Locale, cause: &str) -> String {
     summary
 }
 
-fn mount_error_message(
-    id: String,
-    operation: MountOperation,
-    action: MountErrorAction,
-) -> Message {
+fn mount_error_message(id: String, operation: MountOperation, action: MountErrorAction) -> Message {
     match action {
         MountErrorAction::Retry => Message::RetryOperation(id, operation),
         MountErrorAction::ViewLog => Message::OpenOperationLog(id),
@@ -4243,36 +4239,35 @@ impl App {
             ConnectionMethod::Interactive,
             cfg!(windows),
         );
-        let mut transport_choice = column![pick_list(
-            localized_choices(
-                ConnectionMethod::ALL.into_iter().filter(|method| {
-                    connection_method_allowed(
-                        draft.source,
-                        draft.ssh_config_managed,
-                        *method,
-                        cfg!(windows),
-                    )
-                }),
-                locale,
-                Locale::connection_method,
-            ),
-            Some(locale.choice(
-                draft.connection_method,
-                locale.connection_method(draft.connection_method),
-            )),
-            |method| Message::ConnectionMethodChanged(method.value),
-        )
-        .width(Fill)]
+        let mut transport_choice = column![
+            pick_list(
+                localized_choices(
+                    ConnectionMethod::ALL.into_iter().filter(|method| {
+                        connection_method_allowed(
+                            draft.source,
+                            draft.ssh_config_managed,
+                            *method,
+                            cfg!(windows),
+                        )
+                    }),
+                    locale,
+                    Locale::connection_method,
+                ),
+                Some(locale.choice(
+                    draft.connection_method,
+                    locale.connection_method(draft.connection_method),
+                )),
+                |method| Message::ConnectionMethodChanged(method.value),
+            )
+            .width(Fill)
+        ]
         .spacing(5);
         if interactive_disabled {
-            transport_choice = transport_choice
-                .push(text(interactive_ssh_config_unavailable(locale)).size(12));
+            transport_choice =
+                transport_choice.push(text(interactive_ssh_config_unavailable(locale)).size(12));
         }
         let transport = row![
-            labeled_control(
-                locale.text(TextKey::Transport),
-                transport_choice,
-            ),
+            labeled_control(locale.text(TextKey::Transport), transport_choice,),
             labeled_control(locale.text(TextKey::Authentication), authentication),
         ]
         .spacing(12);
@@ -7098,7 +7093,7 @@ mod localization_tests {
         assert!(connection_method_allowed(
             ConnectionSource::SshConfig,
             false,
-            ConnectionMethod::OpenSsh,
+            ConnectionMethod::Openssh,
             true,
         ));
         assert!(connection_method_allowed(
