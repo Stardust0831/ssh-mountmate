@@ -455,8 +455,15 @@ mod tests {
         };
         let first = control_directory(&paths, "0123456789abcdef");
         let second = control_directory(&paths, "0123456789abcdef");
+        let state_hash = format!(
+            "{:x}",
+            Sha256::digest(paths.state_dir.as_os_str().to_string_lossy().as_bytes())
+        );
         assert_eq!(first, second);
-        assert!(first.starts_with(std::env::temp_dir()));
+        assert_eq!(
+            first,
+            std::env::temp_dir().join(format!("ssh-mountmate-{}", &state_hash[..16]))
+        );
     }
 
     #[cfg(unix)]

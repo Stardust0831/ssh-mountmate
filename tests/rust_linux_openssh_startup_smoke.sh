@@ -12,6 +12,18 @@ gui_pid=""
 window_manager_pid=""
 server_ids=(native-a native-b openssh-a openssh-b)
 interactive_id="interactive-a"
+control_candidates=()
+
+locate_control_socket() {
+  local candidate
+  for candidate in "${control_candidates[@]}"; do
+    if [[ -S "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+  return 1
+}
 
 cleanup() {
   status=$?
@@ -52,7 +64,7 @@ cleanup() {
     fi
   done
   if [[ -n "${XDG_STATE_HOME:-}" ]]; then
-    control="$(find "${XDG_STATE_HOME}/rsshmount/ssh-control" -type s -name '*.sock' -print -quit 2>/dev/null || true)"
+    control="$(locate_control_socket || true)"
     if [[ -n "${control}" ]]; then
       ssh -F "${test_root}/ssh-config" -S "${control}" -O exit local-openssh-a \
         >/dev/null 2>&1 || true
@@ -153,6 +165,15 @@ chmod 600 "${ssh_config}"
 
 config_dir="${XDG_CONFIG_HOME}/rsshmount"
 state_dir="${XDG_STATE_HOME}/rsshmount"
+interactive_digest="$(printf '%s' "${interactive_id}" | sha256sum)"
+interactive_digest="${interactive_digest%% *}"
+state_digest="$(printf '%s' "${state_dir}" | sha256sum)"
+state_digest="${state_digest%% *}"
+control_name="${interactive_digest:0:16}.sock"
+control_candidates=(
+  "${state_dir}/ssh-control/${control_name}"
+  "${TMPDIR:-/tmp}/ssh-mountmate-${state_digest:0:16}/${control_name}"
+)
 mkdir -p "${config_dir}"
 
 jq -n \
@@ -238,7 +259,7 @@ if "${binary}" --mount-id "${interactive_id}"; then
 fi
 shared_ready=false
 for _ in $(seq 1 100); do
-  control="$(find "${state_dir}/ssh-control" -type s -name '*.sock' -print -quit 2>/dev/null || true)"
+  control="$(locate_control_socket || true)"
   if [[ -n "${control}" ]] \
     && ssh -F "${ssh_config}" -S "${control}" -O check local-openssh-a >/dev/null 2>&1; then
     shared_ready=true
