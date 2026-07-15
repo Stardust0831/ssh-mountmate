@@ -188,6 +188,15 @@ Cross-platform considerations:
   `0.4.0-alpha.7`. Re-running the pinned `cargo-about 0.9.1` generator produced exactly those three
   version-line changes and no dependency or license-content changes; the committed inventory now
   matches the generated output byte for byte.
+- Replacement branch run
+  [29382800350](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29382800350)
+  passed quality and all six authoritative Windows, Linux, and macOS x64/ARM64 package,
+  update/rollback, and real SFTP lifecycle jobs on commit `19d096d`.
+- Replacement non-publishing release run
+  [29382809180](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29382809180)
+  passed quality, all six blocking native build/lifecycle jobs including macOS ARM64, and the final
+  release aggregation. The aggregation downloaded exactly six platform ZIPs, generated and checked
+  `SHA256SUMS.txt`, and skipped only the publication step because `publish=false`.
 - Confirmed user-owned untracked files (`issue-1-reply.md` and five screenshots) remain untouched.
 - Accepted the post-release order: Experimental macOS NFS, opt-in system credential protection,
   then reusable interactive SSH. System credential protection remains off by default; enabling it

@@ -13,6 +13,8 @@ This document maps every requirement in `docs/rust-rewrite.md` to current author
 - [29245426903](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29245426903): non-publishing release workflow dry run; release quality gate plus six complete platform packages and exactly six artifacts.
 - [29251143444](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29251143444): six-platform quality/build run with complete legacy migration, real changed-host-key rejection and cleanup, real OpenSSH transport, four concurrent login mounts, two simultaneous bottom-right transfer popups, transfer-center activation, and popup completion on Linux x64/ARM64.
 - [29378614305](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29378614305): current six-platform quality/build run for configurable VFS upload concurrency. All Windows, Linux, and macOS x64/ARM64 jobs passed package smoke tests, update/rollback, active queued-upload package replacement, and real SFTP mount/refresh/upload/unmount lifecycles.
+- [29382800350](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29382800350): stable-version branch gate. Quality and all six authoritative package, update/rollback, and real SFTP lifecycle jobs passed on `19d096d`.
+- [29382809180](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29382809180): non-publishing stable release gate. All six platform jobs were blocking and passed, including macOS ARM64 active-upload package replacement; release aggregation verified exactly six ZIPs and `SHA256SUMS.txt`.
 
 ## Product requirements
 
@@ -50,12 +52,11 @@ This document maps every requirement in `docs/rust-rewrite.md` to current author
 | `cargo fmt --all --check` | Verified in rewrite and release quality jobs. |
 | Zero-warning workspace Clippy | Verified in rewrite and release quality jobs. |
 | Complete workspace tests | Verified in rewrite and release quality jobs and on all six build targets. |
-| Six-platform packages and smoke tests | Verified at 29378614305; the stable release workflow remains the final publication gate. |
+| Six-platform packages and smoke tests | Verified at 29382800350 and the complete non-publishing release workflow 29382809180. |
 | Windows Explorer/ACL/IPC/Toast/tray/taskbar/mount/refresh/upload/update/rollback | Verified. |
 | macOS bundle/notifications/menu bar/Finder/mount/update/rollback | Verified on x64 and ARM64; signing-ready layout is verified with ad-hoc signatures, while production signing/notarization configuration remains a distribution task. |
 | Linux X11/Wayland/notifications/tray/file manager/mount/update/rollback | Verified on x64 and ARM64 where architecture-specific; X11 and Wayland desktop protocol checks run on Ubuntu x64. |
 
 ## Remaining stable release gates
 
-1. Pass a non-publishing `release.yml` run with all six native lifecycle jobs blocking and exact six-archive checksum validation.
-2. Complete the final diff review, refresh PR #11, remove Draft status, and merge the verified commit into `main`.
+1. Complete the final diff review, refresh PR #11, remove Draft status, and merge the verified commit into `main`.
