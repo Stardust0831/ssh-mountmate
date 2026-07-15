@@ -182,14 +182,12 @@ impl ConnectionDraft {
             return PreservedSecretState::Absent;
         };
         let (obscured, credential) = match kind {
-            crate::credential::CredentialKind::Password => (
-                &existing.password_obscured,
-                &existing.password_credential,
-            ),
-            crate::credential::CredentialKind::KeyPassphrase => (
-                &existing.key_pass_obscured,
-                &existing.key_pass_credential,
-            ),
+            crate::credential::CredentialKind::Password => {
+                (&existing.password_obscured, &existing.password_credential)
+            }
+            crate::credential::CredentialKind::KeyPassphrase => {
+                (&existing.key_pass_obscured, &existing.key_pass_credential)
+            }
         };
         if !credential.is_empty() {
             PreservedSecretState::System

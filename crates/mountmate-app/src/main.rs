@@ -3692,7 +3692,8 @@ impl App {
                     column![
                         text(locale.text(TextKey::NoSavedConnections)).size(20),
                         text(match locale {
-                            Locale::English => "Create a connection to mount your first remote folder.",
+                            Locale::English =>
+                                "Create a connection to mount your first remote folder.",
                             Locale::Chinese => "新建连接以挂载第一个远程目录。",
                         })
                         .size(14),
@@ -3702,9 +3703,9 @@ impl App {
                     .spacing(12)
                     .align_x(Center),
                 )
-                    .padding(28)
-                    .width(Fill)
-                    .center_x(Fill),
+                .padding(28)
+                .width(Fill)
+                .center_x(Fill),
             );
         } else {
             for server in &self.servers {
@@ -4696,7 +4697,9 @@ impl App {
         .width(Length::Fixed(260.0));
         let Some(log_view) = &self.log_view else {
             let guidance = match locale {
-                Locale::English => "Choose a connection from the selector above to view its mount log.",
+                Locale::English => {
+                    "Choose a connection from the selector above to view its mount log."
+                }
                 Locale::Chinese => "请从上方选择器选择一个连接以查看其挂载日志。",
             };
             return editor_shell(
@@ -5932,12 +5935,7 @@ fn rollback_credential_storage_change(
     let Some(migration) = migration else {
         return message;
     };
-    rollback_migrations_after_persistence(
-        paths,
-        previous_servers,
-        &migration.migrations,
-        message,
-    )
+    rollback_migrations_after_persistence(paths, previous_servers, &migration.migrations, message)
 }
 
 fn rollback_migrations_after_persistence(
@@ -6022,15 +6020,13 @@ fn migrate_servers_for_storage(
             ));
         };
         let finalized_server = match target {
-            CredentialStorage::System => {
-                migration.finalize_to_system(persisted).map(|server| (server, Vec::new()))
-            }
-            CredentialStorage::Obscure => {
-                migration.finalize_to_obscure(persisted).map(|commit| {
-                    let retired = commit.retired_references().to_vec();
-                    (commit.into_server(), retired)
-                })
-            }
+            CredentialStorage::System => migration
+                .finalize_to_system(persisted)
+                .map(|server| (server, Vec::new())),
+            CredentialStorage::Obscure => migration.finalize_to_obscure(persisted).map(|commit| {
+                let retired = commit.retired_references().to_vec();
+                (commit.into_server(), retired)
+            }),
         };
         match finalized_server {
             Ok((server, retired)) => {
@@ -6072,10 +6068,7 @@ fn persist_and_reload_servers(
     match result {
         Ok(persisted) => Ok(persisted),
         Err(error) => Err(rollback_migrations_after_persistence(
-            paths,
-            original,
-            migrations,
-            error,
+            paths, original, migrations, error,
         )),
     }
 }

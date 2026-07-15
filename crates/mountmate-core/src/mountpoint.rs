@@ -183,10 +183,16 @@ fn windows_drive_in_use(drive: char) -> bool {
 fn system_windows_volume_kind(path: &Path) -> WindowsVolumeKind {
     use std::os::windows::ffi::OsStrExt;
 
-    use windows_sys::Win32::Storage::FileSystem::{
-        GetDriveTypeW, GetVolumePathNameW, DRIVE_CDROM, DRIVE_FIXED, DRIVE_NO_ROOT_DIR,
-        DRIVE_RAMDISK, DRIVE_REMOTE, DRIVE_REMOVABLE, DRIVE_UNKNOWN,
-    };
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetVolumePathNameW};
+
+    // GetDriveTypeW's documented return values are stable Win32 ABI values.
+    const DRIVE_UNKNOWN: u32 = 0;
+    const DRIVE_NO_ROOT_DIR: u32 = 1;
+    const DRIVE_REMOVABLE: u32 = 2;
+    const DRIVE_FIXED: u32 = 3;
+    const DRIVE_REMOTE: u32 = 4;
+    const DRIVE_CDROM: u32 = 5;
+    const DRIVE_RAMDISK: u32 = 6;
 
     let mut input: Vec<u16> = path.as_os_str().encode_wide().collect();
     input.push(0);
@@ -194,9 +200,8 @@ fn system_windows_volume_kind(path: &Path) -> WindowsVolumeKind {
     // accepts a caller-provided buffer, so use the documented maximum path
     // length and leave room for the terminating NUL.
     let mut volume = vec![0u16; 32_768];
-    let resolved = unsafe {
-        GetVolumePathNameW(input.as_ptr(), volume.as_mut_ptr(), volume.len() as u32)
-    };
+    let resolved =
+        unsafe { GetVolumePathNameW(input.as_ptr(), volume.as_mut_ptr(), volume.len() as u32) };
     if resolved == 0 {
         return WindowsVolumeKind::Missing;
     }
@@ -325,10 +330,7 @@ impl<'a> MountpointAllocator<'a> {
                     return Err(MountpointError::WindowsVolumeMissing(parent));
                 }
                 kind => {
-                    return Err(MountpointError::WindowsVolumeUnsupported {
-                        path: parent,
-                        kind,
-                    });
+                    return Err(MountpointError::WindowsVolumeUnsupported { path: parent, kind });
                 }
             }
         } else if self.probe.path_exists(path) && !self.probe.path_is_dir(path) {
@@ -588,9 +590,7 @@ mod tests {
     #[test]
     fn drive_letter_mountpoints_skip_folder_volume_preflight() {
         let mut probe = FakeProbe::default();
-        probe
-            .volumes
-            .insert("z:".into(), WindowsVolumeKind::Remote);
+        probe.volumes.insert("z:".into(), WindowsVolumeKind::Remote);
         let mut allocator = MountpointAllocator::new(PathBuf::from("C:/Users/me"), true, &probe);
 
         assert_eq!(allocator.resolve(&server("Z:")), Ok(PathBuf::from("Z:")));
@@ -599,8 +599,12 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn native_volume_probe_resolves_the_current_windows_volume() {
-        let current = std::env::current_dir().expect("Windows test process has a current directory");
-        assert_ne!(system_windows_volume_kind(&current), WindowsVolumeKind::Missing);
+        let current =
+            std::env::current_dir().expect("Windows test process has a current directory");
+        assert_ne!(
+            system_windows_volume_kind(&current),
+            WindowsVolumeKind::Missing
+        );
     }
 
     #[test]

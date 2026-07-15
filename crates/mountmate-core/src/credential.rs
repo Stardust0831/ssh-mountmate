@@ -387,7 +387,7 @@ pub fn prepare_server_to_system(
 ) -> Result<CredentialMigration, CredentialError> {
     let mut candidate = server.clone();
     let mut changes = Vec::new();
-    let result = (|| {
+    let result = (|| -> Result<(), CredentialError> {
         migrate_obscured_field(
             &mut candidate.password_obscured,
             &mut candidate.password_credential,
@@ -406,15 +406,15 @@ pub fn prepare_server_to_system(
             &reveal,
             &mut changes,
         )?;
-        Ok(CredentialMigration {
+        Ok(())
+    })();
+    match result {
+        Ok(()) => Ok(CredentialMigration {
             candidate,
             changes,
             retired_references: Vec::new(),
             kind: CredentialMigrationKind::ToSystem,
-        })
-    })();
-    match result {
-        Ok(migration) => Ok(migration),
+        }),
         Err(error) => match rollback_changes(store, &changes) {
             Ok(()) => Err(error),
             Err(rollback) => Err(rollback),
