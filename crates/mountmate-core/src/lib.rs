@@ -19,7 +19,9 @@ pub mod update_helper;
 pub mod update_install;
 pub mod update_workflow;
 
-pub use model::{AuthMethod, ConnectionMethod, MountPhase, MountState, ServerConfig, Settings};
+pub use model::{
+    AuthMethod, ConnectionMethod, MountBackend, MountPhase, MountState, ServerConfig, Settings,
+};
 
 pub const APP_NAME: &str = "SSH MountMate";
 pub const APP_ID: &str = "ssh-mountmate";

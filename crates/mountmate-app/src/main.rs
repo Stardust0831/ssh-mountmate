@@ -43,7 +43,8 @@ use mountmate_core::update_helper::{
 };
 use mountmate_core::update_workflow::{PreparedUpdateLaunch, prepare_update_install};
 use mountmate_core::{
-    APP_NAME, AuthMethod, ConnectionMethod, MountState, ServerConfig, Settings, VERSION,
+    APP_NAME, AuthMethod, ConnectionMethod, MountBackend, MountState, ServerConfig, Settings,
+    VERSION,
 };
 #[cfg(windows)]
 use mountmate_platform::NativeWindowHandle;
@@ -678,6 +679,7 @@ struct SettingsDraft {
     dir_cache_time: String,
     buffer_size: String,
     upload_transfers: String,
+    mount_backend: MountBackend,
     startup_all: bool,
     auto_show_transfers: bool,
     auto_check_updates: bool,
@@ -696,6 +698,7 @@ impl SettingsDraft {
             dir_cache_time: settings.dir_cache_time.clone(),
             buffer_size: settings.buffer_size.clone(),
             upload_transfers: settings.vfs_upload_transfers.to_string(),
+            mount_backend: settings.macos_mount_backend,
             startup_all: settings.startup_all,
             auto_show_transfers: settings.auto_show_transfers,
             auto_check_updates: settings.auto_check_updates,
@@ -745,6 +748,7 @@ impl SettingsDraft {
         settings.dir_cache_time = self.dir_cache_time.trim().into();
         settings.buffer_size = self.buffer_size.trim().into();
         settings.vfs_upload_transfers = upload_transfers;
+        settings.macos_mount_backend = self.mount_backend;
         settings.startup_all = self.startup_all;
         settings.auto_show_transfers = self.auto_show_transfers;
         settings.auto_check_updates = self.auto_check_updates;
@@ -819,6 +823,7 @@ enum Message {
     BrowseCacheRoot,
     CacheRootPicked(Option<PathBuf>),
     CacheModeChanged(CacheMode),
+    MountBackendChanged(MountBackend),
     SettingOptionChanged(SettingOption),
     CustomSettingDigitsChanged(String),
     CustomSettingUnitChanged(String),
@@ -1771,6 +1776,11 @@ impl App {
             Message::CacheModeChanged(mode) => {
                 if let Some(draft) = &mut self.settings_draft {
                     draft.cache_mode = mode;
+                }
+            }
+            Message::MountBackendChanged(backend) => {
+                if let Some(draft) = &mut self.settings_draft {
+                    draft.mount_backend = backend;
                 }
             }
             Message::SettingOptionChanged(option) => {
@@ -2749,10 +2759,17 @@ impl App {
     fn dependency_check_task(&self) -> Task<Message> {
         let paths = self.paths.clone();
         let app_root = application_root();
+        let mount_backend = self
+            .settings_draft
+            .as_ref()
+            .map_or(self.settings.macos_mount_backend, |draft| {
+                draft.mount_backend
+            });
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    check_dependencies(&paths, &app_root).map_err(|error| error.to_string())
+                    check_dependencies(&paths, &app_root, mount_backend)
+                        .map_err(|error| error.to_string())
                 })
                 .await
                 .unwrap_or_else(|error| Err(error.to_string()))
@@ -3984,6 +4001,29 @@ impl App {
             .spacing(5),
         ]
         .spacing(12);
+        let mount_backend = if mount_backend_settings_visible(std::env::consts::OS) {
+            column![
+                text(match locale {
+                    Locale::English => "Mount method",
+                    Locale::Chinese => "挂载方式",
+                })
+                .size(20),
+                pick_list(
+                    localized_choices(MountBackend::ALL, locale, Locale::mount_backend),
+                    Some(locale.choice(
+                        draft.mount_backend,
+                        locale.mount_backend(draft.mount_backend),
+                    )),
+                    |backend| Message::MountBackendChanged(backend.value)
+                )
+                .width(Fill),
+                text(mount_backend_help(locale)).size(14),
+            ]
+            .spacing(8)
+            .max_width(640)
+        } else {
+            column![]
+        };
         let cache_limits = row![
             setting_picker(
                 SettingKind::MaxSize,
@@ -4222,6 +4262,7 @@ impl App {
         );
         update_section = update_section.push(row![check, install].spacing(10));
         let content = column![
+            mount_backend,
             cache_profile,
             cache_limits,
             cache_timing,
@@ -5007,6 +5048,21 @@ fn mountpoint_help(locale: Locale) -> &'static str {
 
 fn file_manager_settings_visible(os: &str) -> bool {
     matches!(os, "windows" | "linux" | "macos")
+}
+
+fn mount_backend_settings_visible(os: &str) -> bool {
+    os == "macos"
+}
+
+fn mount_backend_help(locale: Locale) -> &'static str {
+    match locale {
+        Locale::English => {
+            "Experimental built-in NFS uses a loopback-only NFS service and does not require macFUSE or FUSE-T. Filesystem semantics, performance, and cache behavior can differ from FUSE. Changes apply to the next mount and do not interrupt active mounts."
+        }
+        Locale::Chinese => {
+            "实验性的内置 NFS 使用仅限本机回环的 NFS 服务，不需要 macFUSE 或 FUSE-T。文件系统语义、性能和缓存行为可能与 FUSE 不同。设置变更仅影响下一次挂载，不会中断已有挂载。"
+        }
+    }
 }
 
 fn settings_folder_input<'a>(
@@ -5848,6 +5904,28 @@ mod localization_tests {
         assert!(file_manager_settings_visible("macos"));
         assert!(!file_manager_settings_visible("freebsd"));
         assert!(!file_manager_settings_visible("android"));
+        assert!(mount_backend_settings_visible("macos"));
+        assert!(!mount_backend_settings_visible("windows"));
+        assert!(!mount_backend_settings_visible("linux"));
+    }
+
+    #[test]
+    fn nfs_ui_copy_explains_experimental_loopback_and_semantic_differences() {
+        for locale in [Locale::English, Locale::Chinese] {
+            let label = locale.mount_backend(MountBackend::Nfs);
+            let help = mount_backend_help(locale);
+            assert!(label.contains("NFS"));
+            assert!(help.contains("NFS"));
+            assert!(help.contains("FUSE"));
+        }
+        let english = mount_backend_help(Locale::English);
+        assert!(english.contains("loopback-only"));
+        assert!(english.contains("Experimental"));
+        assert!(english.contains("next mount"));
+        let chinese = mount_backend_help(Locale::Chinese);
+        assert!(chinese.contains("回环"));
+        assert!(chinese.contains("实验"));
+        assert!(chinese.contains("下一次挂载"));
     }
 
     #[test]
@@ -6103,17 +6181,15 @@ mod localization_tests {
         let original = Settings {
             cache_root: PathBuf::from("cache"),
             vfs_upload_transfers: 12,
+            macos_mount_backend: MountBackend::Nfs,
             ..Settings::default()
         };
         let draft = SettingsDraft::from_settings(&original);
         assert_eq!(draft.upload_transfers, "12");
-        assert_eq!(
-            draft
-                .build(&original, Locale::English)
-                .unwrap()
-                .vfs_upload_transfers,
-            12
-        );
+        assert_eq!(draft.mount_backend, MountBackend::Nfs);
+        let rebuilt = draft.build(&original, Locale::English).unwrap();
+        assert_eq!(rebuilt.vfs_upload_transfers, 12);
+        assert_eq!(rebuilt.macos_mount_backend, MountBackend::Nfs);
     }
 
     #[test]

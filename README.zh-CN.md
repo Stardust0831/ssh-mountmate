@@ -73,6 +73,12 @@ brew install --cask fuse-t
 
 FUSE-T 可能需要在 `System Settings -> Privacy & Security -> Files and Folders` 中允许 `Network Volumes` 访问。由于它使用 NFS 语义，访问时间和修改时间等行为存在已知差异，请先阅读 [rclone 的 FUSE-T 注意事项](https://rclone.org/commands/rclone_mount/#fuse-t-limitations-caveats-and-notes)。SSH MountMate 不会内置 FUSE-T；FUSE-T 公布的二进制许可还要求商业使用或随商业软件捆绑时另行取得商业许可。
 
+v0.4.0 之后的开发版本还会在 macOS 的“设置 -> 挂载方式”中提供“rclone 内置 NFS
+（实验性）”。这是手动选择的可选后端，rclone 自带的 NFS 服务会被明确限制在本机回环地址，
+不需要 macFUSE 或 FUSE-T。新设置和旧设置迁移仍默认使用 FUSE；修改只影响下一次挂载，
+不会中断已有挂载，NFS 启动失败时也不会静默回退。NFS 的文件系统语义、性能和缓存行为可能
+与 FUSE 不同。无论该 macOS 设置字段为何值，Windows 仍使用 WinFsp，Linux 仍使用 FUSE3。
+
 如果 macOS 因为程序未公证而阻止打开，解压后可以移除 quarantine 属性：
 
 ```bash

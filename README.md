@@ -73,6 +73,14 @@ brew install --cask fuse-t
 
 FUSE-T may require `Network Volumes` access under `System Settings -> Privacy & Security -> Files and Folders`. Its NFS-backed semantics also have documented differences, including access/modification-time behavior; review the [rclone FUSE-T caveats](https://rclone.org/commands/rclone_mount/#fuse-t-limitations-caveats-and-notes). FUSE-T is not bundled with SSH MountMate, and its published binary license requires a separate commercial license for commercial use or bundling.
 
+Development builds after v0.4.0 also expose `Settings -> Mount method -> rclone built-in NFS
+(Experimental)` on macOS. This opt-in backend runs rclone's own NFS service on an explicitly
+loopback-only address and does not require macFUSE or FUSE-T. FUSE remains the default for new and
+migrated settings. Changing the option affects only the next mount, never interrupts an existing
+mount, and never falls back silently if NFS startup fails. NFS filesystem semantics, performance,
+and cache behavior can differ from FUSE. Windows continues to use WinFsp and Linux continues to use
+FUSE3 regardless of this stored macOS setting.
+
 If macOS blocks the downloaded app because it is not notarized, remove the quarantine attribute after unzipping:
 
 ```bash

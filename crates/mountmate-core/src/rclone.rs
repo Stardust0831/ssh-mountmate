@@ -10,7 +10,7 @@ use crate::model::{AuthMethod, ConnectionMethod};
 use crate::paths::AppPaths;
 use crate::ssh::{ResolvedSshConfig, readable_file, validate_host_alias};
 use crate::storage::{FileLock, StorageError, atomic_write};
-use crate::{ServerConfig, Settings};
+use crate::{MountBackend, ServerConfig, Settings};
 
 #[derive(Debug, Error)]
 pub enum RcloneConfigError {
@@ -265,12 +265,45 @@ pub struct MountCommand<'a> {
     pub rc_addr: &'a str,
     pub rc_user: &'a str,
     pub rc_pass: &'a str,
-    pub windows: bool,
+    pub platform: MountPlatform,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountPlatform {
+    Windows,
+    Macos,
+    Linux,
+    Other,
+}
+
+impl MountPlatform {
+    pub const fn current() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else if cfg!(target_os = "macos") {
+            Self::Macos
+        } else if cfg!(target_os = "linux") {
+            Self::Linux
+        } else {
+            Self::Other
+        }
+    }
+
+    pub const fn effective_backend(self, selected: MountBackend) -> MountBackend {
+        if matches!(self, Self::Macos) && matches!(selected, MountBackend::Nfs) {
+            MountBackend::Nfs
+        } else {
+            MountBackend::Fuse
+        }
+    }
 }
 
 impl MountCommand<'_> {
     pub fn build(&self) -> Vec<String> {
         let cache_mode = self.server.effective_cache_mode(self.settings);
+        let backend = self
+            .platform
+            .effective_backend(self.settings.macos_mount_backend);
         let mut command = vec![
             self.rclone.display().to_string(),
             "--config".into(),
@@ -282,7 +315,10 @@ impl MountCommand<'_> {
             self.rc_user.into(),
             "--rc-pass".into(),
             self.rc_pass.into(),
-            "mount".into(),
+            match backend {
+                MountBackend::Fuse => "mount".into(),
+                MountBackend::Nfs => "nfsmount".into(),
+            },
             self.remote.into(),
             self.mountpoint.display().to_string(),
             "--vfs-fast-fingerprint".into(),
@@ -298,6 +334,9 @@ impl MountCommand<'_> {
             "--transfers".into(),
             self.settings.vfs_upload_transfers.to_string(),
         ];
+        if backend == MountBackend::Nfs {
+            command.extend(["--addr".into(), "127.0.0.1:0".into()]);
+        }
         push_option(
             &mut command,
             "--vfs-cache-max-size",
@@ -326,7 +365,10 @@ impl MountCommand<'_> {
             &self.settings.dir_cache_time,
         );
         push_option(&mut command, "--buffer-size", &self.settings.buffer_size);
-        if self.windows && self.server.network_mode && is_windows_drive(self.mountpoint) {
+        if self.platform == MountPlatform::Windows
+            && self.server.network_mode
+            && is_windows_drive(self.mountpoint)
+        {
             command.push("--network-mode".into());
         }
         command
@@ -411,7 +453,7 @@ mod tests {
             rc_addr: "127.0.0.1:1234",
             rc_user: "mountmate",
             rc_pass: "secret",
-            windows: true,
+            platform: MountPlatform::Windows,
         }
         .build()
     }
@@ -465,7 +507,7 @@ mod tests {
             vfs_upload_transfers: 12,
             ..Settings::default()
         };
-        for windows in [false, true] {
+        for platform in [MountPlatform::Linux, MountPlatform::Windows] {
             let command = MountCommand {
                 rclone: Path::new("rclone"),
                 config: Path::new("rclone.conf"),
@@ -478,7 +520,7 @@ mod tests {
                 rc_addr: "127.0.0.1:1234",
                 rc_user: "mountmate",
                 rc_pass: "secret",
-                windows,
+                platform,
             }
             .build();
             assert_eq!(
@@ -496,6 +538,84 @@ mod tests {
     fn write_back_is_not_passed_for_non_write_cache_modes() {
         let command = command("off");
         assert!(!command.contains(&"--vfs-write-back".into()));
+    }
+
+    #[test]
+    fn mount_backend_command_is_platform_scoped() {
+        let server = ServerConfig {
+            id: "alpha".into(),
+            name: "Alpha".into(),
+            ..ServerConfig::default()
+        };
+        for (platform, selected, expected) in [
+            (MountPlatform::Macos, MountBackend::Fuse, "mount"),
+            (MountPlatform::Macos, MountBackend::Nfs, "nfsmount"),
+            (MountPlatform::Windows, MountBackend::Nfs, "mount"),
+            (MountPlatform::Linux, MountBackend::Nfs, "mount"),
+        ] {
+            let settings = Settings {
+                macos_mount_backend: selected,
+                ..Settings::default()
+            };
+            let command = MountCommand {
+                rclone: Path::new("rclone"),
+                config: Path::new("rclone.conf"),
+                server: &server,
+                settings: &settings,
+                remote: "alpha:",
+                mountpoint: Path::new("/mnt/alpha"),
+                cache_dir: Path::new("cache"),
+                log_path: Path::new("alpha.log"),
+                rc_addr: "127.0.0.1:1234",
+                rc_user: "mountmate",
+                rc_pass: "secret",
+                platform,
+            }
+            .build();
+            assert_eq!(command[10], expected);
+        }
+    }
+
+    #[test]
+    fn macos_nfs_keeps_rc_cache_writeback_and_log_arguments_on_loopback() {
+        let server = ServerConfig {
+            id: "alpha".into(),
+            name: "Alpha".into(),
+            ..ServerConfig::default()
+        };
+        let settings = Settings {
+            macos_mount_backend: MountBackend::Nfs,
+            ..Settings::default()
+        };
+        let command = MountCommand {
+            rclone: Path::new("rclone"),
+            config: Path::new("rclone.conf"),
+            server: &server,
+            settings: &settings,
+            remote: "alpha:",
+            mountpoint: Path::new("/mnt/alpha"),
+            cache_dir: Path::new("cache"),
+            log_path: Path::new("alpha.log"),
+            rc_addr: "127.0.0.1:1234",
+            rc_user: "mountmate",
+            rc_pass: "secret",
+            platform: MountPlatform::Macos,
+        }
+        .build();
+        for expected in [
+            ["--rc-addr", "127.0.0.1:1234"],
+            ["--cache-dir", "cache"],
+            ["--log-file", "alpha.log"],
+            ["--vfs-cache-mode", "full"],
+            ["--vfs-write-back", "5s"],
+            ["--dir-cache-time", "5m"],
+            ["--addr", "127.0.0.1:0"],
+        ] {
+            assert!(command.windows(2).any(|pair| pair == expected));
+        }
+        assert!(command.contains(&"--links".into()));
+        assert!(command.contains(&"--volname".into()));
+        assert!(!command.iter().any(|value| value == "0.0.0.0"));
     }
 
     #[test]

@@ -17,6 +17,9 @@ This document maps every requirement in `docs/rust-rewrite.md` to current author
 - [29382809180](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29382809180): non-publishing stable release gate. All six platform jobs were blocking and passed, including macOS ARM64 active-upload package replacement; release aggregation verified exactly six ZIPs and `SHA256SUMS.txt`.
 - [29393569520](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29393569520): final stable branch gate on `b54be59`. Quality and all six native package, update/rollback, active-upload, real SFTP, and platform integration jobs passed.
 - [29393569262](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29393569262): final non-publishing release gate. Tests exercised the exact final standalone Windows/Linux ZIPs and macOS application ZIPs; all six jobs and exact six-archive checksum aggregation passed.
+- [29395079259](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29395079259): formal
+  v0.4.0 tag run. Quality, all six native lifecycle jobs, final six-ZIP aggregation, checksum
+  validation, and non-prerelease GitHub Release publication passed from merge commit `e2b222f`.
 
 ## Product requirements
 

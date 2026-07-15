@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::MountState;
+use crate::{MountBackend, MountState};
 
 pub fn normalize_command(value: &str) -> String {
     value.replace('\\', "/").to_lowercase()
@@ -8,12 +8,38 @@ pub fn normalize_command(value: &str) -> String {
 
 pub fn command_looks_like_rclone_mount(command: &str) -> bool {
     let command = normalize_command(command);
-    command.contains("rclone") && command.split_whitespace().any(|part| part == "mount")
+    let mut arguments = command.split_whitespace();
+    arguments.next().is_some_and(is_rclone_executable_token) && arguments.any(is_mount_subcommand)
+}
+
+fn is_rclone_executable_token(value: &str) -> bool {
+    let value = value.trim_matches(['\'', '"']);
+    value
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| matches!(name, "rclone" | "rclone.exe"))
+}
+
+fn is_mount_subcommand(value: &str) -> bool {
+    matches!(value, "mount" | "nfsmount")
+}
+
+fn backend_subcommand(backend: MountBackend) -> &'static str {
+    match backend {
+        MountBackend::Fuse => "mount",
+        MountBackend::Nfs => "nfsmount",
+    }
 }
 
 pub fn command_matches_state(command: &str, state: &MountState, require_log: bool) -> bool {
     let command = normalize_command(command);
     if !command_looks_like_rclone_mount(&command) {
+        return false;
+    }
+    if !command
+        .split_whitespace()
+        .any(|argument| argument == backend_subcommand(state.mount_backend))
+    {
         return false;
     }
     let remote = normalize_command(&state.remote);
@@ -73,7 +99,11 @@ pub fn argv_matches_state(arguments: &[String], state: &MountState, windows: boo
     let mountpoint = normalize(&state.mountpoint.to_string_lossy());
     let log = normalize(&state.log.to_string_lossy());
     let rclone = normalize(&state.rclone.to_string_lossy());
-    let Some(mount_index) = arguments.iter().position(|value| value == "mount") else {
+    let expected_subcommand = backend_subcommand(state.mount_backend);
+    let Some(mount_index) = arguments
+        .iter()
+        .position(|value| value == expected_subcommand)
+    else {
         return false;
     };
     let identity_matches = arguments.get(mount_index + 1) == Some(&remote)
@@ -107,6 +137,7 @@ mod tests {
             phase: crate::MountPhase::Mounted,
             process_started_at: Some(100),
             rclone: PathBuf::from("rclone"),
+            mount_backend: MountBackend::Fuse,
         }
     }
 
@@ -179,5 +210,39 @@ mod tests {
             &state,
             true
         ));
+    }
+
+    #[test]
+    fn process_recognition_accepts_mount_and_nfsmount_as_exact_subcommands() {
+        assert!(command_looks_like_rclone_mount(
+            "rclone mount alpha: /mnt/alpha"
+        ));
+        assert!(command_looks_like_rclone_mount(
+            "rclone nfsmount alpha: /mnt/alpha"
+        ));
+        assert!(!command_looks_like_rclone_mount(
+            "/tmp/rclone-mount-helper alpha: /mnt/alpha"
+        ));
+        assert!(!command_looks_like_rclone_mount(
+            "rclone copy /tmp/nfsmount/report.txt remote:"
+        ));
+    }
+
+    #[test]
+    fn argv_identity_requires_the_backend_recorded_in_state() {
+        let mut nfs = state();
+        nfs.mount_backend = MountBackend::Nfs;
+        let arguments = vec![
+            "rclone".into(),
+            "nfsmount".into(),
+            "alpha:folder".into(),
+            "R:".into(),
+            "--log-file".into(),
+            "C:/State/alpha.log".into(),
+        ];
+        assert!(argv_matches_state(&arguments, &nfs, true));
+
+        nfs.mount_backend = MountBackend::Fuse;
+        assert!(!argv_matches_state(&arguments, &nfs, true));
     }
 }

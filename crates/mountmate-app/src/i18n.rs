@@ -2,7 +2,7 @@ use std::fmt;
 
 use mountmate_core::connection::{ConnectionSource, ImportAction, ImportStatus};
 use mountmate_core::rc::RefreshResult;
-use mountmate_core::{AuthMethod, ConnectionMethod};
+use mountmate_core::{AuthMethod, ConnectionMethod, MountBackend};
 
 use super::CacheMode;
 
@@ -83,6 +83,15 @@ impl Locale {
             (Self::English, ConnectionMethod::Openssh) => "OpenSSH",
             (Self::Chinese, ConnectionMethod::Native) => "原生 SFTP",
             (Self::Chinese, ConnectionMethod::Openssh) => "OpenSSH",
+        }
+    }
+
+    pub(crate) fn mount_backend(self, value: MountBackend) -> &'static str {
+        match (self, value) {
+            (Self::English, MountBackend::Fuse) => "FUSE (macFUSE / FUSE-T, default)",
+            (Self::English, MountBackend::Nfs) => "rclone built-in NFS (Experimental)",
+            (Self::Chinese, MountBackend::Fuse) => "FUSE（macFUSE / FUSE-T，默认）",
+            (Self::Chinese, MountBackend::Nfs) => "rclone 内置 NFS（实验性）",
         }
     }
 

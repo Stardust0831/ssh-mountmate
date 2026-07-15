@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const SETTINGS_SCHEMA_VERSION: u32 = 10;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 11;
 pub const DEFAULT_VFS_UPLOAD_TRANSFERS: u16 = 4;
 pub const MIN_VFS_UPLOAD_TRANSFERS: u16 = 1;
 pub const MAX_VFS_UPLOAD_TRANSFERS: u16 = 32;
@@ -39,6 +39,10 @@ fn default_dir_cache_time() -> String {
 
 fn default_vfs_upload_transfers() -> u16 {
     DEFAULT_VFS_UPLOAD_TRANSFERS
+}
+
+fn default_mount_backend() -> MountBackend {
+    MountBackend::Fuse
 }
 
 fn default_true() -> bool {
@@ -83,6 +87,27 @@ impl fmt::Display for ConnectionMethod {
         formatter.write_str(match self {
             Self::Native => "Native SFTP",
             Self::Openssh => "OpenSSH",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MountBackend {
+    #[default]
+    Fuse,
+    Nfs,
+}
+
+impl MountBackend {
+    pub const ALL: [Self; 2] = [Self::Fuse, Self::Nfs];
+}
+
+impl fmt::Display for MountBackend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Fuse => "FUSE",
+            Self::Nfs => "rclone built-in NFS (Experimental)",
         })
     }
 }
@@ -267,6 +292,8 @@ pub struct Settings {
     pub buffer_size: String,
     #[serde(default = "default_vfs_upload_transfers")]
     pub vfs_upload_transfers: u16,
+    #[serde(default = "default_mount_backend")]
+    pub macos_mount_backend: MountBackend,
     #[serde(default)]
     pub startup_all: bool,
     #[serde(default = "default_true")]
@@ -298,6 +325,7 @@ impl Default for Settings {
             dir_cache_time: default_dir_cache_time(),
             buffer_size: String::new(),
             vfs_upload_transfers: default_vfs_upload_transfers(),
+            macos_mount_backend: default_mount_backend(),
             startup_all: false,
             auto_show_transfers: true,
             auto_check_updates: true,
@@ -393,6 +421,8 @@ pub struct MountState {
     pub process_started_at: Option<u64>,
     #[serde(default)]
     pub rclone: PathBuf,
+    #[serde(default = "default_mount_backend")]
+    pub mount_backend: MountBackend,
 }
 
 #[cfg(test)]
@@ -481,6 +511,34 @@ mod tests {
                 .unwrap()
                 .vfs_upload_transfers,
             8
+        );
+    }
+
+    #[test]
+    fn legacy_settings_and_state_default_to_fuse() {
+        let settings: Settings = serde_json::from_str(r#"{"settings_schema_version":10}"#).unwrap();
+        assert_eq!(settings.migrate().macos_mount_backend, MountBackend::Fuse);
+
+        let state: MountState = serde_json::from_str(
+            r#"{"pid":42,"server_id":"alpha","remote":"alpha:","mountpoint":"/tmp/mnt","log":"/tmp/alpha.log","rc_addr":"127.0.0.1:1234"}"#,
+        )
+        .unwrap();
+        assert_eq!(state.mount_backend, MountBackend::Fuse);
+    }
+
+    #[test]
+    fn mount_backend_serializes_as_a_typed_setting() {
+        let settings = Settings {
+            macos_mount_backend: MountBackend::Nfs,
+            ..Settings::default()
+        };
+        let json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(json["macos_mount_backend"], "nfs");
+        assert_eq!(
+            serde_json::from_value::<Settings>(json)
+                .unwrap()
+                .macos_mount_backend,
+            MountBackend::Nfs
         );
     }
 

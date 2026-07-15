@@ -20,7 +20,7 @@ use crate::mountpoint::{path_key, system_mountpoint_ready};
 use crate::paths::AppPaths;
 use crate::process::{MountStatus, argv_matches_state};
 use crate::rc::HttpRcClient;
-use crate::rclone::MountCommand;
+use crate::rclone::{MountCommand, MountPlatform};
 use crate::storage::{FileLock, StorageError, read_json, write_private_json};
 use crate::{MountPhase, MountState, ServerConfig, Settings};
 
@@ -279,6 +279,7 @@ pub struct MountRuntime<'a> {
     mountpoints: &'a dyn MountpointControl,
     options: RuntimeOptions,
     windows: bool,
+    platform: MountPlatform,
 }
 
 impl<'a> MountRuntime<'a> {
@@ -295,6 +296,7 @@ impl<'a> MountRuntime<'a> {
             mountpoints,
             options: RuntimeOptions::default(),
             windows: cfg!(windows),
+            platform: MountPlatform::current(),
         }
     }
 
@@ -357,7 +359,7 @@ impl<'a> MountRuntime<'a> {
             rc_addr: &rc_addr,
             rc_user: &rc_user,
             rc_pass: &rc_pass,
-            windows: self.windows,
+            platform: self.platform,
         }
         .build();
         let arguments = &command[1..];
@@ -381,6 +383,9 @@ impl<'a> MountRuntime<'a> {
             phase: MountPhase::Starting,
             process_started_at,
             rclone: request.rclone.to_owned(),
+            mount_backend: self
+                .platform
+                .effective_backend(request.settings.macos_mount_backend),
         };
         if let Err(error) = self.save_state(&state) {
             let _ = self.stop_if_owned(&state);
@@ -832,6 +837,7 @@ mod tests {
             phase: MountPhase::Mounted,
             process_started_at: Some(100),
             rclone: PathBuf::from("rclone"),
+            mount_backend: crate::MountBackend::Fuse,
         };
         (
             state,

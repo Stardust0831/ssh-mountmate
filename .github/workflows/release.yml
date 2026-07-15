@@ -448,11 +448,17 @@ jobs:
         shell: pwsh
         run: ./tests/rust_windows_mount_smoke.ps1 -PackageRoot (Join-Path $env:RUNNER_TEMP 'shipping-package')
 
-      - name: Exercise real SFTP mount, refresh, upload, and unmount
+      - name: Exercise real macOS FUSE mount lifecycle and performance record
         if: runner.os == 'macOS'
-        timeout-minutes: 5
+        timeout-minutes: 7
         shell: bash
-        run: bash tests/rust_macos_mount_smoke.sh "${RUNNER_TEMP}/shipping-package/SSH MountMate.app"
+        run: bash tests/rust_macos_mount_smoke.sh "${RUNNER_TEMP}/shipping-package/SSH MountMate.app" fuse
+
+      - name: Exercise real macOS NFS mount lifecycle and performance record
+        if: runner.os == 'macOS'
+        timeout-minutes: 7
+        shell: bash
+        run: bash tests/rust_macos_mount_smoke.sh "${RUNNER_TEMP}/shipping-package/SSH MountMate.app" nfs
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

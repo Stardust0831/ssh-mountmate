@@ -168,6 +168,24 @@ Cross-platform considerations:
 
 ### 2026-07-15
 
+- Formal [`v0.4.0`](https://github.com/Stardust0831/ssh-mountmate/releases/tag/v0.4.0)
+  publication completed from merge commit `e2b222f`. Tag run
+  [29395079259](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29395079259)
+  passed quality, all six blocking native package and real-mount jobs, and final aggregation. The
+  release is non-draft and non-prerelease and contains exactly six ZIPs plus `SHA256SUMS.txt`; the
+  manifest matches the release asset digests.
+- Started the post-v0.4.0 extension branch from `origin/main` without touching the user-owned
+  untracked files. Implemented the first local macOS NFS slice: typed `MountBackend`, settings
+  schema 11 with FUSE-compatible defaults, backend-aware state, exact `mount`/`nfsmount` ownership
+  recognition, macOS-only settings UI and dependency behavior, and loopback-only
+  `--addr 127.0.0.1:0`. Windows and Linux force the existing `mount` command.
+- Parameterized the macOS lifecycle script for FUSE and NFS. Both paths retain RC, full VFS cache,
+  write-back, directory cache, logs, links, volume name, and upload concurrency. The suite now also
+  checks mount source, refresh, queued 8 MiB upload and digest, rename/delete, Chinese and spaced
+  names, 500-file enumeration, clean unmount, failed-start cleanup, and non-blocking timing output.
+  Real x64/ARM64 NFS evidence is still pending; this branch must not be merged or released before
+  both architectures pass genuine NFS mounts.
+
 - Began stable `v0.4.0` preparation after explicit approval to merge PR #11 and publish a formal
   release. The stable scope is the verified Rust rewrite plus configurable upload concurrency;
   macOS NFS, system credential protection, interactive SSH reuse, installer work, and server

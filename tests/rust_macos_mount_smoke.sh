@@ -2,6 +2,11 @@
 set -euo pipefail
 
 bundle_input="${1:?packaged SSH MountMate application is required}"
+backend="${2:-fuse}"
+if [[ "$backend" != "fuse" && "$backend" != "nfs" ]]; then
+  echo "unsupported macOS mount backend: $backend" >&2
+  exit 2
+fi
 bundle_parent="$(cd "$(dirname "$bundle_input")" && pwd)"
 source_bundle="$bundle_parent/$(basename "$bundle_input")"
 test_root="$(mktemp -d "${RUNNER_TEMP:-/tmp}/ssh-mountmate-mount-e2e-XXXXXX")"
@@ -60,7 +65,9 @@ test -x "$binary"
 test -x "$rclone"
 cp "$rclone" "$server_rclone"
 chmod 755 "$server_rclone"
-test -e /usr/local/lib/libfuse-t.dylib
+if [[ "$backend" == "fuse" ]]; then
+  test -e /usr/local/lib/libfuse-t.dylib
+fi
 command -v jq >/dev/null
 command -v nc >/dev/null
 export DYLD_FALLBACK_LIBRARY_PATH="/usr/local/lib${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
@@ -125,8 +132,9 @@ jq -n \
     mountpoint: $mountpoint,
     cache_mode: "full"
   }]' >"$config_dir/servers.json"
-jq -n '{
-  settings_schema_version: 8,
+jq -n --arg backend "$backend" '{
+  settings_schema_version: 11,
+  macos_mount_backend: $backend,
   vfs_cache_mode: "full",
   vfs_cache_max_age: "30m",
   vfs_write_back: "90s",
@@ -138,7 +146,19 @@ jq -n '{
 
 "$binary" --mount-id local-sftp
 is_mounted
+mount_line="$(mount | grep -F " on $mountpoint (")"
+if [[ "$backend" == "nfs" ]]; then
+  grep -Eiq '(nfs|localhost|127\.0\.0\.1)' <<<"$mount_line"
+  grep -Eiq '(localhost|127\.0\.0\.1)' <<<"$mount_line"
+else
+  grep -Eiq '(fuse|nfs)' <<<"$mount_line"
+fi
+read_started=$SECONDS
 test "$(cat "$mountpoint/initial.txt")" = 'initial remote content'
+first_read_seconds=$((SECONDS - read_started))
+read_started=$SECONDS
+test "$(cat "$mountpoint/initial.txt")" = 'initial remote content'
+cached_read_seconds=$((SECONDS - read_started))
 
 printf '%s\n' 'created outside the mount' >"$remote_root/remote-new.txt"
 refresh_output="$("$binary" --refresh-path "$mountpoint")"
@@ -149,8 +169,11 @@ for _ in {1..100}; do
 done
 test "$(cat "$mountpoint/remote-new.txt")" = 'created outside the mount'
 
+write_started=$SECONDS
 dd if=/dev/zero of="$mountpoint/upload.bin" bs=1048576 count=8 2>/dev/null
 sync
+sequential_write_seconds=$((SECONDS - write_started))
+upload_started=$SECONDS
 queued_output="$("$binary" --refresh-id local-sftp)"
 grep -F 'local file(s) are still waiting to upload' <<<"$queued_output"
 
@@ -169,6 +192,7 @@ for _ in {1..1200}; do
 done
 test "$(file_size "$remote_root/upload.bin")" -eq $((8 * 1024 * 1024))
 test "$(file_digest "$mountpoint/upload.bin")" = "$(file_digest "$remote_root/upload.bin")"
+remote_upload_seconds=$((SECONDS - upload_started))
 
 completed_output=""
 for _ in {1..100}; do
@@ -183,6 +207,44 @@ if grep -Fq 'still waiting to upload' <<<"$completed_output"; then
   exit 1
 fi
 
+mv "$mountpoint/upload.bin" "$mountpoint/renamed upload.bin"
+for _ in {1..100}; do
+  [[ -f "$remote_root/renamed upload.bin" && ! -e "$remote_root/upload.bin" ]] && break
+  sleep 0.1
+done
+test -f "$remote_root/renamed upload.bin"
+rm "$mountpoint/renamed upload.bin"
+for _ in {1..100}; do
+  [[ ! -e "$remote_root/renamed upload.bin" ]] && break
+  sleep 0.1
+done
+test ! -e "$remote_root/renamed upload.bin"
+
+unicode_name='中文 空格.txt'
+printf '%s\n' 'unicode content' >"$remote_root/$unicode_name"
+"$binary" --refresh-id local-sftp >/dev/null
+for _ in {1..100}; do
+  [[ -f "$mountpoint/$unicode_name" ]] && break
+  sleep 0.1
+done
+test "$(cat "$mountpoint/$unicode_name")" = 'unicode content'
+rm "$mountpoint/$unicode_name"
+for _ in {1..100}; do
+  [[ ! -e "$remote_root/$unicode_name" ]] && break
+  sleep 0.1
+done
+test ! -e "$remote_root/$unicode_name"
+
+mkdir -p "$remote_root/perf-small"
+for index in {1..500}; do
+  printf '%s\n' "$index" >"$remote_root/perf-small/file-$index.txt"
+done
+"$binary" --refresh-id local-sftp --relative-dir perf-small >/dev/null
+enumeration_started=$SECONDS
+small_file_count="$(find "$mountpoint/perf-small" -type f | wc -l | tr -d ' ')"
+enumeration_seconds=$((SECONDS - enumeration_started))
+test "$small_file_count" -eq 500
+
 "$binary" --unmount-id local-sftp
 if is_mounted; then
   echo 'mountpoint remained active after unmount' >&2
@@ -190,5 +252,22 @@ if is_mounted; then
 fi
 test ! -e "$XDG_STATE_HOME/rsshmount/local-sftp.json"
 
-printf 'macOS real mount integration passed: arch=%s bytes=%s\n' \
-  "$(uname -m)" "$(file_size "$remote_root/upload.bin")"
+if [[ "$backend" == "nfs" ]]; then
+  closed_port=$((port + 500))
+  jq --arg closed_port "$closed_port" '.[0].port = $closed_port' \
+    "$config_dir/servers.json" >"$config_dir/servers.failed.json"
+  mv "$config_dir/servers.failed.json" "$config_dir/servers.json"
+  if "$binary" --mount-id local-sftp; then
+    echo 'NFS mount unexpectedly succeeded against a closed SFTP port' >&2
+    exit 1
+  fi
+  test ! -e "$XDG_STATE_HOME/rsshmount/local-sftp.json"
+  if is_mounted; then
+    echo 'failed NFS startup left a stale mount' >&2
+    exit 1
+  fi
+fi
+
+printf 'macOS real mount integration passed: arch=%s backend=%s write_seconds=%s upload_seconds=%s first_read_seconds=%s cached_read_seconds=%s enumerate_500_seconds=%s\n' \
+  "$(uname -m)" "$backend" "$sequential_write_seconds" "$remote_upload_seconds" \
+  "$first_read_seconds" "$cached_read_seconds" "$enumeration_seconds"

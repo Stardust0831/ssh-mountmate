@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
+use crate::MountBackend;
 use crate::paths::AppPaths;
+use crate::rclone::MountPlatform;
 use crate::rclone_binary::{
     RcloneBinaryError, ResolvedRclone, find_system_executable, resolve_rclone,
 };
@@ -32,29 +34,39 @@ impl DependencyStatus {
 pub fn check_dependencies(
     paths: &AppPaths,
     app_root: &Path,
+    selected_backend: MountBackend,
 ) -> Result<DependencyStatus, RcloneBinaryError> {
     let rclone = resolve_rclone(paths, app_root, None)?;
     let openssh = find_system_executable(if cfg!(windows) { "ssh.exe" } else { "ssh" });
+    let (mount_dependency, mount_dependency_installed) =
+        mount_dependency_status(selected_backend, MountPlatform::current());
     Ok(DependencyStatus {
         rclone,
-        mount_dependency: mount_dependency_name(),
-        mount_dependency_installed: mount_dependency_installed(),
+        mount_dependency,
+        mount_dependency_installed,
         openssh,
     })
 }
 
-pub fn mount_dependency_name() -> &'static str {
-    if cfg!(windows) {
-        "WinFsp"
-    } else if cfg!(target_os = "macos") {
-        "macFUSE / FUSE-T"
-    } else {
-        "FUSE"
+pub fn mount_dependency_status(
+    selected_backend: MountBackend,
+    platform: MountPlatform,
+) -> (&'static str, bool) {
+    match platform.effective_backend(selected_backend) {
+        MountBackend::Nfs => ("rclone built-in NFS", true),
+        MountBackend::Fuse => {
+            let name = match platform {
+                MountPlatform::Windows => "WinFsp",
+                MountPlatform::Macos => "macFUSE / FUSE-T",
+                MountPlatform::Linux | MountPlatform::Other => "FUSE",
+            };
+            (name, fuse_dependency_installed())
+        }
     }
 }
 
 #[cfg(windows)]
-fn mount_dependency_installed() -> bool {
+fn fuse_dependency_installed() -> bool {
     ["ProgramFiles", "ProgramFiles(x86)"]
         .into_iter()
         .filter_map(std::env::var_os)
@@ -64,7 +76,7 @@ fn mount_dependency_installed() -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn mount_dependency_installed() -> bool {
+fn fuse_dependency_installed() -> bool {
     [
         "/Library/Filesystems/macfuse.fs",
         "/Library/Filesystems/osxfuse.fs",
@@ -82,14 +94,14 @@ fn mount_dependency_installed() -> bool {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn mount_dependency_installed() -> bool {
+fn fuse_dependency_installed() -> bool {
     Path::new("/dev/fuse").exists()
         && (find_system_executable("fusermount3").is_some()
             || find_system_executable("fusermount").is_some())
 }
 
 #[cfg(not(any(unix, windows)))]
-fn mount_dependency_installed() -> bool {
+fn fuse_dependency_installed() -> bool {
     false
 }
 
@@ -106,5 +118,21 @@ mod tests {
             openssh: None,
         };
         assert_eq!(status.missing(), vec!["rclone", "FUSE", "OpenSSH"]);
+    }
+
+    #[test]
+    fn nfs_skips_fuse_only_on_macos() {
+        assert_eq!(
+            mount_dependency_status(MountBackend::Nfs, MountPlatform::Macos),
+            ("rclone built-in NFS", true)
+        );
+        assert_eq!(
+            mount_dependency_status(MountBackend::Nfs, MountPlatform::Windows).0,
+            "WinFsp"
+        );
+        assert_eq!(
+            mount_dependency_status(MountBackend::Nfs, MountPlatform::Linux).0,
+            "FUSE"
+        );
     }
 }
