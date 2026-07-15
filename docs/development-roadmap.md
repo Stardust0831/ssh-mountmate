@@ -203,6 +203,28 @@ Cross-platform considerations:
   confirms and verifies migration of all existing passwords and key passphrases. Interactive
   one-time codes are never stored. Windows interactive reuse initially supports direct connections
   through packaged official Plink, not complex ProxyJump/ProxyCommand translation.
+- Final stable hardening made packaged update tests layout-aware: Windows/Linux standalone
+  executables are located as onefile payloads and verified by executable SHA-256, while directory
+  bundles and macOS applications retain whole-bundle marker checks. Final-archive mount fixtures
+  now obtain verified rclone through the application's `--rclone-path` contract instead of assuming
+  an adjacent `bin/rclone`. The isolated mount tests preserve the runner's Cargo and Rustup homes so
+  changing the application HOME cannot consume the queued-upload write-back window by reinstalling
+  the toolchain.
+- Fresh Rust 1.97 verification on final commit `b54be59` passed format, warnings-denied workspace
+  Clippy, and the complete workspace suite: 176 core tests passed with one live-network test
+  ignored, legacy migration passed, five platform tests passed, and 38 application tests passed.
+  A locally built embedded-rclone Linux onefile resolved the SHA-256-verified official rclone
+  v1.74.4 into the isolated data directory. The three packaged GUI update scenarios also passed
+  locally against a standalone executable under a virtual graphical session.
+- Final branch run
+  [29393569520](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29393569520)
+  passed quality and all six authoritative Windows, Linux, and macOS x64/ARM64 package,
+  update/rollback, active-upload, real SFTP, and platform integration jobs on `b54be59`.
+- Final non-publishing release run
+  [29393569262](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29393569262)
+  passed quality, all six final-ZIP lifecycle jobs, and release aggregation. The aggregation
+  downloaded exactly six platform archives, generated and verified `SHA256SUMS.txt`, and skipped
+  only publication because `publish=false`.
 
 - Researched and implemented rclone VFS upload concurrency. `--transfers` limits simultaneous
   uploads of different modified cache files and defaults to 4; zero or negative values are

@@ -15,6 +15,8 @@ This document maps every requirement in `docs/rust-rewrite.md` to current author
 - [29378614305](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29378614305): current six-platform quality/build run for configurable VFS upload concurrency. All Windows, Linux, and macOS x64/ARM64 jobs passed package smoke tests, update/rollback, active queued-upload package replacement, and real SFTP mount/refresh/upload/unmount lifecycles.
 - [29382800350](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29382800350): stable-version branch gate. Quality and all six authoritative package, update/rollback, and real SFTP lifecycle jobs passed on `19d096d`.
 - [29382809180](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29382809180): non-publishing stable release gate. All six platform jobs were blocking and passed, including macOS ARM64 active-upload package replacement; release aggregation verified exactly six ZIPs and `SHA256SUMS.txt`.
+- [29393569520](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29393569520): final stable branch gate on `b54be59`. Quality and all six native package, update/rollback, active-upload, real SFTP, and platform integration jobs passed.
+- [29393569262](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29393569262): final non-publishing release gate. Tests exercised the exact final standalone Windows/Linux ZIPs and macOS application ZIPs; all six jobs and exact six-archive checksum aggregation passed.
 
 ## Product requirements
 
@@ -52,14 +54,12 @@ This document maps every requirement in `docs/rust-rewrite.md` to current author
 | `cargo fmt --all --check` | Verified in rewrite and release quality jobs. |
 | Zero-warning workspace Clippy | Verified in rewrite and release quality jobs. |
 | Complete workspace tests | Verified in rewrite and release quality jobs and on all six build targets. |
-| Six-platform packages and smoke tests | Verified at 29382800350 and the complete non-publishing release workflow 29382809180. |
+| Six-platform packages and smoke tests | Verified at final branch run 29393569520 and complete non-publishing release workflow 29393569262. |
 | Windows Explorer/ACL/IPC/Toast/tray/taskbar/mount/refresh/upload/update/rollback | Verified. |
 | macOS bundle/notifications/menu bar/Finder/mount/update/rollback | Verified on x64 and ARM64; signing-ready layout is verified with ad-hoc signatures, while production signing/notarization configuration remains a distribution task. |
 | Linux X11/Wayland/notifications/tray/file manager/mount/update/rollback | Verified on x64 and ARM64 where architecture-specific; X11 and Wayland desktop protocol checks run on Ubuntu x64. |
 
 ## Remaining stable release gates
 
-1. Pass the replacement six-platform branch workflow and non-publishing release workflow for the
-   post-review hardening commit.
-2. Complete the refreshed PR #11 review, merge the verified commit into `main`, and publish the
+1. Complete the refreshed PR #11 review, merge the verified commit into `main`, and publish the
    formal non-prerelease `v0.4.0` from the exact merge commit.
