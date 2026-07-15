@@ -14,7 +14,9 @@ points, and the evidence required before the next prerelease.
 - Immutable release tag commit: `be1b917dc5d527db12964d7e163433116b2d973d`
 - Release URL:
   <https://github.com/Stardust0831/ssh-mountmate/releases/tag/v0.4.1-alpha.1>
-- The extension branch is not merged. Do not merge it without a new explicit user request.
+- The extension branch is currently unmerged. The user authorizes merging it after the requested
+  implementation, review, and required verification are complete; do not merge incomplete or
+  failing work merely because merge permission exists.
 - Do not move, delete, or reuse `v0.4.1-alpha.1`. The next prerelease must use a new version and
   tag, normally `v0.4.1-alpha.2` unless repository state requires another version.
 
@@ -76,7 +78,6 @@ The user explicitly authorized implementing all issues in this handoff and publi
 prerelease after implementation, self-review, and required verification. Do not ask for a second
 release authorization. This does not authorize:
 
-- merging the extension branch;
 - publishing a stable Release;
 - weakening or bypassing Ed25519 checks;
 - moving an existing tag;
@@ -86,6 +87,9 @@ release authorization. This does not authorize:
 Use the protected production-signing Environment normally for the new prerelease. A new production
 public-key confirmation is not required unless the signing key changes. Environment approval and
 all workflow security gates still apply.
+
+The user also explicitly authorizes a branch merge after implementation, self-review, and required
+CI evidence. A merge does not itself authorize a stable Release or bypass prerelease signing gates.
 
 ## Product and platform boundaries
 
@@ -565,4 +569,5 @@ Before creating the next tag:
 - the new annotated tag points to the exact green commit;
 - protected production signing, draft rollback, public metadata, and Ed25519 verification pass;
 - Release is marked prerelease, not stable;
-- the extension branch remains unmerged unless separately authorized.
+- if a branch merge is performed, it contains only the reviewed green changes and preserves the
+  release/tag rules above; merge authorization is already granted.

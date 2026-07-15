@@ -12,7 +12,8 @@
 - 已发布预览版：`v0.4.1-alpha.1`
 - 该 Release 的不可变 tag 提交：`be1b917dc5d527db12964d7e163433116b2d973d`
 - Release：<https://github.com/Stardust0831/ssh-mountmate/releases/tag/v0.4.1-alpha.1>
-- 当前扩展分支尚未合并。除非用户另行明确要求，不要合并回主分支。
+- 当前扩展分支尚未合并。用户已授权在需求实现、自审和必要验证完成后执行分支合并；不能
+  因为已有合并权限，就提前合并未完成或测试失败的代码。
 - 不要移动、删除或复用 `v0.4.1-alpha.1`。下一次预发布应使用新版本和新 tag，通常为
   `v0.4.1-alpha.2`，除非届时代码版本状态要求其他编号。
 
@@ -82,7 +83,6 @@ prerelease，不需要再次请求发布授权。
 
 该授权不包括：
 
-- 合并当前扩展分支；
 - 发布 stable 正式版；
 - 绕过或削弱 Ed25519 验证；
 - 移动已有 tag；
@@ -91,6 +91,9 @@ prerelease，不需要再次请求发布授权。
 
 下一次预发布仍要正常使用受保护的生产签名 Environment。只要生产密钥不变，不需要再次
 确认公钥指纹，但 Environment 审批和全部安全门禁必须保留。
+
+用户也已明确授权：实现、自审和必要 CI 证据完成后，可以执行分支合并。允许合并不等于允许
+发布 stable，也不能绕过 prerelease 签名门禁。
 
 ## 产品和平台边界
 
@@ -522,4 +525,5 @@ cargo test --workspace --all-features
 - annotated tag 指向精确绿色提交；
 - 受保护生产签名、draft rollback、公开 metadata 和 Ed25519 验证通过；
 - Release 标记为 prerelease，不是 stable；
-- 当前扩展分支保持未合并，除非另行授权。
+- 如执行分支合并，只合并已经审阅并通过验证的修改，同时保持本文的 Release/tag 规则；
+  合并权限已经获得。
