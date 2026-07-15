@@ -26,6 +26,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
+          ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: 1.97.0
@@ -124,6 +125,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
+          ref: ${{ inputs.tag || github.ref }}
       - name: Validate release version
         shell: bash
         env:
@@ -521,6 +523,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
+          ref: ${{ inputs.tag || github.ref }}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: release-assets
@@ -585,6 +588,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
+          ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: 1.97.0
@@ -605,7 +609,11 @@ jobs:
           set -euo pipefail
           git fetch --force origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
           tag_commit="$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")"
-          test "${tag_commit}" = "${GITHUB_SHA}"
+          checked_out_commit="$(git rev-parse HEAD)"
+          test "${tag_commit}" = "${checked_out_commit}"
+          if [ "${GITHUB_EVENT_NAME}" = push ]; then
+            test "${tag_commit}" = "${GITHUB_SHA}"
+          fi
 
       - name: Build signing tool before exposing the private key
         run: cargo build --release --package mountmate-core --bin update-signing
