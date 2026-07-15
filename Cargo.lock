@@ -2687,7 +2687,7 @@ dependencies = [
 
 [[package]]
 name = "mountmate-core"
-version = "0.4.1-alpha.1"
+version = "0.4.1-alpha.2"
 dependencies = [
  "base64",
  "configparser",
@@ -2717,7 +2717,7 @@ dependencies = [
 
 [[package]]
 name = "mountmate-platform"
-version = "0.4.1-alpha.1"
+version = "0.4.1-alpha.2"
 dependencies = [
  "mountmate-core",
  "notify-rust",
@@ -4624,7 +4624,7 @@ dependencies = [
 
 [[package]]
 name = "ssh-mountmate"
-version = "0.4.1-alpha.1"
+version = "0.4.1-alpha.2"
 dependencies = [
  "async-channel",
  "gtk",
