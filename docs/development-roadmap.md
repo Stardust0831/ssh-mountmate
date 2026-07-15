@@ -84,6 +84,13 @@ Local verification on 2026-07-15:
   `ed25519-563e14d2c6b880f9` and full public-key SHA-256
   `563e14d2c6b880f9326f71c809a49474ec74cf74ca2347cc5ac3bf6efad27a2a`. Owner confirmation and a
   fresh six-platform run containing that embedded public key remain required before tagging.
+- The first post-key run
+  [29434334267](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29434334267)
+  showed a second ARM runner mirror mode: IPv4 was selected correctly, but the connection to
+  `ports.ubuntu.com:80` dropped during the large GUI dependency download. The immediately preceding
+  run completed the same ARM install, so both workflows now use apt's bounded five-attempt download
+  retry in addition to IPv4. This changes CI bootstrap only; a complete exact-commit rerun is still
+  required.
 
 ## Prerelease scope: `v0.4.0-alpha.7`
 
