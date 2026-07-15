@@ -1631,9 +1631,18 @@ impl App {
             }
             Message::ConnectionMethodChanged(method) => {
                 if let Some(draft) = &mut self.connection_draft {
-                    draft.connection_method = method;
-                    if method != ConnectionMethod::Native {
-                        draft.auth = AuthMethod::Key;
+                    if connection_method_allowed(
+                        draft.source,
+                        draft.ssh_config_managed,
+                        method,
+                        cfg!(windows),
+                    ) {
+                        draft.connection_method = method;
+                        if method != ConnectionMethod::Native {
+                            draft.auth = AuthMethod::Key;
+                        }
+                    } else {
+                        self.status = interactive_ssh_config_unavailable(locale).into();
                     }
                 }
             }
@@ -4102,25 +4111,37 @@ impl App {
             ),
         ]
         .spacing(12);
-        let target = row![
-            connection_input(
-                locale.text(TextKey::IpHost),
-                &draft.host,
-                ConnectionField::Host
-            ),
-            connection_input(
-                locale.text(TextKey::User),
-                &draft.user,
-                ConnectionField::User
-            ),
-            connection_input(
-                locale.text(TextKey::Port),
-                &draft.port,
-                ConnectionField::Port
-            )
-            .width(Length::Fixed(150.0)),
-        ]
-        .spacing(12);
+        let ssh_config_authoritative = draft.source == ConnectionSource::SshConfig
+            && draft.connection_method != ConnectionMethod::Native;
+        let target = if ssh_config_authoritative {
+            row![
+                connection_read_only_field(locale.text(TextKey::IpHost), &draft.host),
+                connection_read_only_field(locale.text(TextKey::User), &draft.user),
+                connection_read_only_field(locale.text(TextKey::Port), &draft.port)
+                    .width(Length::Fixed(150.0)),
+            ]
+            .spacing(12)
+        } else {
+            row![
+                connection_input(
+                    locale.text(TextKey::IpHost),
+                    &draft.host,
+                    ConnectionField::Host
+                ),
+                connection_input(
+                    locale.text(TextKey::User),
+                    &draft.user,
+                    ConnectionField::User
+                ),
+                connection_input(
+                    locale.text(TextKey::Port),
+                    &draft.port,
+                    ConnectionField::Port
+                )
+                .width(Length::Fixed(150.0)),
+            ]
+            .spacing(12)
+        };
         let authentication: Element<'_, Message> =
             if draft.connection_method != ConnectionMethod::Native {
                 let label = if draft.connection_method == ConnectionMethod::Interactive {
@@ -4138,22 +4159,85 @@ impl App {
                 .width(Fill)
                 .into()
             };
+        let interactive_disabled = !connection_method_allowed(
+            draft.source,
+            draft.ssh_config_managed,
+            ConnectionMethod::Interactive,
+            cfg!(windows),
+        );
+        let mut transport_choice = column![pick_list(
+            localized_choices(
+                ConnectionMethod::ALL.into_iter().filter(|method| {
+                    connection_method_allowed(
+                        draft.source,
+                        draft.ssh_config_managed,
+                        *method,
+                        cfg!(windows),
+                    )
+                }),
+                locale,
+                Locale::connection_method,
+            ),
+            Some(locale.choice(
+                draft.connection_method,
+                locale.connection_method(draft.connection_method),
+            )),
+            |method| Message::ConnectionMethodChanged(method.value),
+        )
+        .width(Fill)]
+        .spacing(5);
+        if interactive_disabled {
+            transport_choice = transport_choice
+                .push(text(interactive_ssh_config_unavailable(locale)).size(12));
+        }
         let transport = row![
             labeled_control(
                 locale.text(TextKey::Transport),
-                pick_list(
-                    localized_choices(ConnectionMethod::ALL, locale, Locale::connection_method,),
-                    Some(locale.choice(
-                        draft.connection_method,
-                        locale.connection_method(draft.connection_method),
-                    )),
-                    |method| Message::ConnectionMethodChanged(method.value),
-                )
-                .width(Fill),
+                transport_choice,
             ),
             labeled_control(locale.text(TextKey::Authentication), authentication),
         ]
         .spacing(12);
+
+        if ssh_config_authoritative {
+            ssh_config_controls = ssh_config_controls.push(
+                container(
+                    column![
+                        text(match locale {
+                            Locale::English => "OpenSSH source of truth",
+                            Locale::Chinese => "OpenSSH 权威来源",
+                        })
+                        .size(16),
+                        text(format!(
+                            "{}: {}",
+                            locale.text(TextKey::SshConfigFile),
+                            draft.ssh_config_path
+                        ))
+                        .size(13),
+                        text(format!(
+                            "{}: {}",
+                            locale.text(TextKey::SshHostAlias),
+                            draft.host_alias
+                        ))
+                        .size(13),
+                        text(openssh_command_preview(
+                            &draft.ssh_config_path,
+                            &draft.host_alias
+                        ))
+                        .size(13),
+                        text(match locale {
+                            Locale::English => "The visible resolved fields are only an import snapshot. The actual OpenSSH command remains authoritative and may apply Include, Match, ProxyJump, ProxyCommand, agent, certificate, and token expansion rules not shown here.",
+                            Locale::Chinese => "可见的解析字段只是导入快照。实际 OpenSSH 命令仍是权威来源，并可能应用此处未显示的 Include、Match、ProxyJump、ProxyCommand、代理、证书和令牌展开规则。",
+                        })
+                        .size(12),
+                    ]
+                    .spacing(5),
+                )
+                .padding(10)
+                .width(Fill)
+                .style(container::rounded_box),
+            );
+        }
 
         let mut auth_fields = column![].spacing(12);
         if draft.connection_method == ConnectionMethod::Native {
@@ -5104,6 +5188,13 @@ fn connection_input<'a>(
     )
 }
 
+fn connection_read_only_field<'a>(
+    label: &'a str,
+    value: &'a str,
+) -> iced::widget::Column<'a, Message> {
+    labeled_control(label, container(text(value)).padding(10).width(Fill))
+}
+
 fn secret_input_control<'a>(
     label: &'a str,
     placeholder: &'a str,
@@ -5565,6 +5656,51 @@ fn interactive_auth_help(locale: Locale) -> &'static str {
         (Locale::Chinese, false) => {
             "没有共享 SSH 会话时，挂载会打开 OpenSSH 终端。请在终端完成登录并保持窗口打开，然后再次挂载。一次性验证码不会保存。"
         }
+    }
+}
+
+fn connection_method_allowed(
+    source: ConnectionSource,
+    managed_profile: bool,
+    method: ConnectionMethod,
+    windows: bool,
+) -> bool {
+    !(windows
+        && method == ConnectionMethod::Interactive
+        && (matches!(
+            source,
+            ConnectionSource::SshConfig | ConnectionSource::SshConfigBatch
+        ) || managed_profile))
+}
+
+fn interactive_ssh_config_unavailable(locale: Locale) -> &'static str {
+    match locale {
+        Locale::English => {
+            "Interactive shared SSH is unavailable on Windows for SSH-config or app-managed profiles because Plink cannot preserve the full OpenSSH configuration contract."
+        }
+        Locale::Chinese => {
+            "Windows 上的 SSH config 或应用托管配置不能使用交互式共享 SSH，因为 Plink 无法保留完整的 OpenSSH 配置语义。"
+        }
+    }
+}
+
+fn openssh_command_preview(config_path: &str, host_alias: &str) -> String {
+    format!(
+        "ssh -F {} {}",
+        quote_command_preview_argument(config_path),
+        quote_command_preview_argument(host_alias)
+    )
+}
+
+fn quote_command_preview_argument(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-._/:\\".contains(character))
+    {
+        value.into()
+    } else {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\""))
     }
 }
 
@@ -6785,6 +6921,46 @@ mod localization_tests {
         assert!(summary.contains("key_pass_reference=true"));
         assert!(!summary.contains("password-secret-sentinel"));
         assert!(!summary.contains("credential-secret-sentinel"));
+    }
+
+    #[test]
+    fn windows_filters_interactive_transport_when_openssh_semantics_are_authoritative() {
+        assert!(!connection_method_allowed(
+            ConnectionSource::SshConfig,
+            false,
+            ConnectionMethod::Interactive,
+            true,
+        ));
+        assert!(!connection_method_allowed(
+            ConnectionSource::Manual,
+            true,
+            ConnectionMethod::Interactive,
+            true,
+        ));
+        assert!(connection_method_allowed(
+            ConnectionSource::SshConfig,
+            false,
+            ConnectionMethod::OpenSsh,
+            true,
+        ));
+        assert!(connection_method_allowed(
+            ConnectionSource::SshConfig,
+            false,
+            ConnectionMethod::Interactive,
+            false,
+        ));
+    }
+
+    #[test]
+    fn openssh_command_preview_quotes_unsafe_arguments_without_interpreting_them() {
+        assert_eq!(
+            openssh_command_preview("C:\\Users\\A B\\.ssh\\config", "host alias"),
+            "ssh -F \"C:\\\\Users\\\\A B\\\\.ssh\\\\config\" \"host alias\""
+        );
+        assert_eq!(
+            openssh_command_preview("C:\\Users\\me\\.ssh\\config", "host-a"),
+            "ssh -F C:\\Users\\me\\.ssh\\config host-a"
+        );
     }
 
     #[test]
