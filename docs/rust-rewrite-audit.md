@@ -26,6 +26,12 @@ This document maps every requirement in `docs/rust-rewrite.md` to current author
 - [29404531615](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29404531615): opt-in system
   credential storage run. Quality and all six jobs passed; Windows exercised Credential Manager and
   macOS exercised Keychain round trips. Linux Secret Service remains simulated in tests.
+- [29414771418](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29414771418): final
+  interactive shared-SSH run on `037dd88`. Quality and all six jobs passed. Linux x64/ARM64 opened
+  the terminal login path, verified normal or shortened ControlMaster sockets, mounted through the
+  non-interactive shared connector, and preserved separate interactive/OpenSSH rclone remotes.
+  Windows x64/ARM64 verified fixed-key Plink sharing and completed the real mount lifecycle. Both
+  macOS architectures also retained passing FUSE and loopback-only NFS lifecycle evidence.
 
 ## Product requirements
 
@@ -42,7 +48,7 @@ This document maps every requirement in `docs/rust-rewrite.md` to current author
 | Native x64/ARM64 packages without Python | Verified for portable packages | Six native ZIP packages contain the Rust executable, verified rclone, and notices with no Python runtime. The approved v0.4.0 scope is portable and unsigned; native installers and production signing/notarization remain separate distribution work. |
 | Experimental macOS built-in NFS | Verified as opt-in, not default | Both macOS architectures completed real loopback NFS lifecycles in run 29398901355. Legacy settings and new defaults remain FUSE; Windows/Linux commands are unchanged. Evidence is not yet sufficient to promote NFS to the default. |
 | System credential storage | Verified on Windows/macOS; Linux native service pending | The setting is manually enabled and migrates only passwords/private-key passphrases after write/read verification. Credential Manager and Keychain have real CI evidence; Linux currently has compile and fake-store coverage only. |
-| Interactive shared SSH | Implemented locally; native CI pending | OpenSSH ControlMaster and verified Plink sharing connectors contain no one-time response. Windows is limited to direct manual connections. Linux and Windows real lifecycle scripts are prepared but require authoritative CI evidence before merge. |
+| Interactive shared SSH | Verified on Linux and Windows x64/ARM64 | OpenSSH ControlMaster and verified Plink sharing connectors contain no one-time response. Linux uses owner-only normal or stable shortened sockets and isolates interactive rclone remotes by server ID; both Linux architectures completed real terminal-login, second-request mount, read, and transfer-window lifecycles. Windows remains limited to direct manual connections, but both architectures completed fixed-host-key Plink sharing and real mounts. macOS uses the same OpenSSH implementation and has unit/build coverage; a dedicated macOS interactive-login lifecycle is still a useful follow-up, not a blocker for the verified Linux/Windows scope. |
 
 ## Historical regressions
 

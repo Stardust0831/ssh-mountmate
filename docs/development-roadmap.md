@@ -11,10 +11,11 @@ until its stated evidence exists.
    remains the migration and UI default; Windows WinFsp and Linux FUSE3 remain unchanged.
 3. User-enabled system credential protection is implemented. The default remains compatible
    `rclone obscure` storage until the user confirms and verifies migration.
-4. Complete reusable interactive SSH authentication: OpenSSH ControlMaster on macOS/Linux and
-   verified official Plink connection sharing for direct Windows connections.
-5. Obtain six-platform CI and real Linux/Windows shared-session mount evidence. Do not merge or
-   publish this extension branch until the results are reviewed.
+4. Reusable interactive SSH authentication is implemented. Linux and Windows real lifecycle
+   evidence is complete; macOS shares the tested OpenSSH implementation but does not yet have a
+   dedicated interactive-login lifecycle.
+5. Review the completed six-platform and real Linux/Windows shared-session evidence. Do not merge
+   or publish this extension branch until that separate decision is made.
 6. Keep installer work, Explorer navigation-triggered refresh, complex Windows ProxyJump
    translation, server changes, and production signing/notarization as separate later work.
 
@@ -212,9 +213,16 @@ Cross-platform considerations:
 - Added Linux and Windows real shared-session lifecycle coverage. The Linux suite starts the login
   through the terminal path, verifies the ControlMaster, mounts on the second request, and confirms
   the generated rclone remote uses the exact socket in non-interactive mode. The Windows suite
-  fingerprints the live test host, starts a password-authenticated Plink sharing master, and proves
-  the application mounts through a password-free shared connector. Windows packages and onefile
-  builds now include separately verified Plink payloads and license notices.
+  generates a fixed ECDSA host key, passes its exact public-key blob to Plink `-hostkey`, starts a
+  password-authenticated sharing master, and proves the application mounts through a password-free
+  shared connector. Windows packages and onefile builds now include separately verified Plink
+  payloads and license notices.
+- Hardened interactive OpenSSH startup for desktop portability. `x-terminal-emulator` symlinks are
+  resolved before choosing terminal-specific arguments, xterm/lxterm receive an explicit scalable
+  font, and long state paths use a stable owner-only short ControlMaster socket directory. Imported
+  interactive SSH-config profiles use their unique server ID as the rclone remote name, while
+  ordinary OpenSSH profiles retain the host alias; this prevents the two transports from
+  overwriting the same rclone config section during concurrent startup or remount.
 - Corrected macOS FUSE/NFS performance logging from whole seconds to monotonic milliseconds so
   cached reads and small-file enumeration no longer collapse to misleading zero-second records.
   Fresh Rust 1.97 local verification passed format, zero-warning workspace Clippy, shell and
@@ -223,8 +231,26 @@ Cross-platform considerations:
   fixture passed with three graphical package tests ignored, five platform tests passed, and 42
   application tests passed. The pinned cargo-about 0.9.1 output matched the committed Rust license
   inventory byte for byte. Real official Plink x64/ARM64 downloads matched their pinned SHA-256
-  values, and an embedded x64 payload passed the build-time digest test. Native six-platform CI is
-  still required before acceptance. No Release or merge is authorized from the current work.
+  values, and an embedded x64 payload passed the build-time digest test.
+- Final branch run [29414771418](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29414771418)
+  passed quality and all six authoritative Windows, Linux, and macOS x64/ARM64 jobs on `037dd88`.
+  Linux x64/ARM64 opened the real terminal login path, found the stable shortened ControlMaster
+  socket after checking the normal and fallback locations, mounted `interactive-a:interactive-a`
+  on the second request, read through the mount, retained separate `[interactive-a]` and
+  `[local-openssh-a]` rclone sections, and completed the shared transfer popup lifecycle. Windows
+  x64/ARM64 established verified Plink connection sharing against the generated fixed host key and
+  completed the real mount lifecycle. Quality passed the full workspace format, Clippy, test,
+  license, build, and GUI smoke gates.
+- The same run retained real macOS dual-backend evidence. ARM64 FUSE recorded write 68 ms, upload
+  90481 ms, first read 14 ms, cached read 8 ms, and 500-file enumeration 89 ms; ARM64 NFS recorded
+  116 ms, 90339 ms, 13 ms, 8 ms, and 57 ms. x64 FUSE recorded 658 ms, 90311 ms, 40 ms, 29 ms, and
+  534 ms; x64 NFS recorded 927 ms, 90497 ms, 28 ms, 23 ms, and 271 ms. Upload time includes the
+  intentional 90-second write-back delay and is not a pure backend throughput measurement.
+- Fresh local verification for the final remote-name isolation fix passed format, zero-warning
+  `mountmate-core` Clippy across all targets/features, shell syntax, and the complete core suite:
+  210 unit tests passed with two environment/network tests ignored, legacy migration passed, and
+  the packaged update fixture passed with three graphical package tests ignored. No Release or
+  merge is authorized from the current work.
 
 - Began stable `v0.4.0` preparation after explicit approval to merge PR #11 and publish a formal
   release. The stable scope is the verified Rust rewrite plus configurable upload concurrency;
