@@ -31,13 +31,15 @@ use mountmate_core::credential::{
     migrate_server_to_system, replace_verified, rollback_change,
 };
 use mountmate_core::dependency::{DependencyStatus, check_dependencies};
+use mountmate_core::interactive_ssh::InteractiveSshError;
 use mountmate_core::model::{MAX_VFS_UPLOAD_TRANSFERS, MIN_VFS_UPLOAD_TRANSFERS};
 use mountmate_core::mountpoint::HOME_MOUNTPOINT_VALUE;
 use mountmate_core::paths::AppPaths;
+use mountmate_core::plink_binary::resolve_plink;
 use mountmate_core::process::MountStatus;
 use mountmate_core::rclone::clear_rclone_remote_secrets;
 use mountmate_core::rclone_binary::resolve_rclone;
-use mountmate_core::service::MountService;
+use mountmate_core::service::{MountService, ServiceError};
 use mountmate_core::ssh::{
     default_ssh_config_path, prepare_managed_ssh_server, remove_managed_ssh_server,
 };
@@ -116,6 +118,14 @@ fn run() -> Result<(), String> {
             let resolved = resolve_rclone(&paths, &application_root(), None)
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| "rclone is not available".to_owned())?;
+            println!("{}", resolved.path.display());
+            return Ok(());
+        }
+        LaunchAction::PlinkPath => {
+            let paths = AppPaths::discover();
+            let resolved = resolve_plink(&paths, &application_root())
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "verified Plink is not available".to_owned())?;
             println!("{}", resolved.path.display());
             return Ok(());
         }
@@ -1602,7 +1612,7 @@ impl App {
             Message::ConnectionMethodChanged(method) => {
                 if let Some(draft) = &mut self.connection_draft {
                     draft.connection_method = method;
-                    if method == ConnectionMethod::Openssh {
+                    if method != ConnectionMethod::Native {
                         draft.auth = AuthMethod::Key;
                     }
                 }
@@ -3451,7 +3461,7 @@ impl App {
                                     state.mountpoint.display()
                                 ),
                             })
-                            .map_err(|error| error.to_string())
+                            .map_err(|error| localize_service_error(locale, &error))
                     }
                     MountOperation::Unmount => service
                         .unmount(&id)
@@ -4069,11 +4079,13 @@ impl App {
         ]
         .spacing(12);
         let authentication: Element<'_, Message> =
-            if draft.connection_method == ConnectionMethod::Openssh {
-                container(text(locale.text(TextKey::ManagedByOpenSsh)))
-                    .padding(10)
-                    .width(Fill)
-                    .into()
+            if draft.connection_method != ConnectionMethod::Native {
+                let label = if draft.connection_method == ConnectionMethod::Interactive {
+                    interactive_auth_help(locale)
+                } else {
+                    locale.text(TextKey::ManagedByOpenSsh)
+                };
+                container(text(label)).padding(10).width(Fill).into()
             } else {
                 pick_list(
                     localized_choices(AuthMethod::ALL, locale, Locale::auth_method),
@@ -4453,6 +4465,12 @@ impl App {
                     "OpenSSH: {}",
                     available(dependencies.openssh.is_some())
                 )));
+            if cfg!(windows) {
+                dependency_section = dependency_section.push(text(format!(
+                    "Plink (optional interactive sharing): {}",
+                    available(dependencies.plink.is_some())
+                )));
+            }
         }
         dependency_section = dependency_section.push(
             button(match locale {
@@ -5376,6 +5394,50 @@ fn credential_storage_confirmation(locale: Locale, target: CredentialStorage) ->
         (Locale::Chinese, CredentialStorage::Obscure) => {
             "是否恢复为 rclone obscure 存储？系统凭据会先在本机转换并保存到 SSH MountMate 私有配置，之后才删除凭据库条目。这种方式安全性较低但兼容性更好。"
         }
+    }
+}
+
+fn interactive_auth_help(locale: Locale) -> &'static str {
+    match (locale, cfg!(windows)) {
+        (Locale::English, true) => {
+            "For direct manual connections, Mount opens bundled Plink when no shared session exists. Complete login, keep the window open, then mount again. SSH-config proxies are not supported. One-time codes are never stored."
+        }
+        (Locale::English, false) => {
+            "Mount opens an OpenSSH terminal when no shared session exists. Complete login there, keep it open, then mount again. One-time codes are never stored."
+        }
+        (Locale::Chinese, true) => {
+            "手动直连没有共享会话时，挂载会打开内置 Plink。请完成登录并保持窗口打开，然后再次挂载。暂不支持 SSH config 代理。一次性验证码不会保存。"
+        }
+        (Locale::Chinese, false) => {
+            "没有共享 SSH 会话时，挂载会打开 OpenSSH 终端。请在终端完成登录并保持窗口打开，然后再次挂载。一次性验证码不会保存。"
+        }
+    }
+}
+
+fn localize_service_error(locale: Locale, error: &ServiceError) -> String {
+    if locale == Locale::English {
+        return error.to_string();
+    }
+    match error {
+        ServiceError::InteractiveSsh(InteractiveSshError::LoginStarted) => {
+            "交互式 SSH 登录窗口已打开。请完成 OAuth、2FA 或动态验证码登录并保持窗口打开，然后再次点击挂载。".into()
+        }
+        ServiceError::InteractiveSsh(InteractiveSshError::SessionMissing) => {
+            "交互式 SSH 共享会话不可用。请重新开始交互登录，然后再次挂载。".into()
+        }
+        ServiceError::InteractiveSsh(InteractiveSshError::UnsupportedWindowsSshConfig) => {
+            "Windows 交互式 SSH 目前仅支持手动直连，不支持 SSH config、ProxyJump 或 ProxyCommand 转换。".into()
+        }
+        ServiceError::InteractiveSsh(InteractiveSshError::PlinkMissing) => {
+            "当前 Windows 程序包缺少已校验的 Plink。".into()
+        }
+        ServiceError::InteractiveSsh(InteractiveSshError::OpenSshMissing) => {
+            "未找到 OpenSSH。".into()
+        }
+        ServiceError::InteractiveSsh(InteractiveSshError::TerminalMissing) => {
+            "未找到可用于交互登录的终端程序。".into()
+        }
+        _ => error.to_string(),
     }
 }
 
@@ -6711,6 +6773,18 @@ mod localization_tests {
         assert_eq!(rebuilt.vfs_upload_transfers, 12);
         assert_eq!(rebuilt.macos_mount_backend, MountBackend::Nfs);
         assert_eq!(rebuilt.credential_storage, CredentialStorage::System);
+    }
+
+    #[test]
+    fn interactive_login_states_are_explained_in_chinese() {
+        let started = ServiceError::InteractiveSsh(InteractiveSshError::LoginStarted);
+        assert!(localize_service_error(Locale::Chinese, &started).contains("再次点击挂载"));
+
+        let unsupported =
+            ServiceError::InteractiveSsh(InteractiveSshError::UnsupportedWindowsSshConfig);
+        let message = localize_service_error(Locale::Chinese, &unsupported);
+        assert!(message.contains("手动直连"));
+        assert!(message.contains("ProxyJump"));
     }
 
     #[test]

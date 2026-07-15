@@ -20,6 +20,8 @@ pub enum RcloneConfigError {
     InvalidValue { field: &'static str },
     #[error("SSH config resolution is required for an SSH config connection")]
     MissingResolvedSshConfig,
+    #[error("interactive SSH requires a verified shared-session connector")]
+    MissingInteractiveConnector,
     #[error("invalid rclone config at {path}: {message}")]
     InvalidConfig { path: PathBuf, message: String },
     #[error(transparent)]
@@ -39,6 +41,16 @@ impl RcloneRemote {
         known_hosts: Option<&Path>,
         windows: bool,
     ) -> Result<Self, RcloneConfigError> {
+        Self::for_server_with_external_ssh(server, resolved, known_hosts, windows, None)
+    }
+
+    pub fn for_server_with_external_ssh(
+        server: &ServerConfig,
+        resolved: Option<&ResolvedSshConfig>,
+        known_hosts: Option<&Path>,
+        windows: bool,
+        external_ssh_arguments: Option<&[String]>,
+    ) -> Result<Self, RcloneConfigError> {
         let name = server.remote_name().to_owned();
         validate_remote_name(&name)?;
         let mut options = vec![
@@ -46,8 +58,31 @@ impl RcloneRemote {
             ("shell_type".into(), "unix".into()),
             ("disable_hashcheck".into(), "true".into()),
         ];
-        if server.connection_method == ConnectionMethod::Openssh {
-            options.push(("ssh".into(), openssh_command(server, windows)?));
+        if server.connection_method != ConnectionMethod::Native {
+            let arguments = match server.connection_method {
+                ConnectionMethod::Interactive => external_ssh_arguments
+                    .filter(|arguments| !arguments.is_empty())
+                    .ok_or(RcloneConfigError::MissingInteractiveConnector)?,
+                ConnectionMethod::Openssh => {
+                    if let Some(arguments) = external_ssh_arguments {
+                        arguments
+                    } else {
+                        let ssh = openssh_command(server, windows)?;
+                        options.push(("ssh".into(), ssh));
+                        return Ok(Self { name, options });
+                    }
+                }
+                ConnectionMethod::Native => unreachable!(),
+            };
+            for argument in arguments {
+                validate_scalar(argument, "external SSH argument")?;
+            }
+            let ssh = arguments
+                .iter()
+                .map(|argument| quote_command_argument(argument, windows))
+                .collect::<Vec<_>>()
+                .join(" ");
+            options.push(("ssh".into(), ssh));
             return Ok(Self { name, options });
         }
 
@@ -787,6 +822,78 @@ mod tests {
             .1;
         assert!(command.contains("-F '/home/user/ssh configs/research'"));
         assert!(command.ends_with("cluster"));
+    }
+
+    #[test]
+    fn interactive_remote_uses_only_the_verified_shared_connector() {
+        let server = ServerConfig {
+            id: "interactive".into(),
+            connection_method: ConnectionMethod::Interactive,
+            password_obscured: "must-not-appear".into(),
+            key_pass_obscured: "must-not-appear".into(),
+            ..ServerConfig::default()
+        };
+        let connector = vec![
+            "C:/Program Files/SSH MountMate/plink.exe".into(),
+            "-batch".into(),
+            "-share".into(),
+            "host.example".into(),
+        ];
+        let remote =
+            RcloneRemote::for_server_with_external_ssh(&server, None, None, true, Some(&connector))
+                .unwrap();
+        let ssh = remote
+            .options
+            .iter()
+            .find(|(key, _)| key == "ssh")
+            .map(|(_, value)| value.as_str())
+            .unwrap();
+        assert!(ssh.contains("\"C:/Program Files/SSH MountMate/plink.exe\""));
+        assert!(ssh.contains("-batch -share host.example"));
+        assert!(
+            !remote
+                .options
+                .iter()
+                .any(|(key, _)| { matches!(key.as_str(), "pass" | "key_file" | "key_file_pass") })
+        );
+        assert!(!format!("{remote:?}").contains("must-not-appear"));
+    }
+
+    #[test]
+    fn interactive_remote_never_falls_back_to_a_normal_ssh_process() {
+        let server = ServerConfig {
+            id: "interactive".into(),
+            connection_method: ConnectionMethod::Interactive,
+            ..ServerConfig::default()
+        };
+
+        assert!(matches!(
+            RcloneRemote::for_server(&server, None, None, false),
+            Err(RcloneConfigError::MissingInteractiveConnector)
+        ));
+    }
+
+    #[test]
+    fn interactive_remote_rejects_config_line_injection_in_connector_arguments() {
+        let server = ServerConfig {
+            id: "interactive".into(),
+            connection_method: ConnectionMethod::Interactive,
+            ..ServerConfig::default()
+        };
+        let connector = vec!["ssh".into(), "host\npass = leaked".into()];
+
+        assert!(matches!(
+            RcloneRemote::for_server_with_external_ssh(
+                &server,
+                None,
+                None,
+                false,
+                Some(&connector)
+            ),
+            Err(RcloneConfigError::InvalidValue {
+                field: "external SSH argument"
+            })
+        ));
     }
 
     #[test]

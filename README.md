@@ -14,7 +14,8 @@ It uses rclone for the actual mount operation and provides a small GUI around th
 - Start from an SAI cluster preset and write app-managed SSH config entries.
 - Add connections manually with host, username, port, password, key file, and key passphrase.
 - Optionally copy a selected key into `~/.ssh` and write the copied `IdentityFile` path.
-- Choose the connection method per mount: rclone native SFTP or system OpenSSH.
+- Choose the connection method per mount: rclone native SFTP, system OpenSSH, or an interactive
+  shared SSH session for OAuth/2FA-style login.
 - Store passwords and key passphrases through `rclone obscure`, not as plain text.
 - Check for rclone and platform mount dependencies.
 - Bundle and verify the official rclone binary in release builds.
@@ -138,7 +139,10 @@ Use the latest GitHub Release and download the package for your platform:
 - `SSHMountMate-linux-x64.zip`
 - `SSHMountMate-linux-arm64.zip`
 
-Release builds are produced from the Rust workspace by six native GitHub Actions runners. Windows and Linux ZIPs contain one executable with the verified official rclone embedded. macOS ZIPs contain the native `SSH MountMate.app` bundle with rclone and license notices inside the application.
+Release builds are produced from the Rust workspace by six native GitHub Actions runners. Windows
+and Linux ZIPs contain one executable with the verified official rclone embedded; Windows builds
+also embed the independently verified official Plink used by interactive sharing. macOS ZIPs
+contain the native `SSH MountMate.app` bundle with rclone and license notices inside the application.
 
 Bundled third-party notices can be viewed from Settings or with:
 
@@ -168,7 +172,12 @@ $env:PROCESSOR_ARCHITECTURE
 uname -m
 ```
 
-Use `x64` packages for `AMD64` / `x86_64`, and `arm64` packages for `ARM64` / `arm64` / `aarch64`. Windows and Linux provide one canonical onefile package per architecture; the executable materializes its embedded rclone as a content-addressed managed copy on first use. macOS provides one canonical native `.app` package per architecture. The release matrix intentionally has six ZIPs instead of separate onefile and onedir variants.
+Use `x64` packages for `AMD64` / `x86_64`, and `arm64` packages for `ARM64` / `arm64` / `aarch64`.
+Windows and Linux provide one canonical onefile package per architecture; the executable
+materializes embedded tools as content-addressed managed copies on first use. Windows includes
+rclone and Plink, while Linux includes rclone. macOS provides one canonical native `.app` package
+per architecture. The release matrix intentionally has six ZIPs instead of separate onefile and
+onedir variants.
 
 On macOS, choose the `x64` asset for Intel Macs and `arm64` for Apple Silicon; both contain the native application bundle.
 
@@ -232,10 +241,23 @@ If `Copy key to ~/.ssh` is enabled, the selected private key is copied into `~/.
 
 ## Connection Method
 
-Each saved connection can use one of two methods:
+Each saved connection can use one of three methods:
 
 - `rclone native SFTP`: the default. rclone handles SSH/SFTP itself and can use saved rclone-obscured passwords or key passphrases.
 - `OpenSSH`: rclone calls the system `ssh` command. This is useful for OpenSSH features such as `ProxyJump`, `ProxyCommand`, custom `Include` logic, or system ssh-agent behavior.
+- `Interactive shared SSH`: the first mount attempt opens a terminal for OAuth, 2FA, dynamic
+  password, or other keyboard-interactive authentication. Complete login, keep the terminal open,
+  then click Mount again. rclone receives only a non-interactive connector to the verified shared
+  session; the one-time response is never passed through SSH MountMate arguments or configuration.
+
+On macOS and Linux, interactive sharing uses an OpenSSH ControlMaster socket in a private state
+directory. On Windows, portable packages include the pinned official PuTTY Plink 0.84 binary and
+verify its SHA-256 before using connection sharing. The initial Windows implementation supports
+direct `Manual` connections only; imported SSH-config profiles, `ProxyJump`, and `ProxyCommand`
+translation remain unsupported. Closing the login terminal ends the reusable session, so new
+mounts and capacity probes that need it will ask for login again; already running rclone mounts are
+not automatically unmounted, but they can report transport errors until a shared session is
+re-established.
 
 When `OpenSSH` is selected, SSH MountMate does not save or pass key passphrases to `ssh`. Add passphrase-protected keys to your agent first:
 
@@ -271,6 +293,9 @@ one-time 2FA/OAuth tokens are never stored in the vault. Mounts temporarily hydr
 configuration and remove its secret fields immediately after startup; a cleanup failure stops the
 new mount instead of leaving a misleading protected state. Returning to `rclone obscure` is an
 explicit confirmed migration in the other direction.
+
+Interactive shared SSH deliberately bypasses both stored credential modes. Passwords, OAuth
+responses, and rotating 2FA codes are entered only in the terminal owned by OpenSSH or Plink.
 
 ## Host Key Validation
 

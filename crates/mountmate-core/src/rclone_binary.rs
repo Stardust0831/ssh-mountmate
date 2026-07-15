@@ -37,11 +37,11 @@ pub struct ResolvedRclone {
 
 #[derive(Debug, Error)]
 pub enum RcloneBinaryError {
-    #[error("bundled rclone is missing its SHA-256 manifest: {0}")]
+    #[error("bundled executable is missing its SHA-256 manifest: {0}")]
     MissingManifest(PathBuf),
-    #[error("invalid rclone SHA-256 manifest: {0}")]
+    #[error("invalid executable SHA-256 manifest: {0}")]
     InvalidManifest(PathBuf),
-    #[error("rclone SHA-256 mismatch for {path}: expected {expected}, got {actual}")]
+    #[error("executable SHA-256 mismatch for {path}: expected {expected}, got {actual}")]
     DigestMismatch {
         path: PathBuf,
         expected: String,
@@ -198,7 +198,7 @@ fn materialize_bundled(
     digest: &str,
     windows: bool,
 ) -> Result<PathBuf, RcloneBinaryError> {
-    materialize_verified(paths, digest, windows, |target| {
+    materialize_verified(paths, "rclone", digest, windows, |target| {
         copy_executable(source, target, windows)
     })
 }
@@ -210,13 +210,14 @@ fn materialize_embedded(paths: &AppPaths, windows: bool) -> Result<PathBuf, Rclo
             "embedded:rclone",
         )));
     }
-    materialize_verified(paths, digest, windows, |target| {
+    materialize_verified(paths, "rclone", digest, windows, |target| {
         write_executable_bytes(target, EMBEDDED_RCLONE, windows)
     })
 }
 
-fn materialize_verified(
+pub(crate) fn materialize_verified(
     paths: &AppPaths,
+    name: &str,
     digest: &str,
     windows: bool,
     write: impl FnOnce(&Path) -> Result<(), RcloneBinaryError>,
@@ -224,12 +225,12 @@ fn materialize_verified(
     let directory = paths.managed_bin_dir();
     let suffix = if windows { ".exe" } else { "" };
     let target = directory.join(format!(
-        "rclone-{}{}",
+        "{name}-{}{}",
         &digest[..HASH_PREFIX_LENGTH],
         suffix
     ));
     let _lock = FileLock::acquire(
-        &directory.join(".rclone-materialize.lock"),
+        &directory.join(format!(".{name}-materialize.lock")),
         Duration::from_secs(180),
     )?;
     if target.is_file() && file_sha256(&target)? == digest {
@@ -245,7 +246,7 @@ fn materialize_verified(
         path: directory.clone(),
         source,
     })?;
-    let temporary = directory.join(format!(".rclone.{}.tmp", Uuid::new_v4()));
+    let temporary = directory.join(format!(".{name}.{}.tmp", Uuid::new_v4()));
     let result = write(&temporary)
         .and_then(|()| verify_exact_digest(&temporary, digest))
         .and_then(|()| {
@@ -261,7 +262,11 @@ fn materialize_verified(
     Ok(target)
 }
 
-fn copy_executable(source: &Path, target: &Path, _windows: bool) -> Result<(), RcloneBinaryError> {
+pub(crate) fn copy_executable(
+    source: &Path,
+    target: &Path,
+    _windows: bool,
+) -> Result<(), RcloneBinaryError> {
     let mut input = File::open(source).map_err(|source_error| RcloneBinaryError::Io {
         path: source.to_owned(),
         source: source_error,
@@ -304,7 +309,7 @@ fn copy_executable(source: &Path, target: &Path, _windows: bool) -> Result<(), R
     Ok(())
 }
 
-fn write_executable_bytes(
+pub(crate) fn write_executable_bytes(
     target: &Path,
     payload: &[u8],
     _windows: bool,
@@ -573,17 +578,37 @@ mod tests {
         let paths = paths(temp.path());
         let payload = b"embedded-rclone-test";
         let digest = format!("{:x}", Sha256::digest(payload));
-        let first = materialize_verified(&paths, &digest, cfg!(windows), |target| {
+        let first = materialize_verified(&paths, "rclone", &digest, cfg!(windows), |target| {
             write_executable_bytes(target, payload, cfg!(windows))
         })
         .unwrap();
-        let second = materialize_verified(&paths, &digest, cfg!(windows), |_| {
+        let second = materialize_verified(&paths, "rclone", &digest, cfg!(windows), |_| {
             panic!("an existing verified content-addressed binary must be reused")
         })
         .unwrap();
 
         assert_eq!(first, second);
         assert_eq!(fs::read(first).unwrap(), payload);
+    }
+
+    #[test]
+    fn materialized_tools_with_the_same_digest_remain_separate() {
+        let temp = tempdir().unwrap();
+        let paths = paths(temp.path());
+        let payload = b"shared-test-payload";
+        let digest = format!("{:x}", Sha256::digest(payload));
+        let rclone = materialize_verified(&paths, "rclone", &digest, cfg!(windows), |target| {
+            write_executable_bytes(target, payload, cfg!(windows))
+        })
+        .unwrap();
+        let plink = materialize_verified(&paths, "plink", &digest, cfg!(windows), |target| {
+            write_executable_bytes(target, payload, cfg!(windows))
+        })
+        .unwrap();
+
+        assert_ne!(rclone, plink);
+        assert_eq!(fs::read(rclone).unwrap(), payload);
+        assert_eq!(fs::read(plink).unwrap(), payload);
     }
 
     #[test]

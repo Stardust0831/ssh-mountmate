@@ -81,8 +81,10 @@ impl Locale {
         match (self, value) {
             (Self::English, ConnectionMethod::Native) => "Native SFTP",
             (Self::English, ConnectionMethod::Openssh) => "OpenSSH",
+            (Self::English, ConnectionMethod::Interactive) => "Interactive shared SSH",
             (Self::Chinese, ConnectionMethod::Native) => "原生 SFTP",
             (Self::Chinese, ConnectionMethod::Openssh) => "OpenSSH",
+            (Self::Chinese, ConnectionMethod::Interactive) => "交互式共享 SSH",
         }
     }
 
@@ -683,6 +685,19 @@ mod tests {
         let choice = Locale::Chinese.choice(AuthMethod::Key, "私钥");
         assert_eq!(choice.value, AuthMethod::Key);
         assert_eq!(choice.to_string(), "私钥");
+    }
+
+    #[test]
+    fn interactive_connection_method_has_bilingual_labels() {
+        assert_eq!(ConnectionMethod::ALL.len(), 3);
+        assert_eq!(
+            Locale::English.connection_method(ConnectionMethod::Interactive),
+            "Interactive shared SSH"
+        );
+        assert_eq!(
+            Locale::Chinese.connection_method(ConnectionMethod::Interactive),
+            "交互式共享 SSH"
+        );
     }
 
     #[test]

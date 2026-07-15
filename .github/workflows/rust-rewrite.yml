@@ -83,11 +83,15 @@ jobs:
             rclone_platform: windows
             rclone_arch: amd64
             rclone_sha256: ef097ef9de37a57feb7d9f9c7afb34148ad3c65be8025f1d8f7f521554a701ea
+            plink_arch: w64
+            plink_sha256: e5621ffe4879f0ec39ed40f688db9399c2d43054d41ef14472fa335c4693b915
           - os: windows-11-arm
             artifact: SSHMountMate-rust-windows-arm64
             rclone_platform: windows
             rclone_arch: arm64
             rclone_sha256: 72194ad0aaf210d7a55808801191fecc7e175444dab7be7491b7a63074521f3a
+            plink_arch: wa64
+            plink_sha256: 998011ef455dabbb66c176913ea897a58e176402d53dc01607a5b36610a7f5fa
           - os: macos-15-intel
             artifact: SSHMountMate-rust-macos-x64
             rclone_platform: osx
@@ -118,7 +122,7 @@ jobs:
           toolchain: 1.97.0
       - name: Linux GUI dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dri libgtk-3-dev libayatana-appindicator3-dev zip xvfb xdotool openbox dbus-x11 fuse3 jq kmod openssh-client
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dri libgtk-3-dev libayatana-appindicator3-dev zip xvfb xdotool openbox xterm dbus-x11 fuse3 jq kmod openssh-client
       - name: Install verified FUSE-T for macOS mount integration
         if: runner.os == 'macOS'
         shell: bash
@@ -299,7 +303,7 @@ jobs:
           shasum -a 256 target/release/bin/rclone | awk '{print $1}' > target/release/bin/rclone.sha256
           cp THIRD_PARTY_NOTICES.md licenses/*.txt target/release/
           cp distribution/SSHMountMate.install-layout target/release/
-      - name: Bundle verified rclone
+      - name: Bundle verified rclone and Plink
         if: runner.os == 'Windows'
         shell: pwsh
         env:
@@ -307,6 +311,9 @@ jobs:
           RCLONE_PLATFORM: ${{ matrix.rclone_platform }}
           RCLONE_ARCH: ${{ matrix.rclone_arch }}
           RCLONE_SHA256: ${{ matrix.rclone_sha256 }}
+          PLINK_VERSION: '0.84'
+          PLINK_ARCH: ${{ matrix.plink_arch }}
+          PLINK_SHA256: ${{ matrix.plink_sha256 }}
         run: |
           $archive = "rclone-$env:RCLONE_VERSION-$env:RCLONE_PLATFORM-$env:RCLONE_ARCH.zip"
           $archivePath = Join-Path $env:RUNNER_TEMP $archive
@@ -321,6 +328,11 @@ jobs:
           Copy-Item $binary.FullName target/release/bin/rclone.exe
           (Get-FileHash -Algorithm SHA256 target/release/bin/rclone.exe).Hash.ToLowerInvariant() |
             Set-Content -NoNewline target/release/bin/rclone.exe.sha256
+          $plinkUrl = "https://the.earth.li/~sgtatham/putty/$env:PLINK_VERSION/$env:PLINK_ARCH/plink.exe"
+          Invoke-WebRequest $plinkUrl -OutFile target/release/bin/plink.exe
+          $plinkActual = (Get-FileHash -Algorithm SHA256 target/release/bin/plink.exe).Hash.ToLowerInvariant()
+          if ($plinkActual -ne $env:PLINK_SHA256) { throw "Plink SHA-256 mismatch: $plinkActual" }
+          $plinkActual | Set-Content -NoNewline target/release/bin/plink.exe.sha256
           Copy-Item THIRD_PARTY_NOTICES.md, licenses/*.txt target/release/
           Copy-Item distribution/SSHMountMate.install-layout target/release/
       - name: Assemble and verify macOS application bundle
@@ -389,7 +401,7 @@ jobs:
           $extracted = Join-Path $env:RUNNER_TEMP package-smoke
           New-Item -ItemType Directory -Force "$root/bin", (Split-Path $archive) | Out-Null
           Copy-Item target/release/SSHMountMate.exe "$root/SSHMountMate.exe"
-          Copy-Item target/release/bin/rclone.exe, target/release/bin/rclone.exe.sha256 "$root/bin/"
+          Copy-Item target/release/bin/rclone.exe, target/release/bin/rclone.exe.sha256, target/release/bin/plink.exe, target/release/bin/plink.exe.sha256 "$root/bin/"
           Copy-Item THIRD_PARTY_NOTICES.md, licenses/*.txt, distribution/SSHMountMate.install-layout $root
           Compress-Archive -Path $root -DestinationPath $archive
           Expand-Archive $archive $extracted
@@ -397,6 +409,8 @@ jobs:
           if ($app.ExitCode -ne 0) { throw "packaged SSH MountMate smoke test failed" }
           $rclone = Start-Process -FilePath "$extracted/SSHMountMate/bin/rclone.exe" -ArgumentList 'version' -Wait -PassThru
           if ($rclone.ExitCode -ne 0) { throw "packaged rclone smoke test failed" }
+          $plink = Start-Process -FilePath "$extracted/SSHMountMate/bin/plink.exe" -ArgumentList '-V' -Wait -PassThru
+          if ($plink.ExitCode -ne 0) { throw "packaged Plink smoke test failed" }
           $python = Get-ChildItem $extracted -Recurse -File | Where-Object { $_.Name -match '^(python|libpython)' -or $_.Extension -eq '.py' }
           if ($python) { throw "packaged archive contains Python runtime files" }
       - name: Build and verify embedded-rclone onefile
@@ -430,6 +444,8 @@ jobs:
         run: |
           $env:SSH_MOUNTMATE_EMBED_RCLONE_PATH = (Resolve-Path 'target/release/bin/rclone.exe').Path
           $env:SSH_MOUNTMATE_EMBED_RCLONE_SHA256 = (Get-Content 'target/release/bin/rclone.exe.sha256' -Raw).Trim()
+          $env:SSH_MOUNTMATE_EMBED_PLINK_PATH = (Resolve-Path 'target/release/bin/plink.exe').Path
+          $env:SSH_MOUNTMATE_EMBED_PLINK_SHA256 = (Get-Content 'target/release/bin/plink.exe.sha256' -Raw).Trim()
           cargo build --release --package ssh-mountmate
           if ($LASTEXITCODE -ne 0) { throw "onefile build failed" }
           New-Item -ItemType Directory -Force target/onefile | Out-Null
@@ -460,6 +476,21 @@ jobs:
           }
           $rclone = Start-Process -FilePath $rclonePath -ArgumentList 'version' -Wait -PassThru
           if ($rclone.ExitCode -ne 0) { throw "materialized onefile rclone failed" }
+          $plinkStdout = Join-Path $env:RUNNER_TEMP 'onefile-plink-path.txt'
+          $plinkApp = Start-Process `
+            -FilePath '.\target\onefile\SSHMountMate.exe' `
+            -ArgumentList '--plink-path' `
+            -RedirectStandardOutput $plinkStdout `
+            -RedirectStandardError $stderr `
+            -Wait -PassThru
+          if ($plinkApp.ExitCode -ne 0) { throw "onefile Plink resolution failed" }
+          $plinkPath = (Get-Content $plinkStdout -Raw).Trim()
+          $plinkActual = (Get-FileHash -Algorithm SHA256 $plinkPath).Hash.ToLowerInvariant()
+          if ($plinkActual -ne $env:SSH_MOUNTMATE_EMBED_PLINK_SHA256) {
+            throw "materialized onefile Plink digest mismatch: $plinkActual"
+          }
+          $plink = Start-Process -FilePath $plinkPath -ArgumentList '-V' -Wait -PassThru
+          if ($plink.ExitCode -ne 0) { throw "materialized onefile Plink failed" }
       - name: Exercise packaged update and rollback
         if: runner.os == 'Linux'
         shell: bash

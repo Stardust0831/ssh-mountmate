@@ -11,6 +11,7 @@ server_pid=""
 gui_pid=""
 window_manager_pid=""
 server_ids=(native-a native-b openssh-a openssh-b)
+interactive_id="interactive-a"
 
 cleanup() {
   status=$?
@@ -44,12 +45,19 @@ cleanup() {
     "${binary}" --unmount-all >/dev/null 2>&1 || true
     "${binary}" --unregister-login-startup >/dev/null 2>&1 || true
   fi
-  for server_id in "${server_ids[@]}"; do
+  for server_id in "${server_ids[@]}" "${interactive_id}"; do
     mountpoint="${mount_root}/${server_id}"
     if mountpoint -q "${mountpoint}"; then
       fusermount3 -u "${mountpoint}" 2>/dev/null || sudo umount "${mountpoint}" 2>/dev/null || true
     fi
   done
+  if [[ -n "${XDG_STATE_HOME:-}" ]]; then
+    control="$(find "${XDG_STATE_HOME}/rsshmount/ssh-control" -type s -name '*.sock' -print -quit 2>/dev/null || true)"
+    if [[ -n "${control}" ]]; then
+      ssh -F "${test_root}/ssh-config" -S "${control}" -O exit local-openssh-a \
+        >/dev/null 2>&1 || true
+    fi
+  fi
   if [[ -n "${server_pid}" ]]; then
     kill "${server_pid}" 2>/dev/null || true
     wait "${server_pid}" 2>/dev/null || true
@@ -207,6 +215,44 @@ for server_id in "${server_ids[@]}"; do
   test "$(cat "${mountpoint}/identity.txt")" = "content from ${server_id}"
   test "$(jq -r '.phase' "${state_dir}/${server_id}.json")" = 'mounted'
 done
+
+mkdir -p "${remote_root}/${interactive_id}" "${mount_root}/${interactive_id}"
+printf '%s\n' "content from ${interactive_id}" >"${remote_root}/${interactive_id}/identity.txt"
+interactive_config="${config_dir}/servers.interactive.json"
+jq \
+  --arg ssh_config "${ssh_config}" \
+  --arg port "${port}" \
+  --arg mountpoint "${mount_root}/${interactive_id}" \
+  '. + [{
+    id: "interactive-a", name: "Interactive A", mode: "ssh_config", source: "ssh_config",
+    host_alias: "local-openssh-a", host: "127.0.0.1", user: "mountmate",
+    port: $port, auth: "key", connection_method: "interactive",
+    ssh_config_path: $ssh_config, remote_path: "interactive-a",
+    mountpoint: $mountpoint, cache_mode: "full"
+  }]' "${config_dir}/servers.json" >"${interactive_config}"
+mv "${interactive_config}" "${config_dir}/servers.json"
+
+if "${binary}" --mount-id "${interactive_id}"; then
+  echo 'interactive mount unexpectedly succeeded before the shared login was established' >&2
+  exit 1
+fi
+shared_ready=false
+for _ in $(seq 1 100); do
+  control="$(find "${state_dir}/ssh-control" -type s -name '*.sock' -print -quit 2>/dev/null || true)"
+  if [[ -n "${control}" ]] \
+    && ssh -F "${ssh_config}" -S "${control}" -O check local-openssh-a >/dev/null 2>&1; then
+    shared_ready=true
+    break
+  fi
+  sleep 0.1
+done
+test "${shared_ready}" == true
+"${binary}" --mount-id "${interactive_id}"
+mountpoint -q "${mount_root}/${interactive_id}"
+test "$(cat "${mount_root}/${interactive_id}/identity.txt")" = "content from ${interactive_id}"
+grep -F '[interactive-a]' "${config_dir}/rclone.conf"
+grep -F "ControlMaster=no" "${config_dir}/rclone.conf"
+grep -F "BatchMode=yes" "${config_dir}/rclone.conf"
 
 rclone_config="${config_dir}/rclone.conf"
 grep -F '[local-openssh-a]' "${rclone_config}"

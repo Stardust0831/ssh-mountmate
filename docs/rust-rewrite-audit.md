@@ -20,6 +20,12 @@ This document maps every requirement in `docs/rust-rewrite.md` to current author
 - [29395079259](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29395079259): formal
   v0.4.0 tag run. Quality, all six native lifecycle jobs, final six-ZIP aggregation, checksum
   validation, and non-prerelease GitHub Release publication passed from merge commit `e2b222f`.
+- [29398901355](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29398901355): post-release
+  extension run. All six jobs passed; macOS x64/ARM64 each exercised real FUSE and loopback-only
+  Experimental NFS mount lifecycles without changing the default backend.
+- [29404531615](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29404531615): opt-in system
+  credential storage run. Quality and all six jobs passed; Windows exercised Credential Manager and
+  macOS exercised Keychain round trips. Linux Secret Service remains simulated in tests.
 
 ## Product requirements
 
@@ -34,6 +40,9 @@ This document maps every requirement in `docs/rust-rewrite.md` to current author
 | Verified update, extraction, staged replacement, health, and rollback | Verified | Unit tests cover URL/digest/size trust, redirect restrictions, archive safety, transaction containment, authenticated health, and rollback. Packaged update/rollback runs on all six targets. |
 | Responsive bilingual GUI, shared transfer window, transfer center, tray/menu bar, notifications, global progress, and file-manager integration | Verified | Native tray/menu bar, notifications, Windows taskbar, macOS Dock, X11/Wayland capability reporting, authenticated IPC, and file-manager registration are exercised. The application now reuses one movable transfer window across mounts and expands it to per-connection details; unit tests verify aggregation, dismissal, unknown-size handling, and truthful completion. |
 | Native x64/ARM64 packages without Python | Verified for portable packages | Six native ZIP packages contain the Rust executable, verified rclone, and notices with no Python runtime. The approved v0.4.0 scope is portable and unsigned; native installers and production signing/notarization remain separate distribution work. |
+| Experimental macOS built-in NFS | Verified as opt-in, not default | Both macOS architectures completed real loopback NFS lifecycles in run 29398901355. Legacy settings and new defaults remain FUSE; Windows/Linux commands are unchanged. Evidence is not yet sufficient to promote NFS to the default. |
+| System credential storage | Verified on Windows/macOS; Linux native service pending | The setting is manually enabled and migrates only passwords/private-key passphrases after write/read verification. Credential Manager and Keychain have real CI evidence; Linux currently has compile and fake-store coverage only. |
+| Interactive shared SSH | Implemented locally; native CI pending | OpenSSH ControlMaster and verified Plink sharing connectors contain no one-time response. Windows is limited to direct manual connections. Linux and Windows real lifecycle scripts are prepared but require authoritative CI evidence before merge. |
 
 ## Historical regressions
 

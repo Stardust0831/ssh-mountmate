@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::MountBackend;
 use crate::paths::AppPaths;
+use crate::plink_binary::resolve_plink;
 use crate::rclone::MountPlatform;
 use crate::rclone_binary::{
     RcloneBinaryError, ResolvedRclone, find_system_executable, resolve_rclone,
@@ -13,6 +14,7 @@ pub struct DependencyStatus {
     pub mount_dependency: &'static str,
     pub mount_dependency_installed: bool,
     pub openssh: Option<PathBuf>,
+    pub plink: Option<PathBuf>,
 }
 
 impl DependencyStatus {
@@ -38,6 +40,7 @@ pub fn check_dependencies(
 ) -> Result<DependencyStatus, RcloneBinaryError> {
     let rclone = resolve_rclone(paths, app_root, None)?;
     let openssh = find_system_executable(if cfg!(windows) { "ssh.exe" } else { "ssh" });
+    let plink = resolve_plink(paths, app_root)?.map(|resolved| resolved.path);
     let (mount_dependency, mount_dependency_installed) =
         mount_dependency_status(selected_backend, MountPlatform::current());
     Ok(DependencyStatus {
@@ -45,6 +48,7 @@ pub fn check_dependencies(
         mount_dependency,
         mount_dependency_installed,
         openssh,
+        plink,
     })
 }
 
@@ -116,6 +120,7 @@ mod tests {
             mount_dependency: "FUSE",
             mount_dependency_installed: false,
             openssh: None,
+            plink: None,
         };
         assert_eq!(status.missing(), vec!["rclone", "FUSE", "OpenSSH"]);
     }

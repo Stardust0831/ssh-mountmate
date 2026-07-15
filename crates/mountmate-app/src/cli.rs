@@ -14,6 +14,7 @@ pub(crate) enum LaunchAction {
     RunUpdateHelper(UpdateHelperAuthorization),
     CheckUpdate,
     RclonePath,
+    PlinkPath,
     RegisterFileManagerMenu,
     UnregisterFileManagerMenu,
     RegisterLoginStartup,
@@ -48,6 +49,7 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Launc
             "--licenses" => Some(LaunchAction::Licenses),
             "--check-update" => Some(LaunchAction::CheckUpdate),
             "--rclone-path" => Some(LaunchAction::RclonePath),
+            "--plink-path" => Some(LaunchAction::PlinkPath),
             "--register-file-manager-menu" | "--register-shell-menu" => {
                 Some(LaunchAction::RegisterFileManagerMenu)
             }
@@ -215,6 +217,7 @@ Usage: SSHMountMate [COMMAND]
   --unregister-login-startup     Remove the user login startup command
   --check-update                 Check GitHub for a verified platform update
   --rclone-path                  Print the verified rclone executable path
+  --plink-path                   Print the verified Windows Plink executable path
   --licenses                     Print bundled third-party notices
   -h, --help                     Print this help
   -V, --version                  Print the version"#
@@ -228,6 +231,8 @@ pub(crate) fn licenses() -> &'static str {
         include_str!("../../../licenses/RUST-THIRD-PARTY.txt"),
         "\n\n--- rclone license ---\n\n",
         include_str!("../../../licenses/rclone-COPYING.txt"),
+        "\n\n--- PuTTY Plink license ---\n\n",
+        include_str!("../../../licenses/putty-LICENCE.txt"),
         "\n\n--- rfd license ---\n\n",
         include_str!("../../../licenses/rfd-LICENSE.txt"),
         "\n\n--- sys-locale license ---\n\n",
@@ -293,6 +298,10 @@ mod tests {
             LaunchAction::RclonePath
         );
         assert_eq!(
+            parse(args(&["--plink-path"])).unwrap(),
+            LaunchAction::PlinkPath
+        );
+        assert_eq!(
             parse(args(&["--register-login-startup"])).unwrap(),
             LaunchAction::RegisterLoginStartup
         );
@@ -328,6 +337,7 @@ mod tests {
         assert!(help().contains("\n  --show-main"));
         assert!(help().contains("\n  --check-update"));
         assert!(help().contains("\n  --rclone-path"));
+        assert!(help().contains("\n  --plink-path"));
         assert!(help().contains("\n  -V, --version"));
         assert!(!help().contains("update-helper"));
         assert!(!help().contains("update-health"));

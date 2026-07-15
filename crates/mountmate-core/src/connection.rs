@@ -193,7 +193,7 @@ impl ConnectionDraft {
         let user = required_scalar(&self.user, "User")?;
         let port = normalize_port(&self.port).ok_or(DraftError::InvalidPort)?;
         let connection_method = self.connection_method;
-        let auth = if connection_method == ConnectionMethod::Openssh {
+        let auth = if connection_method != ConnectionMethod::Native {
             AuthMethod::Key
         } else {
             self.auth
@@ -969,6 +969,25 @@ mod tests {
             ..ConnectionDraft::default()
         };
         assert_eq!(draft.validate(&[]).unwrap().server.auth, AuthMethod::Key);
+    }
+
+    #[test]
+    fn interactive_ssh_does_not_require_or_persist_noninteractive_secrets() {
+        let draft = ConnectionDraft {
+            name: "Interactive".into(),
+            host: "host.example".into(),
+            user: "alice".into(),
+            auth: AuthMethod::Password,
+            password: "one-time-token".into(),
+            key_passphrase: "temporary-passphrase".into(),
+            connection_method: ConnectionMethod::Interactive,
+            ..ConnectionDraft::default()
+        };
+        let validated = draft.validate(&[]).unwrap();
+
+        assert_eq!(validated.server.auth, AuthMethod::Key);
+        assert_eq!(validated.password, SecretAction::Clear);
+        assert_eq!(validated.key_passphrase, SecretAction::Clear);
     }
 
     #[test]

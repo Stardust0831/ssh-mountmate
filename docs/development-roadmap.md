@@ -6,17 +6,16 @@ until its stated evidence exists.
 
 ## Current sequence
 
-1. Prepare the verified Rust rewrite and configurable upload concurrency for stable `v0.4.0`.
-2. Remove the macOS ARM64 release exception, complete a blocking six-platform release dry run,
-   refresh PR #11 evidence, review the final diff, and merge the PR into `main`.
-3. Publish `v0.4.0` from the merge commit as six portable ZIPs plus `SHA256SUMS.txt`.
-4. Implement optional macOS `rclone nfsmount` as an explicit Experimental backend. Keep FUSE as
-   the migration and UI default and keep Windows WinFsp and Linux FUSE3 unchanged.
-5. Add user-enabled system credential protection. The default remains the compatible
-   `rclone obscure` storage until the user confirms migration.
-6. Add reusable interactive SSH authentication: OpenSSH ControlMaster on macOS/Linux and verified
-   official Plink connection sharing for direct Windows connections.
-7. Keep installer work, Explorer navigation-triggered refresh, complex Windows ProxyJump
+1. Stable `v0.4.0` publication is complete from the verified merge commit.
+2. Optional macOS `rclone nfsmount` is implemented as an explicit Experimental backend. FUSE
+   remains the migration and UI default; Windows WinFsp and Linux FUSE3 remain unchanged.
+3. User-enabled system credential protection is implemented. The default remains compatible
+   `rclone obscure` storage until the user confirms and verifies migration.
+4. Complete reusable interactive SSH authentication: OpenSSH ControlMaster on macOS/Linux and
+   verified official Plink connection sharing for direct Windows connections.
+5. Obtain six-platform CI and real Linux/Windows shared-session mount evidence. Do not merge or
+   publish this extension branch until the results are reviewed.
+6. Keep installer work, Explorer navigation-triggered refresh, complex Windows ProxyJump
    translation, server changes, and production signing/notarization as separate later work.
 
 ## Prerelease scope: `v0.4.0-alpha.7`
@@ -198,7 +197,34 @@ Cross-platform considerations:
   provider for passwords and private-key passphrases only, verifies every write by reading it back,
   rolls back overwritten credentials when connection persistence fails, and scrubs old and
   temporary rclone config secrets. Private keys and one-time authentication codes are excluded.
-  Native Keychain/Credential Manager CI and complete six-platform regression evidence are pending.
+  Branch run [29404531615](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29404531615)
+  passed quality and all six native jobs on `63cd1bf`. Windows x64/ARM64 exercised Credential
+  Manager round trips and macOS x64/ARM64 exercised Keychain round trips. Linux Secret Service
+  remains covered by compilation and fake-store tests because the workflow does not yet provide a
+  real user Secret Service daemon.
+- Implemented the first local interactive shared-SSH slice. `ConnectionMethod::Interactive` is
+  typed and opt-in. macOS/Linux use per-connection OpenSSH ControlMaster sockets under owner-only
+  state directories, explicitly force `BatchMode=no` for the login master and `BatchMode=yes` for
+  rclone reuse, and open the platform terminal without storing authentication responses. Windows
+  packages pin official Plink 0.84 for x64/ARM64, verify it before packaging/materialization, and
+  use `-shareexists` plus `-batch -share` only for direct manual connections. SSH-config and proxy
+  translation are rejected explicitly on Windows.
+- Added Linux and Windows real shared-session lifecycle coverage. The Linux suite starts the login
+  through the terminal path, verifies the ControlMaster, mounts on the second request, and confirms
+  the generated rclone remote uses the exact socket in non-interactive mode. The Windows suite
+  fingerprints the live test host, starts a password-authenticated Plink sharing master, and proves
+  the application mounts through a password-free shared connector. Windows packages and onefile
+  builds now include separately verified Plink payloads and license notices.
+- Corrected macOS FUSE/NFS performance logging from whole seconds to monotonic milliseconds so
+  cached reads and small-file enumeration no longer collapse to misleading zero-second records.
+  Fresh Rust 1.97 local verification passed format, zero-warning workspace Clippy, shell and
+  PowerShell syntax parsing, workflow YAML parsing, and the complete workspace suite: 205 core
+  tests passed with two environment/network tests ignored, legacy migration passed, one packaged
+  fixture passed with three graphical package tests ignored, five platform tests passed, and 42
+  application tests passed. The pinned cargo-about 0.9.1 output matched the committed Rust license
+  inventory byte for byte. Real official Plink x64/ARM64 downloads matched their pinned SHA-256
+  values, and an embedded x64 payload passed the build-time digest test. Native six-platform CI is
+  still required before acceptance. No Release or merge is authorized from the current work.
 
 - Began stable `v0.4.0` preparation after explicit approval to merge PR #11 and publish a formal
   release. The stable scope is the verified Rust rewrite plus configurable upload concurrency;

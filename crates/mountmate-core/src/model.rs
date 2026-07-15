@@ -80,10 +80,11 @@ pub enum ConnectionMethod {
     #[default]
     Native,
     Openssh,
+    Interactive,
 }
 
 impl ConnectionMethod {
-    pub const ALL: [Self; 2] = [Self::Native, Self::Openssh];
+    pub const ALL: [Self; 3] = [Self::Native, Self::Openssh, Self::Interactive];
 }
 
 impl fmt::Display for ConnectionMethod {
@@ -91,6 +92,7 @@ impl fmt::Display for ConnectionMethod {
         formatter.write_str(match self {
             Self::Native => "Native SFTP",
             Self::Openssh => "OpenSSH",
+            Self::Interactive => "Interactive shared SSH",
         })
     }
 }
@@ -585,6 +587,26 @@ mod tests {
         };
         let json = serde_json::to_value(&settings).unwrap();
         assert_eq!(json["credential_storage"], "system");
+    }
+
+    #[test]
+    fn interactive_connection_method_is_typed_and_opt_in() {
+        let legacy: ServerConfig = serde_json::from_str(r#"{"id":"legacy"}"#).unwrap();
+        assert_eq!(legacy.connection_method, ConnectionMethod::Native);
+
+        let interactive = ServerConfig {
+            id: "interactive".into(),
+            connection_method: ConnectionMethod::Interactive,
+            ..ServerConfig::default()
+        };
+        let json = serde_json::to_value(&interactive).unwrap();
+        assert_eq!(json["connection_method"], "interactive");
+        assert_eq!(
+            serde_json::from_value::<ServerConfig>(json)
+                .unwrap()
+                .connection_method,
+            ConnectionMethod::Interactive
+        );
     }
 
     #[test]

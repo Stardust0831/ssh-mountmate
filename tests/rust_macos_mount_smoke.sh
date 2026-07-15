@@ -34,6 +34,11 @@ file_digest() {
   shasum -a 256 "$1" | awk '{print $1}'
 }
 
+monotonic_ms() {
+  perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC \
+    -e 'printf "%.0f\n", 1000 * clock_gettime(CLOCK_MONOTONIC)'
+}
+
 cleanup() {
   status=$?
   if [[ "$status" -ne 0 ]]; then
@@ -153,12 +158,12 @@ if [[ "$backend" == "nfs" ]]; then
 else
   grep -Eiq '(fuse|nfs)' <<<"$mount_line"
 fi
-read_started=$SECONDS
+read_started="$(monotonic_ms)"
 test "$(cat "$mountpoint/initial.txt")" = 'initial remote content'
-first_read_seconds=$((SECONDS - read_started))
-read_started=$SECONDS
+first_read_ms=$(($(monotonic_ms) - read_started))
+read_started="$(monotonic_ms)"
 test "$(cat "$mountpoint/initial.txt")" = 'initial remote content'
-cached_read_seconds=$((SECONDS - read_started))
+cached_read_ms=$(($(monotonic_ms) - read_started))
 
 printf '%s\n' 'created outside the mount' >"$remote_root/remote-new.txt"
 refresh_output="$("$binary" --refresh-path "$mountpoint")"
@@ -169,11 +174,11 @@ for _ in {1..100}; do
 done
 test "$(cat "$mountpoint/remote-new.txt")" = 'created outside the mount'
 
-write_started=$SECONDS
+write_started="$(monotonic_ms)"
 dd if=/dev/zero of="$mountpoint/upload.bin" bs=1048576 count=8 2>/dev/null
 sync
-sequential_write_seconds=$((SECONDS - write_started))
-upload_started=$SECONDS
+sequential_write_ms=$(($(monotonic_ms) - write_started))
+upload_started="$(monotonic_ms)"
 queued_output="$("$binary" --refresh-id local-sftp)"
 grep -F 'local file(s) are still waiting to upload' <<<"$queued_output"
 
@@ -192,7 +197,7 @@ for _ in {1..1200}; do
 done
 test "$(file_size "$remote_root/upload.bin")" -eq $((8 * 1024 * 1024))
 test "$(file_digest "$mountpoint/upload.bin")" = "$(file_digest "$remote_root/upload.bin")"
-remote_upload_seconds=$((SECONDS - upload_started))
+remote_upload_ms=$(($(monotonic_ms) - upload_started))
 
 completed_output=""
 for _ in {1..100}; do
@@ -240,9 +245,9 @@ for index in {1..500}; do
   printf '%s\n' "$index" >"$remote_root/perf-small/file-$index.txt"
 done
 "$binary" --refresh-id local-sftp --relative-dir perf-small >/dev/null
-enumeration_started=$SECONDS
+enumeration_started="$(monotonic_ms)"
 small_file_count="$(find "$mountpoint/perf-small" -type f | wc -l | tr -d ' ')"
-enumeration_seconds=$((SECONDS - enumeration_started))
+enumeration_ms=$(($(monotonic_ms) - enumeration_started))
 test "$small_file_count" -eq 500
 
 "$binary" --unmount-id local-sftp
@@ -268,6 +273,6 @@ if [[ "$backend" == "nfs" ]]; then
   fi
 fi
 
-printf 'macOS real mount integration passed: arch=%s backend=%s write_seconds=%s upload_seconds=%s first_read_seconds=%s cached_read_seconds=%s enumerate_500_seconds=%s\n' \
-  "$(uname -m)" "$backend" "$sequential_write_seconds" "$remote_upload_seconds" \
-  "$first_read_seconds" "$cached_read_seconds" "$enumeration_seconds"
+printf 'macOS real mount integration passed: arch=%s backend=%s write_ms=%s upload_ms=%s first_read_ms=%s cached_read_ms=%s enumerate_500_ms=%s\n' \
+  "$(uname -m)" "$backend" "$sequential_write_ms" "$remote_upload_ms" \
+  "$first_read_ms" "$cached_read_ms" "$enumeration_ms"

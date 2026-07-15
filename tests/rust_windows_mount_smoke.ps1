@@ -12,12 +12,15 @@ Get-ChildItem -LiteralPath $sourcePackageRoot -Force |
   Copy-Item -Destination $packageRoot -Recurse -Force
 $binary = Join-Path $packageRoot 'SSHMountMate.exe'
 $rclone = $null
+$plink = $null
+$plinkMaster = $null
 $serverRclone = Join-Path $testRoot 'server-rclone.exe'
 $remoteRoot = Join-Path $testRoot 'remote'
 $serverLog = Join-Path $testRoot 'sftp-server.log'
 $winFspLog = Join-Path $testRoot 'winfsp-install.log'
 $server = $null
 $mounted = $false
+$mountedId = $null
 $succeeded = $false
 
 function Invoke-SSHMountMate([string[]] $Arguments, [switch] $NoCapture) {
@@ -67,6 +70,8 @@ try {
   if (-not (Test-Path $binary -PathType Leaf)) { throw 'Packaged SSH MountMate is missing' }
   $rclone = (Invoke-SSHMountMate @('--rclone-path')).Trim()
   if (-not (Test-Path $rclone -PathType Leaf)) { throw 'Packaged rclone is missing' }
+  $plink = (Invoke-SSHMountMate @('--plink-path')).Trim()
+  if (-not (Test-Path $plink -PathType Leaf)) { throw 'Packaged Plink is missing' }
   Copy-Item $rclone $serverRclone
   New-Item -ItemType Directory -Force $remoteRoot | Out-Null
   Set-Content -Path (Join-Path $remoteRoot 'initial.txt') -Value 'initial remote content' -NoNewline
@@ -166,6 +171,7 @@ try {
   Write-Host '[windows-mount-e2e] mounting drive'
   Invoke-SSHMountMate -Arguments @('--mount-id', 'local-sftp') -NoCapture | Out-Null
   $mounted = $true
+  $mountedId = 'local-sftp'
   Wait-Until { Test-Path "${mountpoint}\initial.txt" }
   if ((Get-Content "${mountpoint}\initial.txt" -Raw) -ne 'initial remote content') {
     throw 'Mounted initial file content did not match the SFTP source'
@@ -214,22 +220,96 @@ try {
   Write-Host '[windows-mount-e2e] unmounting drive'
   Invoke-SSHMountMate -Arguments @('--unmount-id', 'local-sftp') -NoCapture | Out-Null
   $mounted = $false
+  $mountedId = $null
   Wait-Until { -not (Test-Path "${mountpoint}\") }
   $state = Join-Path $env:LOCALAPPDATA 'rsshmount/State/local-sftp.json'
   if (Test-Path $state) { throw 'Mount state remained after unmount' }
+
+  Write-Host '[windows-mount-e2e] establishing verified Plink connection sharing'
+  $keyscan = & ssh-keyscan.exe -p $port 127.0.0.1 2>$null
+  if ($LASTEXITCODE -ne 0 -or -not $keyscan) { throw 'ssh-keyscan did not return the test host key' }
+  $fingerprintText = $keyscan | & ssh-keygen.exe -lf -
+  if ($LASTEXITCODE -ne 0) { throw 'ssh-keygen could not fingerprint the test host key' }
+  $fingerprintMatch = [regex]::Match("$fingerprintText", 'SHA256:[A-Za-z0-9+/=]+')
+  if (-not $fingerprintMatch.Success) {
+    throw "The test host key did not contain a SHA-256 fingerprint: $fingerprintText"
+  }
+
+  $masterInfo = [System.Diagnostics.ProcessStartInfo]::new($plink)
+  $masterInfo.UseShellExecute = $false
+  $masterInfo.CreateNoWindow = $true
+  @('-batch', '-ssh', '-share', '-N', '-P', "$port", '-l', 'mountmate', '-pw', 'test-only-password') |
+    ForEach-Object { $masterInfo.ArgumentList.Add($_) }
+  $masterInfo.ArgumentList.Add('-hostkey')
+  $masterInfo.ArgumentList.Add($fingerprintMatch.Value)
+  $masterInfo.ArgumentList.Add('127.0.0.1')
+  $plinkMaster = [System.Diagnostics.Process]::Start($masterInfo)
+  Wait-Until {
+    if ($plinkMaster.HasExited) {
+      throw "Plink sharing master exited with $($plinkMaster.ExitCode)"
+    }
+    $check = Start-Process -FilePath $plink -ArgumentList @(
+      '-batch', '-ssh', '-shareexists', '-P', "$port", '-l', 'mountmate', '127.0.0.1'
+    ) -Wait -PassThru -WindowStyle Hidden
+    return $check.ExitCode -eq 0
+  } 100
+
+  $interactiveServers = @(
+    [ordered]@{
+      id = 'interactive-sftp'
+      name = 'Interactive SFTP'
+      mode = 'manual'
+      source = 'manual'
+      host = '127.0.0.1'
+      user = 'mountmate'
+      port = "$port"
+      auth = 'key'
+      connection_method = 'interactive'
+      remote_path = ''
+      mountpoint = $mountpoint
+      cache_mode = 'full'
+    }
+  )
+  ConvertTo-Json -InputObject $interactiveServers -Depth 4 |
+    Set-Content (Join-Path $configDir 'servers.json')
+  Invoke-SSHMountMate -Arguments @('--mount-id', 'interactive-sftp') -NoCapture | Out-Null
+  $mounted = $true
+  $mountedId = 'interactive-sftp'
+  Wait-Until { Test-Path "${mountpoint}\initial.txt" }
+  if ((Get-Content "${mountpoint}\initial.txt" -Raw) -ne 'initial remote content') {
+    throw 'Plink-shared mount did not read the SFTP source'
+  }
+  $interactiveRemote = Get-Content (Join-Path $configDir 'rclone.conf') -Raw
+  if ($interactiveRemote -notmatch 'plink[^\r\n]*-batch[^\r\n]*-share') {
+    throw 'Interactive rclone remote did not use Plink sharing'
+  }
+  if ($interactiveRemote -match 'test-only-password') {
+    throw 'Interactive rclone remote leaked the test password'
+  }
+  Invoke-SSHMountMate -Arguments @('--unmount-id', 'interactive-sftp') -NoCapture | Out-Null
+  $mounted = $false
+  $mountedId = $null
+  Wait-Until { -not (Test-Path "${mountpoint}\") }
+  $plinkMaster.Kill($true)
+  $plinkMaster.WaitForExit()
+  $plinkMaster = $null
   Write-Host '[windows-mount-e2e] lifecycle passed'
   $succeeded = $true
 } finally {
   if ($mounted) {
     try {
-      Invoke-SSHMountMate -Arguments @('--unmount-id', 'local-sftp') -NoCapture | Out-Null
+      Invoke-SSHMountMate -Arguments @('--unmount-id', $mountedId) -NoCapture | Out-Null
     } catch {
-      Write-Warning "Failed to unmount local-sftp during cleanup: $($_.Exception.Message)"
+      Write-Warning "Failed to unmount $mountedId during cleanup: $($_.Exception.Message)"
     }
   }
   if ($server -and -not $server.HasExited) {
     $server.Kill($true)
     $server.WaitForExit()
+  }
+  if ($plinkMaster -and -not $plinkMaster.HasExited) {
+    $plinkMaster.Kill($true)
+    $plinkMaster.WaitForExit()
   }
   if (-not $succeeded) {
     if (Test-Path $winFspLog) {
