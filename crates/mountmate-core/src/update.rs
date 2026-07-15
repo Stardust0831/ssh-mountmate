@@ -334,10 +334,17 @@ fn trusted_update_url(url: &Url) -> bool {
 }
 
 fn fetch_releases(client: &Client) -> Result<Vec<GithubRelease>, String> {
-    let response = client
+    let request = client
         .get(RELEASES_API)
         .header(ACCEPT, "application/vnd.github+json")
-        .header(USER_AGENT, "SSHMountMate-update-check")
+        .header(USER_AGENT, "SSHMountMate-update-check");
+    #[cfg(test)]
+    let request = if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        request.bearer_auth(token)
+    } else {
+        request
+    };
+    let response = request
         .send()
         .map_err(|error| error.to_string())?
         .error_for_status()
@@ -354,10 +361,17 @@ fn fetch_releases_retry(client: &Client) -> Result<Vec<GithubRelease>, String> {
 }
 
 fn fetch_latest_release(client: &Client) -> Result<GithubRelease, String> {
-    let response = client
+    let request = client
         .get(LATEST_RELEASE_API)
         .header(ACCEPT, "application/vnd.github+json")
-        .header(USER_AGENT, "SSHMountMate-update-check")
+        .header(USER_AGENT, "SSHMountMate-update-check");
+    #[cfg(test)]
+    let request = if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        request.bearer_auth(token)
+    } else {
+        request
+    };
+    let response = request
         .send()
         .map_err(|error| error.to_string())?
         .error_for_status()

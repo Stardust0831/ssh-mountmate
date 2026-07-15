@@ -61,6 +61,14 @@ Local verification on 2026-07-15:
 - The configured `sol_reviewer` role is not exposed by the current collaboration tool and generic
   subagents are not an allowed substitute, so the primary agent performed the working-tree review.
   Six-platform native CI remains the independent execution gate before key creation or tagging.
+- Initial branch run
+  [29431109779](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29431109779)
+  passed Windows x64/ARM64, Linux x64, and macOS x64/ARM64 package and lifecycle jobs. Linux ARM64
+  failed before compilation when apt dependency installation returned exit 100; quality completed
+  all local gates but its separate anonymous live-GitHub test hit API rate limiting. The live test
+  now receives the workflow's read-only `GITHUB_TOKEN` only in test builds; production update
+  requests remain anonymous. A fresh exact-commit run is required rather than treating either
+  infrastructure failure as product evidence.
 
 ## Prerelease scope: `v0.4.0-alpha.7`
 
