@@ -290,6 +290,8 @@ impl MountCommand<'_> {
             self.server.display_name().into(),
             "--vfs-cache-mode".into(),
             cache_mode.into(),
+            "--transfers".into(),
+            self.settings.vfs_upload_transfers.to_string(),
         ];
         push_option(
             &mut command,
@@ -431,6 +433,43 @@ mod tests {
                 .windows(2)
                 .any(|item| item == ["--dir-cache-time", "5m"])
         );
+        assert!(command.windows(2).any(|item| item == ["--transfers", "4"]));
+    }
+
+    #[test]
+    fn mount_command_uses_configured_upload_transfer_limit() {
+        let server = ServerConfig {
+            id: "alpha".into(),
+            name: "Alpha".into(),
+            ..ServerConfig::default()
+        };
+        let settings = Settings {
+            vfs_upload_transfers: 12,
+            ..Settings::default()
+        };
+        for windows in [false, true] {
+            let command = MountCommand {
+                rclone: Path::new("rclone"),
+                config: Path::new("rclone.conf"),
+                server: &server,
+                settings: &settings,
+                remote: "alpha:",
+                mountpoint: Path::new("R:"),
+                cache_dir: Path::new("cache"),
+                log_path: Path::new("alpha.log"),
+                rc_addr: "127.0.0.1:1234",
+                windows,
+            }
+            .build();
+            assert_eq!(
+                command
+                    .windows(2)
+                    .filter(|item| item[0] == "--transfers")
+                    .count(),
+                1
+            );
+            assert!(command.windows(2).any(|item| item == ["--transfers", "12"]));
+        }
     }
 
     #[test]

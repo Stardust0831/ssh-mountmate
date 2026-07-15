@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const SETTINGS_SCHEMA_VERSION: u32 = 9;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 10;
+pub const DEFAULT_VFS_UPLOAD_TRANSFERS: u16 = 4;
+pub const MIN_VFS_UPLOAD_TRANSFERS: u16 = 1;
+pub const MAX_VFS_UPLOAD_TRANSFERS: u16 = 32;
 
 fn default_port() -> String {
     "22".into()
@@ -32,6 +35,10 @@ fn default_write_back() -> String {
 
 fn default_dir_cache_time() -> String {
     "5m".into()
+}
+
+fn default_vfs_upload_transfers() -> u16 {
+    DEFAULT_VFS_UPLOAD_TRANSFERS
 }
 
 fn default_true() -> bool {
@@ -254,6 +261,8 @@ pub struct Settings {
     pub dir_cache_time: String,
     #[serde(default)]
     pub buffer_size: String,
+    #[serde(default = "default_vfs_upload_transfers")]
+    pub vfs_upload_transfers: u16,
     #[serde(default)]
     pub startup_all: bool,
     #[serde(default = "default_true")]
@@ -284,6 +293,7 @@ impl Default for Settings {
             vfs_write_back: default_write_back(),
             dir_cache_time: default_dir_cache_time(),
             buffer_size: String::new(),
+            vfs_upload_transfers: default_vfs_upload_transfers(),
             startup_all: false,
             auto_show_transfers: true,
             auto_check_updates: true,
@@ -331,6 +341,11 @@ impl Settings {
             && self.dir_cache_time == "5m"
         {
             self.vfs_write_back = default_write_back();
+        }
+        if !(MIN_VFS_UPLOAD_TRANSFERS..=MAX_VFS_UPLOAD_TRANSFERS)
+            .contains(&self.vfs_upload_transfers)
+        {
+            self.vfs_upload_transfers = default_vfs_upload_transfers();
         }
         self.settings_schema_version = SETTINGS_SCHEMA_VERSION;
         self
@@ -418,6 +433,47 @@ mod tests {
         }
         .migrate();
         assert_eq!(custom.vfs_write_back, "0s");
+    }
+
+    #[test]
+    fn upload_transfer_defaults_and_invalid_values_migrate_safely() {
+        let missing: Settings = serde_json::from_str(r#"{"settings_schema_version":9}"#).unwrap();
+        assert_eq!(
+            missing.migrate().vfs_upload_transfers,
+            DEFAULT_VFS_UPLOAD_TRANSFERS
+        );
+
+        for invalid in [0, MAX_VFS_UPLOAD_TRANSFERS + 1] {
+            let settings = Settings {
+                vfs_upload_transfers: invalid,
+                ..Settings::default()
+            }
+            .migrate();
+            assert_eq!(settings.vfs_upload_transfers, DEFAULT_VFS_UPLOAD_TRANSFERS);
+        }
+
+        let custom = Settings {
+            vfs_upload_transfers: 12,
+            ..Settings::default()
+        }
+        .migrate();
+        assert_eq!(custom.vfs_upload_transfers, 12);
+    }
+
+    #[test]
+    fn upload_transfer_limit_serializes_as_a_typed_number() {
+        let settings = Settings {
+            vfs_upload_transfers: 8,
+            ..Settings::default()
+        };
+        let json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(json["vfs_upload_transfers"], 8);
+        assert_eq!(
+            serde_json::from_value::<Settings>(json)
+                .unwrap()
+                .vfs_upload_transfers,
+            8
+        );
     }
 
     #[test]

@@ -141,6 +141,11 @@ Planned Windows direction:
 - Create a stable Start menu shortcut and AUMID for Toast identity, rather than relying on the path
   and identity of an arbitrary downloaded executable.
 - Register Explorer refresh/transfer commands and login startup against the installed executable.
+- Evaluate an installed Explorer integration that can observe folder navigation. Its target flow is
+  to open a directory immediately, refresh that directory's VFS cache in the background, and notify
+  Explorer to reread it when refresh completes; file targets refresh their parent directory. The
+  explicit right-click Refresh command remains the force-and-confirm path. Portable builds do not
+  attempt to intercept arbitrary Explorer navigation.
 - Make upgrades preserve settings, mounts, the managed rclone copy, and the authenticated update
   health/rollback protocol.
 - Provide an uninstaller that removes application files, Start menu entries, Explorer commands,
@@ -163,6 +168,18 @@ Cross-platform considerations:
 ## Work log
 
 ### 2026-07-15
+
+- Researched and implemented rclone VFS upload concurrency. `--transfers` limits simultaneous
+  uploads of different modified cache files and defaults to 4; zero or negative values are
+  normalized to 1 rather than meaning unlimited. Settings schema 10 adds a typed global value with
+  presets 4/8/12 plus a numeric custom range of 1-32, applied only to subsequent mounts. Mount
+  commands now pass the validated value explicitly on every platform. Automatic refresh on
+  arbitrary Explorer folder navigation is deferred to the installed-distribution design and is not
+  added to the portable executable.
+- Local Rust 1.97 verification for the upload-concurrency change passed format, workspace Clippy
+  with warnings denied, 165 core tests with one live-network test ignored, legacy migration, five
+  platform tests, and 37 application tests. Three packaged-GUI tests remain intentionally ignored
+  locally because they require release artifacts and a graphical session.
 
 - Published
   [`v0.4.0-alpha.7`](https://github.com/Stardust0831/ssh-mountmate/releases/tag/v0.4.0-alpha.7)

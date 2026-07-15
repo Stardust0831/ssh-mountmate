@@ -26,6 +26,7 @@ use mountmate_core::connection::{
     SshImportPlan,
 };
 use mountmate_core::dependency::{DependencyStatus, check_dependencies};
+use mountmate_core::model::{MAX_VFS_UPLOAD_TRANSFERS, MIN_VFS_UPLOAD_TRANSFERS};
 use mountmate_core::mountpoint::HOME_MOUNTPOINT_VALUE;
 use mountmate_core::paths::AppPaths;
 use mountmate_core::process::MountStatus;
@@ -603,6 +604,7 @@ enum SettingKind {
     WriteBack,
     DirCacheTime,
     BufferSize,
+    Transfers,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -666,6 +668,7 @@ struct SettingsDraft {
     write_back: String,
     dir_cache_time: String,
     buffer_size: String,
+    upload_transfers: String,
     startup_all: bool,
     auto_show_transfers: bool,
     auto_check_updates: bool,
@@ -683,6 +686,7 @@ impl SettingsDraft {
             write_back: settings.vfs_write_back.clone(),
             dir_cache_time: settings.dir_cache_time.clone(),
             buffer_size: settings.buffer_size.clone(),
+            upload_transfers: settings.vfs_upload_transfers.to_string(),
             startup_all: settings.startup_all,
             auto_show_transfers: settings.auto_show_transfers,
             auto_check_updates: settings.auto_check_updates,
@@ -721,6 +725,7 @@ impl SettingsDraft {
         ] {
             validate_setting_value(locale.text(name), value, required, locale)?;
         }
+        let upload_transfers = validate_upload_transfers(&self.upload_transfers, locale)?;
         let mut settings = original.clone();
         settings.cache_root = PathBuf::from(self.cache_root.trim());
         settings.vfs_cache_mode = self.cache_mode.value().into();
@@ -730,6 +735,7 @@ impl SettingsDraft {
         settings.vfs_write_back = self.write_back.trim().into();
         settings.dir_cache_time = self.dir_cache_time.trim().into();
         settings.buffer_size = self.buffer_size.trim().into();
+        settings.vfs_upload_transfers = upload_transfers;
         settings.startup_all = self.startup_all;
         settings.auto_show_transfers = self.auto_show_transfers;
         settings.auto_check_updates = self.auto_check_updates;
@@ -1770,11 +1776,19 @@ impl App {
                         };
                         self.custom_setting = Some(custom);
                     } else if let Some(draft) = &mut self.settings_draft {
-                        set_setting_value(
-                            draft,
-                            custom.kind,
-                            format!("{}{}", custom.digits, custom.unit),
-                        );
+                        let value = if custom.kind == SettingKind::Transfers {
+                            match validate_upload_transfers(&custom.digits, locale) {
+                                Ok(value) => value.to_string(),
+                                Err(error) => {
+                                    self.status = error;
+                                    self.custom_setting = Some(custom);
+                                    return Task::none();
+                                }
+                            }
+                        } else {
+                            format!("{}{}", custom.digits, custom.unit)
+                        };
+                        set_setting_value(draft, custom.kind, value);
                     }
                 }
             }
@@ -3861,6 +3875,12 @@ impl App {
                 &draft.buffer_size,
                 locale,
             ),
+            setting_picker(
+                SettingKind::Transfers,
+                locale.text(TextKey::UploadConcurrency),
+                &draft.upload_transfers,
+                locale,
+            ),
         ]
         .spacing(12);
         let behavior = column![
@@ -4075,21 +4095,26 @@ impl App {
                 Locale::English => "Custom setting",
                 Locale::Chinese => "自定义设置",
             };
+            let mut custom_value = row![
+                text_input("0", &custom.digits)
+                    .on_input(Message::CustomSettingDigitsChanged)
+                    .width(Length::Fixed(180.0))
+            ]
+            .spacing(10);
+            if !units.is_empty() {
+                custom_value = custom_value.push(
+                    pick_list(
+                        units,
+                        Some(custom.unit.clone()),
+                        Message::CustomSettingUnitChanged,
+                    )
+                    .width(Length::Fixed(120.0)),
+                );
+            }
             let dialog = container(
                 column![
                     text(title).size(22),
-                    row![
-                        text_input("0", &custom.digits)
-                            .on_input(Message::CustomSettingDigitsChanged)
-                            .width(Length::Fixed(180.0)),
-                        pick_list(
-                            units,
-                            Some(custom.unit.clone()),
-                            Message::CustomSettingUnitChanged,
-                        )
-                        .width(Length::Fixed(120.0)),
-                    ]
-                    .spacing(10),
+                    custom_value,
                     row![
                         button(locale.text(TextKey::Cancel)).on_press(Message::CancelCustomSetting),
                         button(locale.text(TextKey::Save)).on_press(Message::SaveCustomSetting),
@@ -4558,6 +4583,7 @@ fn setting_presets(kind: SettingKind) -> &'static [&'static str] {
         SettingKind::WriteBack => &["0s", "5s", "30s", "1m"],
         SettingKind::DirCacheTime => &["30s", "5m", "15m", "1h"],
         SettingKind::BufferSize => &["", "0", "16Mi", "64Mi"],
+        SettingKind::Transfers => &["4", "8", "12"],
     }
 }
 
@@ -4583,6 +4609,7 @@ fn setting_value(draft: &SettingsDraft, kind: SettingKind) -> &str {
         SettingKind::WriteBack => &draft.write_back,
         SettingKind::DirCacheTime => &draft.dir_cache_time,
         SettingKind::BufferSize => &draft.buffer_size,
+        SettingKind::Transfers => &draft.upload_transfers,
     }
 }
 
@@ -4594,6 +4621,7 @@ fn set_setting_value(draft: &mut SettingsDraft, kind: SettingKind, value: String
         SettingKind::WriteBack => draft.write_back = value,
         SettingKind::DirCacheTime => draft.dir_cache_time = value,
         SettingKind::BufferSize => draft.buffer_size = value,
+        SettingKind::Transfers => draft.upload_transfers = value,
     }
 }
 
@@ -4604,6 +4632,7 @@ fn custom_units(kind: SettingKind) -> &'static [&'static str] {
         SettingKind::MaxAge | SettingKind::WriteBack | SettingKind::DirCacheTime => {
             &["s", "m", "h", "d"]
         }
+        SettingKind::Transfers => &[],
     }
 }
 
@@ -4613,11 +4642,15 @@ fn split_custom_setting(kind: SettingKind, value: &str) -> (String, String) {
         .take_while(|character| character.is_ascii_digit())
         .collect::<String>();
     let suffix = value.get(digits.len()..).unwrap_or_default();
-    let unit = custom_units(kind)
+    let units = custom_units(kind);
+    if units.is_empty() {
+        return (digits, String::new());
+    }
+    let unit = units
         .iter()
         .find(|unit| **unit == suffix)
         .copied()
-        .unwrap_or(custom_units(kind)[0])
+        .unwrap_or(units[0])
         .to_owned();
     (digits, unit)
 }
@@ -4648,6 +4681,29 @@ fn setting_help(kind: SettingKind, locale: Locale) -> &'static str {
         (SettingKind::DirCacheTime, Locale::Chinese) => "远端目录列表和元数据的缓存时间。",
         (SettingKind::BufferSize, Locale::English) => "Memory read buffer allocated per open file.",
         (SettingKind::BufferSize, Locale::Chinese) => "每个打开文件使用的内存读取缓冲。",
+        (SettingKind::Transfers, Locale::English) => {
+            "Maximum number of different cached files uploaded at once on the next mount. Custom range: 1-32; rclone has no unlimited VFS upload setting. Extra files wait locally, and higher values increase SSH/SFTP and server load."
+        }
+        (SettingKind::Transfers, Locale::Chinese) => {
+            "下次挂载时同时从缓存上传的不同文件数量上限。自定义范围为 1-32；rclone 没有无限 VFS 上传并发设置。超出数量的文件会留在本地排队，数值越高，SSH/SFTP 和服务器负载越大。"
+        }
+    }
+}
+
+fn validate_upload_transfers(value: &str, locale: Locale) -> Result<u16, String> {
+    let parsed = value.trim().parse::<u16>().ok();
+    match parsed {
+        Some(value) if (MIN_VFS_UPLOAD_TRANSFERS..=MAX_VFS_UPLOAD_TRANSFERS).contains(&value) => {
+            Ok(value)
+        }
+        _ => Err(match locale {
+            Locale::English => format!(
+                "Simultaneous uploads must be a whole number from {MIN_VFS_UPLOAD_TRANSFERS} to {MAX_VFS_UPLOAD_TRANSFERS}"
+            ),
+            Locale::Chinese => format!(
+                "同时上传文件数必须是 {MIN_VFS_UPLOAD_TRANSFERS} 到 {MAX_VFS_UPLOAD_TRANSFERS} 之间的整数"
+            ),
+        }),
     }
 }
 
@@ -5573,13 +5629,14 @@ mod localization_tests {
             SettingKind::WriteBack,
             SettingKind::DirCacheTime,
             SettingKind::BufferSize,
+            SettingKind::Transfers,
         ] {
             assert!(!setting_help(kind, Locale::English).is_empty());
             assert!(!setting_help(kind, Locale::Chinese).is_empty());
-            assert!(!custom_units(kind).is_empty());
         }
         assert!(custom_units(SettingKind::MaxSize).contains(&"Gi"));
         assert!(custom_units(SettingKind::MaxAge).contains(&"m"));
+        assert!(custom_units(SettingKind::Transfers).is_empty());
     }
 
     #[test]
@@ -5789,6 +5846,7 @@ mod localization_tests {
             setting_presets(SettingKind::WriteBack),
             &["0s", "5s", "30s", "1m"]
         );
+        assert_eq!(setting_presets(SettingKind::Transfers), &["4", "8", "12"]);
         assert_eq!(
             split_custom_setting(SettingKind::MaxSize, "250Gi"),
             ("250".into(), "Gi".into())
@@ -5796,6 +5854,42 @@ mod localization_tests {
         assert_eq!(
             split_custom_setting(SettingKind::MaxAge, "1h30m"),
             ("1".into(), "s".into())
+        );
+        assert_eq!(
+            split_custom_setting(SettingKind::Transfers, "24"),
+            ("24".into(), String::new())
+        );
+    }
+
+    #[test]
+    fn upload_transfer_validation_accepts_only_the_supported_range() {
+        for value in ["1", "4", "8", "12", "32"] {
+            assert_eq!(
+                validate_upload_transfers(value, Locale::English).unwrap(),
+                value.parse::<u16>().unwrap()
+            );
+        }
+        for value in ["", "0", "33", "-1", "4.5", "unlimited"] {
+            assert!(validate_upload_transfers(value, Locale::English).is_err());
+            assert!(validate_upload_transfers(value, Locale::Chinese).is_err());
+        }
+    }
+
+    #[test]
+    fn settings_draft_round_trips_upload_transfer_limit() {
+        let original = Settings {
+            cache_root: PathBuf::from("cache"),
+            vfs_upload_transfers: 12,
+            ..Settings::default()
+        };
+        let draft = SettingsDraft::from_settings(&original);
+        assert_eq!(draft.upload_transfers, "12");
+        assert_eq!(
+            draft
+                .build(&original, Locale::English)
+                .unwrap()
+                .vfs_upload_transfers,
+            12
         );
     }
 

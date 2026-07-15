@@ -265,6 +265,8 @@ If rclone reports `knownhosts: key mismatch`, SSH MountMate stops the mount rath
 
 Mounted connection cards show rclone's real VFS upload queue. The recommended cache profile keeps rclone's upstream five-second write-back window so Explorer/Finder can finish close, rename, and metadata operations before remote upload begins. When an upload is queued or starts, that connection gets its own bottom-right progress window; multiple active connections are stacked separately. The Transfer center remains available for manually viewing all mounts together. A file is only shown as cloud-synced after rclone reports no queued or active uploads. SSH MountMate warns before unmounting or exiting while uploads remain.
 
+The simultaneous-upload setting limits how many different cached files rclone may upload at once. The default is 4, with presets for 8 and 12 and a custom range of 1 through 32. Extra files remain queued in the local cache. Rewriting the same path does not create reliable parallel revisions: rclone cancels or reschedules that path's write-back and the latest local content may overwrite another writer's remote change.
+
 Refresh clears the VFS directory cache, actively reloads the requested directory, and verifies it with a direct remote listing. If local writes are still queued, the result states that the verified remote snapshot does not yet include those uploads.
 
 Right-click a connection card for Open, Refresh, Transfers, and Log actions. Settings can register Refresh and Transfers commands in Windows Explorer, macOS Finder Quick Actions, and Nautilus, Nemo, or KDE file managers on Linux. The commands point back to the same SSH MountMate executable; no helper program is installed. A short-lived file-manager process forwards its request to the running app over authenticated loopback IPC and exits.
@@ -293,6 +295,7 @@ The Settings window contains:
 - write-back delay
 - directory cache time
 - read buffer size
+- simultaneous cached-file uploads
 
 Each setting option has a `?` help icon in the GUI. Hover the icon to see what the option does. Batch mount and unmount concurrency are fixed internally at 4 and 8 workers.
 

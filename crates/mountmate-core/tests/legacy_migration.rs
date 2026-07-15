@@ -80,6 +80,7 @@ fn complete_python_layout_migrates_without_losing_user_data() {
     assert_eq!(settings.vfs_write_back, "17s");
     assert_eq!(settings.dir_cache_time, "9m");
     assert_eq!(settings.buffer_size, "32M");
+    assert_eq!(settings.vfs_upload_transfers, 4);
     assert!(settings.startup_all);
     assert!(!settings.auto_show_transfers);
     assert!(!settings.auto_check_updates);
