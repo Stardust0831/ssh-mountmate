@@ -180,6 +180,10 @@ Cross-platform considerations:
   with warnings denied, 165 core tests with one live-network test ignored, legacy migration, five
   platform tests, and 37 application tests. Three packaged-GUI tests remain intentionally ignored
   locally because they require release artifacts and a graphical session.
+- Authoritative branch run
+  [29378614305](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29378614305)
+  passed quality plus Windows, Linux, and macOS x64/ARM64 package, update/rollback, and real SFTP
+  mount/refresh/upload/unmount jobs on commit `37ebf4b`.
 
 - Published
   [`v0.4.0-alpha.7`](https://github.com/Stardust0831/ssh-mountmate/releases/tag/v0.4.0-alpha.7)
