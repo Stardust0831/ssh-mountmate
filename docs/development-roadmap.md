@@ -181,6 +181,13 @@ Cross-platform considerations:
   locally because they require release artifacts and a graphical session. The local WSL check used
   verification-only GTK pkg-config metadata and linker aliases under `/tmp`; native CI remains the
   authoritative linking and integration gate.
+- The first stable release dry run
+  [29382155863](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29382155863)
+  stopped in the generated-license comparison before any build jobs. The workspace version changed
+  to `0.4.0`, but `licenses/RUST-THIRD-PARTY.txt` still named the three workspace crates as
+  `0.4.0-alpha.7`. Re-running the pinned `cargo-about 0.9.1` generator produced exactly those three
+  version-line changes and no dependency or license-content changes; the committed inventory now
+  matches the generated output byte for byte.
 - Confirmed user-owned untracked files (`issue-1-reply.md` and five screenshots) remain untouched.
 - Accepted the post-release order: Experimental macOS NFS, opt-in system credential protection,
   then reusable interactive SSH. System credential protection remains off by default; enabling it
