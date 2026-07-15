@@ -381,7 +381,7 @@ impl MountService {
             }
             return Err(InteractiveSshError::SessionMissing.into());
         }
-        Ok(Some(session.connector_arguments().to_vec()))
+        Ok(Some(session.verified_connector_arguments()?.to_vec()))
     }
 
     fn hydrate_server_credentials(
