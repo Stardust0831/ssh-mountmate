@@ -14,9 +14,13 @@ $binary = Join-Path $packageRoot 'SSHMountMate.exe'
 $rclone = $null
 $plink = $null
 $plinkMaster = $null
+$plinkMasterStdout = $null
+$plinkMasterStderr = $null
 $serverRclone = Join-Path $testRoot 'server-rclone.exe'
 $remoteRoot = Join-Path $testRoot 'remote'
 $serverLog = Join-Path $testRoot 'sftp-server.log'
+$hostKey = Join-Path $testRoot 'sftp-host-key'
+$hostKeyBlob = $null
 $winFspLog = Join-Path $testRoot 'winfsp-install.log'
 $server = $null
 $mounted = $false
@@ -76,6 +80,20 @@ try {
   New-Item -ItemType Directory -Force $remoteRoot | Out-Null
   Set-Content -Path (Join-Path $remoteRoot 'initial.txt') -Value 'initial remote content' -NoNewline
 
+  $hostKeyInfo = [System.Diagnostics.ProcessStartInfo]::new('ssh-keygen.exe')
+  $hostKeyInfo.UseShellExecute = $false
+  $hostKeyInfo.CreateNoWindow = $true
+  @('-q', '-t', 'ecdsa', '-b', '256', '-N', '', '-f', $hostKey) |
+    ForEach-Object { $hostKeyInfo.ArgumentList.Add($_) }
+  $hostKeyProcess = [System.Diagnostics.Process]::Start($hostKeyInfo)
+  $hostKeyProcess.WaitForExit()
+  if ($hostKeyProcess.ExitCode -ne 0) { throw 'ssh-keygen could not create the test host key' }
+  $hostKeyFields = (Get-Content "$hostKey.pub" -Raw).Trim() -split '\s+'
+  if ($hostKeyFields.Count -lt 2 -or -not $hostKeyFields[1]) {
+    throw 'ssh-keygen produced an invalid public host key'
+  }
+  $hostKeyBlob = $hostKeyFields[1]
+
   Write-Host '[windows-mount-e2e] installing WinFsp'
   $winFspUrl = 'https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi'
   $winFspSha256 = '073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a'
@@ -111,6 +129,7 @@ try {
     '--log-file', $serverLog,
     '-vv', 'serve', 'sftp', $remoteRoot,
     '--addr', "127.0.0.1:$port",
+    '--key', $hostKey,
     '--user', 'mountmate', '--pass', 'test-only-password',
     '--dir-cache-time', '0s', '--poll-interval', '0'
   ) | ForEach-Object { $serverInfo.ArgumentList.Add($_) }
@@ -226,27 +245,24 @@ try {
   if (Test-Path $state) { throw 'Mount state remained after unmount' }
 
   Write-Host '[windows-mount-e2e] establishing verified Plink connection sharing'
-  $keyscan = & ssh-keyscan.exe -p $port 127.0.0.1 2>$null
-  if ($LASTEXITCODE -ne 0 -or -not $keyscan) { throw 'ssh-keyscan did not return the test host key' }
-  $fingerprintText = $keyscan | & ssh-keygen.exe -lf -
-  if ($LASTEXITCODE -ne 0) { throw 'ssh-keygen could not fingerprint the test host key' }
-  $fingerprintMatch = [regex]::Match("$fingerprintText", 'SHA256:[A-Za-z0-9+/=]+')
-  if (-not $fingerprintMatch.Success) {
-    throw "The test host key did not contain a SHA-256 fingerprint: $fingerprintText"
-  }
-
   $masterInfo = [System.Diagnostics.ProcessStartInfo]::new($plink)
   $masterInfo.UseShellExecute = $false
   $masterInfo.CreateNoWindow = $true
+  $masterInfo.RedirectStandardOutput = $true
+  $masterInfo.RedirectStandardError = $true
   @('-batch', '-ssh', '-share', '-N', '-P', "$port", '-l', 'mountmate', '-pw', 'test-only-password') |
     ForEach-Object { $masterInfo.ArgumentList.Add($_) }
   $masterInfo.ArgumentList.Add('-hostkey')
-  $masterInfo.ArgumentList.Add($fingerprintMatch.Value)
+  $masterInfo.ArgumentList.Add($hostKeyBlob)
   $masterInfo.ArgumentList.Add('127.0.0.1')
   $plinkMaster = [System.Diagnostics.Process]::Start($masterInfo)
+  $plinkMasterStdout = $plinkMaster.StandardOutput.ReadToEndAsync()
+  $plinkMasterStderr = $plinkMaster.StandardError.ReadToEndAsync()
   Wait-Until {
     if ($plinkMaster.HasExited) {
-      throw "Plink sharing master exited with $($plinkMaster.ExitCode)"
+      $masterOutput = $plinkMasterStdout.GetAwaiter().GetResult()
+      $masterError = $plinkMasterStderr.GetAwaiter().GetResult()
+      throw "Plink sharing master exited with $($plinkMaster.ExitCode)`n$masterOutput$masterError"
     }
     $check = Start-Process -FilePath $plink -ArgumentList @(
       '-batch', '-ssh', '-shareexists', '-P', "$port", '-l', 'mountmate', '127.0.0.1'
@@ -292,6 +308,8 @@ try {
   Wait-Until { -not (Test-Path "${mountpoint}\") }
   $plinkMaster.Kill($true)
   $plinkMaster.WaitForExit()
+  $null = $plinkMasterStdout.GetAwaiter().GetResult()
+  $null = $plinkMasterStderr.GetAwaiter().GetResult()
   $plinkMaster = $null
   Write-Host '[windows-mount-e2e] lifecycle passed'
   $succeeded = $true
@@ -311,6 +329,8 @@ try {
     $plinkMaster.Kill($true)
     $plinkMaster.WaitForExit()
   }
+  if ($plinkMasterStdout) { $null = $plinkMasterStdout.GetAwaiter().GetResult() }
+  if ($plinkMasterStderr) { $null = $plinkMasterStderr.GetAwaiter().GetResult() }
   if (-not $succeeded) {
     if (Test-Path $winFspLog) {
       Write-Host '--- WinFsp installer log ---'

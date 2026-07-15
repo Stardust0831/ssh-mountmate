@@ -306,12 +306,28 @@ fn terminal_command(login: &[String]) -> Result<(PathBuf, Vec<String>), Interact
         ("xterm", "-e"),
     ] {
         if let Some(program) = find_system_executable(name) {
-            let mut arguments = vec![separator.into()];
-            arguments.extend_from_slice(login);
+            let arguments = terminal_launch_arguments(&program, separator, login);
             return Ok((program, arguments));
         }
     }
     Err(InteractiveSshError::TerminalMissing)
+}
+
+fn terminal_launch_arguments(program: &Path, separator: &str, login: &[String]) -> Vec<String> {
+    let resolved = fs::canonicalize(program).unwrap_or_else(|_| program.to_owned());
+    let terminal_name = resolved
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mut arguments = Vec::new();
+    // Debian alternatives can resolve to lxterm without its legacy bitmap font installed.
+    if matches!(terminal_name.as_str(), "xterm" | "lxterm") {
+        arguments.extend(["-fa".into(), "Monospace".into()]);
+    }
+    arguments.push(separator.into());
+    arguments.extend_from_slice(login);
+    arguments
 }
 
 fn write_login_script(path: &Path, arguments: &[String]) -> Result<(), InteractiveSshError> {
@@ -441,6 +457,35 @@ mod tests {
         let second = control_directory(&paths, "0123456789abcdef");
         assert_eq!(first, second);
         assert!(first.starts_with(std::env::temp_dir()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xterm_alias_uses_a_scalable_font_before_the_login_command() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let lxterm = temp.path().join("lxterm");
+        fs::write(&lxterm, "#!/bin/sh\n").unwrap();
+        let alias = temp.path().join("x-terminal-emulator");
+        symlink(&lxterm, &alias).unwrap();
+
+        assert_eq!(
+            terminal_launch_arguments(&alias, "-e", &["/state/login.sh".into()]),
+            vec!["-fa", "Monospace", "-e", "/state/login.sh"]
+        );
+    }
+
+    #[test]
+    fn non_xterm_launch_keeps_the_terminal_specific_separator() {
+        assert_eq!(
+            terminal_launch_arguments(
+                Path::new("/usr/bin/gnome-terminal"),
+                "--",
+                &["/state/login.sh".into()],
+            ),
+            vec!["--", "/state/login.sh"]
+        );
     }
 
     #[cfg(unix)]
