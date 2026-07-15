@@ -91,6 +91,13 @@ Local verification on 2026-07-15:
   run completed the same ARM install, so both workflows now use apt's bounded five-attempt download
   retry in addition to IPv4. This changes CI bootstrap only; a complete exact-commit rerun is still
   required.
+- Bounded retries in run
+  [29434768692](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29434768692)
+  could not recover because both IPv4 and IPv6 paths to the primary Ubuntu Ports service remained
+  unavailable. The Azure alias resolves to the same service, so it is not a fallback. ARM build
+  jobs now replace only that source with the reachable HTTPS Leaseweb Ubuntu Ports mirror; apt's
+  normal Ubuntu archive signature verification remains mandatory. x64 sources and application
+  networking are unchanged.
 
 ## Prerelease scope: `v0.4.0-alpha.7`
 
