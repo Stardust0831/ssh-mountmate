@@ -11,7 +11,7 @@ New-Item -ItemType Directory -Force $packageRoot | Out-Null
 Get-ChildItem -LiteralPath $sourcePackageRoot -Force |
   Copy-Item -Destination $packageRoot -Recurse -Force
 $binary = Join-Path $packageRoot 'SSHMountMate.exe'
-$rclone = Join-Path $packageRoot 'bin/rclone.exe'
+$rclone = $null
 $serverRclone = Join-Path $testRoot 'server-rclone.exe'
 $remoteRoot = Join-Path $testRoot 'remote'
 $serverLog = Join-Path $testRoot 'sftp-server.log'
@@ -57,7 +57,13 @@ function Wait-Until([scriptblock] $Condition, [int] $Attempts = 100) {
 }
 
 try {
+  $env:HOME = Join-Path $testRoot 'home'
+  $env:USERPROFILE = $env:HOME
+  $env:APPDATA = Join-Path $testRoot 'roaming'
+  $env:LOCALAPPDATA = Join-Path $testRoot 'local'
+
   if (-not (Test-Path $binary -PathType Leaf)) { throw 'Packaged SSH MountMate is missing' }
+  $rclone = (Invoke-SSHMountMate @('--rclone-path')).Trim()
   if (-not (Test-Path $rclone -PathType Leaf)) { throw 'Packaged rclone is missing' }
   Copy-Item $rclone $serverRclone
   New-Item -ItemType Directory -Force $remoteRoot | Out-Null
@@ -121,10 +127,6 @@ try {
   if (-not $drive) { throw 'No free drive letter is available for the mount test' }
   $mountpoint = "${drive}:"
 
-  $env:HOME = Join-Path $testRoot 'home'
-  $env:USERPROFILE = $env:HOME
-  $env:APPDATA = Join-Path $testRoot 'roaming'
-  $env:LOCALAPPDATA = Join-Path $testRoot 'local'
   $configDir = Join-Path $env:APPDATA 'rsshmount'
   New-Item -ItemType Directory -Force $configDir | Out-Null
   $passwordObscured = (& $rclone obscure 'test-only-password').Trim()

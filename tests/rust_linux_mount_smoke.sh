@@ -7,7 +7,7 @@ package_root="${test_root}/install/SSHMountMate"
 mkdir -p "$(dirname "${package_root}")"
 cp -a "${source_package_root}" "${package_root}"
 binary="${package_root}/SSHMountMate"
-rclone="${package_root}/bin/rclone"
+rclone=""
 server_rclone="${test_root}/server-rclone"
 server_user="mountmate"
 server_password="test-only-password"
@@ -64,7 +64,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
+mkdir -p "${remote_root}" "${mountpoint}" "${test_root}/home"
+export HOME="${test_root}/home"
+export XDG_CONFIG_HOME="${test_root}/config"
+export XDG_CACHE_HOME="${test_root}/cache"
+export XDG_STATE_HOME="${test_root}/state"
+export XDG_DATA_HOME="${test_root}/data"
+
 test -x "${binary}"
+rclone="$("${binary}" --rclone-path)"
 test -x "${rclone}"
 cp "${rclone}" "${server_rclone}"
 chmod 755 "${server_rclone}"
@@ -77,7 +85,6 @@ fi
 test -c /dev/fuse
 sudo chmod a+rw /dev/fuse
 
-mkdir -p "${remote_root}" "${mountpoint}" "${test_root}/home"
 printf '%s\n' 'initial remote content' >"${remote_root}/initial.txt"
 first_host_key="${test_root}/host-key-first"
 second_host_key="${test_root}/host-key-second"
@@ -95,11 +102,6 @@ done
 test -n "${port}"
 start_server "${first_host_key}"
 
-export HOME="${test_root}/home"
-export XDG_CONFIG_HOME="${test_root}/config"
-export XDG_CACHE_HOME="${test_root}/cache"
-export XDG_STATE_HOME="${test_root}/state"
-export XDG_DATA_HOME="${test_root}/data"
 config_dir="${XDG_CONFIG_HOME}/rsshmount"
 mkdir -p "${config_dir}"
 password_obscured="$("${rclone}" obscure "${server_password}")"
