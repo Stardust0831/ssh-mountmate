@@ -73,3 +73,14 @@ The application packages themselves are still not backed by Windows Authenticode
 Developer ID/notarization. Ed25519 protects the SSH MountMate updater path, not downloads installed
 manually through a browser. Current Releases also provide no canonical Windows/Linux onedir update
 asset; those directory layouts remain manual-update only.
+
+## Initial production trust root
+
+Pending explicit owner confirmation before the first tag:
+
+- `key_id`: `ed25519-563e14d2c6b880f9`
+- SHA-256 of the raw 32-byte public key:
+  `563e14d2c6b880f9326f71c809a49474ec74cf74ca2347cc5ac3bf6efad27a2a`
+
+The private key was piped directly into the protected Environment secret and has no repository or
+local-file copy. Under the selected no-backup policy, the GitHub secret is the only copy.

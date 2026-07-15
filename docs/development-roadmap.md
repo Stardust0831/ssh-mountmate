@@ -75,6 +75,15 @@ Local verification on 2026-07-15:
   IPv6 while the hosted runner had no IPv6 route (`connect (101: Network is unreachable)`). Both
   native workflows now force apt to IPv4 for Linux dependency installation; this is scoped to CI
   bootstrap and does not alter application networking.
+- Final pre-key run
+  [29432591792](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29432591792)
+  passed quality and all six Windows, Linux, and macOS x64/ARM64 jobs on `f858c8c`, including real
+  SFTP lifecycles and both macOS FUSE/NFS backends. The protected `production-update-signing`
+  Environment now requires owner approval and allows only `v*` tags. The initial private key was
+  piped directly to its secret with no file copy; the public registry records key ID
+  `ed25519-563e14d2c6b880f9` and full public-key SHA-256
+  `563e14d2c6b880f9326f71c809a49474ec74cf74ca2347cc5ac3bf6efad27a2a`. Owner confirmation and a
+  fresh six-platform run containing that embedded public key remain required before tagging.
 
 ## Prerelease scope: `v0.4.0-alpha.7`
 

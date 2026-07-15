@@ -2,8 +2,8 @@ use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
 use mountmate_core::update_manifest::{
     ManifestAsset, PublishedAsset, ReleaseChannel, SignedUpdateManifestV1, TrustedUpdateKey,
-    TrustedUpdateKeySet, UpdateTrustError, build_release_manifest, public_key_record,
-    sign_manifest, verify_local_release_set, verify_release_manifest,
+    TrustedUpdateKeySet, UpdateTrustError, build_release_manifest, embedded_trusted_keys,
+    public_key_record, sign_manifest, verify_local_release_set, verify_release_manifest,
 };
 use rand_core::OsRng;
 use sha2::{Digest, Sha256};
@@ -344,6 +344,11 @@ fn key_registry_is_strict_and_binds_key_id_to_the_full_public_key() {
         TrustedUpdateKeySet::from_json(&serde_json::to_vec(&unknown_field).unwrap()),
         Err(UpdateTrustError::InvalidKeyRegistry(_))
     ));
+}
+
+#[test]
+fn production_build_embeds_at_least_one_valid_trusted_update_key() {
+    assert!(!embedded_trusted_keys().unwrap().is_empty());
 }
 
 #[test]
