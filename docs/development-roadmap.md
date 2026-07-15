@@ -69,6 +69,12 @@ Local verification on 2026-07-15:
   now receives the workflow's read-only `GITHUB_TOKEN` only in test builds; production update
   requests remain anonymous. A fresh exact-commit run is required rather than treating either
   infrastructure failure as product evidence.
+- Replacement run
+  [29432288665](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29432288665)
+  reproduced the Linux ARM64 dependency failure. Its apt log showed `ports.ubuntu.com` resolving to
+  IPv6 while the hosted runner had no IPv6 route (`connect (101: Network is unreachable)`). Both
+  native workflows now force apt to IPv4 for Linux dependency installation; this is scoped to CI
+  bootstrap and does not alter application networking.
 
 ## Prerelease scope: `v0.4.0-alpha.7`
 

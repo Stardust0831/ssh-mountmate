@@ -37,7 +37,7 @@ jobs:
           command-arguments: licenses sources
           arguments: --all-features
       - name: Linux GUI dependencies
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dri libgtk-3-dev libayatana-appindicator3-dev xvfb xdotool openbox dbus-x11 dunst haskell-gtk-sni-tray-utils weston
+        run: sudo apt-get -o Acquire::ForceIPv4=true update && sudo apt-get -o Acquire::ForceIPv4=true install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dri libgtk-3-dev libayatana-appindicator3-dev xvfb xdotool openbox dbus-x11 dunst haskell-gtk-sni-tray-utils weston
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
@@ -124,7 +124,7 @@ jobs:
           toolchain: 1.97.0
       - name: Linux GUI dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dri libgtk-3-dev libayatana-appindicator3-dev zip xvfb xdotool openbox xterm dbus-x11 fuse3 jq kmod openssh-client
+        run: sudo apt-get -o Acquire::ForceIPv4=true update && sudo apt-get -o Acquire::ForceIPv4=true install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dri libgtk-3-dev libayatana-appindicator3-dev zip xvfb xdotool openbox xterm dbus-x11 fuse3 jq kmod openssh-client
       - name: Install verified FUSE-T for macOS mount integration
         if: runner.os == 'macOS'
         shell: bash
