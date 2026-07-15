@@ -1738,6 +1738,18 @@ impl App {
             Message::ManagedSshChanged(value) => {
                 if let Some(draft) = &mut self.connection_draft {
                     draft.ssh_config_managed = value;
+                    if value
+                        && !connection_method_allowed(
+                            draft.source,
+                            true,
+                            draft.connection_method,
+                            cfg!(windows),
+                        )
+                    {
+                        draft.connection_method = ConnectionMethod::Openssh;
+                        draft.auth = AuthMethod::Key;
+                        self.status = interactive_ssh_config_unavailable(locale).into();
+                    }
                     if !value {
                         draft.copy_key_to_ssh_dir = false;
                     }
@@ -5710,10 +5722,10 @@ fn credential_storage_help(locale: Locale) -> &'static str {
 fn credential_storage_confirmation(locale: Locale, target: CredentialStorage) -> &'static str {
     match (locale, target) {
         (Locale::English, CredentialStorage::System) => {
-            "Enable the system credential store? Existing passwords and private-key passphrases will be revealed locally, written to the OS store, read back for verification, and removed from SSH MountMate files only after migration succeeds. One-time codes are never stored."
+            "Enable the system credential store? Existing passwords and private-key passphrases will be revealed locally, written to the OS store, and read back for verification. A verified rclone-obscured compatibility copy remains in SSH MountMate's private configuration. System-store read failures never silently fall back to it. One-time codes are never stored."
         }
         (Locale::Chinese, CredentialStorage::System) => {
-            "是否启用系统凭据库？现有密码和私钥短语会在本机解开，写入系统凭据库并回读验证；只有迁移成功后才会从 SSH MountMate 文件中移除。一次性验证码永远不会保存。"
+            "是否启用系统凭据库？现有密码和私钥短语会在本机解开，写入系统凭据库并回读验证。SSH MountMate 私有配置会保留一份经过验证的 rclone obscure 兼容副本；系统凭据读取失败时不会静默回退使用它。一次性验证码永远不会保存。"
         }
         (Locale::English, CredentialStorage::Obscure) => {
             "Return to rclone obscure storage? Vault secrets will be converted locally and saved in SSH MountMate's private configuration before vault entries are removed. This is less secure but more compatible."
@@ -7030,6 +7042,14 @@ mod localization_tests {
         }
         assert!(credential_storage_help(Locale::English).contains("write-and-read verification"));
         assert!(credential_storage_help(Locale::Chinese).contains("回读验证"));
+        assert!(
+            credential_storage_confirmation(Locale::English, CredentialStorage::System)
+                .contains("compatibility copy")
+        );
+        assert!(
+            credential_storage_confirmation(Locale::Chinese, CredentialStorage::System)
+                .contains("兼容副本")
+        );
     }
 
     #[test]

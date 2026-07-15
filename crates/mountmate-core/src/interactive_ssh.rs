@@ -527,7 +527,8 @@ fn plink_target_arguments(server: &ServerConfig) -> Vec<String> {
 }
 
 fn windows_direct_connection_supported(server: &ServerConfig) -> bool {
-    !matches!(server.source.as_str(), "ssh_config" | "ssh_config_batch")
+    !server.ssh_config_managed
+        && !matches!(server.source.as_str(), "ssh_config" | "ssh_config_batch")
 }
 
 fn openssh_login_arguments(ssh: &Path, control: &Path, target: &[String]) -> Vec<String> {
@@ -688,6 +689,11 @@ mod tests {
             };
             assert!(!windows_direct_connection_supported(&configured));
         }
+        let managed = ServerConfig {
+            ssh_config_managed: true,
+            ..server()
+        };
+        assert!(!windows_direct_connection_supported(&managed));
     }
 
     #[test]
