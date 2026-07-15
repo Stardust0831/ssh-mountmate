@@ -22,8 +22,8 @@ use mountmate_core::app_command::{
 };
 use mountmate_core::capacity::CapacityInfo;
 use mountmate_core::connection::{
-    ConnectionDraft, ConnectionSource, DraftError, ImportAction, ImportStatus, SecretAction,
-    SshImportPlan,
+    ConnectionDraft, ConnectionSource, DraftError, ImportAction, ImportStatus,
+    PreservedSecretState, SecretAction, SshImportPlan,
 };
 use mountmate_core::credential::{
     CredentialChange, CredentialError, CredentialKind, CredentialStore, SystemCredentialStore,
@@ -459,6 +459,7 @@ struct App {
     busy: HashSet<String>,
     transfers: HashMap<String, TransferSnapshot>,
     transfer_errors: HashMap<String, String>,
+    operation_errors: HashMap<String, ConnectionOperationError>,
     transfer_failures: HashMap<String, u8>,
     transfer_refreshing: bool,
     main_window: window::Id,
@@ -577,6 +578,7 @@ struct LoadedMountLog {
     path: PathBuf,
     content: String,
     truncated: bool,
+    existed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -587,6 +589,13 @@ struct MountLogView {
     content: text_editor::Content,
     truncated: bool,
     loading: bool,
+    existed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ConnectionOperationError {
+    operation: MountOperation,
+    cause: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -827,6 +836,7 @@ enum Message {
     ConnectionMethodChanged(ConnectionMethod),
     PasswordChanged(SecretInput),
     KeyPassphraseChanged(SecretInput),
+    ClearSecret(CredentialKind),
     ManagedSshChanged(bool),
     CopyKeyChanged(bool),
     LoadSshConfig,
@@ -895,6 +905,9 @@ enum Message {
         operation: MountOperation,
         result: Result<String, String>,
     },
+    RetryOperation(String, MountOperation),
+    DismissOperationError(String),
+    OpenOperationLog(String),
     Open(String),
     OpenFinished(Result<(), String>),
     Edit(String),
@@ -1023,6 +1036,7 @@ impl App {
             busy: HashSet::new(),
             transfers: HashMap::new(),
             transfer_errors: HashMap::new(),
+            operation_errors: HashMap::new(),
             transfer_failures: HashMap::new(),
             transfer_refreshing: false,
             main_window,
@@ -1461,6 +1475,7 @@ impl App {
                             .content
                             .perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
                         log_view.truncated = log.truncated;
+                        log_view.existed = log.existed;
                         self.status = locale.text(TextKey::Logs).into();
                     }
                     Err(error) => self.status = error,
@@ -1629,6 +1644,11 @@ impl App {
             Message::KeyPassphraseChanged(value) => {
                 if let Some(draft) = &mut self.connection_draft {
                     draft.key_passphrase = value.0;
+                }
+            }
+            Message::ClearSecret(kind) => {
+                if let Some(draft) = &mut self.connection_draft {
+                    draft.clear_preserved_secret(kind);
                 }
             }
             Message::ManagedSshChanged(value) => {
@@ -2131,6 +2151,7 @@ impl App {
                 let mut tasks = Vec::new();
                 match result {
                     Ok(message) => {
+                        self.operation_errors.remove(&id);
                         self.mount_statuses.insert(
                             id.clone(),
                             match operation {
@@ -2149,6 +2170,13 @@ impl App {
                         }
                     }
                     Err(error) => {
+                        self.operation_errors.insert(
+                            id.clone(),
+                            ConnectionOperationError {
+                                operation,
+                                cause: error.clone(),
+                            },
+                        );
                         self.status = error;
                         tasks.push(self.status_task());
                     }
@@ -2162,6 +2190,13 @@ impl App {
                 ));
                 return Task::batch(tasks);
             }
+            Message::RetryOperation(id, operation) => {
+                return self.start_mount_operation(id, Some(operation));
+            }
+            Message::DismissOperationError(id) => {
+                self.operation_errors.remove(&id);
+            }
+            Message::OpenOperationLog(id) => return self.open_log(id),
             Message::Open(id) => return self.open_mountpoint(id),
             Message::OpenFinished(result) => match result {
                 Ok(()) => self.status = locale.text(TextKey::OpenedMountpoint).into(),
@@ -3444,6 +3479,7 @@ impl App {
         }
         self.mount_statuses
             .insert(id.clone(), MountStatus::Starting);
+        self.operation_errors.remove(&id);
         let server = self.servers.iter().find(|server| server.id == id).cloned();
         let display_name = operation_display_name(server.as_ref(), &id);
         self.status = match operation {
@@ -3589,6 +3625,7 @@ impl App {
             content: text_editor::Content::new(),
             truncated: false,
             loading: true,
+            existed: false,
         });
         self.status = self.locale().text(TextKey::LoadingLog).into();
         let load = load_log_task(id, path);
@@ -3682,7 +3719,20 @@ impl App {
         let mut connections = column![].spacing(8);
         if self.servers.is_empty() {
             connections = connections.push(
-                container(text(locale.text(TextKey::NoSavedConnections)).size(20))
+                container(
+                    column![
+                        text(locale.text(TextKey::NoSavedConnections)).size(20),
+                        text(match locale {
+                            Locale::English => "Create a connection to mount your first remote folder.",
+                            Locale::Chinese => "新建连接以挂载第一个远程目录。",
+                        })
+                        .size(14),
+                        button(locale.text(TextKey::AddConnection))
+                            .on_press(Message::AddConnection),
+                    ]
+                    .spacing(12)
+                    .align_x(Center),
+                )
                     .padding(28)
                     .width(Fill)
                     .center_x(Fill),
@@ -3707,6 +3757,7 @@ impl App {
                         can_modify: self.can_modify(&server.id),
                         confirming_remove: self.pending_delete.as_deref() == Some(&server.id),
                         waiting_unmount: self.pending_unmount_after_sync.contains(&server.id),
+                        operation_error: self.operation_errors.get(&server.id),
                     },
                     locale,
                 ));
@@ -4129,12 +4180,13 @@ impl App {
         if draft.connection_method == ConnectionMethod::Native {
             match draft.auth {
                 AuthMethod::Password => {
-                    auth_fields = auth_fields.push(labeled_control(
+                    auth_fields = auth_fields.push(secret_input_control(
                         locale.text(TextKey::Password),
-                        text_input(locale.text(TextKey::PasswordRequired), &draft.password)
-                            .secure(true)
-                            .on_input(|value| Message::PasswordChanged(SecretInput(value)))
-                            .width(Fill),
+                        locale.text(TextKey::PasswordRequired),
+                        &draft.password,
+                        draft.preserved_secret_state(CredentialKind::Password),
+                        CredentialKind::Password,
+                        locale,
                     ));
                 }
                 AuthMethod::Key => {
@@ -4147,14 +4199,13 @@ impl App {
                                 Message::BrowsePrivateKey,
                                 locale.text(TextKey::Browse),
                             ),
-                            labeled_control(
+                            secret_input_control(
                                 locale.text(TextKey::KeyPassphrase),
-                                text_input(locale.text(TextKey::Optional), &draft.key_passphrase)
-                                    .secure(true)
-                                    .on_input(|value| Message::KeyPassphraseChanged(SecretInput(
-                                        value
-                                    )))
-                                    .width(Fill),
+                                locale.text(TextKey::Optional),
+                                &draft.key_passphrase,
+                                draft.preserved_secret_state(CredentialKind::KeyPassphrase),
+                                CredentialKind::KeyPassphrase,
+                                locale,
                             ),
                         ]
                         .spacing(12),
@@ -4675,6 +4726,10 @@ impl App {
         })
         .width(Length::Fixed(260.0));
         let Some(log_view) = &self.log_view else {
+            let guidance = match locale {
+                Locale::English => "Choose a connection from the selector above to view its mount log.",
+                Locale::Chinese => "请从上方选择器选择一个连接以查看其挂载日志。",
+            };
             return editor_shell(
                 row![
                     text(locale.text(TextKey::Logs)).size(28),
@@ -4684,7 +4739,7 @@ impl App {
                 ]
                 .spacing(10)
                 .align_y(Center),
-                container(text(locale.text(TextKey::NoLogContent)))
+                container(text(guidance).size(18))
                     .center_x(Fill)
                     .center_y(Fill),
                 &self.status,
@@ -4713,6 +4768,21 @@ impl App {
         }
         if log_view.truncated {
             details = details.push(text(locale.text(TextKey::LogTruncated)).size(13));
+        }
+        if !log_view.loading && !log_view.existed {
+            details = details.push(
+                text(match locale {
+                    Locale::English => format!(
+                        "No log file exists at {}. This connection may never have been mounted, or logging has not started.",
+                        log_view.path.display()
+                    ),
+                    Locale::Chinese => format!(
+                        "{} 尚不存在。该连接可能从未挂载，或日志记录尚未开始。",
+                        log_view.path.display()
+                    ),
+                })
+                .size(13),
+            );
         }
         let log_content: Element<'_, Message> = if log_view.content.is_empty() {
             container(text(locale.text(TextKey::NoLogContent)).size(13))
@@ -4845,6 +4915,7 @@ struct ConnectionCardState<'a> {
     can_modify: bool,
     confirming_remove: bool,
     waiting_unmount: bool,
+    operation_error: Option<&'a ConnectionOperationError>,
 }
 
 fn capacity_progress_view(
@@ -4923,6 +4994,7 @@ fn connection_card<'a>(
         can_modify,
         confirming_remove,
         waiting_unmount,
+        operation_error,
     } = state;
     let id = server.id.clone();
     let host = format!("{}@{}:{}", server.user, server.host, server.port);
@@ -4974,6 +5046,41 @@ fn connection_card<'a>(
                 .push(progress_bar(0.0..=100.0, snapshot.percentage as f32));
         }
     }
+    if let Some(error) = operation_error {
+        let explanation = match locale {
+            Locale::English => format!("Last operation failed: {}", error.cause),
+            Locale::Chinese => format!("上次操作失败：{}", error.cause),
+        };
+        details = details.push(
+            container(
+                column![
+                    text(explanation).size(13),
+                    row![
+                        button(match locale {
+                            Locale::English => "Retry",
+                            Locale::Chinese => "重试",
+                        })
+                        .on_press(Message::RetryOperation(id.clone(), error.operation)),
+                        button(match locale {
+                            Locale::English => "Open log",
+                            Locale::Chinese => "打开日志",
+                        })
+                        .on_press(Message::OpenOperationLog(id.clone())),
+                        button(match locale {
+                            Locale::English => "Dismiss",
+                            Locale::Chinese => "关闭",
+                        })
+                        .on_press(Message::DismissOperationError(id.clone())),
+                    ]
+                    .spacing(8),
+                ]
+                .spacing(6),
+            )
+            .padding(10)
+            .width(Fill)
+            .style(container::rounded_box),
+        );
+    }
     let edit = button(locale.text(TextKey::Edit))
         .on_press_maybe(can_modify.then(|| Message::Edit(id.clone())));
     let actions: Element<'_, Message> = if confirming_remove {
@@ -5014,6 +5121,54 @@ fn connection_input<'a>(
             .on_input(move |value| Message::ConnectionFieldChanged(field, value))
             .width(Fill),
     )
+}
+
+fn secret_input_control<'a>(
+    label: &'a str,
+    placeholder: &'a str,
+    value: &'a str,
+    state: PreservedSecretState,
+    kind: CredentialKind,
+    locale: Locale,
+) -> iced::widget::Column<'a, Message> {
+    let input = text_input(placeholder, value)
+        .secure(true)
+        .on_input(move |value| match kind {
+            CredentialKind::Password => Message::PasswordChanged(SecretInput(value)),
+            CredentialKind::KeyPassphrase => Message::KeyPassphraseChanged(SecretInput(value)),
+        })
+        .width(Fill);
+    let mut control = labeled_control(label, input);
+    if state != PreservedSecretState::Absent {
+        let state_text = match (locale, state) {
+            (Locale::English, PreservedSecretState::System) => {
+                "Stored in the system credential store. Leave blank to keep it, or type to replace it."
+            }
+            (Locale::Chinese, PreservedSecretState::System) => {
+                "已存入系统凭据库。留空会保留，输入新值会替换。"
+            }
+            (Locale::English, PreservedSecretState::Obscured) => {
+                "Stored with rclone obscure. Leave blank to keep it, or type to replace it."
+            }
+            (Locale::Chinese, PreservedSecretState::Obscured) => {
+                "已使用 rclone obscure 保存。留空会保留，输入新值会替换。"
+            }
+            (_, PreservedSecretState::Absent) => unreachable!(),
+        };
+        control = control.push(
+            row![
+                text(state_text).size(12),
+                button(match locale {
+                    Locale::English => "Clear stored value",
+                    Locale::Chinese => "清除已存值",
+                })
+                .on_press(Message::ClearSecret(kind)),
+            ]
+            .spacing(8)
+            .align_y(Center),
+        );
+    }
+    control
 }
 
 fn connection_file_input<'a>(
@@ -5599,6 +5754,7 @@ fn read_mount_log(path: PathBuf) -> Result<LoadedMountLog, String> {
                 path,
                 content: String::new(),
                 truncated: false,
+                existed: false,
             });
         }
         Err(error) => return Err(format!("{}: {error}", path.display())),
@@ -5625,6 +5781,7 @@ fn read_mount_log(path: PathBuf) -> Result<LoadedMountLog, String> {
         path,
         content: String::from_utf8_lossy(&bytes).into_owned(),
         truncated: start > 0,
+        existed: true,
     })
 }
 
@@ -6567,6 +6724,7 @@ mod localization_tests {
         assert_eq!(empty.path, missing);
         assert!(empty.content.is_empty());
         assert!(!empty.truncated);
+        assert!(!empty.existed);
 
         let path = temp.path().join("large.log");
         let mut bytes = vec![b'x'; LOG_VIEW_LIMIT as usize + 32];
@@ -6575,6 +6733,7 @@ mod localization_tests {
         let loaded = read_mount_log(path.clone()).unwrap();
         assert_eq!(loaded.path, path);
         assert!(loaded.truncated);
+        assert!(loaded.existed);
         assert_eq!(loaded.content, "final log line\n");
     }
 

@@ -76,6 +76,13 @@ pub struct ConnectionDraft {
     existing: Option<ServerConfig>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreservedSecretState {
+    Absent,
+    Obscured,
+    System,
+}
+
 impl fmt::Debug for ConnectionDraft {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -143,6 +150,53 @@ impl ConnectionDraft {
             copy_key_to_ssh_dir: server.copy_key_to_ssh_dir,
             ssh_config_path: server.ssh_config_path.clone(),
             existing: Some(server.clone()),
+        }
+    }
+
+    /// Explicitly forget a preserved secret while editing. Text inputs remain
+    /// blank for both "keep" and "clear", so the UI must call this method for
+    /// an intentional clear instead of inferring it from an empty input.
+    pub fn clear_preserved_secret(&mut self, kind: crate::credential::CredentialKind) {
+        let Some(existing) = &mut self.existing else {
+            return;
+        };
+        match kind {
+            crate::credential::CredentialKind::Password => {
+                self.password.clear();
+                existing.password_obscured.clear();
+                existing.password_credential.clear();
+            }
+            crate::credential::CredentialKind::KeyPassphrase => {
+                self.key_passphrase.clear();
+                existing.key_pass_obscured.clear();
+                existing.key_pass_credential.clear();
+            }
+        }
+    }
+
+    pub fn preserved_secret_state(
+        &self,
+        kind: crate::credential::CredentialKind,
+    ) -> PreservedSecretState {
+        let Some(existing) = &self.existing else {
+            return PreservedSecretState::Absent;
+        };
+        let (obscured, credential) = match kind {
+            crate::credential::CredentialKind::Password => (
+                &existing.password_obscured,
+                &existing.password_credential,
+            ),
+            crate::credential::CredentialKind::KeyPassphrase => (
+                &existing.key_pass_obscured,
+                &existing.key_pass_credential,
+            ),
+        };
+        if !credential.is_empty() {
+            PreservedSecretState::System
+        } else if !obscured.is_empty() {
+            PreservedSecretState::Obscured
+        } else {
+            PreservedSecretState::Absent
         }
     }
 
@@ -865,6 +919,31 @@ mod tests {
         let saved = validated.apply_secrets(None, None).unwrap();
         assert!(saved.password_obscured.is_empty());
         assert_eq!(saved.password_credential, "ssh-mountmate:alpha:password");
+    }
+
+    #[test]
+    fn explicit_secret_clear_is_distinct_from_a_blank_keep_input() {
+        let mut existing = password_server();
+        existing.password_obscured.clear();
+        existing.password_credential = "ssh-mountmate:alpha:password".into();
+        let mut draft = ConnectionDraft::from_server(&existing);
+
+        assert_eq!(
+            draft.preserved_secret_state(crate::credential::CredentialKind::Password),
+            PreservedSecretState::System
+        );
+
+        draft.clear_preserved_secret(crate::credential::CredentialKind::Password);
+
+        assert_eq!(
+            draft.preserved_secret_state(crate::credential::CredentialKind::Password),
+            PreservedSecretState::Absent
+        );
+
+        assert_eq!(
+            draft.validate(std::slice::from_ref(&existing)),
+            Err(DraftError::PasswordRequired)
+        );
     }
 
     #[test]
