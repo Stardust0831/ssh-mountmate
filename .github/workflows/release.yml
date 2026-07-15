@@ -548,6 +548,11 @@ jobs:
         with:
           toolchain: 1.97.0
 
+      - name: Install signing tool system dependencies
+        run: |
+          sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 install -y libdbus-1-dev pkg-config
+
       - name: Exercise signed release set with an ephemeral test key
         shell: bash
         env:
@@ -583,6 +588,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: 1.97.0
+      - name: Install signing tool system dependencies
+        run: |
+          sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 install -y libdbus-1-dev pkg-config
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: SSHMountMate-release-set
