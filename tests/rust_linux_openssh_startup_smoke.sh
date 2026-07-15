@@ -3,7 +3,7 @@ set -euo pipefail
 
 package_root="$(realpath "${1:?packaged SSH MountMate root is required}")"
 binary="${package_root}/SSHMountMate"
-rclone="${package_root}/bin/rclone"
+rclone=""
 test_root="$(mktemp -d "${RUNNER_TEMP:-/tmp}/ssh-mountmate-openssh-e2e-XXXXXX")"
 remote_root="${test_root}/remote"
 mount_root="${test_root}/mounts"
@@ -58,7 +58,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
+mkdir -p "${test_root}/home"
+export HOME="${test_root}/home"
+export XDG_CONFIG_HOME="${test_root}/config"
+export XDG_CACHE_HOME="${test_root}/cache"
+export XDG_STATE_HOME="${test_root}/state"
+export XDG_DATA_HOME="${test_root}/data"
+
 test -x "${binary}"
+rclone="$("${binary}" --rclone-path)"
 test -x "${rclone}"
 command -v ssh >/dev/null
 command -v ssh-keygen >/dev/null
@@ -135,11 +143,6 @@ Host local-openssh-a local-openssh-b
 EOF
 chmod 600 "${ssh_config}"
 
-export HOME="${test_root}/home"
-export XDG_CONFIG_HOME="${test_root}/config"
-export XDG_CACHE_HOME="${test_root}/cache"
-export XDG_STATE_HOME="${test_root}/state"
-export XDG_DATA_HOME="${test_root}/data"
 config_dir="${XDG_CONFIG_HOME}/rsshmount"
 state_dir="${XDG_STATE_HOME}/rsshmount"
 mkdir -p "${config_dir}"
