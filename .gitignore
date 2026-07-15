@@ -11,6 +11,7 @@ env/
 
 bin/
 dist/
+target/
 release/
 build/generated-assets/
 build/generated-bin/

@@ -1,0 +1,30 @@
+[package]
+name = "ssh-mountmate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-channel.workspace = true
+iced.workspace = true
+mountmate-core = { path = "../mountmate-core" }
+mountmate-platform = { path = "../mountmate-platform" }
+rfd.workspace = true
+sys-locale.workspace = true
+tokio.workspace = true
+tray-icon.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+libloading = "0.8"
+tray-icon = { workspace = true, features = ["gtk"] }
+zbus.workspace = true
+
+[[bin]]
+name = "SSHMountMate"
+path = "src/main.rs"
+
+[dev-dependencies]
+tempfile.workspace = true

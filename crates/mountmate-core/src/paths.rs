@@ -1,0 +1,206 @@
+use std::env;
+use std::path::{Path, PathBuf};
+
+use crate::LEGACY_APP_ID;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppPaths {
+    pub config_dir: PathBuf,
+    pub cache_dir: PathBuf,
+    pub state_dir: PathBuf,
+    pub data_dir: PathBuf,
+}
+
+impl AppPaths {
+    pub fn discover() -> Self {
+        let home = home_dir();
+        #[cfg(target_os = "windows")]
+        {
+            let roaming = env::var_os("APPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join("AppData/Roaming"));
+            let local = env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join("AppData/Local"));
+            return Self {
+                config_dir: roaming.join(LEGACY_APP_ID),
+                cache_dir: local.join(LEGACY_APP_ID).join("Cache"),
+                state_dir: local.join(LEGACY_APP_ID).join("State"),
+                data_dir: local.join("ssh-mountmate"),
+            };
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Self {
+                config_dir: env_path("XDG_CONFIG_HOME", home.join(".config")).join(LEGACY_APP_ID),
+                cache_dir: env_path("XDG_CACHE_HOME", home.join(".cache")).join(LEGACY_APP_ID),
+                state_dir: env_path("XDG_STATE_HOME", home.join(".local/state"))
+                    .join(LEGACY_APP_ID),
+                data_dir: home.join("Library/Application Support/ssh-mountmate"),
+            }
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            Self {
+                config_dir: env_path("XDG_CONFIG_HOME", home.join(".config")).join(LEGACY_APP_ID),
+                cache_dir: env_path("XDG_CACHE_HOME", home.join(".cache")).join(LEGACY_APP_ID),
+                state_dir: env_path("XDG_STATE_HOME", home.join(".local/state"))
+                    .join(LEGACY_APP_ID),
+                data_dir: env_path("XDG_DATA_HOME", home.join(".local/share"))
+                    .join("ssh-mountmate"),
+            }
+        }
+    }
+
+    pub fn servers_file(&self) -> PathBuf {
+        self.config_dir.join("servers.json")
+    }
+
+    pub fn settings_file(&self) -> PathBuf {
+        self.config_dir.join("settings.json")
+    }
+
+    pub fn servers_lock(&self) -> PathBuf {
+        self.config_dir.join("servers.json.lock")
+    }
+
+    pub fn settings_lock(&self) -> PathBuf {
+        self.config_dir.join("settings.json.lock")
+    }
+
+    pub fn rclone_config(&self) -> PathBuf {
+        self.config_dir.join("rclone.conf")
+    }
+
+    pub fn rclone_config_lock(&self) -> PathBuf {
+        self.config_dir.join("rclone.conf.lock")
+    }
+
+    pub fn known_hosts(&self) -> PathBuf {
+        self.config_dir.join("known_hosts")
+    }
+
+    pub fn known_hosts_lock(&self) -> PathBuf {
+        self.config_dir.join("known_hosts.lock")
+    }
+
+    pub fn state_file(&self, server_id: &str) -> PathBuf {
+        self.state_dir
+            .join(format!("{}.json", path_component(server_id)))
+    }
+
+    pub fn mount_lock(&self, server_id: &str) -> PathBuf {
+        self.state_dir
+            .join(format!("{}.mount.lock", path_component(server_id)))
+    }
+
+    pub fn mount_allocation_lock(&self) -> PathBuf {
+        self.state_dir.join("mountpoint-allocation.lock")
+    }
+
+    pub fn app_instance_lock(&self) -> PathBuf {
+        self.state_dir.join("app-instance.lock")
+    }
+
+    pub fn app_command_state(&self) -> PathBuf {
+        self.state_dir.join("app-command.json")
+    }
+
+    pub fn mount_log(&self, remote_name: &str) -> PathBuf {
+        self.state_dir
+            .join(format!("{}.log", path_component(remote_name)))
+    }
+
+    pub fn managed_bin_dir(&self) -> PathBuf {
+        self.data_dir.join("bin")
+    }
+
+    pub fn update_helper_dir(&self) -> PathBuf {
+        self.data_dir.join("update")
+    }
+
+    pub fn update_state_dir(&self) -> PathBuf {
+        self.state_dir.join("update")
+    }
+
+    pub fn update_cache_dir(&self) -> PathBuf {
+        self.cache_dir.join("update")
+    }
+
+    pub fn mount_cache_dir(&self, remote_name: &str) -> PathBuf {
+        self.cache_dir.join(path_component(remote_name))
+    }
+
+    pub fn legacy_managed_bin_dirs(&self) -> Vec<PathBuf> {
+        let Some(parent) = self.data_dir.parent() else {
+            return Vec::new();
+        };
+        let legacy_name = if cfg!(target_os = "windows") || cfg!(target_os = "macos") {
+            "SSHMountMate"
+        } else {
+            LEGACY_APP_ID
+        };
+        let legacy = parent.join(legacy_name).join("bin");
+        (legacy != self.managed_bin_dir())
+            .then_some(legacy)
+            .into_iter()
+            .collect()
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn env_path(name: &str, fallback: PathBuf) -> PathBuf {
+    env::var_os(name).map(PathBuf::from).unwrap_or(fallback)
+}
+
+fn home_dir() -> PathBuf {
+    directories::BaseDirs::new()
+        .map(|dirs| dirs.home_dir().to_owned())
+        .unwrap_or_else(|| Path::new(".").to_owned())
+}
+
+fn path_component(value: &str) -> String {
+    let component: String = value
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || matches!(character, '.' | '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let component = component.trim_matches(['.', '_', '-']);
+    if component.is_empty() {
+        "invalid".into()
+    } else {
+        component.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_paths_cannot_escape_the_state_directory() {
+        let paths = AppPaths {
+            config_dir: PathBuf::from("config"),
+            cache_dir: PathBuf::from("cache"),
+            state_dir: PathBuf::from("state"),
+            data_dir: PathBuf::from("data"),
+        };
+        assert_eq!(
+            paths.state_file("../../outside"),
+            PathBuf::from("state/outside.json")
+        );
+        assert_eq!(
+            paths.mount_log("host:22"),
+            PathBuf::from("state/host_22.log")
+        );
+        assert_eq!(paths.managed_bin_dir(), PathBuf::from("data/bin"));
+        assert_eq!(paths.update_helper_dir(), PathBuf::from("data/update"));
+        assert_eq!(paths.update_state_dir(), PathBuf::from("state/update"));
+        assert_eq!(paths.update_cache_dir(), PathBuf::from("cache/update"));
+    }
+}

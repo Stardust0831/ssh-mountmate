@@ -24,7 +24,20 @@ Pull requests are welcome. Please keep changes focused and include a short expla
 Before submitting, run:
 
 ```bash
-python -m py_compile $(find src build -name '*.py' -print) launcher.py
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+```
+
+When `Cargo.lock` changes, audit and regenerate the checked-in Rust license inventory with the
+tool versions pinned by CI:
+
+```bash
+cargo install --locked cargo-deny --version 0.20.2
+cargo deny --all-features check licenses sources
+cargo install --locked cargo-about --version 0.9.1
+cargo fetch --locked
+sh scripts/generate-rust-licenses.sh
 ```
 
 ---
@@ -55,5 +68,17 @@ Bug、易用性问题、依赖安装问题和功能建议都可以通过 GitHub 
 提交前建议运行：
 
 ```bash
-python -m py_compile $(find src build -name '*.py' -print) launcher.py
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+```
+
+`Cargo.lock` 发生变化后，请使用 CI 固定的工具版本审计并重新生成 Rust 许可证清单：
+
+```bash
+cargo install --locked cargo-deny --version 0.20.2
+cargo deny --all-features check licenses sources
+cargo install --locked cargo-about --version 0.9.1
+cargo fetch --locked
+sh scripts/generate-rust-licenses.sh
 ```

@@ -1,0 +1,15 @@
+{
+  "settings_schema_version": 5,
+  "cache_root": "/legacy/custom-cache",
+  "vfs_cache_mode": "writes",
+  "vfs_cache_max_size": "50G",
+  "vfs_cache_max_age": "2h",
+  "vfs_cache_min_free_space": "5G",
+  "vfs_write_back": "17s",
+  "dir_cache_time": "9m",
+  "buffer_size": "32M",
+  "startup_all": true,
+  "auto_show_transfers": false,
+  "auto_check_updates": false,
+  "language": "zh-CN"
+}
