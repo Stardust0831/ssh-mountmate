@@ -599,6 +599,84 @@ struct ConnectionOperationError {
     cause: String,
 }
 
+/// Keep a failed mount from turning a connection card into a full-page error
+/// while retaining enough context to identify the immediate cause. The
+/// dedicated read-only log window remains the source for complete details.
+const MOUNT_ERROR_SUMMARY_MAX_LINES: usize = 2;
+const MOUNT_ERROR_SUMMARY_MAX_CHARS: usize = 240;
+const MOUNT_ERROR_SUMMARY_LINE_MAX_CHARS: usize = 120;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MountErrorAction {
+    Retry,
+    ViewLog,
+    Dismiss,
+}
+
+fn mount_error_summary(locale: Locale, cause: &str) -> String {
+    let prefix = match locale {
+        Locale::English => "Last operation failed: ",
+        Locale::Chinese => "上次操作失败：",
+    };
+    let mut lines = Vec::new();
+    let mut truncated = false;
+    for raw_line in cause.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if lines.len() == MOUNT_ERROR_SUMMARY_MAX_LINES {
+            truncated = true;
+            break;
+        }
+        let clipped = line
+            .chars()
+            .take(MOUNT_ERROR_SUMMARY_LINE_MAX_CHARS)
+            .collect::<String>();
+        if clipped.chars().count() < line.chars().count() {
+            truncated = true;
+        }
+        lines.push(clipped);
+    }
+    if lines.is_empty() {
+        lines.push(match locale {
+            Locale::English => "Unknown mount error".into(),
+            Locale::Chinese => "未知挂载错误".into(),
+        });
+    }
+
+    let mut summary = format!("{prefix}{}", lines.join("\n"));
+    if summary.chars().count() > MOUNT_ERROR_SUMMARY_MAX_CHARS {
+        summary = summary
+            .chars()
+            .take(MOUNT_ERROR_SUMMARY_MAX_CHARS.saturating_sub(1))
+            .collect();
+        truncated = true;
+    }
+    if truncated {
+        if summary.chars().count() >= MOUNT_ERROR_SUMMARY_MAX_CHARS {
+            summary = summary
+                .chars()
+                .take(MOUNT_ERROR_SUMMARY_MAX_CHARS.saturating_sub(1))
+                .collect();
+        }
+        summary.push('…');
+    }
+    summary
+}
+
+fn mount_error_message(
+    id: String,
+    operation: MountOperation,
+    action: MountErrorAction,
+) -> Message {
+    match action {
+        MountErrorAction::Retry => Message::RetryOperation(id, operation),
+        MountErrorAction::ViewLog => Message::OpenOperationLog(id),
+        MountErrorAction::Dismiss => Message::DismissOperationError(id),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LogChoice {
     id: String,
@@ -5112,30 +5190,39 @@ fn connection_card<'a>(
         }
     }
     if let Some(error) = operation_error {
-        let explanation = match locale {
-            Locale::English => format!("Last operation failed: {}", error.cause),
-            Locale::Chinese => format!("上次操作失败：{}", error.cause),
-        };
+        let operation = error.operation;
         details = details.push(
             container(
                 column![
-                    text(explanation).size(13),
+                    text(mount_error_summary(locale, &error.cause)).size(13),
                     row![
                         button(match locale {
                             Locale::English => "Retry",
                             Locale::Chinese => "重试",
                         })
-                        .on_press(Message::RetryOperation(id.clone(), error.operation)),
+                        .on_press(mount_error_message(
+                            id.clone(),
+                            operation,
+                            MountErrorAction::Retry,
+                        )),
                         button(match locale {
-                            Locale::English => "Open log",
-                            Locale::Chinese => "打开日志",
+                            Locale::English => "View full log",
+                            Locale::Chinese => "查看完整日志",
                         })
-                        .on_press(Message::OpenOperationLog(id.clone())),
+                        .on_press(mount_error_message(
+                            id.clone(),
+                            operation,
+                            MountErrorAction::ViewLog,
+                        )),
                         button(match locale {
                             Locale::English => "Dismiss",
                             Locale::Chinese => "关闭",
                         })
-                        .on_press(Message::DismissOperationError(id.clone())),
+                        .on_press(mount_error_message(
+                            id.clone(),
+                            operation,
+                            MountErrorAction::Dismiss,
+                        )),
                     ]
                     .spacing(8),
                 ]
@@ -6798,6 +6885,51 @@ fn open_path(path: &Path, locale: Locale) -> Result<(), String> {
 #[cfg(test)]
 mod localization_tests {
     use super::*;
+
+    #[test]
+    fn mount_error_summary_is_bounded_to_two_lines_and_compact_content() {
+        let cause = "first detail\nsecond detail\nthird detail that should stay in the log";
+        let summary = mount_error_summary(Locale::English, cause);
+        assert_eq!(summary.lines().count(), MOUNT_ERROR_SUMMARY_MAX_LINES);
+        assert!(summary.ends_with('…'));
+        assert!(summary.chars().count() <= MOUNT_ERROR_SUMMARY_MAX_CHARS);
+        assert!(summary.contains("first detail"));
+        assert!(summary.contains("second detail"));
+        assert!(!summary.contains("third detail"));
+
+        let long_line = "x".repeat(MOUNT_ERROR_SUMMARY_LINE_MAX_CHARS + 40);
+        let summary = mount_error_summary(Locale::Chinese, &long_line);
+        assert_eq!(summary.lines().count(), 1);
+        assert!(summary.chars().count() <= MOUNT_ERROR_SUMMARY_MAX_CHARS);
+        assert!(summary.ends_with('…'));
+    }
+
+    #[test]
+    fn mount_error_buttons_route_to_durable_actions() {
+        let retry = mount_error_message(
+            "alpha".into(),
+            MountOperation::Mount,
+            MountErrorAction::Retry,
+        );
+        assert!(matches!(
+            retry,
+            Message::RetryOperation(id, MountOperation::Mount) if id == "alpha"
+        ));
+
+        let view_log = mount_error_message(
+            "alpha".into(),
+            MountOperation::Unmount,
+            MountErrorAction::ViewLog,
+        );
+        assert!(matches!(view_log, Message::OpenOperationLog(id) if id == "alpha"));
+
+        let dismiss = mount_error_message(
+            "alpha".into(),
+            MountOperation::Unmount,
+            MountErrorAction::Dismiss,
+        );
+        assert!(matches!(dismiss, Message::DismissOperationError(id) if id == "alpha"));
+    }
 
     #[test]
     fn unsigned_updates_have_explicit_bilingual_block_reasons() {
