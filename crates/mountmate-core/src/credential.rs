@@ -441,7 +441,7 @@ pub fn migrate_server_to_system(
 }
 
 fn migrate_obscured_field(
-    obscured: &mut String,
+    obscured: &str,
     reference: &mut String,
     server_id: &str,
     kind: CredentialKind,
@@ -596,6 +596,7 @@ mod tests {
         fail_delete_reference: Mutex<Option<String>>,
         fail_after_set_reference: Mutex<Option<String>>,
         mismatch_once_reference: Mutex<Option<String>>,
+        mismatch_ready_reference: Mutex<Option<String>>,
     }
 
     impl CredentialStore for MemoryStore {
@@ -607,6 +608,12 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(reference.into(), secret.into());
+            let mut mismatch = self.mismatch_once_reference.lock().unwrap();
+            if mismatch.as_deref() == Some(reference) {
+                mismatch.take();
+                drop(mismatch);
+                *self.mismatch_ready_reference.lock().unwrap() = Some(reference.into());
+            }
             if self.fail_after_set_reference.lock().unwrap().as_deref() == Some(reference) {
                 return Err(CredentialError::Unavailable("injected failure".into()));
             }
@@ -618,7 +625,7 @@ mod tests {
                 return Err(CredentialError::Unavailable("injected failure".into()));
             }
             if self
-                .mismatch_once_reference
+                .mismatch_ready_reference
                 .lock()
                 .unwrap()
                 .take()
