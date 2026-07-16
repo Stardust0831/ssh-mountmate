@@ -1325,6 +1325,9 @@ impl App {
                         self.pending_main_activation = false;
                         tasks.push(self.activate_main_window());
                     }
+                    if let Some(server_id) = self.terminal_server_id.clone() {
+                        tasks.push(self.open_terminal_window(server_id));
+                    }
                     return Task::batch(tasks);
                 }
             }
@@ -3748,6 +3751,9 @@ impl App {
         self.terminal_server_id = Some(id);
         if let Some(window) = self.terminal_window {
             return window::gain_focus(window);
+        }
+        if !self.main_window_ready {
+            return Task::none();
         }
         let (window, open) = window::open(terminal_window_settings());
         self.terminal_window = Some(window);
