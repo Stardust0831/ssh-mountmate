@@ -2299,8 +2299,8 @@ impl App {
                 Err(error) => self.status = error,
             },
             Message::Edit(id) => {
-                if self.can_modify(&id)
-                    && let Some(server) = self.servers.iter().find(|server| server.id == id)
+                let can_modify = self.can_modify(&id);
+                if let Some(server) = self.servers.iter().find(|server| server.id == id)
                 {
                     self.connection_draft = Some(ConnectionDraft::from_server(server));
                     self.connection_custom_mountpoint = custom_mountpoint_value(&server.mountpoint);
@@ -2312,7 +2312,11 @@ impl App {
                     self.ssh_import_plan = None;
                     self.ssh_import_actions.clear();
                     self.screen = Screen::ConnectionEditor;
-                    self.status = locale.editing(server.display_name());
+                    self.status = if can_modify {
+                        locale.editing(server.display_name())
+                    } else {
+                        connection_settings_locked_help(locale).into()
+                    };
                 }
             }
             Message::Remove(id) => {
@@ -2690,6 +2694,15 @@ impl App {
 
     fn save_connection(&mut self) -> Task<Message> {
         if self.editor_saving {
+            return Task::none();
+        }
+        if self.connection_draft.as_ref().is_some_and(|draft| {
+            draft
+                .editing_id
+                .as_deref()
+                .is_some_and(|id| !self.can_modify(id))
+        }) {
+            self.status = connection_settings_locked_help(self.locale()).into();
             return Task::none();
         }
         if self
@@ -4041,6 +4054,13 @@ impl App {
         } else {
             locale.text(TextKey::AddConnection)
         };
+        if draft
+            .editing_id
+            .as_deref()
+            .is_some_and(|id| !self.can_modify(id))
+        {
+            return self.read_only_connection_settings_view(draft, title);
+        }
         let header = row![
             text(title).size(28),
             Space::new().width(Fill),
@@ -4445,6 +4465,124 @@ impl App {
         ]
         .spacing(16)
         .max_width(900);
+        editor_shell(header, scrollable(content), &self.status)
+    }
+
+    fn read_only_connection_settings_view<'a>(
+        &'a self,
+        draft: &'a ConnectionDraft,
+        title: &'a str,
+    ) -> Element<'a, Message> {
+        let locale = self.locale();
+        let header = row![
+            text(title).size(28),
+            Space::new().width(Fill),
+            button(locale.text(TextKey::Cancel)).on_press(Message::CancelEditor),
+        ]
+        .spacing(10)
+        .align_y(Center);
+        let mut content = column![
+            container(text(connection_settings_locked_help(locale)).size(14))
+                .padding(12)
+                .width(Fill)
+                .style(container::rounded_box),
+            row![
+                connection_read_only_field(
+                    locale.text(TextKey::Source),
+                    locale.connection_source(draft.source),
+                ),
+                connection_read_only_field(locale.text(TextKey::Name), &draft.name),
+            ]
+            .spacing(12),
+            row![
+                connection_read_only_field(
+                    locale.text(TextKey::SshHostAlias),
+                    &draft.host_alias,
+                ),
+                connection_read_only_field(locale.text(TextKey::IpHost), &draft.host),
+            ]
+            .spacing(12),
+            row![
+                connection_read_only_field(locale.text(TextKey::User), &draft.user),
+                connection_read_only_field(locale.text(TextKey::Port), &draft.port),
+            ]
+            .spacing(12),
+            row![
+                connection_read_only_field(
+                    locale.text(TextKey::Transport),
+                    locale.connection_method(draft.connection_method),
+                ),
+                connection_read_only_field(
+                    locale.text(TextKey::Authentication),
+                    locale.auth_method(draft.auth),
+                ),
+            ]
+            .spacing(12),
+        ]
+        .spacing(16)
+        .max_width(900);
+        if matches!(
+            draft.source,
+            ConnectionSource::SshConfig | ConnectionSource::SshConfigBatch
+        ) {
+            content = content.push(connection_read_only_field(
+                locale.text(TextKey::SshConfigFile),
+                &draft.ssh_config_path,
+            ));
+        }
+        if draft.auth == AuthMethod::Key {
+            content = content.push(
+                row![
+                    connection_read_only_field(
+                        locale.text(TextKey::PrivateKeyFile),
+                        &draft.key_file,
+                    ),
+                    connection_read_only_field(
+                        locale.text(TextKey::KeyPassphrase),
+                        connection_secret_state_label(
+                            locale,
+                            draft.preserved_secret_state(CredentialKind::KeyPassphrase),
+                        ),
+                    ),
+                ]
+                .spacing(12),
+            );
+        } else {
+            content = content.push(connection_read_only_field(
+                locale.text(TextKey::Password),
+                connection_secret_state_label(
+                    locale,
+                    draft.preserved_secret_state(CredentialKind::Password),
+                ),
+            ));
+        }
+        content = content
+            .push(
+                row![
+                    connection_read_only_field(
+                        locale.text(TextKey::WriteManagedProfile),
+                        localized_yes_no(locale, draft.ssh_config_managed),
+                    ),
+                    connection_read_only_field(
+                        locale.text(TextKey::CopyPrivateKey),
+                        localized_yes_no(locale, draft.copy_key_to_ssh_dir),
+                    ),
+                ]
+                .spacing(12),
+            )
+            .push(
+                row![
+                    connection_read_only_field(
+                        locale.text(TextKey::RemotePath),
+                        &draft.remote_path,
+                    ),
+                    connection_read_only_field(
+                        locale.text(TextKey::Mountpoint),
+                        display_draft_mountpoint(draft, locale),
+                    ),
+                ]
+                .spacing(12),
+            );
         editor_shell(header, scrollable(content), &self.status)
     }
 
@@ -5240,8 +5378,7 @@ fn connection_card<'a>(
             .style(container::rounded_box),
         );
     }
-    let edit = button(locale.text(TextKey::Edit))
-        .on_press_maybe(can_modify.then(|| Message::Edit(id.clone())));
+    let edit = button(locale.text(TextKey::Edit)).on_press(Message::Edit(id.clone()));
     let actions: Element<'_, Message> = if confirming_remove {
         row![
             button(locale.text(TextKey::Cancel)).on_press(Message::CancelRemove),
@@ -5775,6 +5912,51 @@ fn interactive_ssh_config_unavailable(locale: Locale) -> &'static str {
         Locale::Chinese => {
             "Windows 上的 SSH config 或应用托管配置不能使用交互式共享 SSH，因为 Plink 无法保留完整的 OpenSSH 配置语义。"
         }
+    }
+}
+
+fn connection_settings_locked_help(locale: Locale) -> &'static str {
+    match locale {
+        Locale::English => {
+            "This connection is mounted or busy. Settings are read-only; unmount it to make changes. Changes take effect on the next mount."
+        }
+        Locale::Chinese => {
+            "此连接已挂载或正在执行操作。当前设置为只读；请先卸载再修改，变更会在下次挂载时生效。"
+        }
+    }
+}
+
+fn localized_yes_no(locale: Locale, value: bool) -> &'static str {
+    match (locale, value) {
+        (Locale::English, true) => "Yes",
+        (Locale::English, false) => "No",
+        (Locale::Chinese, true) => "是",
+        (Locale::Chinese, false) => "否",
+    }
+}
+
+fn connection_secret_state_label(
+    locale: Locale,
+    state: PreservedSecretState,
+) -> &'static str {
+    match (locale, state) {
+        (Locale::English, PreservedSecretState::System) => "Stored in system credentials",
+        (Locale::English, PreservedSecretState::Obscured) => "Stored with rclone obscure",
+        (Locale::English, PreservedSecretState::Absent) => "Not stored",
+        (Locale::Chinese, PreservedSecretState::System) => "已存入系统凭据库",
+        (Locale::Chinese, PreservedSecretState::Obscured) => "已使用 rclone obscure 保存",
+        (Locale::Chinese, PreservedSecretState::Absent) => "未保存",
+    }
+}
+
+fn display_draft_mountpoint<'a>(draft: &'a ConnectionDraft, locale: Locale) -> &'a str {
+    if draft.mountpoint.is_empty()
+        || draft.mountpoint == HOME_MOUNTPOINT_VALUE
+        || draft.mountpoint.eq_ignore_ascii_case("auto")
+    {
+        locale.text(TextKey::AutoMountpoint)
+    } else {
+        &draft.mountpoint
     }
 }
 
@@ -7122,6 +7304,40 @@ mod localization_tests {
             ConnectionMethod::Interactive,
             false,
         ));
+    }
+
+    #[test]
+    fn mounted_connection_settings_copy_is_read_only_and_never_reveals_secrets() {
+        assert_eq!(Locale::English.text(TextKey::Edit), "Settings");
+        assert_eq!(Locale::Chinese.text(TextKey::Edit), "设置");
+        assert!(connection_settings_locked_help(Locale::English).contains("read-only"));
+        assert!(connection_settings_locked_help(Locale::Chinese).contains("只读"));
+        assert_eq!(
+            connection_secret_state_label(Locale::English, PreservedSecretState::System),
+            "Stored in system credentials"
+        );
+        assert_eq!(
+            connection_secret_state_label(Locale::Chinese, PreservedSecretState::Obscured),
+            "已使用 rclone obscure 保存"
+        );
+        assert_eq!(localized_yes_no(Locale::English, true), "Yes");
+        assert_eq!(localized_yes_no(Locale::Chinese, false), "否");
+    }
+
+    #[test]
+    fn read_only_settings_use_the_same_mountpoint_display_rules_as_cards() {
+        let mut draft = ConnectionDraft::default();
+        assert_eq!(
+            display_draft_mountpoint(&draft, Locale::English),
+            Locale::English.text(TextKey::AutoMountpoint)
+        );
+        draft.mountpoint = HOME_MOUNTPOINT_VALUE.into();
+        assert_eq!(
+            display_draft_mountpoint(&draft, Locale::Chinese),
+            Locale::Chinese.text(TextKey::AutoMountpoint)
+        );
+        draft.mountpoint = "Z:".into();
+        assert_eq!(display_draft_mountpoint(&draft, Locale::English), "Z:");
     }
 
     #[test]
