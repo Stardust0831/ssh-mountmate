@@ -2300,8 +2300,7 @@ impl App {
             },
             Message::Edit(id) => {
                 let can_modify = self.can_modify(&id);
-                if let Some(server) = self.servers.iter().find(|server| server.id == id)
-                {
+                if let Some(server) = self.servers.iter().find(|server| server.id == id) {
                     self.connection_draft = Some(ConnectionDraft::from_server(server));
                     self.connection_custom_mountpoint = custom_mountpoint_value(&server.mountpoint);
                     if let Some(draft) = &mut self.connection_draft
@@ -4495,10 +4494,7 @@ impl App {
             ]
             .spacing(12),
             row![
-                connection_read_only_field(
-                    locale.text(TextKey::SshHostAlias),
-                    &draft.host_alias,
-                ),
+                connection_read_only_field(locale.text(TextKey::SshHostAlias), &draft.host_alias,),
                 connection_read_only_field(locale.text(TextKey::IpHost), &draft.host),
             ]
             .spacing(12),
@@ -5935,10 +5931,7 @@ fn localized_yes_no(locale: Locale, value: bool) -> &'static str {
     }
 }
 
-fn connection_secret_state_label(
-    locale: Locale,
-    state: PreservedSecretState,
-) -> &'static str {
+fn connection_secret_state_label(locale: Locale, state: PreservedSecretState) -> &'static str {
     match (locale, state) {
         (Locale::English, PreservedSecretState::System) => "Stored in system credentials",
         (Locale::English, PreservedSecretState::Obscured) => "Stored with rclone obscure",
