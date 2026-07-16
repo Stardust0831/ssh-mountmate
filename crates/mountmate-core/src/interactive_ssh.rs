@@ -493,8 +493,6 @@ fn openssh_login_arguments(control: &Path, target: &[String]) -> Vec<OsString> {
         "-o".into(),
         "BatchMode=no".into(),
         "-o".into(),
-        "ControlPersist=10m".into(),
-        "-o".into(),
         "ServerAliveInterval=30".into(),
         "-N".into(),
     ];
@@ -615,6 +613,9 @@ mod tests {
                 .any(|pair| pair == [OsString::from("-o"), OsString::from("BatchMode=no")])
         );
         assert!(!arguments.iter().any(|argument| argument == "BatchMode=yes"));
+        assert!(!arguments
+            .iter()
+            .any(|argument| argument.to_string_lossy().starts_with("ControlPersist=")));
         assert_eq!(
             arguments.last().and_then(|argument| argument.to_str()),
             Some("cluster")
@@ -640,8 +641,6 @@ mod tests {
                 OsString::from("/state/control with space.sock"),
                 OsString::from("-o"),
                 OsString::from("BatchMode=no"),
-                OsString::from("-o"),
-                OsString::from("ControlPersist=10m"),
                 OsString::from("-o"),
                 OsString::from("ServerAliveInterval=30"),
                 OsString::from("-N"),
