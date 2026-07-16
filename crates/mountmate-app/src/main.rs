@@ -1045,10 +1045,7 @@ impl App {
     }
 
     fn theme(&self, _window: window::Id) -> Theme {
-        let (mode, accent) = self.settings_draft.as_ref().map_or(
-            (self.settings.appearance_mode, self.settings.accent_color),
-            |draft| (draft.appearance_mode, draft.accent_color),
-        );
+        let (mode, accent) = effective_appearance(&self.settings, self.settings_draft.as_ref());
         application_theme(mode, accent, self.system_theme_dark)
     }
 
@@ -6038,6 +6035,15 @@ fn system_prefers_dark() -> bool {
     }
 }
 
+fn effective_appearance(
+    settings: &Settings,
+    draft: Option<&SettingsDraft>,
+) -> (AppearanceMode, AccentColor) {
+    draft.map_or((settings.appearance_mode, settings.accent_color), |draft| {
+        (draft.appearance_mode, draft.accent_color)
+    })
+}
+
 fn application_theme(mode: AppearanceMode, accent: AccentColor, system_dark: bool) -> Theme {
     let dark = match mode {
         AppearanceMode::System => system_dark,
@@ -7759,20 +7765,86 @@ mod localization_tests {
 
     #[test]
     fn appearance_choices_are_bilingual_and_generate_contrasting_palettes() {
-        assert_eq!(
-            Locale::English.appearance_mode(AppearanceMode::System),
-            "Follow system"
-        );
-        assert_eq!(Locale::Chinese.accent_color(AccentColor::Purple), "紫色");
+        for locale in [Locale::English, Locale::Chinese] {
+            for mode in AppearanceMode::ALL {
+                assert!(!locale.appearance_mode(mode).is_empty());
+            }
+            for accent in AccentColor::ALL {
+                assert!(!locale.accent_color(accent).is_empty());
+            }
+        }
 
-        let light = application_theme(AppearanceMode::Light, AccentColor::Amber, true).palette();
-        let dark = application_theme(AppearanceMode::Dark, AccentColor::Amber, false).palette();
         let followed_light =
             application_theme(AppearanceMode::System, AccentColor::Amber, false).palette();
-        assert_eq!(light.background, Palette::LIGHT.background);
-        assert_eq!(dark.background, Palette::DARK.background);
         assert_eq!(followed_light.background, Palette::LIGHT.background);
-        assert_ne!(light.primary, dark.primary);
+
+        for accent in AccentColor::ALL {
+            for mode in [AppearanceMode::Light, AppearanceMode::Dark] {
+                let palette = application_theme(mode, accent, false).palette();
+                let expected_background = if mode == AppearanceMode::Light {
+                    Palette::LIGHT.background
+                } else {
+                    Palette::DARK.background
+                };
+                assert_eq!(palette.background, expected_background);
+                assert!(contrast_ratio(palette.text, palette.background) >= 4.5);
+                assert!(contrast_ratio(palette.primary, palette.background) >= 3.0);
+                assert!(
+                    contrast_ratio(palette.primary, Color::BLACK)
+                        .max(contrast_ratio(palette.primary, Color::WHITE))
+                        >= 4.5
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn appearance_preview_cancel_and_save_select_the_expected_source() {
+        let persisted = Settings {
+            appearance_mode: AppearanceMode::Dark,
+            accent_color: AccentColor::Blue,
+            ..Settings::default()
+        };
+        assert_eq!(
+            effective_appearance(&persisted, None),
+            (AppearanceMode::Dark, AccentColor::Blue)
+        );
+
+        let mut draft = SettingsDraft::from_settings(&persisted);
+        draft.appearance_mode = AppearanceMode::Light;
+        draft.accent_color = AccentColor::Purple;
+        assert_eq!(
+            effective_appearance(&persisted, Some(&draft)),
+            (AppearanceMode::Light, AccentColor::Purple)
+        );
+
+        // Cancel removes the draft, while a successful save replaces the persisted settings.
+        assert_eq!(
+            effective_appearance(&persisted, None),
+            (AppearanceMode::Dark, AccentColor::Blue)
+        );
+        let saved = draft.build(&persisted, Locale::English).unwrap();
+        assert_eq!(
+            effective_appearance(&saved, None),
+            (AppearanceMode::Light, AccentColor::Purple)
+        );
+    }
+
+    fn contrast_ratio(first: Color, second: Color) -> f32 {
+        let lighter = relative_luminance(first).max(relative_luminance(second));
+        let darker = relative_luminance(first).min(relative_luminance(second));
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    fn relative_luminance(color: Color) -> f32 {
+        fn channel(value: f32) -> f32 {
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b)
     }
 
     #[test]
