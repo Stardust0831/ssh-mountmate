@@ -22,6 +22,16 @@ remote_root="$test_root/remote"
 mountpoint="$test_root/mount"
 server_pid=""
 
+allocate_loopback_port() {
+  python3 - <<'PY'
+import socket
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+    listener.bind(("127.0.0.1", 0))
+    print(listener.getsockname()[1])
+PY
+}
+
 is_mounted() {
   mount | grep -Fq " on $mountpoint ("
 }
@@ -80,31 +90,29 @@ export DYLD_FALLBACK_LIBRARY_PATH="/usr/local/lib${DYLD_FALLBACK_LIBRARY_PATH:+:
 mkdir -p "$remote_root" "$mountpoint" "$test_root/home"
 printf '%s\n' 'initial remote content' >"$remote_root/initial.txt"
 
-port=""
-for candidate in {42000..42100}; do
-  if ! nc -z 127.0.0.1 "$candidate" >/dev/null 2>&1; then
-    port="$candidate"
-    break
-  fi
-done
-test -n "$port"
-
-"$server_rclone" --cache-dir "$test_root/server-cache" \
-  --log-file "$test_root/sftp-server.log" -vv \
-  serve sftp "$remote_root" --addr "127.0.0.1:$port" \
-  --user "$server_user" --pass "$server_password" \
-  --dir-cache-time 0s --poll-interval 0 &
-server_pid=$!
+port="$(allocate_loopback_port)"
 server_ready=false
-for _ in {1..100}; do
-  if ! kill -0 "$server_pid" 2>/dev/null; then
-    break
-  fi
-  if nc -z 127.0.0.1 "$port" >/dev/null 2>&1; then
-    server_ready=true
-    break
-  fi
-  sleep 0.1
+for _ in {1..20}; do
+  "$server_rclone" --cache-dir "$test_root/server-cache" \
+    --log-file "$test_root/sftp-server.log" -vv \
+    serve sftp "$remote_root" --addr "127.0.0.1:$port" \
+    --user "$server_user" --pass "$server_password" \
+    --dir-cache-time 0s --poll-interval 0 &
+  server_pid=$!
+  for _ in {1..100}; do
+    if ! kill -0 "$server_pid" 2>/dev/null; then
+      break
+    fi
+    if nc -z 127.0.0.1 "$port" >/dev/null 2>&1; then
+      server_ready=true
+      break 2
+    fi
+    sleep 0.1
+  done
+  kill "$server_pid" 2>/dev/null || true
+  wait "$server_pid" 2>/dev/null || true
+  server_pid=""
+  port="$(allocate_loopback_port)"
 done
 [[ "$server_ready" == true ]]
 

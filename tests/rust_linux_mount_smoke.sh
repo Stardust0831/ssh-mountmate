@@ -15,26 +15,49 @@ remote_root="${test_root}/remote"
 mountpoint="${test_root}/mount"
 server_pid=""
 
+allocate_loopback_port() {
+  python3 - <<'PY'
+import socket
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+    listener.bind(("127.0.0.1", 0))
+    print(listener.getsockname()[1])
+PY
+}
+
 start_server() {
   local host_key="${1:?host key is required}"
-  "${server_rclone}" --cache-dir "${test_root}/server-cache" \
-    --log-file "${test_root}/sftp-server.log" -vv \
-    serve sftp "${remote_root}" --addr "127.0.0.1:${port}" \
-    --user "${server_user}" --pass "${server_password}" --key "${host_key}" \
-    --dir-cache-time 0s --poll-interval 0 &
-  server_pid=$!
-  local server_ready=false
-  for _ in $(seq 1 50); do
-    if ! kill -0 "${server_pid}" 2>/dev/null; then
-      break
+  if [[ -z "${port}" ]]; then
+    port="$(allocate_loopback_port)"
+  fi
+  for _ in $(seq 1 20); do
+    "${server_rclone}" --cache-dir "${test_root}/server-cache" \
+      --log-file "${test_root}/sftp-server.log" -vv \
+      serve sftp "${remote_root}" --addr "127.0.0.1:${port}" \
+      --user "${server_user}" --pass "${server_password}" --key "${host_key}" \
+      --dir-cache-time 0s --poll-interval 0 &
+    server_pid=$!
+    for _ in $(seq 1 50); do
+      if ! kill -0 "${server_pid}" 2>/dev/null; then
+        break
+      fi
+      if ss -H -ltn "sport = :${port}" | grep -q .; then
+        return 0
+      fi
+      sleep 0.1
+    done
+    kill "${server_pid}" 2>/dev/null || true
+    wait "${server_pid}" 2>/dev/null || true
+    server_pid=""
+    port="$(allocate_loopback_port)"
+    config_file="${XDG_CONFIG_HOME}/rsshmount/servers.json"
+    if [[ -f "${config_file}" ]]; then
+      jq --arg port "${port}" 'map(.port = $port)' "${config_file}" >"${config_file}.tmp"
+      mv "${config_file}.tmp" "${config_file}"
     fi
-    if ss -H -ltn "sport = :${port}" | grep -q .; then
-      server_ready=true
-      break
-    fi
-    sleep 0.1
   done
-  test "${server_ready}" == true
+  echo 'failed to start the SFTP server on an available loopback port' >&2
+  return 1
 }
 
 cleanup() {
@@ -95,13 +118,6 @@ ssh-keygen -q -t ecdsa -b 256 -N '' -f "${second_host_key}"
 chmod 600 "${first_host_key}" "${second_host_key}"
 
 port=""
-for candidate in $(seq 42000 42100); do
-  if ! ss -H -ltn "sport = :${candidate}" | grep -q .; then
-    port="${candidate}"
-    break
-  fi
-done
-test -n "${port}"
 start_server "${first_host_key}"
 
 config_dir="${XDG_CONFIG_HOME}/rsshmount"
