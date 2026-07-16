@@ -14,8 +14,7 @@ use iced::widget::{
     text, text_editor, text_input, toggler, tooltip,
 };
 use iced::{
-    Center, Color, Element, Fill, Length, Point, Size, Subscription, Task, Theme, clipboard,
-    window,
+    Center, Color, Element, Fill, Length, Point, Size, Subscription, Task, Theme, clipboard, window,
 };
 use mountmate_core::app_command::{
     AppCommand, AppCommandError, AppCommandServer, InstanceLock, running_instance,
@@ -5509,10 +5508,7 @@ fn connection_file_input<'a>(
     .width(Fill)
 }
 
-fn connection_field_label<'a>(
-    label: &'a str,
-    required: bool,
-) -> iced::widget::Row<'a, Message> {
+fn connection_field_label<'a>(label: &'a str, required: bool) -> iced::widget::Row<'a, Message> {
     let mut content = row![text(label).size(13)].spacing(3).align_y(Center);
     if required {
         content = content.push(text("*").size(13).color(Color::from_rgb8(210, 48, 48)));
