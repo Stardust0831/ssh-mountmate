@@ -274,13 +274,18 @@ impl Locale {
         }
     }
 
-    pub(crate) fn exit_warning(self, active: usize, unknown: usize) -> String {
+    pub(crate) fn exit_warning(
+        self,
+        active: usize,
+        unknown: usize,
+        interactive_sessions: usize,
+    ) -> String {
         match self {
             Self::English => format!(
-                "{active} mounted connection(s) still have queued or active uploads, and {unknown} mounted connection(s) have an unknown cloud state. Exiting the interface leaves rclone mounts running, but you will no longer see transfer status. Exit anyway?"
+                "{active} mounted connection(s) still have queued or active uploads, {unknown} mounted connection(s) have an unknown cloud state, and {interactive_sessions} interactive SSH session(s) will end. Exiting the interface leaves rclone mounts running, but you will no longer see transfer status. Exit anyway?"
             ),
             Self::Chinese => format!(
-                "仍有 {active} 个挂载连接存在排队或正在进行的上传，另有 {unknown} 个挂载连接的云端状态未知。退出界面不会停止 rclone 挂载，但你将无法继续查看传输状态。仍要退出吗？"
+                "仍有 {active} 个挂载连接存在排队或正在进行的上传，另有 {unknown} 个挂载连接的云端状态未知，并且 {interactive_sessions} 个交互式 SSH 会话将结束。退出界面不会停止 rclone 挂载，但你将无法继续查看传输状态。仍要退出吗？"
             ),
         }
     }
@@ -428,6 +433,16 @@ pub(crate) enum TextKey {
     TransferCompleted,
     TransferStateUnavailable,
     Transfers,
+    InteractiveTerminal,
+    InteractiveTerminalHelp,
+    InteractiveTerminalStarting,
+    InteractiveTerminalReady,
+    InteractiveTerminalExited,
+    InteractiveTerminalFailed,
+    OpenInteractiveTerminal,
+    RetryTerminal,
+    HideTerminal,
+    EndInteractiveSession,
     Transport,
     Unmount,
     UnmountAll,
@@ -549,6 +564,18 @@ fn english(key: TextKey) -> &'static str {
         TextKey::TransferCompleted => "Transfer completed",
         TextKey::TransferStateUnavailable => "Transfer state unavailable",
         TextKey::Transfers => "Transfers",
+        TextKey::InteractiveTerminal => "Interactive SSH terminal",
+        TextKey::InteractiveTerminalHelp => {
+            "Complete SSH authentication in this terminal. Input and output stay in memory only."
+        }
+        TextKey::InteractiveTerminalStarting => "Starting interactive SSH...",
+        TextKey::InteractiveTerminalReady => "SSH session ready; mount will resume automatically",
+        TextKey::InteractiveTerminalExited => "SSH terminal exited",
+        TextKey::InteractiveTerminalFailed => "SSH terminal failed",
+        TextKey::OpenInteractiveTerminal => "Open terminal",
+        TextKey::RetryTerminal => "Retry",
+        TextKey::HideTerminal => "Hide",
+        TextKey::EndInteractiveSession => "End session",
         TextKey::Transport => "Transport",
         TextKey::Unmount => "Unmount",
         TextKey::UnmountAll => "Unmount all",
@@ -667,6 +694,18 @@ fn chinese(key: TextKey) -> &'static str {
         TextKey::TransferCompleted => "传输已完成",
         TextKey::TransferStateUnavailable => "传输状态不可用",
         TextKey::Transfers => "传输",
+        TextKey::InteractiveTerminal => "交互式 SSH 终端",
+        TextKey::InteractiveTerminalHelp => {
+            "请在此终端中完成 SSH 身份验证。输入和输出仅保留在内存中。"
+        }
+        TextKey::InteractiveTerminalStarting => "正在启动交互式 SSH…",
+        TextKey::InteractiveTerminalReady => "SSH 会话已就绪；挂载将自动继续",
+        TextKey::InteractiveTerminalExited => "SSH 终端已退出",
+        TextKey::InteractiveTerminalFailed => "SSH 终端启动失败",
+        TextKey::OpenInteractiveTerminal => "打开终端",
+        TextKey::RetryTerminal => "重试",
+        TextKey::HideTerminal => "隐藏",
+        TextKey::EndInteractiveSession => "结束会话",
         TextKey::Transport => "传输方式",
         TextKey::Unmount => "卸载",
         TextKey::UnmountAll => "全部卸载",
@@ -724,6 +763,14 @@ mod tests {
             Locale::Chinese.connection_method(ConnectionMethod::Interactive),
             "交互式共享 SSH"
         );
+    }
+
+    #[test]
+    fn exit_warning_counts_interactive_sessions_in_both_languages() {
+        let english = Locale::English.exit_warning(1, 2, 3);
+        assert!(english.contains("3 interactive SSH session(s) will end"));
+        let chinese = Locale::Chinese.exit_warning(1, 2, 3);
+        assert!(chinese.contains("3 个交互式 SSH 会话将结束"));
     }
 
     #[test]

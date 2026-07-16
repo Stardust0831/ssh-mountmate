@@ -24,6 +24,7 @@ ed25519-dalek = { version = "2.2", features = ["pkcs8", "rand_core", "zeroize"] 
 fs2 = "0.4"
 glob = "0.3"
 iced = { version = "0.14.0", features = ["tokio", "svg"] }
+iced_term = "0.8.0"
 keyring = { version = "3.6.3", default-features = false }
 notify-rust = "=4.17.0"
 objc2 = "0.6.4"
