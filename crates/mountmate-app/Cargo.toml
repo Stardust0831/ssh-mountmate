@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 async-channel.workspace = true
+dark-light.workspace = true
 iced.workspace = true
 mountmate-core = { path = "../mountmate-core" }
 mountmate-platform = { path = "../mountmate-platform" }
