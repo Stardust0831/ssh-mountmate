@@ -1272,6 +1272,7 @@ impl App {
             Message::TerminalEvent(event) => return self.handle_terminal_event(event),
             Message::TerminalWindowOpened(id) => {
                 if self.terminal_window == Some(id) {
+                    diagnostic_trace(&format!("interactive terminal window opened {id:?}"));
                     return Task::none();
                 }
             }
@@ -3720,6 +3721,9 @@ impl App {
                 });
         match result {
             Ok((ssh, terminal)) => {
+                diagnostic_trace(&format!(
+                    "interactive terminal session created for {id} generation {generation}"
+                ));
                 self.interactive_terminals.insert(
                     id.clone(),
                     InteractiveTerminalSession {
@@ -3737,6 +3741,9 @@ impl App {
                     .into();
             }
             Err(error) => {
+                diagnostic_trace(&format!(
+                    "interactive terminal session creation failed for {id} generation {generation}"
+                ));
                 self.terminal_error = Some(error);
                 self.status = self
                     .locale()
@@ -3750,12 +3757,21 @@ impl App {
     fn open_terminal_window(&mut self, id: String) -> Task<Message> {
         self.terminal_server_id = Some(id);
         if let Some(window) = self.terminal_window {
+            diagnostic_trace(&format!(
+                "focusing interactive terminal window {window:?} for {id}"
+            ));
             return window::gain_focus(window);
         }
         if !self.main_window_ready {
+            diagnostic_trace(&format!(
+                "deferring interactive terminal window for {id} until main window is ready"
+            ));
             return Task::none();
         }
         let (window, open) = window::open(terminal_window_settings());
+        diagnostic_trace(&format!(
+            "opening interactive terminal window {window:?} for {id}"
+        ));
         self.terminal_window = Some(window);
         open.map(Message::TerminalWindowOpened)
     }

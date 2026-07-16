@@ -309,8 +309,14 @@ for _ in $(seq 1 200); do
   fi
   sleep 0.1
 done
-test "${shared_ready}" == true
-test "${#terminal_windows[@]}" -eq 1
+if [[ "${shared_ready}" != true ]]; then
+  echo "interactive session did not become ready and mount automatically; visible terminal windows: ${#terminal_windows[@]}" >&2
+  exit 1
+fi
+if [[ "${#terminal_windows[@]}" -ne 1 ]]; then
+  echo "expected one visible interactive terminal window, found ${#terminal_windows[@]}" >&2
+  exit 1
+fi
 mountpoint -q "${mount_root}/${interactive_id}"
 test "$(cat "${mount_root}/${interactive_id}/identity.txt")" = "content from ${interactive_id}"
 grep -F '[interactive-a]' "${config_dir}/rclone.conf"
