@@ -5942,7 +5942,7 @@ fn connection_secret_state_label(locale: Locale, state: PreservedSecretState) ->
     }
 }
 
-fn display_draft_mountpoint<'a>(draft: &'a ConnectionDraft, locale: Locale) -> &'a str {
+fn display_draft_mountpoint(draft: &ConnectionDraft, locale: Locale) -> &str {
     if draft.mountpoint.is_empty()
         || draft.mountpoint == HOME_MOUNTPOINT_VALUE
         || draft.mountpoint.eq_ignore_ascii_case("auto")
