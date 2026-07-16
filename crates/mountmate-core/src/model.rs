@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const SETTINGS_SCHEMA_VERSION: u32 = 13;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 14;
 pub const DEFAULT_VFS_UPLOAD_TRANSFERS: u16 = 4;
 pub const MIN_VFS_UPLOAD_TRANSFERS: u16 = 1;
 pub const MAX_VFS_UPLOAD_TRANSFERS: u16 = 32;
@@ -57,6 +57,10 @@ fn default_accent_color() -> AccentColor {
     AccentColor::Blue
 }
 
+fn default_font_scale() -> FontScale {
+    FontScale::Standard
+}
+
 fn default_true() -> bool {
     true
 }
@@ -90,6 +94,29 @@ pub enum AccentColor {
     Green,
     Amber,
     Purple,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FontScale {
+    Small,
+    #[default]
+    Standard,
+    Large,
+    ExtraLarge,
+}
+
+impl FontScale {
+    pub const ALL: [Self; 4] = [Self::Small, Self::Standard, Self::Large, Self::ExtraLarge];
+
+    pub const fn factor(self) -> f32 {
+        match self {
+            Self::Small => 0.9,
+            Self::Standard => 1.0,
+            Self::Large => 1.15,
+            Self::ExtraLarge => 1.3,
+        }
+    }
 }
 
 impl AccentColor {
@@ -373,6 +400,8 @@ pub struct Settings {
     pub appearance_mode: AppearanceMode,
     #[serde(default = "default_accent_color")]
     pub accent_color: AccentColor,
+    #[serde(default = "default_font_scale")]
+    pub font_scale: FontScale,
 }
 
 fn schema_version() -> u32 {
@@ -404,6 +433,7 @@ impl Default for Settings {
             language: default_language(),
             appearance_mode: default_appearance_mode(),
             accent_color: default_accent_color(),
+            font_scale: default_font_scale(),
         }
     }
 }
@@ -653,6 +683,26 @@ mod tests {
         assert_eq!(json["appearance_mode"], "dark");
         assert_eq!(json["accent_color"], "purple");
         assert_eq!(serde_json::from_value::<Settings>(json).unwrap(), settings);
+    }
+
+    #[test]
+    fn settings_schema_13_defaults_to_standard_font_scale() {
+        let legacy: Settings = serde_json::from_str(r#"{"settings_schema_version":13}"#).unwrap();
+        let migrated = legacy.migrate();
+        assert_eq!(migrated.settings_schema_version, SETTINGS_SCHEMA_VERSION);
+        assert_eq!(migrated.font_scale, FontScale::Standard);
+    }
+
+    #[test]
+    fn font_scale_variants_round_trip_through_settings_json() {
+        for font_scale in FontScale::ALL {
+            let settings = Settings {
+                font_scale,
+                ..Settings::default()
+            };
+            let json = serde_json::to_string(&settings).unwrap();
+            assert_eq!(serde_json::from_str::<Settings>(&json).unwrap(), settings);
+        }
     }
 
     #[test]
