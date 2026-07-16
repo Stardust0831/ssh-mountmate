@@ -167,8 +167,9 @@ impl InteractiveSshSession {
     /// `spawn_blocking`) because it polls a child process. A successful exit
     /// returns `Ok(true)`, a normal nonzero exit returns `Ok(false)`, and
     /// spawning, polling, termination, or timeout failures return an error.
-    /// On Unix, control-path validation runs before spawning and a failed
-    /// check attempts the same safe stale-socket cleanup as [`Self::is_ready`].
+    /// On Unix, control-path validation runs before spawning and a normal
+    /// not-ready result attempts safe stale-socket cleanup. Process-management
+    /// errors leave the socket untouched because they do not prove it is stale.
     pub fn check_ready(&self, timeout: Duration) -> Result<bool, InteractiveSshError> {
         #[cfg(unix)]
         self.validate_control_paths()?;
@@ -181,7 +182,7 @@ impl InteractiveSshSession {
             .stderr(Stdio::null());
         configure_readiness_command(&mut command);
         let result = run_readiness_command(&mut command, timeout);
-        if !matches!(result, Ok(true)) {
+        if matches!(result, Ok(false)) {
             self.cleanup_failed_readiness();
         }
         result

@@ -694,6 +694,18 @@ mod tests {
     }
 
     #[test]
+    fn font_scale_variants_round_trip_through_settings_json() {
+        for font_scale in FontScale::ALL {
+            let settings = Settings {
+                font_scale,
+                ..Settings::default()
+            };
+            let json = serde_json::to_string(&settings).unwrap();
+            assert_eq!(serde_json::from_str::<Settings>(&json).unwrap(), settings);
+        }
+    }
+
+    #[test]
     fn interactive_connection_method_is_typed_and_opt_in() {
         let legacy: ServerConfig = serde_json::from_str(r#"{"id":"legacy"}"#).unwrap();
         assert_eq!(legacy.connection_method, ConnectionMethod::Native);

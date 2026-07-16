@@ -632,6 +632,7 @@ enum InteractiveTerminalLifecycle {
     Starting,
     Ready,
     Exited,
+    Failed,
 }
 
 struct InteractiveTerminalSession {
@@ -1365,9 +1366,15 @@ impl App {
                         }
                     }
                     Ok(false) => {}
-                    Err(error) => diagnostic_trace(&format!(
-                        "interactive readiness check failed for {id} generation {generation}: {error}"
-                    )),
+                    Err(error) => {
+                        diagnostic_trace(&format!(
+                            "interactive readiness check failed for {id} generation {generation}: {error}"
+                        ));
+                        session.lifecycle = InteractiveTerminalLifecycle::Failed;
+                        session.queued_mount = false;
+                        self.terminal_error = Some(error);
+                        self.status = locale.text(TextKey::InteractiveTerminalFailed).into();
+                    }
                 }
             }
             Message::TerminalEvent(event) => return self.handle_terminal_event(event),
@@ -3872,7 +3879,9 @@ impl App {
         if self.interactive_terminals.get(&id).is_some_and(|session| {
             matches!(
                 session.lifecycle,
-                InteractiveTerminalLifecycle::Ready | InteractiveTerminalLifecycle::Exited
+                InteractiveTerminalLifecycle::Ready
+                    | InteractiveTerminalLifecycle::Exited
+                    | InteractiveTerminalLifecycle::Failed
             )
         }) {
             self.interactive_terminals.remove(&id);
@@ -5897,6 +5906,7 @@ impl App {
             }
             InteractiveTerminalLifecycle::Ready => locale.text(TextKey::InteractiveTerminalReady),
             InteractiveTerminalLifecycle::Exited => locale.text(TextKey::InteractiveTerminalExited),
+            InteractiveTerminalLifecycle::Failed => locale.text(TextKey::InteractiveTerminalFailed),
         };
         let terminal = iced_term::TerminalView::show(&session.terminal)
             .map(|event| Message::TerminalEvent(RedactedTerminalEvent(event)));
@@ -8951,6 +8961,10 @@ mod localization_tests {
         ));
         assert!(!interactive_readiness_result_is_current(
             InteractiveTerminalLifecycle::Exited,
+            true
+        ));
+        assert!(!interactive_readiness_result_is_current(
+            InteractiveTerminalLifecycle::Failed,
             true
         ));
         assert!(!interactive_readiness_result_is_current(
