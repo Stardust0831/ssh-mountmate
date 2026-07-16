@@ -21,6 +21,26 @@ until its stated evidence exists.
 7. Keep installer work, Explorer navigation-triggered refresh, complex Windows ProxyJump
    translation, server changes, and production signing/notarization as separate later work.
 
+## Low-priority connection organization backlog
+
+After the current credential, diagnostics, transport, mounted-settings, onboarding, required-field,
+and theme work is complete, improve organization for users with many mount entries:
+
+- Search connections by display name, host/alias, user, and remote path without mutating the saved
+  order.
+- Add explicit sort choices such as manual order, name, recent use, mount state, and creation or
+  modification time. Define stable tie-breaking and preserve the user's selection in migrated
+  settings.
+- Add optional folders/groups with drag or explicit move actions, a safe ungrouped default, and no
+  change to mount identity, credential references, or update behavior.
+- Keep search/sort/group metadata local to the application. Import/export must either round-trip it
+  explicitly or document that organization metadata is omitted.
+- Provide migration and serialization tests plus keyboard-accessible, bilingual empty/search-zero
+  states. Defer visual acceptance until the broader UI acceptance pass.
+
+This is intentionally lower priority than the active prerelease plan and must not delay credential
+or transport correctness releases.
+
 ## Prerelease scope: `v0.4.1-alpha.1`
 
 Published with production signing and six-platform evidence:
