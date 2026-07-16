@@ -1,6 +1,8 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::OsStr;
+use std::fmt;
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Seek, SeekFrom};
@@ -33,7 +35,9 @@ use mountmate_core::credential::{
     replace_verified, rollback_change,
 };
 use mountmate_core::dependency::{DependencyStatus, check_dependencies};
-use mountmate_core::interactive_ssh::InteractiveSshError;
+use mountmate_core::interactive_ssh::{
+    InteractiveSshError, InteractiveSshLoginCommand, InteractiveSshSession,
+};
 use mountmate_core::model::{MAX_VFS_UPLOAD_TRANSFERS, MIN_VFS_UPLOAD_TRANSFERS};
 use mountmate_core::mountpoint::HOME_MOUNTPOINT_VALUE;
 use mountmate_core::paths::AppPaths;
@@ -490,6 +494,11 @@ struct App {
     settings_draft: Option<SettingsDraft>,
     log_view: Option<MountLogView>,
     log_window: Option<window::Id>,
+    terminal_window: Option<window::Id>,
+    terminal_server_id: Option<String>,
+    interactive_terminals: HashMap<String, InteractiveTerminalSession>,
+    next_terminal_generation: u64,
+    terminal_error: Option<String>,
     custom_setting: Option<CustomSettingDraft>,
     editor_saving: bool,
     ssh_import_loading: bool,
@@ -599,6 +608,35 @@ struct MountLogView {
 struct ConnectionOperationError {
     operation: MountOperation,
     cause: String,
+}
+
+/// iced_term events may contain terminal input bytes (including passwords).
+/// Keep the event usable by the update loop, but make all application Debug
+/// output intentionally opaque.
+#[derive(Clone)]
+struct RedactedTerminalEvent(iced_term::Event);
+
+impl fmt::Debug for RedactedTerminalEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("TerminalEvent(<redacted>)")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractiveTerminalLifecycle {
+    Starting,
+    Ready,
+    Exited,
+    Failed,
+}
+
+struct InteractiveTerminalSession {
+    generation: u64,
+    ssh: InteractiveSshSession,
+    terminal: iced_term::Terminal,
+    lifecycle: InteractiveTerminalLifecycle,
+    queued_mount: bool,
+    resume_sent: bool,
 }
 
 /// Keep a failed mount from turning a connection card into a full-page error
@@ -877,6 +915,12 @@ enum Message {
     AppCommand(AppCommand),
     TrayAction(TrayAction),
     TrayTick,
+    InteractiveTick,
+    TerminalEvent(RedactedTerminalEvent),
+    TerminalWindowOpened(window::Id),
+    HideTerminal,
+    EndInteractiveSession,
+    RetryTerminal,
     MainWindowOpened(window::Id),
     Refresh,
     RefreshFinished(Result<mountmate_core::rc::RefreshResult, String>),
@@ -1030,6 +1074,17 @@ impl App {
             format!("{APP_NAME} {VERSION}")
         } else if self.log_window == Some(window) {
             format!("{} - {APP_NAME}", self.locale().text(TextKey::Logs))
+        } else if self.terminal_window == Some(window) {
+            let name = self
+                .terminal_server_id
+                .as_deref()
+                .and_then(|id| self.servers.iter().find(|server| server.id == id))
+                .map(|server| server.display_name().to_owned())
+                .unwrap_or_else(|| self.locale().text(TextKey::InteractiveTerminal).into());
+            format!(
+                "{name} - {}",
+                self.locale().text(TextKey::InteractiveTerminal)
+            )
         } else {
             self.locale().text(TextKey::FileTransfer).into()
         }
@@ -1050,16 +1105,24 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        Subscription::batch([
+        let mut subscriptions: Vec<Subscription<Message>> = vec![
             Subscription::run_with(self.command_receiver.clone(), command_stream)
                 .map(Message::AppCommand),
             Subscription::run_with(self.tray_actions.clone(), tray_stream).map(Message::TrayAction),
             iced::time::every(Duration::from_millis(100)).map(|_| Message::TrayTick),
+            iced::time::every(Duration::from_millis(500)).map(|_| Message::InteractiveTick),
             iced::time::every(Duration::from_secs(1)).map(|_| Message::TransferTick),
             iced::time::every(Duration::from_secs(30)).map(|_| Message::CapacityTick),
             window::close_requests().map(Message::CloseRequested),
             window::close_events().map(Message::WindowClosed),
-        ])
+        ];
+        subscriptions.extend(self.interactive_terminals.values().map(|session| {
+            session
+                .terminal
+                .subscription()
+                .map(|event| Message::TerminalEvent(RedactedTerminalEvent(event)))
+        }));
+        Subscription::batch(subscriptions)
     }
 
     fn new(bootstrap: Bootstrap) -> (Self, Task<Message>) {
@@ -1152,6 +1215,11 @@ impl App {
             settings_draft: None,
             log_view: None,
             log_window: None,
+            terminal_window: None,
+            terminal_server_id: None,
+            interactive_terminals: HashMap::new(),
+            next_terminal_generation: 1,
+            terminal_error: None,
             custom_setting: None,
             editor_saving: false,
             ssh_import_loading: false,
@@ -1199,6 +1267,21 @@ impl App {
                 return self.handle_app_command(command);
             }
             Message::TrayAction(action) => return self.handle_tray_action(action),
+            Message::InteractiveTick => return self.poll_interactive_terminals(),
+            Message::TerminalEvent(event) => return self.handle_terminal_event(event),
+            Message::TerminalWindowOpened(id) => {
+                if self.terminal_window == Some(id) {
+                    return Task::none();
+                }
+            }
+            Message::HideTerminal => {
+                if let Some(id) = self.terminal_window.take() {
+                    self.terminal_server_id = None;
+                    return window::close(id);
+                }
+            }
+            Message::EndInteractiveSession => return self.end_interactive_session(),
+            Message::RetryTerminal => return self.retry_interactive_terminal(),
             Message::TrayTick => {
                 if self.tray.is_some() {
                     TrayController::desktop_iteration();
@@ -1449,6 +1532,11 @@ impl App {
                 self.log_view = None;
                 return window::close(id);
             }
+            Message::CloseRequested(id) if self.terminal_window == Some(id) => {
+                self.terminal_window = None;
+                self.terminal_server_id = None;
+                return window::close(id);
+            }
             Message::CloseRequested(_) => {}
             Message::ExitDecision(confirmed) => {
                 self.exit_confirmation_open = false;
@@ -1472,6 +1560,9 @@ impl App {
                 } else if self.log_window == Some(id) {
                     self.log_window = None;
                     self.log_view = None;
+                } else if self.terminal_window == Some(id) {
+                    self.terminal_window = None;
+                    self.terminal_server_id = None;
                 }
             }
             Message::AddConnection => {
@@ -3550,6 +3641,187 @@ impl App {
         global_progress_state(&totals, out_of_space)
     }
 
+    fn interactive_session_ready(&self, id: &str) -> bool {
+        self.interactive_terminals.get(id).is_some_and(|session| {
+            session.lifecycle == InteractiveTerminalLifecycle::Ready
+                || (session.lifecycle == InteractiveTerminalLifecycle::Starting
+                    && session.ssh.is_ready())
+        })
+    }
+
+    fn queue_interactive_mount(&mut self, id: String, server: ServerConfig) -> Task<Message> {
+        if self.interactive_terminals.get(&id).is_some_and(|session| {
+            matches!(
+                session.lifecycle,
+                InteractiveTerminalLifecycle::Exited | InteractiveTerminalLifecycle::Failed
+            )
+        }) {
+            self.interactive_terminals.remove(&id);
+            return self.open_interactive_terminal(id, server);
+        }
+        if !self.interactive_terminals.contains_key(&id) {
+            self.open_interactive_terminal(id.clone(), server)
+        } else {
+            if let Some(session) = self.interactive_terminals.get_mut(&id) {
+                session.queued_mount = true;
+            }
+            self.status = self
+                .locale()
+                .text(TextKey::InteractiveTerminalStarting)
+                .into();
+            self.open_terminal_window(id)
+        }
+    }
+
+    fn open_interactive_terminal(&mut self, id: String, server: ServerConfig) -> Task<Message> {
+        self.terminal_error = None;
+        let generation = self.next_terminal_generation;
+        self.next_terminal_generation = self.next_terminal_generation.saturating_add(1);
+        let result: Result<(InteractiveSshSession, iced_term::Terminal), String> =
+            InteractiveSshSession::for_server(&self.paths, &application_root(), &server)
+                .map_err(|error| error.to_string())
+                .and_then(|ssh| {
+                    let (program, args) = strict_terminal_command(ssh.login_command())?;
+                    let terminal = iced_term::Terminal::new(
+                        generation,
+                        iced_term::settings::Settings {
+                            backend: iced_term::settings::BackendSettings {
+                                program,
+                                args,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                    )
+                    .map_err(|error| {
+                        format!("could not start interactive SSH terminal: {error}")
+                    })?;
+                    Ok((ssh, terminal))
+                });
+        match result {
+            Ok((ssh, terminal)) => {
+                self.interactive_terminals.insert(
+                    id.clone(),
+                    InteractiveTerminalSession {
+                        generation,
+                        ssh,
+                        terminal,
+                        lifecycle: InteractiveTerminalLifecycle::Starting,
+                        queued_mount: true,
+                        resume_sent: false,
+                    },
+                );
+                self.status = self
+                    .locale()
+                    .text(TextKey::InteractiveTerminalStarting)
+                    .into();
+            }
+            Err(error) => {
+                self.terminal_error = Some(error);
+                self.status = self
+                    .locale()
+                    .text(TextKey::InteractiveTerminalFailed)
+                    .into();
+            }
+        }
+        self.open_terminal_window(id)
+    }
+
+    fn open_terminal_window(&mut self, id: String) -> Task<Message> {
+        self.terminal_server_id = Some(id);
+        if let Some(window) = self.terminal_window {
+            return window::gain_focus(window);
+        }
+        let (window, open) = window::open(terminal_window_settings());
+        self.terminal_window = Some(window);
+        open.map(Message::TerminalWindowOpened)
+    }
+
+    fn poll_interactive_terminals(&mut self) -> Task<Message> {
+        let ids = self
+            .interactive_terminals
+            .iter()
+            .filter_map(|(id, session)| session.queued_mount.then_some(id.clone()))
+            .collect::<Vec<_>>();
+        let mut resume = Vec::new();
+        for id in ids {
+            let Some(session) = self.interactive_terminals.get_mut(&id) else {
+                continue;
+            };
+            if !interactive_mount_resume_once(
+                session.queued_mount,
+                session.resume_sent,
+                session.lifecycle != InteractiveTerminalLifecycle::Exited
+                    && session.lifecycle != InteractiveTerminalLifecycle::Failed
+                    && session.ssh.is_ready(),
+            ) {
+                continue;
+            }
+            session.lifecycle = InteractiveTerminalLifecycle::Ready;
+            session.resume_sent = true;
+            session.queued_mount = false;
+            resume.push(id);
+        }
+        Task::batch(
+            resume
+                .into_iter()
+                .map(|id| self.start_mount_operation(id, Some(MountOperation::Mount))),
+        )
+    }
+
+    fn handle_terminal_event(&mut self, event: RedactedTerminalEvent) -> Task<Message> {
+        let iced_term::Event::BackendCall(generation, command) = event.0;
+        let Some(session) = self
+            .interactive_terminals
+            .values_mut()
+            .find(|session| session.generation == generation)
+        else {
+            return Task::none();
+        };
+        let action = session
+            .terminal
+            .handle(iced_term::Command::ProxyToBackend(command));
+        if action == iced_term::actions::Action::Shutdown {
+            session.lifecycle = InteractiveTerminalLifecycle::Exited;
+            session.queued_mount = false;
+            session.resume_sent = true;
+            self.status = self
+                .locale()
+                .text(TextKey::InteractiveTerminalExited)
+                .into();
+        } else if session.lifecycle == InteractiveTerminalLifecycle::Starting
+            && session.ssh.is_ready()
+        {
+            session.lifecycle = InteractiveTerminalLifecycle::Ready;
+            self.status = self.locale().text(TextKey::InteractiveTerminalReady).into();
+        }
+        Task::none()
+    }
+
+    fn end_interactive_session(&mut self) -> Task<Message> {
+        let window = self.terminal_window.take();
+        if let Some(id) = self.terminal_server_id.take() {
+            self.interactive_terminals.remove(&id);
+        }
+        self.terminal_error = None;
+        if let Some(window) = window {
+            window::close(window)
+        } else {
+            Task::none()
+        }
+    }
+
+    fn retry_interactive_terminal(&mut self) -> Task<Message> {
+        let Some(id) = self.terminal_server_id.clone() else {
+            return Task::none();
+        };
+        let Some(server) = self.servers.iter().find(|server| server.id == id).cloned() else {
+            return self.end_interactive_session();
+        };
+        self.interactive_terminals.remove(&id);
+        self.open_interactive_terminal(id, server)
+    }
+
     fn start_mount_operation(
         &mut self,
         id: String,
@@ -3575,6 +3847,29 @@ impl App {
         {
             return self.confirm_waiting_unmount(vec![id]);
         }
+        let server = self.servers.iter().find(|server| server.id == id).cloned();
+        if operation == MountOperation::Mount
+            && server
+                .as_ref()
+                .is_some_and(|server| server.connection_method == ConnectionMethod::Interactive)
+            && !self.interactive_session_ready(&id)
+        {
+            let Some(server) = server else {
+                self.status = self.locale().text(TextKey::ConnectionGone).into();
+                return Task::none();
+            };
+            return self.queue_interactive_mount(id, server);
+        }
+        if operation == MountOperation::Mount
+            && server
+                .as_ref()
+                .is_some_and(|server| server.connection_method == ConnectionMethod::Interactive)
+            && let Some(session) = self.interactive_terminals.get_mut(&id)
+        {
+            session.lifecycle = InteractiveTerminalLifecycle::Ready;
+            session.queued_mount = false;
+            session.resume_sent = true;
+        }
         if !self.busy.insert(id.clone()) {
             return Task::none();
         }
@@ -3588,7 +3883,6 @@ impl App {
         self.mount_statuses
             .insert(id.clone(), MountStatus::Starting);
         self.operation_errors.remove(&id);
-        let server = self.servers.iter().find(|server| server.id == id).cloned();
         let display_name = operation_display_name(server.as_ref(), &id);
         self.status = match operation {
             MountOperation::Mount => self.locale().mounting(&display_name),
@@ -3768,6 +4062,8 @@ impl App {
             }
         } else if self.log_window == Some(window) {
             self.log_viewer_view()
+        } else if self.terminal_window == Some(window) {
+            self.interactive_terminal_view()
         } else {
             self.transfer_popup_view(window)
         }
@@ -5175,6 +5471,71 @@ impl App {
         editor_shell(header, content, &self.status)
     }
 
+    fn interactive_terminal_view(&self) -> Element<'_, Message> {
+        let locale = self.locale();
+        let Some(server_id) = self.terminal_server_id.as_deref() else {
+            return container(text(locale.text(TextKey::InteractiveTerminalFailed)))
+                .width(Fill)
+                .height(Fill)
+                .into();
+        };
+        if let Some(error) = &self.terminal_error {
+            return column![
+                text(locale.text(TextKey::InteractiveTerminal)).size(24),
+                text(locale.text(TextKey::InteractiveTerminalHelp)).size(13),
+                text(error),
+                row![
+                    button(locale.text(TextKey::RetryTerminal)).on_press(Message::RetryTerminal),
+                    button(locale.text(TextKey::HideTerminal)).on_press(Message::HideTerminal),
+                    button(locale.text(TextKey::EndInteractiveSession))
+                        .on_press(Message::EndInteractiveSession),
+                ]
+                .spacing(10),
+            ]
+            .spacing(10)
+            .padding(14)
+            .into();
+        }
+        let Some(session) = self.interactive_terminals.get(server_id) else {
+            return container(text(locale.text(TextKey::InteractiveTerminalFailed)))
+                .width(Fill)
+                .height(Fill)
+                .into();
+        };
+        let lifecycle = match session.lifecycle {
+            InteractiveTerminalLifecycle::Starting => {
+                locale.text(TextKey::InteractiveTerminalStarting)
+            }
+            InteractiveTerminalLifecycle::Ready => locale.text(TextKey::InteractiveTerminalReady),
+            InteractiveTerminalLifecycle::Exited => locale.text(TextKey::InteractiveTerminalExited),
+            InteractiveTerminalLifecycle::Failed => locale.text(TextKey::InteractiveTerminalFailed),
+        };
+        let terminal = iced_term::TerminalView::show(&session.terminal)
+            .map(|event| Message::TerminalEvent(RedactedTerminalEvent(event)));
+        let controls = row![
+            text(lifecycle),
+            Space::new().width(Fill),
+            button(locale.text(TextKey::RetryTerminal)).on_press_maybe(
+                (session.lifecycle != InteractiveTerminalLifecycle::Starting)
+                    .then_some(Message::RetryTerminal),
+            ),
+            button(locale.text(TextKey::HideTerminal)).on_press(Message::HideTerminal),
+            button(locale.text(TextKey::EndInteractiveSession))
+                .on_press(Message::EndInteractiveSession),
+        ]
+        .spacing(10)
+        .align_y(Center);
+        column![
+            text(locale.text(TextKey::InteractiveTerminal)).size(24),
+            text(locale.text(TextKey::InteractiveTerminalHelp)).size(13),
+            controls,
+            terminal,
+        ]
+        .spacing(10)
+        .padding(14)
+        .into()
+    }
+
     fn transfer_popup_view(&self, window: window::Id) -> Element<'_, Message> {
         let locale = self.locale();
         if self.transfer_popup != Some(window) {
@@ -5976,20 +6337,7 @@ fn credential_storage_confirmation(locale: Locale, target: CredentialStorage) ->
 }
 
 fn interactive_auth_help(locale: Locale) -> &'static str {
-    match (locale, cfg!(windows)) {
-        (Locale::English, true) => {
-            "For direct manual connections, Mount opens bundled Plink when no shared session exists. Complete login, keep the window open, then mount again. SSH-config proxies are not supported. One-time codes are never stored."
-        }
-        (Locale::English, false) => {
-            "Mount opens an OpenSSH terminal when no shared session exists. Complete login there, keep it open, then mount again. One-time codes are never stored."
-        }
-        (Locale::Chinese, true) => {
-            "手动直连没有共享会话时，挂载会打开内置 Plink。请完成登录并保持窗口打开，然后再次挂载。暂不支持 SSH config 代理。一次性验证码不会保存。"
-        }
-        (Locale::Chinese, false) => {
-            "没有共享 SSH 会话时，挂载会打开 OpenSSH 终端。请在终端完成登录并保持窗口打开，然后再次挂载。一次性验证码不会保存。"
-        }
-    }
+    locale.text(TextKey::InteractiveTerminalHelp)
 }
 
 fn connection_method_allowed(
@@ -6120,11 +6468,8 @@ fn localize_service_error(locale: Locale, error: &ServiceError) -> String {
         return error.to_string();
     }
     match error {
-        ServiceError::InteractiveSsh(InteractiveSshError::LoginStarted) => {
-            "交互式 SSH 登录窗口已打开。请完成 OAuth、2FA 或动态验证码登录并保持窗口打开，然后再次点击挂载。".into()
-        }
         ServiceError::InteractiveSsh(InteractiveSshError::SessionMissing) => {
-            "交互式 SSH 共享会话不可用。请重新开始交互登录，然后再次挂载。".into()
+            "交互式 SSH 共享会话不可用。请在交互式 SSH 终端中完成登录，然后再次挂载。".into()
         }
         ServiceError::InteractiveSsh(InteractiveSshError::UnsupportedWindowsSshConfig) => {
             "Windows 交互式 SSH 目前仅支持手动直连，不支持 SSH config、ProxyJump 或 ProxyCommand 转换。".into()
@@ -6134,9 +6479,6 @@ fn localize_service_error(locale: Locale, error: &ServiceError) -> String {
         }
         ServiceError::InteractiveSsh(InteractiveSshError::OpenSshMissing) => {
             "未找到 OpenSSH。".into()
-        }
-        ServiceError::InteractiveSsh(InteractiveSshError::TerminalMissing) => {
-            "未找到可用于交互登录的终端程序。".into()
         }
         _ => error.to_string(),
     }
@@ -7011,6 +7353,37 @@ fn log_window_settings() -> window::Settings {
     }
 }
 
+fn terminal_window_settings() -> window::Settings {
+    window::Settings {
+        size: Size::new(980.0, 680.0),
+        position: window::Position::Centered,
+        exit_on_close_request: false,
+        ..window::Settings::default()
+    }
+}
+
+fn strict_terminal_command(
+    command: &InteractiveSshLoginCommand,
+) -> Result<(String, Vec<String>), String> {
+    let program = strict_terminal_text(command.program().as_os_str(), "executable path")?;
+    let mut arguments = Vec::with_capacity(command.arguments().len());
+    for argument in command.arguments() {
+        arguments.push(strict_terminal_text(argument, "argument")?);
+    }
+    Ok((program, arguments))
+}
+
+fn strict_terminal_text(value: &OsStr, kind: &str) -> Result<String, String> {
+    value
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("interactive SSH {kind} is not valid Unicode"))
+}
+
+fn interactive_mount_resume_once(queued: bool, resumed: bool, ready: bool) -> bool {
+    queued && !resumed && ready
+}
+
 fn transfer_window_settings() -> window::Settings {
     let settings = window::Settings {
         size: transfer_popup_size(false),
@@ -7850,14 +8223,44 @@ mod localization_tests {
 
     #[test]
     fn interactive_login_states_are_explained_in_chinese() {
-        let started = ServiceError::InteractiveSsh(InteractiveSshError::LoginStarted);
-        assert!(localize_service_error(Locale::Chinese, &started).contains("再次点击挂载"));
+        let missing = ServiceError::InteractiveSsh(InteractiveSshError::SessionMissing);
+        assert!(localize_service_error(Locale::Chinese, &missing).contains("交互式 SSH 终端"));
 
         let unsupported =
             ServiceError::InteractiveSsh(InteractiveSshError::UnsupportedWindowsSshConfig);
         let message = localize_service_error(Locale::Chinese, &unsupported);
         assert!(message.contains("手动直连"));
         assert!(message.contains("ProxyJump"));
+    }
+
+    #[test]
+    fn terminal_event_debug_never_exposes_payload_bytes() {
+        let event = RedactedTerminalEvent(iced_term::Event::BackendCall(
+            7,
+            iced_term::BackendCommand::Write(b"super-secret-password".to_vec()),
+        ));
+        let debug = format!("{event:?}");
+        assert_eq!(debug, "TerminalEvent(<redacted>)");
+        assert!(!debug.contains("super-secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_command_conversion_rejects_non_unicode_without_lossy_fallback() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid = OsString::from_vec(vec![b's', b's', 0xff]);
+        let error = strict_terminal_text(&invalid, "argument").unwrap_err();
+        assert!(error.contains("not valid Unicode"));
+        assert!(!error.contains("ff"));
+    }
+
+    #[test]
+    fn queued_interactive_mount_resumes_once_after_readiness() {
+        assert!(interactive_mount_resume_once(true, false, true));
+        assert!(!interactive_mount_resume_once(true, true, true));
+        assert!(!interactive_mount_resume_once(true, false, false));
+        assert!(!interactive_mount_resume_once(false, false, true));
     }
 
     #[test]

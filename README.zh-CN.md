@@ -250,14 +250,15 @@ Include ~/.ssh/ssh-mountmate.d/*.conf
 
 - `rclone native SFTP`：默认方式。rclone 自己处理 SSH/SFTP，可以使用通过 rclone obscure 保存的密码或密钥短语。
 - `OpenSSH`：rclone 调用系统 `ssh` 命令。适合 `ProxyJump`、`ProxyCommand`、复杂 `Include`、系统 ssh-agent 等 OpenSSH 能力。
-- `交互式共享 SSH`：第一次点击挂载会打开终端，用于完成 OAuth、2FA、动态密码或其他
-  keyboard-interactive 登录。完成登录后保持终端打开，再次点击挂载。rclone 只会收到连接到
-  已验证共享会话的非交互命令；一次性响应不会进入 SSH MountMate 的参数或配置。
+- `交互式共享 SSH`：第一次点击挂载会打开应用内 PTY 终端，用于完成 OAuth、2FA、动态密码或
+  其他 keyboard-interactive 登录。登录完成后，共享会话就绪时排队的挂载会自动且仅恢复一次。
+  可以隐藏终端而保持会话，也可以显式结束会话。rclone 只会收到连接到已验证共享会话的非交互
+  命令；一次性响应不会进入 SSH MountMate 的参数或配置。
 
 macOS 和 Linux 使用位于私有状态目录中的 OpenSSH ControlMaster socket。Windows 便携包会
 内置固定版本的官方 PuTTY Plink 0.84，并在使用 connection sharing 前校验 SHA-256。Windows
 第一阶段仅支持 `手动配置` 直连；导入的 SSH config、`ProxyJump` 和 `ProxyCommand` 转换暂不
-支持。关闭登录终端会结束可复用会话，之后的新挂载或依赖该会话的容量查询会要求重新登录；
+支持。结束应用内会话会终止可复用会话，之后的新挂载或依赖该会话的容量查询会要求重新登录；
 已经运行的 rclone 挂载不会被程序自动卸载，但在重新建立共享会话前可能报告传输错误。
 
 选择 `OpenSSH` 时，SSH MountMate 不会保存或传递密钥短语给 `ssh`。带短语的密钥需要先加入 agent：

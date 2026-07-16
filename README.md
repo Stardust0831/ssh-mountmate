@@ -260,16 +260,18 @@ Each saved connection can use one of three methods:
 
 - `rclone native SFTP`: the default. rclone handles SSH/SFTP itself and can use saved rclone-obscured passwords or key passphrases.
 - `OpenSSH`: rclone calls the system `ssh` command. This is useful for OpenSSH features such as `ProxyJump`, `ProxyCommand`, custom `Include` logic, or system ssh-agent behavior.
-- `Interactive shared SSH`: the first mount attempt opens a terminal for OAuth, 2FA, dynamic
-  password, or other keyboard-interactive authentication. Complete login, keep the terminal open,
-  then click Mount again. rclone receives only a non-interactive connector to the verified shared
-  session; the one-time response is never passed through SSH MountMate arguments or configuration.
+- `Interactive shared SSH`: the first mount attempt opens an app-managed PTY terminal for OAuth,
+  2FA, dynamic password, or other keyboard-interactive authentication. Complete login there; the
+  queued mount resumes exactly once when the shared session is ready. The terminal can be hidden
+  while its session remains alive, or explicitly ended. rclone receives only a non-interactive
+  connector to the verified shared session; the one-time response is never passed through SSH
+  MountMate arguments or configuration.
 
 On macOS and Linux, interactive sharing uses an OpenSSH ControlMaster socket in a private state
 directory. On Windows, portable packages include the pinned official PuTTY Plink 0.84 binary and
 verify its SHA-256 before using connection sharing. The initial Windows implementation supports
 direct `Manual` connections only; imported SSH-config profiles, `ProxyJump`, and `ProxyCommand`
-translation remain unsupported. Closing the login terminal ends the reusable session, so new
+translation remain unsupported. Ending the app-managed session ends the reusable session, so new
 mounts and capacity probes that need it will ask for login again; already running rclone mounts are
 not automatically unmounted, but they can report transport errors until a shared session is
 re-established.
