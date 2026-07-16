@@ -15,12 +15,20 @@ use thiserror::Error;
 use url::Url;
 use zip::ZipArchive;
 
+use crate::update_manifest::{
+    MANIFEST_ASSET_NAME, MAX_MANIFEST_BYTES, MAX_SIGNATURE_BYTES, ManifestAsset, PublishedAsset,
+    ReleaseChannel, SIGNATURE_ASSET_NAME, UpdateTrustError, embedded_trusted_keys,
+    verify_release_manifest, verify_release_manifest_identity,
+};
+
 const REPOSITORY: &str = "Stardust0831/ssh-mountmate";
 const RELEASES_API: &str =
     "https://api.github.com/repos/Stardust0831/ssh-mountmate/releases?per_page=20";
 const LATEST_RELEASE_API: &str =
     "https://api.github.com/repos/Stardust0831/ssh-mountmate/releases/latest";
 const LATEST_RELEASE_PAGE: &str = "https://github.com/Stardust0831/ssh-mountmate/releases/latest";
+const RELEASES_ATOM: &str = "https://github.com/Stardust0831/ssh-mountmate/releases.atom";
+const MAX_RELEASE_FEED_BYTES: usize = 512 * 1024;
 const DEFAULT_DOWNLOAD_LIMIT: u64 = 512 * 1024 * 1024;
 const MAX_ARCHIVE_FILES: usize = 20_000;
 const MAX_EXTRACTED_SIZE: u64 = 2 * 1024 * 1024 * 1024;
@@ -38,6 +46,76 @@ pub struct ReleaseAsset {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct VerifiedUpdateAsset {
+    name: String,
+    url: String,
+    size: u64,
+    sha256: String,
+    version: String,
+    channel: ReleaseChannel,
+    key_id: String,
+}
+
+impl VerifiedUpdateAsset {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    pub fn channel(&self) -> ReleaseChannel {
+        self.channel
+    }
+
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    pub(crate) fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    fn from_verified(
+        published: &ReleaseAsset,
+        signed: &ManifestAsset,
+        version: String,
+        channel: ReleaseChannel,
+        key_id: String,
+    ) -> Self {
+        Self {
+            name: published.name.clone(),
+            url: published.url.clone(),
+            size: signed.size,
+            sha256: signed.sha256.clone(),
+            version,
+            channel,
+            key_id,
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(payload: &[u8], name: &str) -> Self {
+        Self {
+            name: name.into(),
+            url: format!("https://github.com/{REPOSITORY}/releases/download/v1/{name}"),
+            size: payload.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(payload)),
+            version: "1.0.0".into(),
+            channel: ReleaseChannel::Stable,
+            key_id: "ed25519-0000000000000000".into(),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn verified_asset_for_test(payload: &[u8], name: &str) -> VerifiedUpdateAsset {
+    VerifiedUpdateAsset::for_test(payload, name)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateInfo {
     pub current_version: String,
     pub latest_version: String,
@@ -46,10 +124,11 @@ pub struct UpdateInfo {
     pub body: String,
     pub is_newer: bool,
     pub expected_asset: String,
-    pub asset: Option<ReleaseAsset>,
+    pub asset: Option<VerifiedUpdateAsset>,
+    pub trust_error: Option<UpdateTrustError>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct GithubRelease {
     #[serde(default)]
     tag_name: String,
@@ -109,6 +188,8 @@ pub enum UpdateError {
     DuplicateArchivePath(String),
     #[error("update archive failed: {0}")]
     Archive(String),
+    #[error(transparent)]
+    Trust(#[from] UpdateTrustError),
 }
 
 impl From<io::Error> for UpdateError {
@@ -209,12 +290,22 @@ fn parse_version(value: &str) -> Result<Version, UpdateError> {
 pub fn check_for_updates(current_version: &str) -> Result<UpdateInfo, UpdateError> {
     let client = update_client(Duration::from_secs(15))?;
     if current_is_prerelease(current_version)? {
-        let releases = fetch_releases_retry(&client).map_err(UpdateError::Request)?;
-        let release = select_release_for_channel(current_version, releases)?;
-        update_info_from_release(current_version, release)
+        match fetch_releases_retry(&client) {
+            Ok(releases) => {
+                let release = select_release_for_channel(current_version, releases)?;
+                update_info_from_release(&client, current_version, release)
+            }
+            Err(api_error) => {
+                fetch_prerelease_from_atom(&client, current_version).map_err(|error| {
+                    UpdateError::Request(format!(
+                        "{api_error}; signed release-feed fallback failed: {error}"
+                    ))
+                })
+            }
+        }
     } else {
         match fetch_latest_release(&client) {
-            Ok(release) => update_info_from_release(current_version, release),
+            Ok(release) => update_info_from_release(&client, current_version, release),
             Err(api_error) => {
                 fetch_latest_release_redirect(&client, current_version).map_err(|error| {
                     UpdateError::Request(format!(
@@ -255,10 +346,17 @@ fn trusted_update_url(url: &Url) -> bool {
 }
 
 fn fetch_releases(client: &Client) -> Result<Vec<GithubRelease>, String> {
-    let response = client
+    let request = client
         .get(RELEASES_API)
         .header(ACCEPT, "application/vnd.github+json")
-        .header(USER_AGENT, "SSHMountMate-update-check")
+        .header(USER_AGENT, "SSHMountMate-update-check");
+    #[cfg(test)]
+    let request = if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        request.bearer_auth(token)
+    } else {
+        request
+    };
+    let response = request
         .send()
         .map_err(|error| error.to_string())?
         .error_for_status()
@@ -274,11 +372,81 @@ fn fetch_releases_retry(client: &Client) -> Result<Vec<GithubRelease>, String> {
     })
 }
 
+fn fetch_prerelease_from_atom(
+    client: &Client,
+    current_version: &str,
+) -> Result<UpdateInfo, String> {
+    let feed = fetch_bounded_url(client, RELEASES_ATOM, MAX_RELEASE_FEED_BYTES)?;
+    let releases = releases_from_atom(&feed)?;
+    let release =
+        select_release_for_channel(current_version, releases).map_err(|error| error.to_string())?;
+    update_info_from_signed_tag(client, current_version, release).map_err(|error| error.to_string())
+}
+
+fn releases_from_atom(feed: &[u8]) -> Result<Vec<GithubRelease>, String> {
+    if feed.is_empty() || feed.len() > MAX_RELEASE_FEED_BYTES {
+        return Err("release feed has an invalid size".into());
+    }
+    let text = std::str::from_utf8(feed).map_err(|_| "release feed is not valid UTF-8")?;
+    let document = roxmltree::Document::parse(text)
+        .map_err(|error| format!("release feed XML is invalid: {error}"))?;
+    let expected_prefix = format!("https://github.com/{REPOSITORY}/releases/tag/");
+    let mut releases = Vec::new();
+    for entry in document
+        .descendants()
+        .filter(|node| node.has_tag_name("entry"))
+    {
+        let Some(url) = entry
+            .children()
+            .filter(|node| node.has_tag_name("link"))
+            .find(|node| {
+                node.attribute("rel") == Some("alternate")
+                    && node.attribute("type") == Some("text/html")
+            })
+            .and_then(|node| node.attribute("href"))
+        else {
+            continue;
+        };
+        let Some(tag) = url.strip_prefix(&expected_prefix) else {
+            continue;
+        };
+        if tag.is_empty() || tag.contains(['/', '?', '#', '%']) {
+            continue;
+        }
+        let Ok(version) = parse_version(tag) else {
+            continue;
+        };
+        if tag != format!("v{version}") {
+            continue;
+        }
+        releases.push(GithubRelease {
+            tag_name: tag.into(),
+            name: String::new(),
+            html_url: url.into(),
+            body: String::new(),
+            draft: false,
+            prerelease: !version.pre.is_empty(),
+            assets: Vec::new(),
+        });
+    }
+    if releases.is_empty() {
+        return Err("release feed did not contain a canonical release tag".into());
+    }
+    Ok(releases)
+}
+
 fn fetch_latest_release(client: &Client) -> Result<GithubRelease, String> {
-    let response = client
+    let request = client
         .get(LATEST_RELEASE_API)
         .header(ACCEPT, "application/vnd.github+json")
-        .header(USER_AGENT, "SSHMountMate-update-check")
+        .header(USER_AGENT, "SSHMountMate-update-check");
+    #[cfg(test)]
+    let request = if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        request.bearer_auth(token)
+    } else {
+        request
+    };
+    let response = request
         .send()
         .map_err(|error| error.to_string())?
         .error_for_status()
@@ -314,6 +482,7 @@ fn select_release_for_channel(
 }
 
 fn update_info_from_release(
+    client: &Client,
     current_version: &str,
     release: GithubRelease,
 ) -> Result<UpdateInfo, UpdateError> {
@@ -322,8 +491,11 @@ fn update_info_from_release(
         return Err(UpdateError::MissingReleaseTag);
     }
     let expected_asset = expected_asset_name();
-    let asset = select_asset(&release.assets, &expected_asset)
-        .filter(|asset| validate_asset_url(asset).is_ok() && verified_sha256(asset).is_ok());
+    let verification = verified_update_asset(client, &release, &expected_asset);
+    let (asset, trust_error) = match verification {
+        Ok(asset) => (Some(asset), None),
+        Err(error) => (None, Some(error)),
+    };
     let is_newer = compare_versions(current_version, &latest_version)?.is_lt();
     Ok(UpdateInfo {
         current_version: current_version.into(),
@@ -342,7 +514,212 @@ fn update_info_from_release(
         is_newer,
         expected_asset,
         asset,
+        trust_error,
     })
+}
+
+fn update_info_from_signed_tag(
+    client: &Client,
+    current_version: &str,
+    release: GithubRelease,
+) -> Result<UpdateInfo, UpdateError> {
+    let tag = release.tag_name.trim();
+    if tag.is_empty() {
+        return Err(UpdateError::MissingReleaseTag);
+    }
+    let base = format!("https://github.com/{REPOSITORY}/releases/download/{tag}");
+    let manifest_bytes = fetch_bounded_url(
+        client,
+        &format!("{base}/{MANIFEST_ASSET_NAME}"),
+        MAX_MANIFEST_BYTES,
+    )
+    .map_err(UpdateError::Request)?;
+    let signature_bytes = fetch_bounded_url(
+        client,
+        &format!("{base}/{SIGNATURE_ASSET_NAME}"),
+        MAX_SIGNATURE_BYTES,
+    )
+    .map_err(UpdateError::Request)?;
+    let trusted_keys = embedded_trusted_keys()?;
+    let verified = verify_release_manifest_identity(
+        &manifest_bytes,
+        &signature_bytes,
+        &trusted_keys,
+        tag,
+        release.prerelease,
+    )?;
+    let expected_asset = expected_asset_name();
+    let signed = verified
+        .asset(&expected_asset)
+        .ok_or_else(|| UpdateTrustError::ReleaseAssetMismatch(expected_asset.clone()))?;
+    let published = ReleaseAsset {
+        name: signed.name.clone(),
+        url: format!("{base}/{}", signed.name),
+        digest: format!("sha256:{}", signed.sha256),
+        size: signed.size,
+    };
+    let asset = VerifiedUpdateAsset::from_verified(
+        &published,
+        signed,
+        verified.manifest().version.clone(),
+        verified.manifest().channel,
+        verified.manifest().key_id.clone(),
+    );
+    let latest_version = tag.to_owned();
+    Ok(UpdateInfo {
+        current_version: current_version.into(),
+        latest_version: latest_version.clone(),
+        release_name: format!("SSH MountMate {latest_version}"),
+        release_url: release.html_url,
+        body: String::new(),
+        is_newer: compare_versions(current_version, &latest_version)?.is_lt(),
+        expected_asset,
+        asset: Some(asset),
+        trust_error: None,
+    })
+}
+
+fn fetch_bounded_url(client: &Client, url: &str, maximum: usize) -> Result<Vec<u8>, String> {
+    let mut response = client
+        .get(url)
+        .header(USER_AGENT, "SSHMountMate-update-check")
+        .send()
+        .map_err(|error| error.to_string())?
+        .error_for_status()
+        .map_err(|error| error.to_string())?;
+    if !trusted_update_url(response.url()) {
+        return Err("update response used an unapproved URL".into());
+    }
+    let mut body = Vec::new();
+    response
+        .by_ref()
+        .take(maximum as u64 + 1)
+        .read_to_end(&mut body)
+        .map_err(|error| error.to_string())?;
+    if body.is_empty() || body.len() > maximum {
+        return Err("update response has an invalid size".into());
+    }
+    Ok(body)
+}
+
+fn verified_update_asset(
+    client: &Client,
+    release: &GithubRelease,
+    expected_asset: &str,
+) -> Result<VerifiedUpdateAsset, UpdateTrustError> {
+    let manifest_asset = unique_release_asset(&release.assets, MANIFEST_ASSET_NAME)?;
+    let signature_asset = unique_release_asset(&release.assets, SIGNATURE_ASSET_NAME)?;
+    let manifest_bytes =
+        fetch_small_release_asset(client, release, manifest_asset, MAX_MANIFEST_BYTES)?;
+    let signature_bytes =
+        fetch_small_release_asset(client, release, signature_asset, MAX_SIGNATURE_BYTES)?;
+
+    let zip_assets = release
+        .assets
+        .iter()
+        .filter(|asset| asset.name.starts_with("SSHMountMate-") && asset.name.ends_with(".zip"))
+        .map(|asset| {
+            let digest = verified_sha256(asset)
+                .map_err(|_| UpdateTrustError::ReleaseAssetMismatch(asset.name.clone()))?;
+            Ok(PublishedAsset {
+                name: asset.name.clone(),
+                size: asset.size,
+                digest: format!("sha256:{digest}"),
+                url: asset.url.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, UpdateTrustError>>()?;
+    let trusted_keys = embedded_trusted_keys()?;
+    let verified = verify_release_manifest(
+        &manifest_bytes,
+        &signature_bytes,
+        &trusted_keys,
+        &release.tag_name,
+        release.prerelease,
+        &zip_assets,
+    )?;
+    let signed = verified
+        .asset(expected_asset)
+        .ok_or_else(|| UpdateTrustError::ReleaseAssetMismatch(expected_asset.into()))?;
+    let published = unique_release_asset(&release.assets, expected_asset)?;
+    Ok(VerifiedUpdateAsset::from_verified(
+        published,
+        signed,
+        verified.manifest().version.clone(),
+        verified.manifest().channel,
+        verified.manifest().key_id.clone(),
+    ))
+}
+
+fn unique_release_asset<'a>(
+    assets: &'a [ReleaseAsset],
+    name: &str,
+) -> Result<&'a ReleaseAsset, UpdateTrustError> {
+    let mut matches = assets.iter().filter(|asset| asset.name == name);
+    let asset = matches.next().ok_or_else(|| {
+        if name == MANIFEST_ASSET_NAME {
+            UpdateTrustError::MissingManifest
+        } else if name == SIGNATURE_ASSET_NAME {
+            UpdateTrustError::MissingSignature
+        } else {
+            UpdateTrustError::ReleaseAssetMismatch(name.into())
+        }
+    })?;
+    if matches.next().is_some() {
+        return Err(UpdateTrustError::ReleaseAssetMismatch(format!(
+            "duplicate asset {name}"
+        )));
+    }
+    Ok(asset)
+}
+
+fn fetch_small_release_asset(
+    client: &Client,
+    release: &GithubRelease,
+    asset: &ReleaseAsset,
+    maximum: usize,
+) -> Result<Vec<u8>, UpdateTrustError> {
+    if asset.size == 0 || asset.size > maximum as u64 {
+        return Err(UpdateTrustError::ReleaseAssetMismatch(asset.name.clone()));
+    }
+    if !release_asset_url_matches(asset, &release.tag_name) {
+        return Err(UpdateTrustError::ReleaseAssetMismatch(asset.name.clone()));
+    }
+    let expected_digest = verified_sha256(asset)
+        .map_err(|_| UpdateTrustError::ReleaseAssetMismatch(asset.name.clone()))?;
+    let response = client
+        .get(&asset.url)
+        .header(USER_AGENT, "SSHMountMate-update-manifest")
+        .send()
+        .map_err(|error| UpdateTrustError::ReleaseAssetMismatch(error.to_string()))?
+        .error_for_status()
+        .map_err(|error| UpdateTrustError::ReleaseAssetMismatch(error.to_string()))?;
+    if !trusted_update_url(response.url()) {
+        return Err(UpdateTrustError::ReleaseAssetMismatch(asset.name.clone()));
+    }
+    let body = response
+        .bytes()
+        .map_err(|error| UpdateTrustError::ReleaseAssetMismatch(error.to_string()))?;
+    if body.len() as u64 != asset.size
+        || body.len() > maximum
+        || format!("{:x}", Sha256::digest(&body)) != expected_digest
+    {
+        return Err(UpdateTrustError::ReleaseAssetMismatch(asset.name.clone()));
+    }
+    Ok(body.to_vec())
+}
+
+fn release_asset_url_matches(asset: &ReleaseAsset, release_tag: &str) -> bool {
+    let Ok(url) = Url::parse(&asset.url) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && matches!(url.host_str(), Some("github.com" | "www.github.com"))
+        && url.path()
+            == format!(
+                "/{REPOSITORY}/releases/download/{release_tag}/{}",
+                asset.name
+            )
 }
 
 fn fetch_latest_release_redirect(
@@ -375,6 +752,7 @@ fn fetch_latest_release_redirect(
         is_newer,
         expected_asset: expected_asset_name(),
         asset: None,
+        trust_error: Some(UpdateTrustError::MissingManifest),
     })
 }
 
@@ -403,11 +781,11 @@ fn percent_decode(value: &str) -> Result<String, String> {
 }
 
 pub fn download_verified_asset(
-    asset: &ReleaseAsset,
+    asset: &VerifiedUpdateAsset,
     destination: &Path,
     progress: Option<&mut dyn FnMut(u64, u64)>,
 ) -> Result<PathBuf, UpdateError> {
-    validate_asset_url(asset)?;
+    validate_verified_asset_url(asset)?;
     let client = update_client(Duration::from_secs(30))?;
     let response = client
         .get(&asset.url)
@@ -430,7 +808,7 @@ fn validate_redirect(url: &Url) -> Result<(), UpdateError> {
 
 fn write_verified_response(
     response: Response,
-    asset: &ReleaseAsset,
+    asset: &VerifiedUpdateAsset,
     destination: &Path,
     progress: Option<&mut dyn FnMut(u64, u64)>,
 ) -> Result<PathBuf, UpdateError> {
@@ -440,12 +818,12 @@ fn write_verified_response(
 
 fn write_verified_stream<R: Read>(
     mut reader: R,
-    asset: &ReleaseAsset,
+    asset: &VerifiedUpdateAsset,
     destination: &Path,
     content_length: u64,
     mut progress: Option<&mut dyn FnMut(u64, u64)>,
 ) -> Result<PathBuf, UpdateError> {
-    let expected_digest = verified_sha256(asset)?;
+    let expected_digest = asset.sha256();
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     let temporary = destination.with_extension(format!(
@@ -459,16 +837,8 @@ fn write_verified_stream<R: Read>(
         fs::remove_file(&temporary)?;
     }
 
-    let total = if asset.size > 0 {
-        asset.size
-    } else {
-        content_length
-    };
-    let limit = if asset.size > 0 {
-        asset.size
-    } else {
-        DEFAULT_DOWNLOAD_LIMIT
-    };
+    let total = asset.size;
+    let limit = asset.size.min(DEFAULT_DOWNLOAD_LIMIT);
     if content_length > 0 && content_length > limit {
         return Err(UpdateError::DownloadTooLarge);
     }
@@ -496,7 +866,7 @@ fn write_verified_stream<R: Read>(
         output.flush()?;
         output.sync_all()?;
 
-        if asset.size > 0 && received != asset.size {
+        if received != asset.size {
             return Err(UpdateError::SizeMismatch {
                 expected: asset.size,
                 received,
@@ -514,6 +884,23 @@ fn write_verified_stream<R: Read>(
     }
     replace_download_transactionally(&temporary, destination)?;
     Ok(destination.to_owned())
+}
+
+fn validate_verified_asset_url(asset: &VerifiedUpdateAsset) -> Result<(), UpdateValidationError> {
+    let Ok(url) = Url::parse(&asset.url) else {
+        return Err(UpdateValidationError::InvalidHost);
+    };
+    if url.scheme() != "https"
+        || !matches!(url.host_str(), Some("github.com" | "www.github.com"))
+        || url.path()
+            != format!(
+                "/{REPOSITORY}/releases/download/v{}/{}",
+                asset.version, asset.name
+            )
+    {
+        return Err(UpdateValidationError::InvalidHost);
+    }
+    Ok(())
 }
 
 fn replace_download_transactionally(
@@ -697,6 +1084,10 @@ mod tests {
         }
     }
 
+    fn verified_asset_for(payload: &[u8]) -> VerifiedUpdateAsset {
+        VerifiedUpdateAsset::for_test(payload, "SSHMountMate-windows-x64.zip")
+    }
+
     #[test]
     fn github_asset_uses_browser_download_url_not_api_url() {
         let asset: ReleaseAsset = serde_json::from_str(
@@ -747,6 +1138,25 @@ mod tests {
         assert_eq!(
             expected_asset_name_for("macos", "aarch64"),
             "SSHMountMate-macos-arm64.zip"
+        );
+        assert_eq!(
+            [
+                ("windows", "x86_64"),
+                ("windows", "aarch64"),
+                ("macos", "x86_64"),
+                ("macos", "aarch64"),
+                ("linux", "x86_64"),
+                ("linux", "aarch64"),
+            ]
+            .map(|(os, arch)| expected_asset_name_for(os, arch)),
+            [
+                "SSHMountMate-windows-x64.zip",
+                "SSHMountMate-windows-arm64.zip",
+                "SSHMountMate-macos-x64.zip",
+                "SSHMountMate-macos-arm64.zip",
+                "SSHMountMate-linux-x64.zip",
+                "SSHMountMate-linux-arm64.zip",
+            ]
         );
     }
 
@@ -804,8 +1214,37 @@ mod tests {
     }
 
     #[test]
+    fn atom_release_feed_selects_highest_channel_version_and_rejects_other_links() {
+        let feed = br#"<?xml version="1.0" encoding="UTF-8"?>
+        <feed xmlns="http://www.w3.org/2005/Atom">
+          <entry><link rel="alternate" type="text/html" href="https://github.com/Stardust0831/ssh-mountmate/releases/tag/v0.4.1-alpha.5"/></entry>
+          <entry><link rel="alternate" type="text/html" href="https://github.com/Stardust0831/ssh-mountmate/releases/tag/v0.4.1-alpha.6"/></entry>
+          <entry><link rel="alternate" type="text/html" href="https://example.com/Stardust0831/ssh-mountmate/releases/tag/v99.0.0"/></entry>
+          <entry><link rel="alternate" type="text/html" href="https://github.com/other/repository/releases/tag/v99.0.0"/></entry>
+          <entry><link rel="alternate" type="text/html" href="https://github.com/Stardust0831/ssh-mountmate/releases/tag/%20v99.0.0%20"/></entry>
+        </feed>"#;
+
+        let releases = releases_from_atom(feed).unwrap();
+        let selected = select_release_for_channel("v0.4.1-alpha.5", releases).unwrap();
+        assert_eq!(selected.tag_name, "v0.4.1-alpha.6");
+        assert!(selected.prerelease);
+        assert_eq!(
+            selected.html_url,
+            "https://github.com/Stardust0831/ssh-mountmate/releases/tag/v0.4.1-alpha.6"
+        );
+    }
+
+    #[test]
+    fn atom_release_feed_rejects_empty_oversized_and_malformed_documents() {
+        assert!(releases_from_atom(b"").is_err());
+        assert!(releases_from_atom(&vec![b'x'; MAX_RELEASE_FEED_BYTES + 1]).is_err());
+        assert!(releases_from_atom(b"<feed><entry>").is_err());
+        assert!(releases_from_atom(b"<feed></feed>").is_err());
+    }
+
+    #[test]
     #[ignore = "requires the live GitHub releases API"]
-    fn live_release_channels_decode_and_select_expected_versions() {
+    fn update_live_release_channels_decode_and_select_expected_versions() {
         let client = update_client(Duration::from_secs(30)).unwrap();
         let releases = fetch_releases_retry(&client).unwrap();
         let preview = select_release_for_channel("v0.4.0-alpha.1", releases).unwrap();
@@ -819,6 +1258,33 @@ mod tests {
         assert!(parse_version(&stable.tag_name).unwrap().pre.is_empty());
         assert!(!stable.prerelease);
         assert!(!stable.draft);
+    }
+
+    #[test]
+    #[ignore = "requires live GitHub release pages and signed assets"]
+    fn update_live_prerelease_fallback_returns_a_verified_platform_asset() {
+        let client = update_client(Duration::from_secs(30)).unwrap();
+        let info = fetch_prerelease_from_atom(&client, "v0.4.1-alpha.4").unwrap();
+        assert!(
+            compare_versions("v0.4.1-alpha.4", &info.latest_version)
+                .unwrap()
+                .is_lt()
+        );
+        assert!(info.asset.is_some());
+        assert!(info.trust_error.is_none());
+    }
+
+    #[test]
+    #[ignore = "requires live GitHub update endpoints"]
+    fn update_live_public_prerelease_check_returns_a_verified_platform_asset() {
+        let info = check_for_updates("v0.4.1-alpha.4").unwrap();
+        assert!(
+            compare_versions("v0.4.1-alpha.4", &info.latest_version)
+                .unwrap()
+                .is_lt()
+        );
+        assert!(info.asset.is_some());
+        assert!(info.trust_error.is_none());
     }
 
     #[test]
@@ -891,10 +1357,14 @@ mod tests {
         };
 
         assert!(
-            update_info_from_release("1.0.0", release)
-                .unwrap()
-                .asset
-                .is_none()
+            update_info_from_release(
+                &update_client(Duration::from_secs(1)).unwrap(),
+                "1.0.0",
+                release,
+            )
+            .unwrap()
+            .asset
+            .is_none()
         );
     }
 
@@ -903,7 +1373,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let destination = temp.path().join("app.zip");
         let payload = b"verified update";
-        let asset = asset_for(payload);
+        let asset = verified_asset_for(payload);
         let mut progress = Vec::new();
         write_verified_stream(
             Cursor::new(payload),
@@ -920,7 +1390,7 @@ mod tests {
         );
 
         let mut invalid = asset.clone();
-        invalid.digest = format!("sha256:{}", "0".repeat(64));
+        invalid.sha256 = "0".repeat(64);
         assert!(matches!(
             write_verified_stream(Cursor::new(payload), &invalid, &destination, 0, None),
             Err(UpdateError::DigestMismatch)
@@ -938,7 +1408,7 @@ mod tests {
 
         write_verified_stream(
             Cursor::new(payload),
-            &asset_for(payload),
+            &verified_asset_for(payload),
             &destination,
             payload.len() as u64,
             None,

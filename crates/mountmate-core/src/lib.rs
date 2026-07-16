@@ -1,10 +1,13 @@
 pub mod app_command;
 pub mod capacity;
 pub mod connection;
+pub mod credential;
 pub mod dependency;
+pub mod interactive_ssh;
 pub mod model;
 pub mod mountpoint;
 pub mod paths;
+pub mod plink_binary;
 pub mod process;
 pub mod rc;
 pub mod rclone;
@@ -17,9 +20,13 @@ pub mod transfer;
 pub mod update;
 pub mod update_helper;
 pub mod update_install;
+pub mod update_manifest;
 pub mod update_workflow;
 
-pub use model::{AuthMethod, ConnectionMethod, MountPhase, MountState, ServerConfig, Settings};
+pub use model::{
+    AccentColor, AppearanceMode, AuthMethod, ConnectionMethod, CredentialStorage, MountBackend,
+    MountPhase, MountState, ServerConfig, Settings,
+};
 
 pub const APP_NAME: &str = "SSH MountMate";
 pub const APP_ID: &str = "ssh-mountmate";

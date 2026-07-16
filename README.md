@@ -14,7 +14,8 @@ It uses rclone for the actual mount operation and provides a small GUI around th
 - Start from an SAI cluster preset and write app-managed SSH config entries.
 - Add connections manually with host, username, port, password, key file, and key passphrase.
 - Optionally copy a selected key into `~/.ssh` and write the copied `IdentityFile` path.
-- Choose the connection method per mount: rclone native SFTP or system OpenSSH.
+- Choose the connection method per mount: rclone native SFTP, system OpenSSH, or an interactive
+  shared SSH session for OAuth/2FA-style login.
 - Store passwords and key passphrases through `rclone obscure`, not as plain text.
 - Check for rclone and platform mount dependencies.
 - Bundle and verify the official rclone binary in release builds.
@@ -73,6 +74,14 @@ brew install --cask fuse-t
 
 FUSE-T may require `Network Volumes` access under `System Settings -> Privacy & Security -> Files and Folders`. Its NFS-backed semantics also have documented differences, including access/modification-time behavior; review the [rclone FUSE-T caveats](https://rclone.org/commands/rclone_mount/#fuse-t-limitations-caveats-and-notes). FUSE-T is not bundled with SSH MountMate, and its published binary license requires a separate commercial license for commercial use or bundling.
 
+Development builds after v0.4.0 also expose `Settings -> Mount method -> rclone built-in NFS
+(Experimental)` on macOS. This opt-in backend runs rclone's own NFS service on an explicitly
+loopback-only address and does not require macFUSE or FUSE-T. FUSE remains the default for new and
+migrated settings. Changing the option affects only the next mount, never interrupts an existing
+mount, and never falls back silently if NFS startup fails. NFS filesystem semantics, performance,
+and cache behavior can differ from FUSE. Windows continues to use WinFsp and Linux continues to use
+FUSE3 regardless of this stored macOS setting.
+
 If macOS blocks the downloaded app because it is not notarized, remove the quarantine attribute after unzipping:
 
 ```bash
@@ -130,7 +139,10 @@ Use the latest GitHub Release and download the package for your platform:
 - `SSHMountMate-linux-x64.zip`
 - `SSHMountMate-linux-arm64.zip`
 
-Release builds are produced from the Rust workspace by six native GitHub Actions runners. Windows and Linux ZIPs contain one executable with the verified official rclone embedded. macOS ZIPs contain the native `SSH MountMate.app` bundle with rclone and license notices inside the application.
+Release builds are produced from the Rust workspace by six native GitHub Actions runners. Windows
+and Linux ZIPs contain one executable with the verified official rclone embedded; Windows builds
+also embed the independently verified official Plink used by interactive sharing. macOS ZIPs
+contain the native `SSH MountMate.app` bundle with rclone and license notices inside the application.
 
 Bundled third-party notices can be viewed from Settings or with:
 
@@ -144,9 +156,24 @@ Program updates can be checked from Settings -> Check for updates, or from the c
 SSHMountMate --check-update
 ```
 
-The in-app updater downloads the single matching native GitHub Release asset, verifies its size and SHA-256 digest, rejects unsafe ZIP paths, stages the new executable or macOS application beside the current installation, and restarts SSH MountMate after confirmation. A startup health handshake commits the update; timeout or failure restores and relaunches the previous build. Existing rclone mounts and uploads continue while the GUI restarts.
+The in-app updater first verifies an Ed25519-signed manifest embedded in the application trust
+root. The signature binds the release version, stable/prerelease channel, all six canonical asset
+names, sizes, and SHA-256 digests. GitHub's published asset digest and metadata must independently
+match that signed manifest before the matching ZIP can be installed. Missing signatures, unknown
+keys, mismatched release metadata, or changed ZIPs remain visible in the update view but disable
+automatic installation with an explicit reason.
 
-Automatic installation requires SSH MountMate to be extracted to a permanent, user-writable folder. Builds launched directly from a ZIP temporary directory and assets without a trusted SHA-256 digest remain manual-update only. Automatic background checks can be disabled in Settings.
+After verification, the updater rejects unsafe ZIP paths, stages the new executable or macOS
+application beside the current installation, and restarts SSH MountMate after confirmation. A
+startup health handshake commits the update; timeout or failure restores and relaunches the
+previous build. Existing rclone mounts and uploads continue while the GUI restarts.
+
+Automatic installation requires SSH MountMate to be extracted to a permanent, user-writable
+folder. Builds launched directly from a ZIP temporary directory and releases that fail any signed
+manifest, platform, size, or digest check remain manual-update only. Current Releases intentionally
+contain no Windows/Linux onedir update assets, so automatic replacement of those legacy directory
+layouts is explicitly unsupported; canonical onefile packages and macOS `.app` updates remain the
+supported paths. Automatic background checks can be disabled in Settings.
 
 Check CPU architecture:
 
@@ -160,7 +187,12 @@ $env:PROCESSOR_ARCHITECTURE
 uname -m
 ```
 
-Use `x64` packages for `AMD64` / `x86_64`, and `arm64` packages for `ARM64` / `arm64` / `aarch64`. Windows and Linux provide one canonical onefile package per architecture; the executable materializes its embedded rclone as a content-addressed managed copy on first use. macOS provides one canonical native `.app` package per architecture. The release matrix intentionally has six ZIPs instead of separate onefile and onedir variants.
+Use `x64` packages for `AMD64` / `x86_64`, and `arm64` packages for `ARM64` / `arm64` / `aarch64`.
+Windows and Linux provide one canonical onefile package per architecture; the executable
+materializes embedded tools as content-addressed managed copies on first use. Windows includes
+rclone and Plink, while Linux includes rclone. macOS provides one canonical native `.app` package
+per architecture. The release matrix intentionally has six ZIPs instead of separate onefile and
+onedir variants.
 
 On macOS, choose the `x64` asset for Intel Macs and `arm64` for Apple Silicon; both contain the native application bundle.
 
@@ -224,10 +256,25 @@ If `Copy key to ~/.ssh` is enabled, the selected private key is copied into `~/.
 
 ## Connection Method
 
-Each saved connection can use one of two methods:
+Each saved connection can use one of three methods:
 
 - `rclone native SFTP`: the default. rclone handles SSH/SFTP itself and can use saved rclone-obscured passwords or key passphrases.
 - `OpenSSH`: rclone calls the system `ssh` command. This is useful for OpenSSH features such as `ProxyJump`, `ProxyCommand`, custom `Include` logic, or system ssh-agent behavior.
+- `Interactive shared SSH`: the first mount attempt opens an app-managed PTY terminal for OAuth,
+  2FA, dynamic password, or other keyboard-interactive authentication. Complete login there; the
+  queued mount resumes exactly once when the shared session is ready. The terminal can be hidden
+  while its session remains alive, or explicitly ended. rclone receives only a non-interactive
+  connector to the verified shared session; the one-time response is never passed through SSH
+  MountMate arguments or configuration.
+
+On macOS and Linux, interactive sharing uses an OpenSSH ControlMaster socket in a private state
+directory. On Windows, portable packages include the pinned official PuTTY Plink 0.84 binary and
+verify its SHA-256 before using connection sharing. The initial Windows implementation supports
+direct `Manual` connections only; imported SSH-config profiles, `ProxyJump`, and `ProxyCommand`
+translation remain unsupported. Ending the app-managed session ends the reusable session, so new
+mounts and capacity probes that need it will ask for login again; already running rclone mounts are
+not automatically unmounted, but they can report transport errors until a shared session is
+re-established.
 
 When `OpenSSH` is selected, SSH MountMate does not save or pass key passphrases to `ssh`. Add passphrase-protected keys to your agent first:
 
@@ -249,7 +296,23 @@ Passwords and key passphrases are passed through:
 rclone obscure
 ```
 
-The obscured value is stored in SSH MountMate's private rclone config. This avoids plain-text storage, but it is not strong encryption. On macOS and Linux, SSH MountMate writes configuration files with owner-only permissions. Treat the local user account and its config directory as sensitive.
+The obscured value is stored in SSH MountMate's private configuration. This avoids plain-text
+storage, but it is reversible and is not strong encryption. It remains the default for compatibility.
+On macOS and Linux, SSH MountMate writes configuration files with owner-only permissions. Treat the
+local user account and its config directory as sensitive.
+
+The Settings page also offers a manually enabled `System credential store` mode. It uses Windows
+Credential Manager, macOS Keychain, or the Linux Secret Service through the platform's native
+credential provider. Enabling it asks for confirmation, reveals existing rclone-obscured values
+locally, writes passwords and private-key passphrases to the OS store, reads every value back for
+verification, and only then removes those values from SSH MountMate's files. Private key files and
+one-time 2FA/OAuth tokens are never stored in the vault. Mounts temporarily hydrate the rclone
+configuration and remove its secret fields immediately after startup; a cleanup failure stops the
+new mount instead of leaving a misleading protected state. Returning to `rclone obscure` is an
+explicit confirmed migration in the other direction.
+
+Interactive shared SSH deliberately bypasses both stored credential modes. Passwords, OAuth
+responses, and rotating 2FA codes are entered only in the terminal owned by OpenSSH or Plink.
 
 ## Host Key Validation
 

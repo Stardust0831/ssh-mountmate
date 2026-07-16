@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const SETTINGS_SCHEMA_VERSION: u32 = 10;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 13;
 pub const DEFAULT_VFS_UPLOAD_TRANSFERS: u16 = 4;
 pub const MIN_VFS_UPLOAD_TRANSFERS: u16 = 1;
 pub const MAX_VFS_UPLOAD_TRANSFERS: u16 = 32;
@@ -41,6 +41,22 @@ fn default_vfs_upload_transfers() -> u16 {
     DEFAULT_VFS_UPLOAD_TRANSFERS
 }
 
+fn default_mount_backend() -> MountBackend {
+    MountBackend::Fuse
+}
+
+fn default_credential_storage() -> CredentialStorage {
+    CredentialStorage::Obscure
+}
+
+fn default_appearance_mode() -> AppearanceMode {
+    AppearanceMode::System
+}
+
+fn default_accent_color() -> AccentColor {
+    AccentColor::Blue
+}
+
 fn default_true() -> bool {
     true
 }
@@ -51,6 +67,33 @@ pub enum AuthMethod {
     #[default]
     Key,
     Password,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppearanceMode {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl AppearanceMode {
+    pub const ALL: [Self; 3] = [Self::System, Self::Light, Self::Dark];
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccentColor {
+    #[default]
+    Blue,
+    Green,
+    Amber,
+    Purple,
+}
+
+impl AccentColor {
+    pub const ALL: [Self; 4] = [Self::Blue, Self::Green, Self::Amber, Self::Purple];
 }
 
 impl AuthMethod {
@@ -72,10 +115,11 @@ pub enum ConnectionMethod {
     #[default]
     Native,
     Openssh,
+    Interactive,
 }
 
 impl ConnectionMethod {
-    pub const ALL: [Self; 2] = [Self::Native, Self::Openssh];
+    pub const ALL: [Self; 3] = [Self::Native, Self::Openssh, Self::Interactive];
 }
 
 impl fmt::Display for ConnectionMethod {
@@ -83,8 +127,42 @@ impl fmt::Display for ConnectionMethod {
         formatter.write_str(match self {
             Self::Native => "Native SFTP",
             Self::Openssh => "OpenSSH",
+            Self::Interactive => "Interactive shared SSH",
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MountBackend {
+    #[default]
+    Fuse,
+    Nfs,
+}
+
+impl MountBackend {
+    pub const ALL: [Self; 2] = [Self::Fuse, Self::Nfs];
+}
+
+impl fmt::Display for MountBackend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Fuse => "FUSE",
+            Self::Nfs => "rclone built-in NFS (Experimental)",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialStorage {
+    #[default]
+    Obscure,
+    System,
+}
+
+impl CredentialStorage {
+    pub const ALL: [Self; 2] = [Self::Obscure, Self::System];
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +191,10 @@ pub struct ServerConfig {
     pub password_obscured: String,
     #[serde(default)]
     pub key_pass_obscured: String,
+    #[serde(default)]
+    pub password_credential: String,
+    #[serde(default)]
+    pub key_pass_credential: String,
     #[serde(default = "default_connection_method")]
     pub connection_method: ConnectionMethod,
     #[serde(default)]
@@ -156,6 +238,8 @@ impl Default for ServerConfig {
             key_file: String::new(),
             password_obscured: String::new(),
             key_pass_obscured: String::new(),
+            password_credential: String::new(),
+            key_pass_credential: String::new(),
             connection_method: default_connection_method(),
             remote_path: String::new(),
             mountpoint: String::new(),
@@ -195,7 +279,10 @@ impl ServerConfig {
     }
 
     pub fn remote_name(&self) -> &str {
-        if self.mode == "ssh_config" && !self.host_alias.is_empty() {
+        if self.connection_method != ConnectionMethod::Interactive
+            && self.mode == "ssh_config"
+            && !self.host_alias.is_empty()
+        {
             &self.host_alias
         } else {
             &self.id
@@ -267,6 +354,10 @@ pub struct Settings {
     pub buffer_size: String,
     #[serde(default = "default_vfs_upload_transfers")]
     pub vfs_upload_transfers: u16,
+    #[serde(default = "default_mount_backend")]
+    pub macos_mount_backend: MountBackend,
+    #[serde(default = "default_credential_storage")]
+    pub credential_storage: CredentialStorage,
     #[serde(default)]
     pub startup_all: bool,
     #[serde(default = "default_true")]
@@ -275,6 +366,10 @@ pub struct Settings {
     pub auto_check_updates: bool,
     #[serde(default = "default_language")]
     pub language: String,
+    #[serde(default = "default_appearance_mode")]
+    pub appearance_mode: AppearanceMode,
+    #[serde(default = "default_accent_color")]
+    pub accent_color: AccentColor,
 }
 
 fn schema_version() -> u32 {
@@ -298,10 +393,14 @@ impl Default for Settings {
             dir_cache_time: default_dir_cache_time(),
             buffer_size: String::new(),
             vfs_upload_transfers: default_vfs_upload_transfers(),
+            macos_mount_backend: default_mount_backend(),
+            credential_storage: default_credential_storage(),
             startup_all: false,
             auto_show_transfers: true,
             auto_check_updates: true,
             language: default_language(),
+            appearance_mode: default_appearance_mode(),
+            accent_color: default_accent_color(),
         }
     }
 }
@@ -393,6 +492,8 @@ pub struct MountState {
     pub process_started_at: Option<u64>,
     #[serde(default)]
     pub rclone: PathBuf,
+    #[serde(default = "default_mount_backend")]
+    pub mount_backend: MountBackend,
 }
 
 #[cfg(test)]
@@ -482,6 +583,119 @@ mod tests {
                 .vfs_upload_transfers,
             8
         );
+    }
+
+    #[test]
+    fn legacy_settings_and_state_default_to_fuse() {
+        let settings: Settings = serde_json::from_str(r#"{"settings_schema_version":10}"#).unwrap();
+        assert_eq!(settings.migrate().macos_mount_backend, MountBackend::Fuse);
+
+        let state: MountState = serde_json::from_str(
+            r#"{"pid":42,"server_id":"alpha","remote":"alpha:","mountpoint":"/tmp/mnt","log":"/tmp/alpha.log","rc_addr":"127.0.0.1:1234"}"#,
+        )
+        .unwrap();
+        assert_eq!(state.mount_backend, MountBackend::Fuse);
+    }
+
+    #[test]
+    fn mount_backend_serializes_as_a_typed_setting() {
+        let settings = Settings {
+            macos_mount_backend: MountBackend::Nfs,
+            ..Settings::default()
+        };
+        let json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(json["macos_mount_backend"], "nfs");
+        assert_eq!(
+            serde_json::from_value::<Settings>(json)
+                .unwrap()
+                .macos_mount_backend,
+            MountBackend::Nfs
+        );
+    }
+
+    #[test]
+    fn credential_storage_is_opt_in_and_legacy_settings_remain_obscured() {
+        let legacy: Settings = serde_json::from_str(r#"{"settings_schema_version":11}"#).unwrap();
+        assert_eq!(
+            legacy.migrate().credential_storage,
+            CredentialStorage::Obscure
+        );
+        assert_eq!(
+            Settings::default().credential_storage,
+            CredentialStorage::Obscure
+        );
+
+        let settings = Settings {
+            credential_storage: CredentialStorage::System,
+            ..Settings::default()
+        };
+        let json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(json["credential_storage"], "system");
+    }
+
+    #[test]
+    fn appearance_settings_are_typed_persisted_and_migrated() {
+        let legacy: Settings = serde_json::from_str(r#"{"settings_schema_version":12}"#).unwrap();
+        let migrated = legacy.migrate();
+        assert_eq!(migrated.settings_schema_version, SETTINGS_SCHEMA_VERSION);
+        assert_eq!(migrated.appearance_mode, AppearanceMode::System);
+        assert_eq!(migrated.accent_color, AccentColor::Blue);
+
+        let settings = Settings {
+            appearance_mode: AppearanceMode::Dark,
+            accent_color: AccentColor::Purple,
+            ..Settings::default()
+        };
+        let json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(json["appearance_mode"], "dark");
+        assert_eq!(json["accent_color"], "purple");
+        assert_eq!(serde_json::from_value::<Settings>(json).unwrap(), settings);
+    }
+
+    #[test]
+    fn interactive_connection_method_is_typed_and_opt_in() {
+        let legacy: ServerConfig = serde_json::from_str(r#"{"id":"legacy"}"#).unwrap();
+        assert_eq!(legacy.connection_method, ConnectionMethod::Native);
+
+        let interactive = ServerConfig {
+            id: "interactive".into(),
+            connection_method: ConnectionMethod::Interactive,
+            ..ServerConfig::default()
+        };
+        let json = serde_json::to_value(&interactive).unwrap();
+        assert_eq!(json["connection_method"], "interactive");
+        assert_eq!(
+            serde_json::from_value::<ServerConfig>(json)
+                .unwrap()
+                .connection_method,
+            ConnectionMethod::Interactive
+        );
+    }
+
+    #[test]
+    fn openssh_ssh_config_remote_keeps_host_alias() {
+        let server = ServerConfig {
+            id: "openssh-profile".into(),
+            mode: "ssh_config".into(),
+            host_alias: "cluster-login".into(),
+            connection_method: ConnectionMethod::Openssh,
+            ..ServerConfig::default()
+        };
+
+        assert_eq!(server.remote_name(), "cluster-login");
+    }
+
+    #[test]
+    fn interactive_ssh_config_remote_uses_unique_server_id() {
+        let server = ServerConfig {
+            id: "interactive-profile".into(),
+            mode: "ssh_config".into(),
+            host_alias: "cluster-login".into(),
+            connection_method: ConnectionMethod::Interactive,
+            ..ServerConfig::default()
+        };
+
+        assert_eq!(server.remote_name(), "interactive-profile");
     }
 
     #[test]

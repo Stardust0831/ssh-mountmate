@@ -6,18 +6,141 @@ until its stated evidence exists.
 
 ## Current sequence
 
-1. Prepare the verified Rust rewrite and configurable upload concurrency for stable `v0.4.0`.
-2. Remove the macOS ARM64 release exception, complete a blocking six-platform release dry run,
-   refresh PR #11 evidence, review the final diff, and merge the PR into `main`.
-3. Publish `v0.4.0` from the merge commit as six portable ZIPs plus `SHA256SUMS.txt`.
-4. Implement optional macOS `rclone nfsmount` as an explicit Experimental backend. Keep FUSE as
-   the migration and UI default and keep Windows WinFsp and Linux FUSE3 unchanged.
-5. Add user-enabled system credential protection. The default remains the compatible
-   `rclone obscure` storage until the user confirms migration.
-6. Add reusable interactive SSH authentication: OpenSSH ControlMaster on macOS/Linux and verified
-   official Plink connection sharing for direct Windows connections.
+1. Stable `v0.4.0` publication is complete from the verified merge commit.
+2. Optional macOS `rclone nfsmount` is implemented as an explicit Experimental backend. FUSE
+   remains the migration and UI default; Windows WinFsp and Linux FUSE3 remain unchanged.
+3. User-enabled system credential protection is implemented. The default remains compatible
+   `rclone obscure` storage until the user confirms and verifies migration.
+4. Reusable interactive SSH authentication is implemented. Linux and Windows real lifecycle
+   evidence is complete; macOS shares the tested OpenSSH implementation but does not yet have a
+   dedicated interactive-login lifecycle.
+5. Ed25519 verification is complete and `v0.4.1-alpha.1` is published from the explicitly
+   confirmed production key after all six authoritative CI jobs.
+6. Review the completed six-platform and real Linux/Windows shared-session evidence. Do not merge
+   this extension branch until that separate decision is made.
 7. Keep installer work, Explorer navigation-triggered refresh, complex Windows ProxyJump
    translation, server changes, and production signing/notarization as separate later work.
+
+## Low-priority connection organization backlog
+
+After the current credential, diagnostics, transport, mounted-settings, onboarding, required-field,
+and theme work is complete, improve organization for users with many mount entries:
+
+- Search connections by display name, host/alias, user, and remote path without mutating the saved
+  order.
+- Add explicit sort choices such as manual order, name, recent use, mount state, and creation or
+  modification time. Define stable tie-breaking and preserve the user's selection in migrated
+  settings.
+- Add optional folders/groups with drag or explicit move actions, a safe ungrouped default, and no
+  change to mount identity, credential references, or update behavior.
+- Keep search/sort/group metadata local to the application. Import/export must either round-trip it
+  explicitly or document that organization metadata is omitted.
+- Provide migration and serialization tests plus keyboard-accessible, bilingual empty/search-zero
+  states. Defer visual acceptance until the broader UI acceptance pass.
+
+This is intentionally lower priority than the active prerelease plan and must not delay credential
+or transport correctness releases.
+
+## Prerelease scope: `v0.4.1-alpha.1`
+
+Published with production signing and six-platform evidence:
+
+- A strict versioned update manifest signed with Ed25519, covering one release version/channel and
+  all six canonical ZIP asset names, sizes, and SHA-256 digests.
+- A multi-key embedded public registry and deterministic `key_id` binding for bridge rotation.
+- Mandatory agreement among signature, GitHub Release tag/prerelease state, platform asset, REST
+  digest, size, and canonical browser URL before an installable asset can be constructed.
+- Visible update information with an explicit trust failure while automatic installation remains
+  disabled for unsigned or inconsistent releases.
+- A stdin-only signing tool, ephemeral dry-run signing, protected-Environment production signing,
+  draft-before-publish validation, and refusal to reuse an existing Release.
+- Explicit Windows/Linux onedir auto-update rejection because current Releases contain only the six
+  canonical onefile/macOS application assets.
+
+Security and operations are documented in `docs/update-signing.md`. The selected single-secret,
+no-offline-backup custody policy remains intentionally recorded as high risk. The production
+private key did not enter the repository, application, command line, logs, or build artifacts. The
+owner confirmed the generated `key_id` and full public-key SHA-256; the exact green commit was
+tagged, and the signed Release passed both expected-publication and actual published REST metadata
+verification before the release task was closed.
+
+Local and CI verification on 2026-07-15 and 2026-07-16:
+
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: passed.
+- `cargo test --workspace --all-features`: 211 core tests passed with two native/live tests ignored;
+  legacy migration passed; the standalone packaged-update fixture passed with three graphical
+  package tests ignored; 10 signature tests, three signing-CLI/REST-fixture tests, five platform
+  tests, and 43 application tests passed.
+- Both workflow YAML files parsed successfully, generated third-party licenses match the updated
+  lockfile, and `git diff --check` passed.
+- Security review confirmed that the application receives an opaque verified-asset capability only
+  after signature and Release metadata agreement; local verifier paths are canonicalized by the
+  six-name schema before reads; secret input is bounded and stdin-only; non-signing subprocesses do
+  not inherit the production key; and a failed published-metadata check leaves the Release draft.
+- The configured `sol_reviewer` role is not exposed by the current collaboration tool and generic
+  subagents are not an allowed substitute, so the primary agent performed the working-tree review.
+  Six-platform native CI remains the independent execution gate before key creation or tagging.
+- Initial branch run
+  [29431109779](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29431109779)
+  passed Windows x64/ARM64, Linux x64, and macOS x64/ARM64 package and lifecycle jobs. Linux ARM64
+  failed before compilation when apt dependency installation returned exit 100; quality completed
+  all local gates but its separate anonymous live-GitHub test hit API rate limiting. The live test
+  now receives the workflow's read-only `GITHUB_TOKEN` only in test builds; production update
+  requests remain anonymous. A fresh exact-commit run is required rather than treating either
+  infrastructure failure as product evidence.
+- Replacement run
+  [29432288665](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29432288665)
+  reproduced the Linux ARM64 dependency failure. Its apt log showed `ports.ubuntu.com` resolving to
+  IPv6 while the hosted runner had no IPv6 route (`connect (101: Network is unreachable)`). Both
+  native workflows now force apt to IPv4 for Linux dependency installation; this is scoped to CI
+  bootstrap and does not alter application networking.
+- Final pre-key run
+  [29432591792](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29432591792)
+  passed quality and all six Windows, Linux, and macOS x64/ARM64 jobs on `f858c8c`, including real
+  SFTP lifecycles and both macOS FUSE/NFS backends. The protected `production-update-signing`
+  Environment now requires owner approval and allows only `v*` tags. The initial private key was
+  piped directly to its secret with no file copy; the public registry records key ID
+  `ed25519-563e14d2c6b880f9` and full public-key SHA-256
+  `563e14d2c6b880f9326f71c809a49474ec74cf74ca2347cc5ac3bf6efad27a2a`. Owner confirmation and a
+  fresh six-platform run containing that embedded public key remain required before tagging.
+- The first post-key run
+  [29434334267](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29434334267)
+  showed a second ARM runner mirror mode: IPv4 was selected correctly, but the connection to
+  `ports.ubuntu.com:80` dropped during the large GUI dependency download. The immediately preceding
+  run completed the same ARM install, so both workflows now use apt's bounded five-attempt download
+  retry in addition to IPv4. This changes CI bootstrap only; a complete exact-commit rerun is still
+  required.
+- Bounded retries in run
+  [29434768692](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29434768692)
+  could not recover because both IPv4 and IPv6 paths to the primary Ubuntu Ports service remained
+  unavailable. The Azure alias resolves to the same service, so it is not a fallback. ARM build
+  jobs now replace only that source with the reachable HTTPS Leaseweb Ubuntu Ports mirror; apt's
+  normal Ubuntu archive signature verification remains mandatory. x64 sources and application
+  networking are unchanged.
+- Final embedded-key run
+  [29435256461](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29435256461)
+  passed quality and all six platforms on exact product commit `be1b917`, including packaged
+  update/rollback, real Windows/Linux SFTP, and both macOS FUSE/NFS lifecycle records.
+- The initial tag run
+  [29438369051](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29438369051)
+  safely stopped before production signing because its clean release aggregation runner lacked the
+  Linux Secret Service build dependency. The release and publish jobs now install that dependency
+  explicitly; non-publishing recovery run
+  [29440339655](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29440339655)
+  passed all six platforms and the ephemeral signed release-set exercise.
+- Production run
+  [29442216176](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29442216176)
+  checked out the immutable `v0.4.1-alpha.1` tag for every build and passed quality, all six
+  platform jobs, and the signed release-set exercise. GitHub's draft Release lookup and draft asset
+  URL semantics required controlled recovery: the production manifest and signature were verified
+  against real draft sizes/digests plus canonical post-publication URLs, publication was protected
+  by an automatic draft rollback trap, and the actual public REST metadata then passed the same
+  `update-signing verify-published` verifier. Release
+  [v0.4.1-alpha.1](https://github.com/Stardust0831/ssh-mountmate/releases/tag/v0.4.1-alpha.1)
+  is prerelease ID `354659949` with six canonical ZIPs, checksums, manifest, and signature. The
+  temporary exact-branch Environment policy used for recovery was removed; only the `v*` tag
+  policy remains.
 
 ## Prerelease scope: `v0.4.0-alpha.7`
 
@@ -167,6 +290,90 @@ Cross-platform considerations:
 ## Work log
 
 ### 2026-07-15
+
+- Formal [`v0.4.0`](https://github.com/Stardust0831/ssh-mountmate/releases/tag/v0.4.0)
+  publication completed from merge commit `e2b222f`. Tag run
+  [29395079259](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29395079259)
+  passed quality, all six blocking native package and real-mount jobs, and final aggregation. The
+  release is non-draft and non-prerelease and contains exactly six ZIPs plus `SHA256SUMS.txt`; the
+  manifest matches the release asset digests.
+- Started the post-v0.4.0 extension branch from `origin/main` without touching the user-owned
+  untracked files. Implemented the first local macOS NFS slice: typed `MountBackend`, settings
+  schema 11 with FUSE-compatible defaults, backend-aware state, exact `mount`/`nfsmount` ownership
+  recognition, macOS-only settings UI and dependency behavior, and loopback-only
+  `--addr 127.0.0.1:0`. Windows and Linux force the existing `mount` command.
+- Parameterized the macOS lifecycle script for FUSE and NFS. Both paths retain RC, full VFS cache,
+  write-back, directory cache, logs, links, volume name, and upload concurrency. The suite now also
+  checks mount source, refresh, queued 8 MiB upload and digest, rename/delete, Chinese and spaced
+  names, 500-file enumeration, clean unmount, failed-start cleanup, and non-blocking timing output.
+  The branch remained blocked from merge or release until both architectures produced genuine NFS
+  evidence in the following run.
+- Branch run [29398901355](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29398901355)
+  passed quality and all six Windows/Linux/macOS x64/ARM64 jobs on `e901b8a`. Both macOS jobs ran
+  FUSE and built-in NFS as separate real lifecycles. NFS logs explicitly reported
+  `NFS Server running at 127.0.0.1:<port>`; ARM64 and x64 both verified refresh, queued upload,
+  remote digest, rename/delete, Chinese/spaced names, 500-file enumeration, active-mount package
+  replacement, clean unmount/state removal, and failed-start cleanup. Upload completion took 91s
+  on both architectures under the intentional 90s write-back test setting. This is genuine
+  dual-architecture Experimental evidence, not evidence to make NFS the default.
+- Implemented the local system-credential-store slice behind an explicit confirmed setting. Schema
+  12 still defaults old and new users to `rclone obscure`. The opt-in mode uses the OS credential
+  provider for passwords and private-key passphrases only, verifies every write by reading it back,
+  rolls back overwritten credentials when connection persistence fails, and scrubs old and
+  temporary rclone config secrets. Private keys and one-time authentication codes are excluded.
+  Branch run [29404531615](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29404531615)
+  passed quality and all six native jobs on `63cd1bf`. Windows x64/ARM64 exercised Credential
+  Manager round trips and macOS x64/ARM64 exercised Keychain round trips. Linux Secret Service
+  remains covered by compilation and fake-store tests because the workflow does not yet provide a
+  real user Secret Service daemon.
+- Implemented the first local interactive shared-SSH slice. `ConnectionMethod::Interactive` is
+  typed and opt-in. macOS/Linux use per-connection OpenSSH ControlMaster sockets under owner-only
+  state directories, explicitly force `BatchMode=no` for the login master and `BatchMode=yes` for
+  rclone reuse, and open the platform terminal without storing authentication responses. Windows
+  packages pin official Plink 0.84 for x64/ARM64, verify it before packaging/materialization, and
+  use `-shareexists` plus `-batch -share` only for direct manual connections. SSH-config and proxy
+  translation are rejected explicitly on Windows.
+- Added Linux and Windows real shared-session lifecycle coverage. The Linux suite starts the login
+  through the terminal path, verifies the ControlMaster, mounts on the second request, and confirms
+  the generated rclone remote uses the exact socket in non-interactive mode. The Windows suite
+  generates a fixed ECDSA host key, passes its exact public-key blob to Plink `-hostkey`, starts a
+  password-authenticated sharing master, and proves the application mounts through a password-free
+  shared connector. Windows packages and onefile builds now include separately verified Plink
+  payloads and license notices.
+- Hardened interactive OpenSSH startup for desktop portability. `x-terminal-emulator` symlinks are
+  resolved before choosing terminal-specific arguments, xterm/lxterm receive an explicit scalable
+  font, and long state paths use a stable owner-only short ControlMaster socket directory. Imported
+  interactive SSH-config profiles use their unique server ID as the rclone remote name, while
+  ordinary OpenSSH profiles retain the host alias; this prevents the two transports from
+  overwriting the same rclone config section during concurrent startup or remount.
+- Corrected macOS FUSE/NFS performance logging from whole seconds to monotonic milliseconds so
+  cached reads and small-file enumeration no longer collapse to misleading zero-second records.
+  Fresh Rust 1.97 local verification passed format, zero-warning workspace Clippy, shell and
+  PowerShell syntax parsing, workflow YAML parsing, and the complete workspace suite: 205 core
+  tests passed with two environment/network tests ignored, legacy migration passed, one packaged
+  fixture passed with three graphical package tests ignored, five platform tests passed, and 42
+  application tests passed. The pinned cargo-about 0.9.1 output matched the committed Rust license
+  inventory byte for byte. Real official Plink x64/ARM64 downloads matched their pinned SHA-256
+  values, and an embedded x64 payload passed the build-time digest test.
+- Final branch run [29414771418](https://github.com/Stardust0831/ssh-mountmate/actions/runs/29414771418)
+  passed quality and all six authoritative Windows, Linux, and macOS x64/ARM64 jobs on `037dd88`.
+  Linux x64/ARM64 opened the real terminal login path, found the stable shortened ControlMaster
+  socket after checking the normal and fallback locations, mounted `interactive-a:interactive-a`
+  on the second request, read through the mount, retained separate `[interactive-a]` and
+  `[local-openssh-a]` rclone sections, and completed the shared transfer popup lifecycle. Windows
+  x64/ARM64 established verified Plink connection sharing against the generated fixed host key and
+  completed the real mount lifecycle. Quality passed the full workspace format, Clippy, test,
+  license, build, and GUI smoke gates.
+- The same run retained real macOS dual-backend evidence. ARM64 FUSE recorded write 68 ms, upload
+  90481 ms, first read 14 ms, cached read 8 ms, and 500-file enumeration 89 ms; ARM64 NFS recorded
+  116 ms, 90339 ms, 13 ms, 8 ms, and 57 ms. x64 FUSE recorded 658 ms, 90311 ms, 40 ms, 29 ms, and
+  534 ms; x64 NFS recorded 927 ms, 90497 ms, 28 ms, 23 ms, and 271 ms. Upload time includes the
+  intentional 90-second write-back delay and is not a pure backend throughput measurement.
+- Fresh local verification for the final remote-name isolation fix passed format, zero-warning
+  `mountmate-core` Clippy across all targets/features, shell syntax, and the complete core suite:
+  210 unit tests passed with two environment/network tests ignored, legacy migration passed, and
+  the packaged update fixture passed with three graphical package tests ignored. No Release or
+  merge is authorized from the current work.
 
 - Began stable `v0.4.0` preparation after explicit approval to merge PR #11 and publish a formal
   release. The stable scope is the verified Rust rewrite plus configurable upload concurrency;

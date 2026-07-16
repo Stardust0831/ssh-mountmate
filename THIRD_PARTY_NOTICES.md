@@ -109,3 +109,15 @@ overwriting an existing backup on Linux and macOS.
 
 The macOS integration uses `plist`, with its XML and time dependencies, to write structured
 per-user LaunchAgent and Finder Quick Action documents without ad hoc XML manipulation.
+
+## PuTTY Plink
+
+- Project: https://www.chiark.greenend.org.uk/~sgtatham/putty/
+- Version: 0.84
+- License: MIT
+- License text: `licenses/putty-LICENCE.txt`
+
+Windows packages include the official architecture-specific Plink executable so an explicitly
+selected interactive SSH connection can establish and reuse PuTTY connection sharing without
+storing one-time authentication codes. SSH MountMate verifies the pinned executable SHA-256 before
+packaging and again before materializing it from a onefile build.

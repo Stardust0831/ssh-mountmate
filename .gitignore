@@ -10,6 +10,8 @@ venv/
 env/
 
 bin/
+!crates/mountmate-core/src/bin/
+!crates/mountmate-core/src/bin/update-signing.rs
 dist/
 target/
 release/

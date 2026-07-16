@@ -10,7 +10,7 @@ use crate::model::{AuthMethod, ConnectionMethod};
 use crate::paths::AppPaths;
 use crate::ssh::{ResolvedSshConfig, readable_file, validate_host_alias};
 use crate::storage::{FileLock, StorageError, atomic_write};
-use crate::{ServerConfig, Settings};
+use crate::{MountBackend, ServerConfig, Settings};
 
 #[derive(Debug, Error)]
 pub enum RcloneConfigError {
@@ -20,6 +20,8 @@ pub enum RcloneConfigError {
     InvalidValue { field: &'static str },
     #[error("SSH config resolution is required for an SSH config connection")]
     MissingResolvedSshConfig,
+    #[error("interactive SSH requires a verified shared-session connector")]
+    MissingInteractiveConnector,
     #[error("invalid rclone config at {path}: {message}")]
     InvalidConfig { path: PathBuf, message: String },
     #[error(transparent)]
@@ -39,6 +41,16 @@ impl RcloneRemote {
         known_hosts: Option<&Path>,
         windows: bool,
     ) -> Result<Self, RcloneConfigError> {
+        Self::for_server_with_external_ssh(server, resolved, known_hosts, windows, None)
+    }
+
+    pub fn for_server_with_external_ssh(
+        server: &ServerConfig,
+        resolved: Option<&ResolvedSshConfig>,
+        known_hosts: Option<&Path>,
+        windows: bool,
+        external_ssh_arguments: Option<&[String]>,
+    ) -> Result<Self, RcloneConfigError> {
         let name = server.remote_name().to_owned();
         validate_remote_name(&name)?;
         let mut options = vec![
@@ -46,8 +58,31 @@ impl RcloneRemote {
             ("shell_type".into(), "unix".into()),
             ("disable_hashcheck".into(), "true".into()),
         ];
-        if server.connection_method == ConnectionMethod::Openssh {
-            options.push(("ssh".into(), openssh_command(server, windows)?));
+        if server.connection_method != ConnectionMethod::Native {
+            let arguments = match server.connection_method {
+                ConnectionMethod::Interactive => external_ssh_arguments
+                    .filter(|arguments| !arguments.is_empty())
+                    .ok_or(RcloneConfigError::MissingInteractiveConnector)?,
+                ConnectionMethod::Openssh => {
+                    if let Some(arguments) = external_ssh_arguments {
+                        arguments
+                    } else {
+                        let ssh = openssh_command(server, windows)?;
+                        options.push(("ssh".into(), ssh));
+                        return Ok(Self { name, options });
+                    }
+                }
+                ConnectionMethod::Native => unreachable!(),
+            };
+            for argument in arguments {
+                validate_scalar(argument, "external SSH argument")?;
+            }
+            let ssh = arguments
+                .iter()
+                .map(|argument| quote_command_argument(argument, windows))
+                .collect::<Vec<_>>()
+                .join(" ");
+            options.push(("ssh".into(), ssh));
             return Ok(Self { name, options });
         }
 
@@ -81,6 +116,10 @@ impl RcloneRemote {
                 resolved.and_then(|config| config.first_existing_path("identityfile"))
             {
                 options.push(("key_file".into(), key_file.display().to_string()));
+                if !server.key_pass_obscured.is_empty() {
+                    validate_scalar(&server.key_pass_obscured, "key passphrase")?;
+                    options.push(("key_file_pass".into(), server.key_pass_obscured.clone()));
+                }
             } else {
                 options.push(("key_use_agent".into(), "true".into()));
             }
@@ -138,6 +177,36 @@ pub fn write_rclone_remote(
         validate_scalar(value, "rclone option value")?;
         config.set(&remote.name, key, Some(value.clone()));
     }
+    let write_options = WriteOptions::new_with_params(true, 4, 1);
+    atomic_write(&path, config.pretty_writes(&write_options).as_bytes())?;
+    Ok(())
+}
+
+pub fn clear_rclone_remote_secrets(
+    paths: &AppPaths,
+    remote_name: &str,
+) -> Result<(), RcloneConfigError> {
+    validate_remote_name(remote_name)?;
+    let _lock = FileLock::acquire(&paths.rclone_config_lock(), Duration::from_secs(180))?;
+    let path = paths.rclone_config();
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut defaults = Ini::new_cs().defaults();
+    defaults.enable_inline_comments = false;
+    let mut config = Ini::new_from_defaults(defaults);
+    let content = fs::read_to_string(&path).map_err(|source| StorageError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    config
+        .read(content)
+        .map_err(|message| RcloneConfigError::InvalidConfig {
+            path: path.clone(),
+            message,
+        })?;
+    config.remove_key(remote_name, "pass");
+    config.remove_key(remote_name, "key_file_pass");
     let write_options = WriteOptions::new_with_params(true, 4, 1);
     atomic_write(&path, config.pretty_writes(&write_options).as_bytes())?;
     Ok(())
@@ -265,12 +334,45 @@ pub struct MountCommand<'a> {
     pub rc_addr: &'a str,
     pub rc_user: &'a str,
     pub rc_pass: &'a str,
-    pub windows: bool,
+    pub platform: MountPlatform,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountPlatform {
+    Windows,
+    Macos,
+    Linux,
+    Other,
+}
+
+impl MountPlatform {
+    pub const fn current() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else if cfg!(target_os = "macos") {
+            Self::Macos
+        } else if cfg!(target_os = "linux") {
+            Self::Linux
+        } else {
+            Self::Other
+        }
+    }
+
+    pub const fn effective_backend(self, selected: MountBackend) -> MountBackend {
+        if matches!(self, Self::Macos) && matches!(selected, MountBackend::Nfs) {
+            MountBackend::Nfs
+        } else {
+            MountBackend::Fuse
+        }
+    }
 }
 
 impl MountCommand<'_> {
     pub fn build(&self) -> Vec<String> {
         let cache_mode = self.server.effective_cache_mode(self.settings);
+        let backend = self
+            .platform
+            .effective_backend(self.settings.macos_mount_backend);
         let mut command = vec![
             self.rclone.display().to_string(),
             "--config".into(),
@@ -282,7 +384,10 @@ impl MountCommand<'_> {
             self.rc_user.into(),
             "--rc-pass".into(),
             self.rc_pass.into(),
-            "mount".into(),
+            match backend {
+                MountBackend::Fuse => "mount".into(),
+                MountBackend::Nfs => "nfsmount".into(),
+            },
             self.remote.into(),
             self.mountpoint.display().to_string(),
             "--vfs-fast-fingerprint".into(),
@@ -298,6 +403,9 @@ impl MountCommand<'_> {
             "--transfers".into(),
             self.settings.vfs_upload_transfers.to_string(),
         ];
+        if backend == MountBackend::Nfs {
+            command.extend(["--addr".into(), "127.0.0.1:0".into()]);
+        }
         push_option(
             &mut command,
             "--vfs-cache-max-size",
@@ -326,7 +434,10 @@ impl MountCommand<'_> {
             &self.settings.dir_cache_time,
         );
         push_option(&mut command, "--buffer-size", &self.settings.buffer_size);
-        if self.windows && self.server.network_mode && is_windows_drive(self.mountpoint) {
+        if self.platform == MountPlatform::Windows
+            && self.server.network_mode
+            && is_windows_drive(self.mountpoint)
+        {
             command.push("--network-mode".into());
         }
         command
@@ -411,7 +522,7 @@ mod tests {
             rc_addr: "127.0.0.1:1234",
             rc_user: "mountmate",
             rc_pass: "secret",
-            windows: true,
+            platform: MountPlatform::Windows,
         }
         .build()
     }
@@ -465,7 +576,7 @@ mod tests {
             vfs_upload_transfers: 12,
             ..Settings::default()
         };
-        for windows in [false, true] {
+        for platform in [MountPlatform::Linux, MountPlatform::Windows] {
             let command = MountCommand {
                 rclone: Path::new("rclone"),
                 config: Path::new("rclone.conf"),
@@ -478,7 +589,7 @@ mod tests {
                 rc_addr: "127.0.0.1:1234",
                 rc_user: "mountmate",
                 rc_pass: "secret",
-                windows,
+                platform,
             }
             .build();
             assert_eq!(
@@ -496,6 +607,84 @@ mod tests {
     fn write_back_is_not_passed_for_non_write_cache_modes() {
         let command = command("off");
         assert!(!command.contains(&"--vfs-write-back".into()));
+    }
+
+    #[test]
+    fn mount_backend_command_is_platform_scoped() {
+        let server = ServerConfig {
+            id: "alpha".into(),
+            name: "Alpha".into(),
+            ..ServerConfig::default()
+        };
+        for (platform, selected, expected) in [
+            (MountPlatform::Macos, MountBackend::Fuse, "mount"),
+            (MountPlatform::Macos, MountBackend::Nfs, "nfsmount"),
+            (MountPlatform::Windows, MountBackend::Nfs, "mount"),
+            (MountPlatform::Linux, MountBackend::Nfs, "mount"),
+        ] {
+            let settings = Settings {
+                macos_mount_backend: selected,
+                ..Settings::default()
+            };
+            let command = MountCommand {
+                rclone: Path::new("rclone"),
+                config: Path::new("rclone.conf"),
+                server: &server,
+                settings: &settings,
+                remote: "alpha:",
+                mountpoint: Path::new("/mnt/alpha"),
+                cache_dir: Path::new("cache"),
+                log_path: Path::new("alpha.log"),
+                rc_addr: "127.0.0.1:1234",
+                rc_user: "mountmate",
+                rc_pass: "secret",
+                platform,
+            }
+            .build();
+            assert_eq!(command[10], expected);
+        }
+    }
+
+    #[test]
+    fn macos_nfs_keeps_rc_cache_writeback_and_log_arguments_on_loopback() {
+        let server = ServerConfig {
+            id: "alpha".into(),
+            name: "Alpha".into(),
+            ..ServerConfig::default()
+        };
+        let settings = Settings {
+            macos_mount_backend: MountBackend::Nfs,
+            ..Settings::default()
+        };
+        let command = MountCommand {
+            rclone: Path::new("rclone"),
+            config: Path::new("rclone.conf"),
+            server: &server,
+            settings: &settings,
+            remote: "alpha:",
+            mountpoint: Path::new("/mnt/alpha"),
+            cache_dir: Path::new("cache"),
+            log_path: Path::new("alpha.log"),
+            rc_addr: "127.0.0.1:1234",
+            rc_user: "mountmate",
+            rc_pass: "secret",
+            platform: MountPlatform::Macos,
+        }
+        .build();
+        for expected in [
+            ["--rc-addr", "127.0.0.1:1234"],
+            ["--cache-dir", "cache"],
+            ["--log-file", "alpha.log"],
+            ["--vfs-cache-mode", "full"],
+            ["--vfs-write-back", "5s"],
+            ["--dir-cache-time", "5m"],
+            ["--addr", "127.0.0.1:0"],
+        ] {
+            assert!(command.windows(2).any(|pair| pair == expected));
+        }
+        assert!(command.contains(&"--links".into()));
+        assert!(command.contains(&"--volname".into()));
+        assert!(!command.iter().any(|value| value == "0.0.0.0"));
     }
 
     #[test]
@@ -597,6 +786,34 @@ mod tests {
     }
 
     #[test]
+    fn ssh_config_remote_keeps_key_passphrase_after_server_json_round_trip() {
+        let temp = tempdir().unwrap();
+        let identity = temp.path().join("id key");
+        fs::write(&identity, "PRIVATE KEY").unwrap();
+        let resolved = ResolvedSshConfig::parse(&format!(
+            "hostname c1.example\nuser researcher\nport 12022\nidentityfile \"{}\"\n",
+            identity.display()
+        ));
+        let server = ServerConfig {
+            id: "internal-id".into(),
+            mode: "ssh_config".into(),
+            host_alias: "cluster".into(),
+            key_pass_obscured: "obscured-key-passphrase".into(),
+            ..ServerConfig::default()
+        };
+        let server: ServerConfig =
+            serde_json::from_value(serde_json::to_value(server).unwrap()).unwrap();
+
+        let remote = RcloneRemote::for_server(&server, Some(&resolved), None, false).unwrap();
+
+        assert!(
+            remote
+                .options
+                .contains(&("key_file_pass".into(), "obscured-key-passphrase".into()))
+        );
+    }
+
+    #[test]
     fn openssh_remote_uses_quoted_command_without_saved_secrets() {
         let server = ServerConfig {
             id: "alpha".into(),
@@ -640,6 +857,113 @@ mod tests {
     }
 
     #[test]
+    fn interactive_remote_uses_only_the_verified_shared_connector() {
+        let server = ServerConfig {
+            id: "interactive".into(),
+            connection_method: ConnectionMethod::Interactive,
+            password_obscured: "must-not-appear".into(),
+            key_pass_obscured: "must-not-appear".into(),
+            ..ServerConfig::default()
+        };
+        let connector = vec![
+            "C:/Program Files/SSH MountMate/plink.exe".into(),
+            "-batch".into(),
+            "-share".into(),
+            "host.example".into(),
+        ];
+        let remote =
+            RcloneRemote::for_server_with_external_ssh(&server, None, None, true, Some(&connector))
+                .unwrap();
+        let ssh = remote
+            .options
+            .iter()
+            .find(|(key, _)| key == "ssh")
+            .map(|(_, value)| value.as_str())
+            .unwrap();
+        assert!(ssh.contains("\"C:/Program Files/SSH MountMate/plink.exe\""));
+        assert!(ssh.contains("-batch -share host.example"));
+        assert!(
+            !remote
+                .options
+                .iter()
+                .any(|(key, _)| { matches!(key.as_str(), "pass" | "key_file" | "key_file_pass") })
+        );
+        assert!(!format!("{remote:?}").contains("must-not-appear"));
+    }
+
+    #[test]
+    fn interactive_ssh_config_remote_does_not_collide_with_openssh_remote() {
+        let openssh = ServerConfig {
+            id: "openssh-profile".into(),
+            mode: "ssh_config".into(),
+            source: "ssh_config".into(),
+            host_alias: "cluster-login".into(),
+            connection_method: ConnectionMethod::Openssh,
+            ..ServerConfig::default()
+        };
+        let interactive = ServerConfig {
+            id: "interactive-profile".into(),
+            mode: "ssh_config".into(),
+            source: "ssh_config".into(),
+            host_alias: "cluster-login".into(),
+            connection_method: ConnectionMethod::Interactive,
+            ..ServerConfig::default()
+        };
+        let connector = vec!["ssh".into(), "-o".into(), "ControlMaster=no".into()];
+
+        let openssh_remote = RcloneRemote::for_server(&openssh, None, None, false).unwrap();
+        let interactive_remote = RcloneRemote::for_server_with_external_ssh(
+            &interactive,
+            None,
+            None,
+            false,
+            Some(&connector),
+        )
+        .unwrap();
+
+        assert_eq!(openssh_remote.name, "cluster-login");
+        assert_eq!(interactive_remote.name, "interactive-profile");
+        assert_ne!(openssh_remote.name, interactive_remote.name);
+    }
+
+    #[test]
+    fn interactive_remote_never_falls_back_to_a_normal_ssh_process() {
+        let server = ServerConfig {
+            id: "interactive".into(),
+            connection_method: ConnectionMethod::Interactive,
+            ..ServerConfig::default()
+        };
+
+        assert!(matches!(
+            RcloneRemote::for_server(&server, None, None, false),
+            Err(RcloneConfigError::MissingInteractiveConnector)
+        ));
+    }
+
+    #[test]
+    fn interactive_remote_rejects_config_line_injection_in_connector_arguments() {
+        let server = ServerConfig {
+            id: "interactive".into(),
+            connection_method: ConnectionMethod::Interactive,
+            ..ServerConfig::default()
+        };
+        let connector = vec!["ssh".into(), "host\npass = leaked".into()];
+
+        assert!(matches!(
+            RcloneRemote::for_server_with_external_ssh(
+                &server,
+                None,
+                None,
+                false,
+                Some(&connector)
+            ),
+            Err(RcloneConfigError::InvalidValue {
+                field: "external SSH argument"
+            })
+        ));
+    }
+
+    #[test]
     fn config_update_preserves_other_secrets_and_removes_stale_options() {
         let temp = tempdir().unwrap();
         let paths = app_paths(temp.path());
@@ -669,5 +993,25 @@ mod tests {
             parsed.get("alpha", "ssh"),
             Some("ssh -o BatchMode=yes alpha".into())
         );
+    }
+
+    #[test]
+    fn credential_cleanup_removes_only_persisted_remote_secrets() {
+        let temp = tempdir().unwrap();
+        let paths = app_paths(temp.path());
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        fs::write(
+            paths.rclone_config(),
+            "[alpha]\ntype = sftp\nhost = example.test\npass = obscured\nkey_file_pass = obscured-key\n\n[other]\ntype = sftp\npass = keep-me\n",
+        )
+        .unwrap();
+        clear_rclone_remote_secrets(&paths, "alpha").unwrap();
+        let content = fs::read_to_string(paths.rclone_config()).unwrap();
+        let mut config = Ini::new_cs();
+        config.read(content).unwrap();
+        assert_eq!(config.get("alpha", "host").as_deref(), Some("example.test"));
+        assert_eq!(config.get("alpha", "pass"), None);
+        assert_eq!(config.get("alpha", "key_file_pass"), None);
+        assert_eq!(config.get("other", "pass").as_deref(), Some("keep-me"));
     }
 }

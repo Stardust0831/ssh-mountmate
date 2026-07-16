@@ -1,6 +1,8 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::OsStr;
+use std::fmt;
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Seek, SeekFrom};
@@ -14,7 +16,8 @@ use iced::widget::{
     text, text_editor, text_input, toggler, tooltip,
 };
 use iced::{
-    Center, Element, Fill, Length, Point, Size, Subscription, Task, Theme, clipboard, window,
+    Center, Color, Element, Fill, Length, Point, Size, Subscription, Task, Theme, clipboard,
+    theme::Palette, window,
 };
 use mountmate_core::app_command::{
     AppCommand, AppCommandError, AppCommandServer, InstanceLock, running_instance,
@@ -22,16 +25,27 @@ use mountmate_core::app_command::{
 };
 use mountmate_core::capacity::CapacityInfo;
 use mountmate_core::connection::{
-    ConnectionDraft, ConnectionSource, DraftError, ImportAction, ImportStatus, SecretAction,
-    SshImportPlan,
+    ConnectionDraft, ConnectionSource, DraftError, ImportAction, ImportStatus,
+    PreservedSecretState, SecretAction, SshImportPlan,
+};
+use mountmate_core::credential::{
+    CredentialChange, CredentialError, CredentialKind, CredentialMigration, CredentialStore,
+    SystemCredentialStore, credential_reference, delete_credential_references,
+    delete_server_credentials, prepare_server_to_obscure, prepare_server_to_system,
+    replace_verified, rollback_change,
 };
 use mountmate_core::dependency::{DependencyStatus, check_dependencies};
+use mountmate_core::interactive_ssh::{
+    InteractiveSshError, InteractiveSshLoginCommand, InteractiveSshSession,
+};
 use mountmate_core::model::{MAX_VFS_UPLOAD_TRANSFERS, MIN_VFS_UPLOAD_TRANSFERS};
 use mountmate_core::mountpoint::HOME_MOUNTPOINT_VALUE;
 use mountmate_core::paths::AppPaths;
+use mountmate_core::plink_binary::resolve_plink;
 use mountmate_core::process::MountStatus;
+use mountmate_core::rclone::clear_rclone_remote_secrets;
 use mountmate_core::rclone_binary::resolve_rclone;
-use mountmate_core::service::MountService;
+use mountmate_core::service::{MountService, ServiceError};
 use mountmate_core::ssh::{
     default_ssh_config_path, prepare_managed_ssh_server, remove_managed_ssh_server,
 };
@@ -41,9 +55,11 @@ use mountmate_core::update::{UpdateInfo, check_for_updates};
 use mountmate_core::update_helper::{
     UpdateHealthAuthorization, run_update_helper, write_update_health_marker,
 };
+use mountmate_core::update_manifest::UpdateTrustError;
 use mountmate_core::update_workflow::{PreparedUpdateLaunch, prepare_update_install};
 use mountmate_core::{
-    APP_NAME, AuthMethod, ConnectionMethod, MountState, ServerConfig, Settings, VERSION,
+    APP_NAME, AccentColor, AppearanceMode, AuthMethod, ConnectionMethod, CredentialStorage,
+    MountBackend, MountState, ServerConfig, Settings, VERSION,
 };
 #[cfg(windows)]
 use mountmate_platform::NativeWindowHandle;
@@ -97,8 +113,11 @@ fn run() -> Result<(), String> {
                     "Verified asset: {}",
                     info.asset
                         .as_ref()
-                        .map_or("unavailable", |asset| asset.name.as_str())
+                        .map_or("unavailable", |asset| asset.name())
                 );
+                if let Some(error) = &info.trust_error {
+                    println!("Automatic installation blocked: {error}");
+                }
             } else {
                 println!("SSH MountMate {VERSION} is up to date");
             }
@@ -109,6 +128,14 @@ fn run() -> Result<(), String> {
             let resolved = resolve_rclone(&paths, &application_root(), None)
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| "rclone is not available".to_owned())?;
+            println!("{}", resolved.path.display());
+            return Ok(());
+        }
+        LaunchAction::PlinkPath => {
+            let paths = AppPaths::discover();
+            let resolved = resolve_plink(&paths, &application_root())
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "verified Plink is not available".to_owned())?;
             println!("{}", resolved.path.display());
             return Ok(());
         }
@@ -432,12 +459,14 @@ struct App {
     settings: Settings,
     settings_load_error: Option<String>,
     system_locale: Locale,
+    system_theme_dark: bool,
     servers: Vec<ServerConfig>,
     service: MountService,
     mount_statuses: HashMap<String, MountStatus>,
     busy: HashSet<String>,
     transfers: HashMap<String, TransferSnapshot>,
     transfer_errors: HashMap<String, String>,
+    operation_errors: HashMap<String, ConnectionOperationError>,
     transfer_failures: HashMap<String, u8>,
     transfer_refreshing: bool,
     main_window: window::Id,
@@ -465,6 +494,11 @@ struct App {
     settings_draft: Option<SettingsDraft>,
     log_view: Option<MountLogView>,
     log_window: Option<window::Id>,
+    terminal_window: Option<window::Id>,
+    terminal_server_id: Option<String>,
+    interactive_terminals: HashMap<String, InteractiveTerminalSession>,
+    next_terminal_generation: u64,
+    terminal_error: Option<String>,
     custom_setting: Option<CustomSettingDraft>,
     editor_saving: bool,
     ssh_import_loading: bool,
@@ -556,6 +590,7 @@ struct LoadedMountLog {
     path: PathBuf,
     content: String,
     truncated: bool,
+    existed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -566,6 +601,116 @@ struct MountLogView {
     content: text_editor::Content,
     truncated: bool,
     loading: bool,
+    existed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ConnectionOperationError {
+    operation: MountOperation,
+    cause: String,
+}
+
+/// iced_term events may contain terminal input bytes (including passwords).
+/// Keep the event usable by the update loop, but make all application Debug
+/// output intentionally opaque.
+#[derive(Clone)]
+struct RedactedTerminalEvent(iced_term::Event);
+
+impl fmt::Debug for RedactedTerminalEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("TerminalEvent(<redacted>)")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractiveTerminalLifecycle {
+    Starting,
+    Ready,
+    Exited,
+    Failed,
+}
+
+struct InteractiveTerminalSession {
+    generation: u64,
+    ssh: InteractiveSshSession,
+    terminal: iced_term::Terminal,
+    lifecycle: InteractiveTerminalLifecycle,
+    queued_mount: bool,
+    resume_sent: bool,
+}
+
+/// Keep a failed mount from turning a connection card into a full-page error
+/// while retaining enough context to identify the immediate cause. The
+/// dedicated read-only log window remains the source for complete details.
+const MOUNT_ERROR_SUMMARY_MAX_LINES: usize = 2;
+const MOUNT_ERROR_SUMMARY_MAX_CHARS: usize = 240;
+const MOUNT_ERROR_SUMMARY_LINE_MAX_CHARS: usize = 120;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MountErrorAction {
+    Retry,
+    ViewLog,
+    Dismiss,
+}
+
+fn mount_error_summary(locale: Locale, cause: &str) -> String {
+    let prefix = match locale {
+        Locale::English => "Last operation failed: ",
+        Locale::Chinese => "上次操作失败：",
+    };
+    let mut lines = Vec::new();
+    let mut truncated = false;
+    for raw_line in cause.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if lines.len() == MOUNT_ERROR_SUMMARY_MAX_LINES {
+            truncated = true;
+            break;
+        }
+        let clipped = line
+            .chars()
+            .take(MOUNT_ERROR_SUMMARY_LINE_MAX_CHARS)
+            .collect::<String>();
+        if clipped.chars().count() < line.chars().count() {
+            truncated = true;
+        }
+        lines.push(clipped);
+    }
+    if lines.is_empty() {
+        lines.push(match locale {
+            Locale::English => "Unknown mount error".into(),
+            Locale::Chinese => "未知挂载错误".into(),
+        });
+    }
+
+    let mut summary = format!("{prefix}{}", lines.join("\n"));
+    if summary.chars().count() > MOUNT_ERROR_SUMMARY_MAX_CHARS {
+        summary = summary
+            .chars()
+            .take(MOUNT_ERROR_SUMMARY_MAX_CHARS.saturating_sub(1))
+            .collect();
+        truncated = true;
+    }
+    if truncated {
+        if summary.chars().count() >= MOUNT_ERROR_SUMMARY_MAX_CHARS {
+            summary = summary
+                .chars()
+                .take(MOUNT_ERROR_SUMMARY_MAX_CHARS.saturating_sub(1))
+                .collect();
+        }
+        summary.push('…');
+    }
+    summary
+}
+
+fn mount_error_message(id: String, operation: MountOperation, action: MountErrorAction) -> Message {
+    match action {
+        MountErrorAction::Retry => Message::RetryOperation(id, operation),
+        MountErrorAction::ViewLog => Message::OpenOperationLog(id),
+        MountErrorAction::Dismiss => Message::DismissOperationError(id),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -678,10 +823,14 @@ struct SettingsDraft {
     dir_cache_time: String,
     buffer_size: String,
     upload_transfers: String,
+    mount_backend: MountBackend,
+    credential_storage: CredentialStorage,
     startup_all: bool,
     auto_show_transfers: bool,
     auto_check_updates: bool,
     language: Language,
+    appearance_mode: AppearanceMode,
+    accent_color: AccentColor,
 }
 
 impl SettingsDraft {
@@ -696,10 +845,14 @@ impl SettingsDraft {
             dir_cache_time: settings.dir_cache_time.clone(),
             buffer_size: settings.buffer_size.clone(),
             upload_transfers: settings.vfs_upload_transfers.to_string(),
+            mount_backend: settings.macos_mount_backend,
+            credential_storage: settings.credential_storage,
             startup_all: settings.startup_all,
             auto_show_transfers: settings.auto_show_transfers,
             auto_check_updates: settings.auto_check_updates,
             language: Language::from_value(&settings.language),
+            appearance_mode: settings.appearance_mode,
+            accent_color: settings.accent_color,
         }
     }
 
@@ -745,10 +898,14 @@ impl SettingsDraft {
         settings.dir_cache_time = self.dir_cache_time.trim().into();
         settings.buffer_size = self.buffer_size.trim().into();
         settings.vfs_upload_transfers = upload_transfers;
+        settings.macos_mount_backend = self.mount_backend;
+        settings.credential_storage = self.credential_storage;
         settings.startup_all = self.startup_all;
         settings.auto_show_transfers = self.auto_show_transfers;
         settings.auto_check_updates = self.auto_check_updates;
         settings.language = self.language.value().into();
+        settings.appearance_mode = self.appearance_mode;
+        settings.accent_color = self.accent_color;
         Ok(settings)
     }
 }
@@ -758,6 +915,13 @@ enum Message {
     AppCommand(AppCommand),
     TrayAction(TrayAction),
     TrayTick,
+    InteractiveTick,
+    TerminalEvent(RedactedTerminalEvent),
+    TerminalWindowOpened(window::Id),
+    OpenInteractiveTerminal(String),
+    HideTerminal,
+    EndInteractiveSession,
+    RetryTerminal,
     MainWindowOpened(window::Id),
     Refresh,
     RefreshFinished(Result<mountmate_core::rc::RefreshResult, String>),
@@ -800,6 +964,7 @@ enum Message {
     ConnectionMethodChanged(ConnectionMethod),
     PasswordChanged(SecretInput),
     KeyPassphraseChanged(SecretInput),
+    ClearSecret(CredentialKind),
     ManagedSshChanged(bool),
     CopyKeyChanged(bool),
     LoadSshConfig,
@@ -819,6 +984,12 @@ enum Message {
     BrowseCacheRoot,
     CacheRootPicked(Option<PathBuf>),
     CacheModeChanged(CacheMode),
+    MountBackendChanged(MountBackend),
+    CredentialStorageChanged(CredentialStorage),
+    CredentialStorageDecision {
+        target: CredentialStorage,
+        result: rfd::MessageDialogResult,
+    },
     SettingOptionChanged(SettingOption),
     CustomSettingDigitsChanged(String),
     CustomSettingUnitChanged(String),
@@ -841,11 +1012,13 @@ enum Message {
     CapacityTick,
     CapacitiesLoaded(Vec<(String, Result<Option<CapacityInfo>, String>)>),
     LanguageChanged(Language),
+    AppearanceModeChanged(AppearanceMode),
+    AccentColorChanged(AccentColor),
     RegisterFileManagerMenu,
     UnregisterFileManagerMenu,
     FileManagerMenuFinished(Result<bool, String>),
     SaveSettings,
-    SettingsSaved(Result<Settings, String>),
+    SettingsSaved(Result<SettingsMutation, String>),
     StartupReconciled(Result<(), String>),
     Mount(String),
     CancelPendingUnmount(String),
@@ -862,6 +1035,9 @@ enum Message {
         operation: MountOperation,
         result: Result<String, String>,
     },
+    RetryOperation(String, MountOperation),
+    DismissOperationError(String),
+    OpenOperationLog(String),
     Open(String),
     OpenFinished(Result<(), String>),
     Edit(String),
@@ -880,6 +1056,13 @@ struct ServerMutation {
     warning: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct SettingsMutation {
+    settings: Settings,
+    servers: Vec<ServerConfig>,
+    warning: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MountOperation {
     Mount,
@@ -892,6 +1075,17 @@ impl App {
             format!("{APP_NAME} {VERSION}")
         } else if self.log_window == Some(window) {
             format!("{} - {APP_NAME}", self.locale().text(TextKey::Logs))
+        } else if self.terminal_window == Some(window) {
+            let name = self
+                .terminal_server_id
+                .as_deref()
+                .and_then(|id| self.servers.iter().find(|server| server.id == id))
+                .map(|server| server.display_name().to_owned())
+                .unwrap_or_else(|| self.locale().text(TextKey::InteractiveTerminal).into());
+            format!(
+                "{name} - {}",
+                self.locale().text(TextKey::InteractiveTerminal)
+            )
         } else {
             self.locale().text(TextKey::FileTransfer).into()
         }
@@ -907,20 +1101,29 @@ impl App {
     }
 
     fn theme(&self, _window: window::Id) -> Theme {
-        Theme::Dark
+        let (mode, accent) = effective_appearance(&self.settings, self.settings_draft.as_ref());
+        application_theme(mode, accent, self.system_theme_dark)
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        Subscription::batch([
+        let mut subscriptions: Vec<Subscription<Message>> = vec![
             Subscription::run_with(self.command_receiver.clone(), command_stream)
                 .map(Message::AppCommand),
             Subscription::run_with(self.tray_actions.clone(), tray_stream).map(Message::TrayAction),
             iced::time::every(Duration::from_millis(100)).map(|_| Message::TrayTick),
+            iced::time::every(Duration::from_millis(500)).map(|_| Message::InteractiveTick),
             iced::time::every(Duration::from_secs(1)).map(|_| Message::TransferTick),
             iced::time::every(Duration::from_secs(30)).map(|_| Message::CapacityTick),
             window::close_requests().map(Message::CloseRequested),
             window::close_events().map(Message::WindowClosed),
-        ])
+        ];
+        subscriptions.extend(self.interactive_terminals.values().map(|session| {
+            session
+                .terminal
+                .subscription()
+                .map(|event| Message::TerminalEvent(RedactedTerminalEvent(event)))
+        }));
+        Subscription::batch(subscriptions)
     }
 
     fn new(bootstrap: Bootstrap) -> (Self, Task<Message>) {
@@ -933,6 +1136,7 @@ impl App {
             update_health,
         } = bootstrap;
         let system_locale = Locale::system();
+        let system_theme_dark = system_prefers_dark();
         let service = MountService::new(paths.clone(), application_root());
         let (settings, settings_load_error) = match storage::load_settings(&paths) {
             Ok(settings) => (settings, None),
@@ -977,12 +1181,14 @@ impl App {
             settings,
             settings_load_error,
             system_locale,
+            system_theme_dark,
             servers,
             service,
             mount_statuses: HashMap::new(),
             busy: HashSet::new(),
             transfers: HashMap::new(),
             transfer_errors: HashMap::new(),
+            operation_errors: HashMap::new(),
             transfer_failures: HashMap::new(),
             transfer_refreshing: false,
             main_window,
@@ -1010,6 +1216,11 @@ impl App {
             settings_draft: None,
             log_view: None,
             log_window: None,
+            terminal_window: None,
+            terminal_server_id: None,
+            interactive_terminals: HashMap::new(),
+            next_terminal_generation: 1,
+            terminal_error: None,
             custom_setting: None,
             editor_saving: false,
             ssh_import_loading: false,
@@ -1057,6 +1268,23 @@ impl App {
                 return self.handle_app_command(command);
             }
             Message::TrayAction(action) => return self.handle_tray_action(action),
+            Message::InteractiveTick => return self.poll_interactive_terminals(),
+            Message::TerminalEvent(event) => return self.handle_terminal_event(event),
+            Message::TerminalWindowOpened(id) => {
+                if self.terminal_window == Some(id) {
+                    diagnostic_trace(&format!("interactive terminal window opened {id:?}"));
+                    return Task::none();
+                }
+            }
+            Message::OpenInteractiveTerminal(id) => return self.open_terminal_window(id),
+            Message::HideTerminal => {
+                if let Some(id) = self.terminal_window.take() {
+                    self.terminal_server_id = None;
+                    return window::close(id);
+                }
+            }
+            Message::EndInteractiveSession => return self.end_interactive_session(),
+            Message::RetryTerminal => return self.retry_interactive_terminal(),
             Message::TrayTick => {
                 if self.tray.is_some() {
                     TrayController::desktop_iteration();
@@ -1097,6 +1325,9 @@ impl App {
                     if self.pending_main_activation {
                         self.pending_main_activation = false;
                         tasks.push(self.activate_main_window());
+                    }
+                    if let Some(server_id) = self.terminal_server_id.clone() {
+                        tasks.push(self.open_terminal_window(server_id));
                     }
                     return Task::batch(tasks);
                 }
@@ -1307,6 +1538,11 @@ impl App {
                 self.log_view = None;
                 return window::close(id);
             }
+            Message::CloseRequested(id) if self.terminal_window == Some(id) => {
+                self.terminal_window = None;
+                self.terminal_server_id = None;
+                return window::close(id);
+            }
             Message::CloseRequested(_) => {}
             Message::ExitDecision(confirmed) => {
                 self.exit_confirmation_open = false;
@@ -1330,6 +1566,9 @@ impl App {
                 } else if self.log_window == Some(id) {
                     self.log_window = None;
                     self.log_view = None;
+                } else if self.terminal_window == Some(id) {
+                    self.terminal_window = None;
+                    self.terminal_server_id = None;
                 }
             }
             Message::AddConnection => {
@@ -1421,6 +1660,7 @@ impl App {
                             .content
                             .perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
                         log_view.truncated = log.truncated;
+                        log_view.existed = log.existed;
                         self.status = locale.text(TextKey::Logs).into();
                     }
                     Err(error) => self.status = error,
@@ -1575,9 +1815,18 @@ impl App {
             }
             Message::ConnectionMethodChanged(method) => {
                 if let Some(draft) = &mut self.connection_draft {
-                    draft.connection_method = method;
-                    if method == ConnectionMethod::Openssh {
-                        draft.auth = AuthMethod::Key;
+                    if connection_method_allowed(
+                        draft.source,
+                        draft.ssh_config_managed,
+                        method,
+                        cfg!(windows),
+                    ) {
+                        draft.connection_method = method;
+                        if method != ConnectionMethod::Native {
+                            draft.auth = AuthMethod::Key;
+                        }
+                    } else {
+                        self.status = interactive_ssh_config_unavailable(locale).into();
                     }
                 }
             }
@@ -1591,9 +1840,26 @@ impl App {
                     draft.key_passphrase = value.0;
                 }
             }
+            Message::ClearSecret(kind) => {
+                if let Some(draft) = &mut self.connection_draft {
+                    draft.clear_preserved_secret(kind);
+                }
+            }
             Message::ManagedSshChanged(value) => {
                 if let Some(draft) = &mut self.connection_draft {
                     draft.ssh_config_managed = value;
+                    if value
+                        && !connection_method_allowed(
+                            draft.source,
+                            true,
+                            draft.connection_method,
+                            cfg!(windows),
+                        )
+                    {
+                        draft.connection_method = ConnectionMethod::Openssh;
+                        draft.auth = AuthMethod::Key;
+                        self.status = interactive_ssh_config_unavailable(locale).into();
+                    }
                     if !value {
                         draft.copy_key_to_ssh_dir = false;
                     }
@@ -1731,13 +1997,14 @@ impl App {
                 self.editor_saving = false;
                 match result {
                     Ok(outcome) => {
+                        let terminal_task = self.reconcile_interactive_sessions(&outcome.servers);
                         self.servers = outcome.servers;
                         self.connection_draft = None;
                         self.screen = Screen::Connections;
                         self.status = outcome
                             .warning
                             .unwrap_or_else(|| locale.text(TextKey::ConnectionSaved).into());
-                        return self.status_task();
+                        return Task::batch([terminal_task, self.status_task()]);
                     }
                     Err(error) => self.status = error,
                 }
@@ -1771,6 +2038,41 @@ impl App {
             Message::CacheModeChanged(mode) => {
                 if let Some(draft) = &mut self.settings_draft {
                     draft.cache_mode = mode;
+                }
+            }
+            Message::MountBackendChanged(backend) => {
+                if let Some(draft) = &mut self.settings_draft {
+                    draft.mount_backend = backend;
+                }
+            }
+            Message::CredentialStorageChanged(target) => {
+                let current = self
+                    .settings_draft
+                    .as_ref()
+                    .map_or(self.settings.credential_storage, |draft| {
+                        draft.credential_storage
+                    });
+                if target == current {
+                    return Task::none();
+                }
+                let description = credential_storage_confirmation(locale, target);
+                return Task::perform(
+                    async move {
+                        rfd::AsyncMessageDialog::new()
+                            .set_title(APP_NAME)
+                            .set_description(description)
+                            .set_buttons(rfd::MessageButtons::YesNo)
+                            .show()
+                            .await
+                    },
+                    move |result| Message::CredentialStorageDecision { target, result },
+                );
+            }
+            Message::CredentialStorageDecision { target, result } => {
+                if result == rfd::MessageDialogResult::Yes
+                    && let Some(draft) = &mut self.settings_draft
+                {
+                    draft.credential_storage = target;
                 }
             }
             Message::SettingOptionChanged(option) => {
@@ -1989,6 +2291,16 @@ impl App {
                 self.status = self.locale().text(TextKey::Settings).into();
                 self.sync_tray();
             }
+            Message::AppearanceModeChanged(mode) => {
+                if let Some(draft) = &mut self.settings_draft {
+                    draft.appearance_mode = mode;
+                }
+            }
+            Message::AccentColorChanged(accent) => {
+                if let Some(draft) = &mut self.settings_draft {
+                    draft.accent_color = accent;
+                }
+            }
             Message::RegisterFileManagerMenu => return self.file_manager_menu_task(true),
             Message::UnregisterFileManagerMenu => return self.file_manager_menu_task(false),
             Message::FileManagerMenuFinished(result) => match result {
@@ -2000,11 +2312,14 @@ impl App {
             Message::SettingsSaved(result) => {
                 self.editor_saving = false;
                 match result {
-                    Ok(settings) => {
-                        self.settings = settings;
+                    Ok(outcome) => {
+                        self.settings = outcome.settings;
+                        self.servers = outcome.servers;
                         self.settings_draft = None;
                         self.screen = Screen::Connections;
-                        self.status = locale.text(TextKey::SettingsSaved).into();
+                        self.status = outcome
+                            .warning
+                            .unwrap_or_else(|| locale.text(TextKey::SettingsSaved).into());
                     }
                     Err(error) => self.status = error,
                 }
@@ -2053,6 +2368,7 @@ impl App {
                 let mut tasks = Vec::new();
                 match result {
                     Ok(message) => {
+                        self.operation_errors.remove(&id);
                         self.mount_statuses.insert(
                             id.clone(),
                             match operation {
@@ -2071,6 +2387,13 @@ impl App {
                         }
                     }
                     Err(error) => {
+                        self.operation_errors.insert(
+                            id.clone(),
+                            ConnectionOperationError {
+                                operation,
+                                cause: error.clone(),
+                            },
+                        );
                         self.status = error;
                         tasks.push(self.status_task());
                     }
@@ -2084,15 +2407,21 @@ impl App {
                 ));
                 return Task::batch(tasks);
             }
+            Message::RetryOperation(id, operation) => {
+                return self.start_mount_operation(id, Some(operation));
+            }
+            Message::DismissOperationError(id) => {
+                self.operation_errors.remove(&id);
+            }
+            Message::OpenOperationLog(id) => return self.open_log(id),
             Message::Open(id) => return self.open_mountpoint(id),
             Message::OpenFinished(result) => match result {
                 Ok(()) => self.status = locale.text(TextKey::OpenedMountpoint).into(),
                 Err(error) => self.status = error,
             },
             Message::Edit(id) => {
-                if self.can_modify(&id)
-                    && let Some(server) = self.servers.iter().find(|server| server.id == id)
-                {
+                let can_modify = self.can_modify(&id);
+                if let Some(server) = self.servers.iter().find(|server| server.id == id) {
                     self.connection_draft = Some(ConnectionDraft::from_server(server));
                     self.connection_custom_mountpoint = custom_mountpoint_value(&server.mountpoint);
                     if let Some(draft) = &mut self.connection_draft
@@ -2103,7 +2432,11 @@ impl App {
                     self.ssh_import_plan = None;
                     self.ssh_import_actions.clear();
                     self.screen = Screen::ConnectionEditor;
-                    self.status = locale.editing(server.display_name());
+                    self.status = if can_modify {
+                        locale.editing(server.display_name())
+                    } else {
+                        connection_settings_locked_help(locale).into()
+                    };
                 }
             }
             Message::Remove(id) => {
@@ -2133,24 +2466,44 @@ impl App {
                         tokio::task::spawn_blocking(move || {
                             let servers = storage::remove_server(&paths, &id)
                                 .map_err(|error| error.to_string())?;
-                            let warning = if let Some(server) = server
-                                && server.ssh_config_managed
-                                && let Err(error) = remove_managed_ssh_server(&server)
-                            {
-                                diagnostic_trace(&format!(
-                                    "connection removed but managed SSH cleanup failed: {error}"
-                                ));
-                                Some(match locale {
-                                    Locale::English => format!(
-                                        "Connection removed; managed SSH cleanup failed: {error}"
-                                    ),
-                                    Locale::Chinese => {
-                                        format!("连接已删除，但托管 SSH 配置清理失败：{error}")
-                                    }
-                                })
-                            } else {
-                                None
-                            };
+                            let mut cleanup_errors = Vec::new();
+                            if let Some(server) = &server {
+                                if server.ssh_config_managed
+                                    && let Err(error) = remove_managed_ssh_server(server)
+                                {
+                                    cleanup_errors.push(match locale {
+                                        Locale::English => {
+                                            format!("managed SSH cleanup failed: {error}")
+                                        }
+                                        Locale::Chinese => {
+                                            format!("托管 SSH 配置清理失败：{error}")
+                                        }
+                                    });
+                                }
+                                if let Err(error) =
+                                    delete_server_credentials(server, &SystemCredentialStore)
+                                {
+                                    cleanup_errors.push(match locale {
+                                        Locale::English => {
+                                            format!("credential cleanup failed: {error}")
+                                        }
+                                        Locale::Chinese => {
+                                            format!("系统凭据清理失败：{error}")
+                                        }
+                                    });
+                                }
+                            }
+                            let warning = (!cleanup_errors.is_empty()).then(|| match locale {
+                                Locale::English => {
+                                    format!("Connection removed; {}", cleanup_errors.join("; "))
+                                }
+                                Locale::Chinese => {
+                                    format!("连接已删除，但{}", cleanup_errors.join("；"))
+                                }
+                            });
+                            if let Some(warning) = &warning {
+                                diagnostic_trace(warning);
+                            }
                             Ok(ServerMutation { servers, warning })
                         })
                         .await
@@ -2167,10 +2520,12 @@ impl App {
                 self.busy.remove(&id);
                 match result {
                     Ok(outcome) => {
+                        let terminal_task = self.reconcile_interactive_sessions(&outcome.servers);
                         self.servers = outcome.servers;
                         self.status = outcome
                             .warning
                             .unwrap_or_else(|| locale.text(TextKey::ConnectionRemoved).into());
+                        return terminal_task;
                     }
                     Err(error) => self.status = error,
                 }
@@ -2333,7 +2688,7 @@ impl App {
             }
             AppCommand::ExitForReplacement => {
                 if self.busy.is_empty() {
-                    iced::exit()
+                    self.request_exit()
                 } else {
                     self.status = match self.locale() {
                         Locale::English => {
@@ -2430,11 +2785,18 @@ impl App {
                     || !self.transfers.contains_key(&server.id)
             })
             .count();
-        if active == 0 && unknown == 0 {
+        let interactive_sessions = self
+            .interactive_terminals
+            .values()
+            .filter(|session| interactive_terminal_is_live(session.lifecycle))
+            .count();
+        if active == 0 && unknown == 0 && interactive_sessions == 0 {
             return iced::exit();
         }
         self.exit_confirmation_open = true;
-        let description = self.locale().exit_warning(active, unknown);
+        let description = self
+            .locale()
+            .exit_warning(active, unknown, interactive_sessions);
         Task::perform(
             async move {
                 rfd::AsyncMessageDialog::new()
@@ -2461,6 +2823,15 @@ impl App {
 
     fn save_connection(&mut self) -> Task<Message> {
         if self.editor_saving {
+            return Task::none();
+        }
+        if self.connection_draft.as_ref().is_some_and(|draft| {
+            draft
+                .editing_id
+                .as_deref()
+                .is_some_and(|id| !self.can_modify(id))
+        }) {
+            self.status = connection_settings_locked_help(self.locale()).into();
             return Task::none();
         }
         if self
@@ -2490,52 +2861,125 @@ impl App {
             .as_deref()
             .and_then(|id| self.servers.iter().find(|server| server.id == id))
             .cloned();
+        let credential_storage = self.settings.credential_storage;
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    let password = obscure_action(&service, &validated.password)?;
-                    let key_passphrase = obscure_action(&service, &validated.key_passphrase)?;
-                    let mut server = validated
-                        .apply_secrets(password, key_passphrase)
-                        .map_err(|error| localize_draft_error(locale, &error))?;
-                    let managed_snapshot = capture_managed_profile(previous.as_ref())?;
-                    prepare_managed_ssh_server(&mut server, &Platform)
-                        .map_err(|error| error.to_string())?;
-                    let servers = match storage::upsert_server(&paths, server.clone()) {
-                        Ok(servers) => servers,
+                    let server_id = validated.server.id.clone();
+                    let password = prepare_secret_action(
+                        &service,
+                        credential_storage,
+                        &server_id,
+                        CredentialKind::Password,
+                        &validated.password,
+                    )?;
+                    let key_passphrase = match prepare_secret_action(
+                        &service,
+                        credential_storage,
+                        &server_id,
+                        CredentialKind::KeyPassphrase,
+                        &validated.key_passphrase,
+                    ) {
+                        Ok(prepared) => prepared,
                         Err(error) => {
-                            let rollback = rollback_prepared_managed_profile(
-                                &server,
-                                managed_snapshot.as_ref(),
-                            );
+                            let _ = rollback_prepared_secret(&password);
+                            return Err(error);
+                        }
+                    };
+                    let mut server = match validated
+                        .apply_secrets(password.obscured.clone(), key_passphrase.obscured.clone())
+                    {
+                        Ok(server) => server,
+                        Err(error) => {
+                            let _ = rollback_prepared_secrets([&password, &key_passphrase]);
+                            return Err(localize_draft_error(locale, &error));
+                        }
+                    };
+                    password.apply(&mut server);
+                    key_passphrase.apply(&mut server);
+                    let managed_snapshot = match capture_managed_profile(previous.as_ref()) {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            let rollback = rollback_prepared_secrets([&password, &key_passphrase]);
                             return Err(match rollback {
-                                Ok(()) => error.to_string(),
+                                Ok(()) => error,
                                 Err(rollback) => {
-                                    format!("{error}; managed SSH rollback failed: {rollback}")
+                                    format!("{error}; credential rollback failed: {rollback}")
                                 }
                             });
                         }
                     };
-                    let warning = if let Some(previous) = previous
-                        && previous.ssh_config_managed
-                        && (!server.ssh_config_managed
-                            || previous.managed_ssh_config_path != server.managed_ssh_config_path)
-                        && let Err(error) = remove_managed_ssh_server(&previous)
-                    {
-                        diagnostic_trace(&format!(
-                            "connection saved but old managed SSH cleanup failed: {error}"
-                        ));
-                        Some(match locale {
-                            Locale::English => {
-                                format!("Connection saved; old managed SSH cleanup failed: {error}")
+                    if let Err(error) = prepare_managed_ssh_server(&mut server, &Platform) {
+                        let rollback = rollback_prepared_secrets([&password, &key_passphrase]);
+                        return Err(match rollback {
+                            Ok(()) => error.to_string(),
+                            Err(rollback) => {
+                                format!("{error}; credential rollback failed: {rollback}")
                             }
-                            Locale::Chinese => {
-                                format!("连接已保存，但旧托管 SSH 配置清理失败：{error}")
+                        });
+                    }
+                    let servers = match storage::upsert_server(&paths, server.clone()) {
+                        Ok(servers) => servers,
+                        Err(error) => {
+                            let managed_rollback = rollback_prepared_managed_profile(
+                                &server,
+                                managed_snapshot.as_ref(),
+                            );
+                            let credential_rollback =
+                                rollback_prepared_secrets([&password, &key_passphrase]);
+                            let mut message = error.to_string();
+                            if let Err(rollback) = managed_rollback {
+                                message.push_str(&format!(
+                                    "; managed SSH rollback failed: {rollback}"
+                                ));
                             }
-                        })
-                    } else {
-                        None
+                            if let Err(rollback) = credential_rollback {
+                                message
+                                    .push_str(&format!("; credential rollback failed: {rollback}"));
+                            }
+                            return Err(message);
+                        }
                     };
+                    let mut cleanup_errors = Vec::new();
+                    if let Some(previous) = &previous {
+                        if previous.ssh_config_managed
+                            && (!server.ssh_config_managed
+                                || previous.managed_ssh_config_path
+                                    != server.managed_ssh_config_path)
+                            && let Err(error) = remove_managed_ssh_server(previous)
+                        {
+                            cleanup_errors.push(match locale {
+                                Locale::English => {
+                                    format!("old managed SSH cleanup failed: {error}")
+                                }
+                                Locale::Chinese => {
+                                    format!("旧托管 SSH 配置清理失败：{error}")
+                                }
+                            });
+                        }
+                        if let Err(error) = delete_retired_connection_credentials(previous, &server)
+                        {
+                            cleanup_errors.push(match locale {
+                                Locale::English => {
+                                    format!("retired credential cleanup failed: {error}")
+                                }
+                                Locale::Chinese => {
+                                    format!("旧系统凭据清理失败：{error}")
+                                }
+                            });
+                        }
+                    }
+                    let warning = (!cleanup_errors.is_empty()).then(|| match locale {
+                        Locale::English => {
+                            format!("Connection saved; {}", cleanup_errors.join("; "))
+                        }
+                        Locale::Chinese => {
+                            format!("连接已保存，但{}", cleanup_errors.join("；"))
+                        }
+                    });
+                    if let Some(warning) = &warning {
+                        diagnostic_trace(warning);
+                    }
                     Ok(ServerMutation { servers, warning })
                 })
                 .await
@@ -2605,13 +3049,36 @@ impl App {
         self.editor_saving = true;
         self.status = self.locale().saving_connections(updates.len());
         let paths = self.paths.clone();
+        let previous_servers = self.servers.clone();
+        let locale = self.locale();
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
                     storage::upsert_servers(&paths, updates)
-                        .map(|servers| ServerMutation {
-                            servers,
-                            warning: None,
+                        .map(|servers| {
+                            let errors: Vec<_> = previous_servers
+                                .iter()
+                                .filter_map(|previous| {
+                                    let current =
+                                        servers.iter().find(|server| server.id == previous.id)?;
+                                    delete_retired_connection_credentials(previous, current)
+                                        .err()
+                                        .map(|error| {
+                                            format!("{}: {error}", previous.display_name())
+                                        })
+                                })
+                                .collect();
+                            let warning = (!errors.is_empty()).then(|| match locale {
+                                Locale::English => format!(
+                                    "Connections saved; retired credential cleanup failed: {}",
+                                    errors.join("; ")
+                                ),
+                                Locale::Chinese => format!(
+                                    "连接已保存，但旧系统凭据清理失败：{}",
+                                    errors.join("；")
+                                ),
+                            });
+                            ServerMutation { servers, warning }
                         })
                         .map_err(|error| error.to_string())
                 })
@@ -2645,6 +3112,9 @@ impl App {
         let paths = self.paths.clone();
         let result_settings = settings.clone();
         let previous_settings = self.settings.clone();
+        let previous_servers = self.servers.clone();
+        let service = self.service.clone();
+        let locale = self.locale();
         let executable = match std::env::current_exe() {
             Ok(executable) => executable,
             Err(error) => {
@@ -2656,7 +3126,52 @@ impl App {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    storage::save_settings(&paths, &settings).map_err(|error| error.to_string())?;
+                    let storage_changed =
+                        settings.credential_storage != previous_settings.credential_storage;
+                    if storage_changed {
+                        diagnostic_trace(&credential_presence_summary(
+                            "before",
+                            &previous_servers,
+                        ));
+                    }
+                    let credential_migration = if storage_changed {
+                        Some(migrate_servers_for_storage(
+                            &paths,
+                            &service,
+                            &previous_servers,
+                            settings.credential_storage,
+                        )?)
+                    } else {
+                        None
+                    };
+                    let migrated_servers = credential_migration
+                        .as_ref()
+                        .map_or_else(|| previous_servers.clone(), |migration| migration.servers.clone());
+                    if storage_changed {
+                        diagnostic_trace(&credential_presence_summary("after", &migrated_servers));
+                    }
+                    if storage_changed && settings.credential_storage == CredentialStorage::System {
+                        for server in &migrated_servers {
+                            if let Err(error) =
+                                clear_rclone_remote_secrets(&paths, server.remote_name())
+                            {
+                                return Err(rollback_credential_storage_change(
+                                    &paths,
+                                    &previous_servers,
+                                    credential_migration.as_ref(),
+                                    error.to_string(),
+                                ));
+                            }
+                        }
+                    }
+                    if let Err(error) = storage::save_settings(&paths, &settings) {
+                        return Err(rollback_credential_storage_change(
+                            &paths,
+                            &previous_servers,
+                            credential_migration.as_ref(),
+                            error.to_string(),
+                        ));
+                    }
                     if let Err(error) =
                         Platform.set_login_startup(&executable, settings.startup_all)
                     {
@@ -2665,7 +3180,12 @@ impl App {
                         let startup_rollback = Platform
                             .set_login_startup(&executable, previous_settings.startup_all)
                             .map_err(|rollback| rollback.to_string());
-                        let mut message = error.to_string();
+                        let mut message = rollback_credential_storage_change(
+                            &paths,
+                            &previous_servers,
+                            credential_migration.as_ref(),
+                            error.to_string(),
+                        );
                         if let Err(rollback) = settings_rollback {
                             message.push_str(&format!("; settings rollback failed: {rollback}"));
                         }
@@ -2674,7 +3194,27 @@ impl App {
                         }
                         return Err(message);
                     }
-                    Ok(result_settings)
+                    let warning = if storage_changed
+                        && settings.credential_storage == CredentialStorage::Obscure
+                    {
+                        credential_migration.as_ref().and_then(|migration| {
+                            migration.retire_system_references().err().map(|error| match locale {
+                                Locale::English => format!(
+                                    "Settings saved, but some retired vault entries could not be removed: {error}"
+                                ),
+                                Locale::Chinese => format!(
+                                    "设置已保存，但部分旧系统凭据无法删除：{error}"
+                                ),
+                            })
+                        })
+                    } else {
+                        None
+                    };
+                    Ok(SettingsMutation {
+                        settings: result_settings,
+                        servers: migrated_servers,
+                        warning,
+                    })
                 })
                 .await
                 .unwrap_or_else(|error| Err(error.to_string()))
@@ -2749,10 +3289,17 @@ impl App {
     fn dependency_check_task(&self) -> Task<Message> {
         let paths = self.paths.clone();
         let app_root = application_root();
+        let mount_backend = self
+            .settings_draft
+            .as_ref()
+            .map_or(self.settings.macos_mount_backend, |draft| {
+                draft.mount_backend
+            });
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    check_dependencies(&paths, &app_root).map_err(|error| error.to_string())
+                    check_dependencies(&paths, &app_root, mount_backend)
+                        .map_err(|error| error.to_string())
                 })
                 .await
                 .unwrap_or_else(|error| Err(error.to_string()))
@@ -2767,10 +3314,19 @@ impl App {
             .as_ref()
             .and_then(|info| info.asset.clone())
         else {
-            self.status = match self.locale() {
-                Locale::English => "This release has no verified asset for this platform".into(),
-                Locale::Chinese => "此版本没有适用于当前平台的已验证安装包".into(),
-            };
+            self.status = self
+                .update_info
+                .as_ref()
+                .and_then(|info| info.trust_error.as_ref())
+                .map_or_else(
+                    || match self.locale() {
+                        Locale::English => {
+                            "This release has no verified asset for this platform".into()
+                        }
+                        Locale::Chinese => "此版本没有适用于当前平台的已验证安装包".into(),
+                    },
+                    |error| automatic_install_blocked_message(self.locale(), error),
+                );
             return Task::none();
         };
         let executable = match std::env::current_exe() {
@@ -3101,6 +3657,264 @@ impl App {
         global_progress_state(&totals, out_of_space)
     }
 
+    fn interactive_session_ready(&self, id: &str) -> bool {
+        self.interactive_terminals.get(id).is_some_and(|session| {
+            !matches!(
+                session.lifecycle,
+                InteractiveTerminalLifecycle::Exited | InteractiveTerminalLifecycle::Failed
+            ) && session.ssh.is_ready()
+        })
+    }
+
+    fn queue_interactive_mount(&mut self, id: String, server: ServerConfig) -> Task<Message> {
+        if self.interactive_terminals.get(&id).is_some_and(|session| {
+            matches!(
+                session.lifecycle,
+                InteractiveTerminalLifecycle::Ready
+                    | InteractiveTerminalLifecycle::Exited
+                    | InteractiveTerminalLifecycle::Failed
+            )
+        }) {
+            self.interactive_terminals.remove(&id);
+            return self.open_interactive_terminal(id, server);
+        }
+        if !self.interactive_terminals.contains_key(&id) {
+            self.open_interactive_terminal(id.clone(), server)
+        } else {
+            if let Some(session) = self.interactive_terminals.get_mut(&id) {
+                session.queued_mount = true;
+                session.resume_sent = false;
+            }
+            self.terminal_error = None;
+            self.status = self
+                .locale()
+                .text(TextKey::InteractiveTerminalStarting)
+                .into();
+            self.open_terminal_window(id)
+        }
+    }
+
+    fn open_interactive_terminal(&mut self, id: String, server: ServerConfig) -> Task<Message> {
+        self.terminal_error = None;
+        let generation = self.next_terminal_generation;
+        self.next_terminal_generation = self.next_terminal_generation.saturating_add(1);
+        let result: Result<(InteractiveSshSession, iced_term::Terminal), String> =
+            InteractiveSshSession::for_server(&self.paths, &application_root(), &server)
+                .map_err(|error| error.to_string())
+                .and_then(|ssh| {
+                    let (program, args) = strict_terminal_command(ssh.login_command())?;
+                    let terminal = iced_term::Terminal::new(
+                        generation,
+                        iced_term::settings::Settings {
+                            backend: iced_term::settings::BackendSettings {
+                                program,
+                                args,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                    )
+                    .map_err(|error| {
+                        format!("could not start interactive SSH terminal: {error}")
+                    })?;
+                    Ok((ssh, terminal))
+                });
+        match result {
+            Ok((ssh, terminal)) => {
+                diagnostic_trace(&format!(
+                    "interactive terminal session created for {id} generation {generation}"
+                ));
+                self.interactive_terminals.insert(
+                    id.clone(),
+                    InteractiveTerminalSession {
+                        generation,
+                        ssh,
+                        terminal,
+                        lifecycle: InteractiveTerminalLifecycle::Starting,
+                        queued_mount: true,
+                        resume_sent: false,
+                    },
+                );
+                self.status = self
+                    .locale()
+                    .text(TextKey::InteractiveTerminalStarting)
+                    .into();
+            }
+            Err(error) => {
+                diagnostic_trace(&format!(
+                    "interactive terminal session creation failed for {id} generation {generation}"
+                ));
+                self.terminal_error = Some(error);
+                self.status = self
+                    .locale()
+                    .text(TextKey::InteractiveTerminalFailed)
+                    .into();
+            }
+        }
+        self.open_terminal_window(id)
+    }
+
+    fn open_terminal_window(&mut self, id: String) -> Task<Message> {
+        self.terminal_server_id = Some(id.clone());
+        if let Some(window) = self.terminal_window {
+            diagnostic_trace(&format!(
+                "focusing interactive terminal window {window:?} for {id}"
+            ));
+            return window::gain_focus(window);
+        }
+        if !self.main_window_ready {
+            diagnostic_trace(&format!(
+                "deferring interactive terminal window for {id} until main window is ready"
+            ));
+            return Task::none();
+        }
+        let (window, open) = window::open(terminal_window_settings());
+        diagnostic_trace(&format!(
+            "opening interactive terminal window {window:?} for {id}"
+        ));
+        self.terminal_window = Some(window);
+        open.map(Message::TerminalWindowOpened)
+    }
+
+    fn poll_interactive_terminals(&mut self) -> Task<Message> {
+        let saving_id = self
+            .editor_saving
+            .then(|| {
+                self.connection_draft
+                    .as_ref()
+                    .and_then(|draft| draft.editing_id.clone())
+            })
+            .flatten();
+        let ids = self
+            .interactive_terminals
+            .iter()
+            .filter_map(|(id, session)| {
+                interactive_mount_poll_eligible(id, session.queued_mount, saving_id.as_deref())
+                    .then_some(id.clone())
+            })
+            .collect::<Vec<_>>();
+        let mut resume = Vec::new();
+        for id in ids {
+            let Some(session) = self.interactive_terminals.get_mut(&id) else {
+                continue;
+            };
+            if !interactive_mount_resume_once(
+                session.queued_mount,
+                session.resume_sent,
+                session.lifecycle != InteractiveTerminalLifecycle::Exited
+                    && session.lifecycle != InteractiveTerminalLifecycle::Failed
+                    && session.ssh.is_ready(),
+            ) {
+                continue;
+            }
+            session.lifecycle = InteractiveTerminalLifecycle::Ready;
+            session.resume_sent = true;
+            session.queued_mount = false;
+            resume.push(id);
+        }
+        Task::batch(
+            resume
+                .into_iter()
+                .map(|id| self.start_mount_operation(id, Some(MountOperation::Mount))),
+        )
+    }
+
+    fn handle_terminal_event(&mut self, event: RedactedTerminalEvent) -> Task<Message> {
+        let iced_term::Event::BackendCall(generation, command) = event.0;
+        match &command {
+            iced_term::BackendCommand::ProcessAlacrittyEvent(
+                iced_term::AlacrittyEvent::ChildExit(code),
+            ) => diagnostic_trace(&format!(
+                "interactive terminal child exited for generation {generation} with code {code}"
+            )),
+            iced_term::BackendCommand::ProcessAlacrittyEvent(iced_term::AlacrittyEvent::Exit) => {
+                diagnostic_trace(&format!(
+                    "interactive terminal backend exited for generation {generation}"
+                ));
+            }
+            _ => {}
+        }
+        let Some(session) = self
+            .interactive_terminals
+            .values_mut()
+            .find(|session| session.generation == generation)
+        else {
+            return Task::none();
+        };
+        let action = session
+            .terminal
+            .handle(iced_term::Command::ProxyToBackend(command));
+        if action == iced_term::actions::Action::Shutdown {
+            session.lifecycle = InteractiveTerminalLifecycle::Exited;
+            session.queued_mount = false;
+            session.resume_sent = true;
+            self.status = self
+                .locale()
+                .text(TextKey::InteractiveTerminalExited)
+                .into();
+        } else if session.lifecycle == InteractiveTerminalLifecycle::Starting
+            && session.ssh.is_ready()
+        {
+            session.lifecycle = InteractiveTerminalLifecycle::Ready;
+            self.status = self.locale().text(TextKey::InteractiveTerminalReady).into();
+        }
+        Task::none()
+    }
+
+    fn end_interactive_session(&mut self) -> Task<Message> {
+        let window = self.terminal_window.take();
+        if let Some(id) = self.terminal_server_id.take() {
+            self.interactive_terminals.remove(&id);
+        }
+        self.terminal_error = None;
+        if let Some(window) = window {
+            window::close(window)
+        } else {
+            Task::none()
+        }
+    }
+
+    fn retry_interactive_terminal(&mut self) -> Task<Message> {
+        let Some(id) = self.terminal_server_id.clone() else {
+            return Task::none();
+        };
+        let Some(server) = self.servers.iter().find(|server| server.id == id).cloned() else {
+            return self.end_interactive_session();
+        };
+        self.interactive_terminals.remove(&id);
+        self.open_interactive_terminal(id, server)
+    }
+
+    fn reconcile_interactive_sessions(&mut self, next_servers: &[ServerConfig]) -> Task<Message> {
+        let compatible = self
+            .servers
+            .iter()
+            .filter_map(|previous| {
+                next_servers
+                    .iter()
+                    .find(|next| next.id == previous.id)
+                    .filter(|next| interactive_session_config_compatible(previous, next))
+                    .map(|next| next.id.clone())
+            })
+            .collect::<HashSet<_>>();
+        self.interactive_terminals
+            .retain(|id, _| compatible.contains(id));
+
+        let visible_is_compatible = self
+            .terminal_server_id
+            .as_deref()
+            .is_none_or(|id| compatible.contains(id));
+        if visible_is_compatible {
+            return Task::none();
+        }
+
+        self.terminal_server_id = None;
+        self.terminal_error = None;
+        self.terminal_window
+            .take()
+            .map_or_else(Task::none, window::close)
+    }
+
     fn start_mount_operation(
         &mut self,
         id: String,
@@ -3126,6 +3940,29 @@ impl App {
         {
             return self.confirm_waiting_unmount(vec![id]);
         }
+        let server = self.servers.iter().find(|server| server.id == id).cloned();
+        if operation == MountOperation::Mount
+            && server
+                .as_ref()
+                .is_some_and(|server| server.connection_method == ConnectionMethod::Interactive)
+            && !self.interactive_session_ready(&id)
+        {
+            let Some(server) = server else {
+                self.status = self.locale().text(TextKey::ConnectionGone).into();
+                return Task::none();
+            };
+            return self.queue_interactive_mount(id, server);
+        }
+        if operation == MountOperation::Mount
+            && server
+                .as_ref()
+                .is_some_and(|server| server.connection_method == ConnectionMethod::Interactive)
+            && let Some(session) = self.interactive_terminals.get_mut(&id)
+        {
+            session.lifecycle = InteractiveTerminalLifecycle::Ready;
+            session.queued_mount = false;
+            session.resume_sent = true;
+        }
         if !self.busy.insert(id.clone()) {
             return Task::none();
         }
@@ -3138,7 +3975,7 @@ impl App {
         }
         self.mount_statuses
             .insert(id.clone(), MountStatus::Starting);
-        let server = self.servers.iter().find(|server| server.id == id).cloned();
+        self.operation_errors.remove(&id);
         let display_name = operation_display_name(server.as_ref(), &id);
         self.status = match operation {
             MountOperation::Mount => self.locale().mounting(&display_name),
@@ -3168,7 +4005,7 @@ impl App {
                                     state.mountpoint.display()
                                 ),
                             })
-                            .map_err(|error| error.to_string())
+                            .map_err(|error| localize_service_error(locale, &error))
                     }
                     MountOperation::Unmount => service
                         .unmount(&id)
@@ -3283,6 +4120,7 @@ impl App {
             content: text_editor::Content::new(),
             truncated: false,
             loading: true,
+            existed: false,
         });
         self.status = self.locale().text(TextKey::LoadingLog).into();
         let load = load_log_task(id, path);
@@ -3317,6 +4155,8 @@ impl App {
             }
         } else if self.log_window == Some(window) {
             self.log_viewer_view()
+        } else if self.terminal_window == Some(window) {
+            self.interactive_terminal_view()
         } else {
             self.transfer_popup_view(window)
         }
@@ -3376,10 +4216,24 @@ impl App {
         let mut connections = column![].spacing(8);
         if self.servers.is_empty() {
             connections = connections.push(
-                container(text(locale.text(TextKey::NoSavedConnections)).size(20))
-                    .padding(28)
-                    .width(Fill)
-                    .center_x(Fill),
+                container(
+                    column![
+                        text(locale.text(TextKey::NoSavedConnections)).size(20),
+                        text(match locale {
+                            Locale::English =>
+                                "Create a connection to mount your first remote folder.",
+                            Locale::Chinese => "新建连接以挂载第一个远程目录。",
+                        })
+                        .size(14),
+                        button(locale.text(TextKey::AddConnection))
+                            .on_press(Message::AddConnection),
+                    ]
+                    .spacing(12)
+                    .align_x(Center),
+                )
+                .padding(28)
+                .width(Fill)
+                .center_x(Fill),
             );
         } else {
             for server in &self.servers {
@@ -3401,6 +4255,10 @@ impl App {
                         can_modify: self.can_modify(&server.id),
                         confirming_remove: self.pending_delete.as_deref() == Some(&server.id),
                         waiting_unmount: self.pending_unmount_after_sync.contains(&server.id),
+                        operation_error: self.operation_errors.get(&server.id),
+                        has_interactive_terminal: self
+                            .interactive_terminals
+                            .contains_key(&server.id),
                     },
                     locale,
                 ));
@@ -3610,6 +4468,14 @@ impl App {
         } else {
             locale.text(TextKey::AddConnection)
         };
+        if draft
+            .editing_id
+            .as_deref()
+            .is_some_and(|id| !self.can_modify(id))
+        {
+            return self.read_only_connection_settings_view(draft, title);
+        }
+        let requirements = draft.requirements();
         let header = row![
             text(title).size(28),
             Space::new().width(Fill),
@@ -3654,6 +4520,7 @@ impl App {
                         locale.text(TextKey::SshConfigFile),
                         &draft.ssh_config_path,
                         ConnectionField::SshConfigPath,
+                        requirements.ssh_config_path,
                     ),
                     button(locale.text(TextKey::Browse)).on_press(Message::BrowseSshConfig),
                     button(if self.ssh_import_loading {
@@ -3757,40 +4624,59 @@ impl App {
             connection_input(
                 locale.text(TextKey::Name),
                 &draft.name,
-                ConnectionField::Name
+                ConnectionField::Name,
+                requirements.name,
             ),
             connection_input(
                 locale.text(TextKey::SshHostAlias),
                 &draft.host_alias,
                 ConnectionField::HostAlias,
+                requirements.host_alias,
             ),
         ]
         .spacing(12);
-        let target = row![
-            connection_input(
-                locale.text(TextKey::IpHost),
-                &draft.host,
-                ConnectionField::Host
-            ),
-            connection_input(
-                locale.text(TextKey::User),
-                &draft.user,
-                ConnectionField::User
-            ),
-            connection_input(
-                locale.text(TextKey::Port),
-                &draft.port,
-                ConnectionField::Port
-            )
-            .width(Length::Fixed(150.0)),
-        ]
-        .spacing(12);
+        let ssh_config_authoritative = draft.source == ConnectionSource::SshConfig
+            && draft.connection_method != ConnectionMethod::Native;
+        let target = if ssh_config_authoritative {
+            row![
+                connection_read_only_field(locale.text(TextKey::IpHost), &draft.host),
+                connection_read_only_field(locale.text(TextKey::User), &draft.user),
+                connection_read_only_field(locale.text(TextKey::Port), &draft.port)
+                    .width(Length::Fixed(150.0)),
+            ]
+            .spacing(12)
+        } else {
+            row![
+                connection_input(
+                    locale.text(TextKey::IpHost),
+                    &draft.host,
+                    ConnectionField::Host,
+                    requirements.host,
+                ),
+                connection_input(
+                    locale.text(TextKey::User),
+                    &draft.user,
+                    ConnectionField::User,
+                    requirements.user,
+                ),
+                connection_input(
+                    locale.text(TextKey::Port),
+                    &draft.port,
+                    ConnectionField::Port,
+                    requirements.port,
+                )
+                .width(Length::Fixed(150.0)),
+            ]
+            .spacing(12)
+        };
         let authentication: Element<'_, Message> =
-            if draft.connection_method == ConnectionMethod::Openssh {
-                container(text(locale.text(TextKey::ManagedByOpenSsh)))
-                    .padding(10)
-                    .width(Fill)
-                    .into()
+            if draft.connection_method != ConnectionMethod::Native {
+                let label = if draft.connection_method == ConnectionMethod::Interactive {
+                    interactive_auth_help(locale)
+                } else {
+                    locale.text(TextKey::ManagedByOpenSsh)
+                };
+                container(text(label)).padding(10).width(Fill).into()
             } else {
                 pick_list(
                     localized_choices(AuthMethod::ALL, locale, Locale::auth_method),
@@ -3800,33 +4686,97 @@ impl App {
                 .width(Fill)
                 .into()
             };
+        let interactive_disabled = !connection_method_allowed(
+            draft.source,
+            draft.ssh_config_managed,
+            ConnectionMethod::Interactive,
+            cfg!(windows),
+        );
+        let mut transport_choice = column![
+            pick_list(
+                localized_choices(
+                    ConnectionMethod::ALL.into_iter().filter(|method| {
+                        connection_method_allowed(
+                            draft.source,
+                            draft.ssh_config_managed,
+                            *method,
+                            cfg!(windows),
+                        )
+                    }),
+                    locale,
+                    Locale::connection_method,
+                ),
+                Some(locale.choice(
+                    draft.connection_method,
+                    locale.connection_method(draft.connection_method),
+                )),
+                |method| Message::ConnectionMethodChanged(method.value),
+            )
+            .width(Fill)
+        ]
+        .spacing(5);
+        if interactive_disabled {
+            transport_choice =
+                transport_choice.push(text(interactive_ssh_config_unavailable(locale)).size(12));
+        }
         let transport = row![
-            labeled_control(
-                locale.text(TextKey::Transport),
-                pick_list(
-                    localized_choices(ConnectionMethod::ALL, locale, Locale::connection_method,),
-                    Some(locale.choice(
-                        draft.connection_method,
-                        locale.connection_method(draft.connection_method),
-                    )),
-                    |method| Message::ConnectionMethodChanged(method.value),
-                )
-                .width(Fill),
-            ),
+            labeled_control(locale.text(TextKey::Transport), transport_choice,),
             labeled_control(locale.text(TextKey::Authentication), authentication),
         ]
         .spacing(12);
+
+        if ssh_config_authoritative {
+            ssh_config_controls = ssh_config_controls.push(
+                container(
+                    column![
+                        text(match locale {
+                            Locale::English => "OpenSSH source of truth",
+                            Locale::Chinese => "OpenSSH 权威来源",
+                        })
+                        .size(16),
+                        text(format!(
+                            "{}: {}",
+                            locale.text(TextKey::SshConfigFile),
+                            draft.ssh_config_path
+                        ))
+                        .size(13),
+                        text(format!(
+                            "{}: {}",
+                            locale.text(TextKey::SshHostAlias),
+                            draft.host_alias
+                        ))
+                        .size(13),
+                        text(openssh_command_preview(
+                            &draft.ssh_config_path,
+                            &draft.host_alias
+                        ))
+                        .size(13),
+                        text(match locale {
+                            Locale::English => "The visible resolved fields are only an import snapshot. The actual OpenSSH command remains authoritative and may apply Include, Match, ProxyJump, ProxyCommand, agent, certificate, and token expansion rules not shown here.",
+                            Locale::Chinese => "可见的解析字段只是导入快照。实际 OpenSSH 命令仍是权威来源，并可能应用此处未显示的 Include、Match、ProxyJump、ProxyCommand、代理、证书和令牌展开规则。",
+                        })
+                        .size(12),
+                    ]
+                    .spacing(5),
+                )
+                .padding(10)
+                .width(Fill)
+                .style(container::rounded_box),
+            );
+        }
 
         let mut auth_fields = column![].spacing(12);
         if draft.connection_method == ConnectionMethod::Native {
             match draft.auth {
                 AuthMethod::Password => {
-                    auth_fields = auth_fields.push(labeled_control(
+                    auth_fields = auth_fields.push(secret_input_control(
                         locale.text(TextKey::Password),
-                        text_input(locale.text(TextKey::PasswordRequired), &draft.password)
-                            .secure(true)
-                            .on_input(|value| Message::PasswordChanged(SecretInput(value)))
-                            .width(Fill),
+                        locale.text(TextKey::PasswordRequired),
+                        &draft.password,
+                        draft.preserved_secret_state(CredentialKind::Password),
+                        CredentialKind::Password,
+                        locale,
+                        requirements.password,
                     ));
                 }
                 AuthMethod::Key => {
@@ -3838,15 +4788,16 @@ impl App {
                                 ConnectionField::KeyFile,
                                 Message::BrowsePrivateKey,
                                 locale.text(TextKey::Browse),
+                                requirements.key_file,
                             ),
-                            labeled_control(
+                            secret_input_control(
                                 locale.text(TextKey::KeyPassphrase),
-                                text_input(locale.text(TextKey::Optional), &draft.key_passphrase)
-                                    .secure(true)
-                                    .on_input(|value| Message::KeyPassphraseChanged(SecretInput(
-                                        value
-                                    )))
-                                    .width(Fill),
+                                locale.text(TextKey::Optional),
+                                &draft.key_passphrase,
+                                draft.preserved_secret_state(CredentialKind::KeyPassphrase),
+                                CredentialKind::KeyPassphrase,
+                                locale,
+                                false,
                             ),
                         ]
                         .spacing(12),
@@ -3894,7 +4845,7 @@ impl App {
         let custom_mountpoint = mountpoint_choice == "custom";
         let mut mountpoint = column![
             row![
-                text(locale.text(TextKey::Mountpoint)).size(13),
+                connection_field_label(locale.text(TextKey::Mountpoint), custom_mountpoint),
                 settings_help(mountpoint_help(locale)),
             ]
             .spacing(5),
@@ -3941,6 +4892,121 @@ impl App {
         editor_shell(header, scrollable(content), &self.status)
     }
 
+    fn read_only_connection_settings_view<'a>(
+        &'a self,
+        draft: &'a ConnectionDraft,
+        title: &'a str,
+    ) -> Element<'a, Message> {
+        let locale = self.locale();
+        let header = row![
+            text(title).size(28),
+            Space::new().width(Fill),
+            button(locale.text(TextKey::Cancel)).on_press(Message::CancelEditor),
+        ]
+        .spacing(10)
+        .align_y(Center);
+        let mut content = column![
+            container(text(connection_settings_locked_help(locale)).size(14))
+                .padding(12)
+                .width(Fill)
+                .style(container::rounded_box),
+            row![
+                connection_read_only_field(
+                    locale.text(TextKey::Source),
+                    locale.connection_source(draft.source),
+                ),
+                connection_read_only_field(locale.text(TextKey::Name), &draft.name),
+            ]
+            .spacing(12),
+            row![
+                connection_read_only_field(locale.text(TextKey::SshHostAlias), &draft.host_alias,),
+                connection_read_only_field(locale.text(TextKey::IpHost), &draft.host),
+            ]
+            .spacing(12),
+            row![
+                connection_read_only_field(locale.text(TextKey::User), &draft.user),
+                connection_read_only_field(locale.text(TextKey::Port), &draft.port),
+            ]
+            .spacing(12),
+            row![
+                connection_read_only_field(
+                    locale.text(TextKey::Transport),
+                    locale.connection_method(draft.connection_method),
+                ),
+                connection_read_only_field(
+                    locale.text(TextKey::Authentication),
+                    locale.auth_method(draft.auth),
+                ),
+            ]
+            .spacing(12),
+        ]
+        .spacing(16)
+        .max_width(900);
+        if matches!(
+            draft.source,
+            ConnectionSource::SshConfig | ConnectionSource::SshConfigBatch
+        ) {
+            content = content.push(connection_read_only_field(
+                locale.text(TextKey::SshConfigFile),
+                &draft.ssh_config_path,
+            ));
+        }
+        if draft.auth == AuthMethod::Key {
+            content = content.push(
+                row![
+                    connection_read_only_field(
+                        locale.text(TextKey::PrivateKeyFile),
+                        &draft.key_file,
+                    ),
+                    connection_read_only_field(
+                        locale.text(TextKey::KeyPassphrase),
+                        connection_secret_state_label(
+                            locale,
+                            draft.preserved_secret_state(CredentialKind::KeyPassphrase),
+                        ),
+                    ),
+                ]
+                .spacing(12),
+            );
+        } else {
+            content = content.push(connection_read_only_field(
+                locale.text(TextKey::Password),
+                connection_secret_state_label(
+                    locale,
+                    draft.preserved_secret_state(CredentialKind::Password),
+                ),
+            ));
+        }
+        content = content
+            .push(
+                row![
+                    connection_read_only_field(
+                        locale.text(TextKey::WriteManagedProfile),
+                        localized_yes_no(locale, draft.ssh_config_managed),
+                    ),
+                    connection_read_only_field(
+                        locale.text(TextKey::CopyPrivateKey),
+                        localized_yes_no(locale, draft.copy_key_to_ssh_dir),
+                    ),
+                ]
+                .spacing(12),
+            )
+            .push(
+                row![
+                    connection_read_only_field(
+                        locale.text(TextKey::RemotePath),
+                        &draft.remote_path,
+                    ),
+                    connection_read_only_field(
+                        locale.text(TextKey::Mountpoint),
+                        display_draft_mountpoint(draft, locale),
+                    ),
+                ]
+                .spacing(12),
+            );
+        editor_shell(header, scrollable(content), &self.status)
+    }
+
     fn settings_view(&self) -> Element<'_, Message> {
         let locale = self.locale();
         let Some(draft) = &self.settings_draft else {
@@ -3984,6 +5050,103 @@ impl App {
             .spacing(5),
         ]
         .spacing(12);
+        let mount_backend = if mount_backend_settings_visible(std::env::consts::OS) {
+            column![
+                text(match locale {
+                    Locale::English => "Mount method",
+                    Locale::Chinese => "挂载方式",
+                })
+                .size(20),
+                pick_list(
+                    localized_choices(MountBackend::ALL, locale, Locale::mount_backend),
+                    Some(locale.choice(
+                        draft.mount_backend,
+                        locale.mount_backend(draft.mount_backend),
+                    )),
+                    |backend| Message::MountBackendChanged(backend.value)
+                )
+                .width(Fill),
+                text(mount_backend_help(locale)).size(14),
+            ]
+            .spacing(8)
+            .max_width(640)
+        } else {
+            column![]
+        };
+        let credential_storage = column![
+            text(match locale {
+                Locale::English => "Credential storage",
+                Locale::Chinese => "凭据存储",
+            })
+            .size(20),
+            pick_list(
+                localized_choices(CredentialStorage::ALL, locale, Locale::credential_storage,),
+                Some(locale.choice(
+                    draft.credential_storage,
+                    locale.credential_storage(draft.credential_storage),
+                )),
+                |storage| Message::CredentialStorageChanged(storage.value)
+            )
+            .width(Fill),
+            text(credential_storage_help(locale)).size(14),
+        ]
+        .spacing(8)
+        .max_width(640);
+        let appearance = column![
+            text(match locale {
+                Locale::English => "Appearance",
+                Locale::Chinese => "外观",
+            })
+            .size(20),
+            row![
+                labeled_control(
+                    match locale {
+                        Locale::English => "Theme",
+                        Locale::Chinese => "主题",
+                    },
+                    pick_list(
+                        localized_choices(
+                            AppearanceMode::ALL,
+                            locale,
+                            Locale::appearance_mode,
+                        ),
+                        Some(locale.choice(
+                            draft.appearance_mode,
+                            locale.appearance_mode(draft.appearance_mode),
+                        )),
+                        |mode| Message::AppearanceModeChanged(mode.value),
+                    )
+                    .width(Fill),
+                ),
+                labeled_control(
+                    match locale {
+                        Locale::English => "Accent",
+                        Locale::Chinese => "强调色",
+                    },
+                    pick_list(
+                        localized_choices(AccentColor::ALL, locale, Locale::accent_color),
+                        Some(locale.choice(
+                            draft.accent_color,
+                            locale.accent_color(draft.accent_color),
+                        )),
+                        |accent| Message::AccentColorChanged(accent.value),
+                    )
+                    .width(Fill),
+                ),
+            ]
+            .spacing(12),
+            text(match locale {
+                Locale::English => {
+                    "Follow system is detected when the app starts. Theme and accent previews apply immediately; Save makes them persistent."
+                }
+                Locale::Chinese => {
+                    "跟随系统会在应用启动时检测。主题和强调色会立即预览，保存后持久生效。"
+                }
+            })
+            .size(14),
+        ]
+        .spacing(8)
+        .max_width(640);
         let cache_limits = row![
             setting_picker(
                 SettingKind::MaxSize,
@@ -4128,6 +5291,12 @@ impl App {
                     "OpenSSH: {}",
                     available(dependencies.openssh.is_some())
                 )));
+            if cfg!(windows) {
+                dependency_section = dependency_section.push(text(format!(
+                    "Plink (optional interactive sharing): {}",
+                    available(dependencies.plink.is_some())
+                )));
+            }
         }
         dependency_section = dependency_section.push(
             button(match locale {
@@ -4159,10 +5328,15 @@ impl App {
                 Locale::Chinese => format!("可更新至 {}", info.latest_version),
             }));
             if info.asset.is_none() {
-                update_section = update_section.push(text(match locale {
-                    Locale::English => "A verified package is not available for this platform",
-                    Locale::Chinese => "当前平台暂无已验证的安装包",
-                }));
+                update_section = update_section.push(text(info.trust_error.as_ref().map_or_else(
+                    || match locale {
+                        Locale::English => {
+                            "A verified package is not available for this platform".into()
+                        }
+                        Locale::Chinese => "当前平台暂无已验证的安装包".into(),
+                    },
+                    |error| automatic_install_blocked_message(locale, error),
+                )));
             }
         }
         if self.update_downloading {
@@ -4222,6 +5396,9 @@ impl App {
         );
         update_section = update_section.push(row![check, install].spacing(10));
         let content = column![
+            mount_backend,
+            credential_storage,
+            appearance,
             cache_profile,
             cache_limits,
             cache_timing,
@@ -4312,6 +5489,12 @@ impl App {
         })
         .width(Length::Fixed(260.0));
         let Some(log_view) = &self.log_view else {
+            let guidance = match locale {
+                Locale::English => {
+                    "Choose a connection from the selector above to view its mount log."
+                }
+                Locale::Chinese => "请从上方选择器选择一个连接以查看其挂载日志。",
+            };
             return editor_shell(
                 row![
                     text(locale.text(TextKey::Logs)).size(28),
@@ -4321,7 +5504,7 @@ impl App {
                 ]
                 .spacing(10)
                 .align_y(Center),
-                container(text(locale.text(TextKey::NoLogContent)))
+                container(text(guidance).size(18))
                     .center_x(Fill)
                     .center_y(Fill),
                 &self.status,
@@ -4351,6 +5534,21 @@ impl App {
         if log_view.truncated {
             details = details.push(text(locale.text(TextKey::LogTruncated)).size(13));
         }
+        if !log_view.loading && !log_view.existed {
+            details = details.push(
+                text(match locale {
+                    Locale::English => format!(
+                        "No log file exists at {}. This connection may never have been mounted, or logging has not started.",
+                        log_view.path.display()
+                    ),
+                    Locale::Chinese => format!(
+                        "{} 尚不存在。该连接可能从未挂载，或日志记录尚未开始。",
+                        log_view.path.display()
+                    ),
+                })
+                .size(13),
+            );
+        }
         let log_content: Element<'_, Message> = if log_view.content.is_empty() {
             container(text(locale.text(TextKey::NoLogContent)).size(13))
                 .padding(12)
@@ -4367,6 +5565,71 @@ impl App {
         };
         let content = column![details, log_content].spacing(10).height(Fill);
         editor_shell(header, content, &self.status)
+    }
+
+    fn interactive_terminal_view(&self) -> Element<'_, Message> {
+        let locale = self.locale();
+        let Some(server_id) = self.terminal_server_id.as_deref() else {
+            return container(text(locale.text(TextKey::InteractiveTerminalFailed)))
+                .width(Fill)
+                .height(Fill)
+                .into();
+        };
+        if let Some(error) = &self.terminal_error {
+            return column![
+                text(locale.text(TextKey::InteractiveTerminal)).size(24),
+                text(locale.text(TextKey::InteractiveTerminalHelp)).size(13),
+                text(error),
+                row![
+                    button(locale.text(TextKey::RetryTerminal)).on_press(Message::RetryTerminal),
+                    button(locale.text(TextKey::HideTerminal)).on_press(Message::HideTerminal),
+                    button(locale.text(TextKey::EndInteractiveSession))
+                        .on_press(Message::EndInteractiveSession),
+                ]
+                .spacing(10),
+            ]
+            .spacing(10)
+            .padding(14)
+            .into();
+        }
+        let Some(session) = self.interactive_terminals.get(server_id) else {
+            return container(text(locale.text(TextKey::InteractiveTerminalFailed)))
+                .width(Fill)
+                .height(Fill)
+                .into();
+        };
+        let lifecycle = match session.lifecycle {
+            InteractiveTerminalLifecycle::Starting => {
+                locale.text(TextKey::InteractiveTerminalStarting)
+            }
+            InteractiveTerminalLifecycle::Ready => locale.text(TextKey::InteractiveTerminalReady),
+            InteractiveTerminalLifecycle::Exited => locale.text(TextKey::InteractiveTerminalExited),
+            InteractiveTerminalLifecycle::Failed => locale.text(TextKey::InteractiveTerminalFailed),
+        };
+        let terminal = iced_term::TerminalView::show(&session.terminal)
+            .map(|event| Message::TerminalEvent(RedactedTerminalEvent(event)));
+        let controls = row![
+            text(lifecycle),
+            Space::new().width(Fill),
+            button(locale.text(TextKey::RetryTerminal)).on_press_maybe(
+                (session.lifecycle != InteractiveTerminalLifecycle::Starting)
+                    .then_some(Message::RetryTerminal),
+            ),
+            button(locale.text(TextKey::HideTerminal)).on_press(Message::HideTerminal),
+            button(locale.text(TextKey::EndInteractiveSession))
+                .on_press(Message::EndInteractiveSession),
+        ]
+        .spacing(10)
+        .align_y(Center);
+        column![
+            text(locale.text(TextKey::InteractiveTerminal)).size(24),
+            text(locale.text(TextKey::InteractiveTerminalHelp)).size(13),
+            controls,
+            terminal,
+        ]
+        .spacing(10)
+        .padding(14)
+        .into()
     }
 
     fn transfer_popup_view(&self, window: window::Id) -> Element<'_, Message> {
@@ -4482,6 +5745,8 @@ struct ConnectionCardState<'a> {
     can_modify: bool,
     confirming_remove: bool,
     waiting_unmount: bool,
+    operation_error: Option<&'a ConnectionOperationError>,
+    has_interactive_terminal: bool,
 }
 
 fn capacity_progress_view(
@@ -4560,6 +5825,8 @@ fn connection_card<'a>(
         can_modify,
         confirming_remove,
         waiting_unmount,
+        operation_error,
+        has_interactive_terminal,
     } = state;
     let id = server.id.clone();
     let host = format!("{}@{}:{}", server.user, server.host, server.port);
@@ -4611,8 +5878,51 @@ fn connection_card<'a>(
                 .push(progress_bar(0.0..=100.0, snapshot.percentage as f32));
         }
     }
-    let edit = button(locale.text(TextKey::Edit))
-        .on_press_maybe(can_modify.then(|| Message::Edit(id.clone())));
+    if let Some(error) = operation_error {
+        let operation = error.operation;
+        details = details.push(
+            container(
+                column![
+                    text(mount_error_summary(locale, &error.cause)).size(13),
+                    row![
+                        button(match locale {
+                            Locale::English => "Retry",
+                            Locale::Chinese => "重试",
+                        })
+                        .on_press(mount_error_message(
+                            id.clone(),
+                            operation,
+                            MountErrorAction::Retry,
+                        )),
+                        button(match locale {
+                            Locale::English => "View full log",
+                            Locale::Chinese => "查看完整日志",
+                        })
+                        .on_press(mount_error_message(
+                            id.clone(),
+                            operation,
+                            MountErrorAction::ViewLog,
+                        )),
+                        button(match locale {
+                            Locale::English => "Dismiss",
+                            Locale::Chinese => "关闭",
+                        })
+                        .on_press(mount_error_message(
+                            id.clone(),
+                            operation,
+                            MountErrorAction::Dismiss,
+                        )),
+                    ]
+                    .spacing(8),
+                ]
+                .spacing(6),
+            )
+            .padding(10)
+            .width(Fill)
+            .style(container::rounded_box),
+        );
+    }
+    let edit = button(locale.text(TextKey::Edit)).on_press(Message::Edit(id.clone()));
     let actions: Element<'_, Message> = if confirming_remove {
         row![
             button(locale.text(TextKey::Cancel)).on_press(Message::CancelRemove),
@@ -4621,13 +5931,19 @@ fn connection_card<'a>(
         .spacing(8)
         .into()
     } else {
-        row![
-            edit,
-            button(locale.text(TextKey::Remove))
-                .on_press_maybe(can_modify.then_some(Message::Remove(id))),
-        ]
-        .spacing(8)
-        .into()
+        let mut actions = row![edit].spacing(8);
+        if has_interactive_terminal {
+            actions = actions.push(
+                button(locale.text(TextKey::OpenInteractiveTerminal))
+                    .on_press(Message::OpenInteractiveTerminal(id.clone())),
+            );
+        }
+        actions
+            .push(
+                button(locale.text(TextKey::Remove))
+                    .on_press_maybe(can_modify.then_some(Message::Remove(id))),
+            )
+            .into()
     };
     container(
         row![details, operation, open, actions]
@@ -4644,13 +5960,74 @@ fn connection_input<'a>(
     label: &'a str,
     value: &'a str,
     field: ConnectionField,
+    required: bool,
 ) -> iced::widget::Column<'a, Message> {
-    labeled_control(
-        label,
+    column![
+        connection_field_label(label, required),
         text_input(label, value)
             .on_input(move |value| Message::ConnectionFieldChanged(field, value))
             .width(Fill),
-    )
+    ]
+    .spacing(5)
+    .width(Fill)
+}
+
+fn connection_read_only_field<'a>(
+    label: &'a str,
+    value: &'a str,
+) -> iced::widget::Column<'a, Message> {
+    labeled_control(label, container(text(value)).padding(10).width(Fill))
+}
+
+fn secret_input_control<'a>(
+    label: &'a str,
+    placeholder: &'a str,
+    value: &'a str,
+    state: PreservedSecretState,
+    kind: CredentialKind,
+    locale: Locale,
+    required: bool,
+) -> iced::widget::Column<'a, Message> {
+    let input = text_input(placeholder, value)
+        .secure(true)
+        .on_input(move |value| match kind {
+            CredentialKind::Password => Message::PasswordChanged(SecretInput(value)),
+            CredentialKind::KeyPassphrase => Message::KeyPassphraseChanged(SecretInput(value)),
+        })
+        .width(Fill);
+    let mut control = column![connection_field_label(label, required), input]
+        .spacing(5)
+        .width(Fill);
+    if state != PreservedSecretState::Absent {
+        let state_text = match (locale, state) {
+            (Locale::English, PreservedSecretState::System) => {
+                "Stored in the system credential store. Leave blank to keep it, or type to replace it."
+            }
+            (Locale::Chinese, PreservedSecretState::System) => {
+                "已存入系统凭据库。留空会保留，输入新值会替换。"
+            }
+            (Locale::English, PreservedSecretState::Obscured) => {
+                "Stored with rclone obscure. Leave blank to keep it, or type to replace it."
+            }
+            (Locale::Chinese, PreservedSecretState::Obscured) => {
+                "已使用 rclone obscure 保存。留空会保留，输入新值会替换。"
+            }
+            (_, PreservedSecretState::Absent) => unreachable!(),
+        };
+        control = control.push(
+            row![
+                text(state_text).size(12),
+                button(match locale {
+                    Locale::English => "Clear stored value",
+                    Locale::Chinese => "清除已存值",
+                })
+                .on_press(Message::ClearSecret(kind)),
+            ]
+            .spacing(8)
+            .align_y(Center),
+        );
+    }
+    control
 }
 
 fn connection_file_input<'a>(
@@ -4659,9 +6036,10 @@ fn connection_file_input<'a>(
     field: ConnectionField,
     browse: Message,
     browse_label: &'a str,
+    required: bool,
 ) -> iced::widget::Column<'a, Message> {
-    labeled_control(
-        label,
+    column![
+        connection_field_label(label, required),
         row![
             text_input(label, value)
                 .on_input(move |value| Message::ConnectionFieldChanged(field, value))
@@ -4669,7 +6047,17 @@ fn connection_file_input<'a>(
             button(browse_label).on_press(browse),
         ]
         .spacing(8),
-    )
+    ]
+    .spacing(5)
+    .width(Fill)
+}
+
+fn connection_field_label<'a>(label: &'a str, required: bool) -> iced::widget::Row<'a, Message> {
+    let mut content = row![text(label).size(13)].spacing(3).align_y(Center);
+    if required {
+        content = content.push(text("*").size(13).color(Color::from_rgb8(210, 48, 48)));
+    }
+    content
 }
 
 fn setting_picker<'a>(
@@ -5009,6 +6397,197 @@ fn file_manager_settings_visible(os: &str) -> bool {
     matches!(os, "windows" | "linux" | "macos")
 }
 
+fn mount_backend_settings_visible(os: &str) -> bool {
+    os == "macos"
+}
+
+fn mount_backend_help(locale: Locale) -> &'static str {
+    match locale {
+        Locale::English => {
+            "Experimental built-in NFS uses a loopback-only NFS service and does not require macFUSE or FUSE-T. Filesystem semantics, performance, and cache behavior can differ from FUSE. Changes apply to the next mount and do not interrupt active mounts."
+        }
+        Locale::Chinese => {
+            "实验性的内置 NFS 使用仅限本机回环的 NFS 服务，不需要 macFUSE 或 FUSE-T。文件系统语义、性能和缓存行为可能与 FUSE 不同。设置变更仅影响下一次挂载，不会中断已有挂载。"
+        }
+    }
+}
+
+fn credential_storage_help(locale: Locale) -> &'static str {
+    match locale {
+        Locale::English => {
+            "The compatible default uses reversible rclone obscure and is not strong encryption. The system store is opt-in and migrates passwords and private-key passphrases only after write-and-read verification. Private key files remain ordinary files."
+        }
+        Locale::Chinese => {
+            "兼容默认使用可逆的 rclone obscure，并非强加密。系统凭据库需要手动启用；密码和私钥短语只有在写入并回读验证后才会迁移。私钥文件仍作为普通文件保存。"
+        }
+    }
+}
+
+fn credential_storage_confirmation(locale: Locale, target: CredentialStorage) -> &'static str {
+    match (locale, target) {
+        (Locale::English, CredentialStorage::System) => {
+            "Enable the system credential store? Existing passwords and private-key passphrases will be revealed locally, written to the OS store, and read back for verification. A verified rclone-obscured compatibility copy remains in SSH MountMate's private configuration. System-store read failures never silently fall back to it. One-time codes are never stored."
+        }
+        (Locale::Chinese, CredentialStorage::System) => {
+            "是否启用系统凭据库？现有密码和私钥短语会在本机解开，写入系统凭据库并回读验证。SSH MountMate 私有配置会保留一份经过验证的 rclone obscure 兼容副本；系统凭据读取失败时不会静默回退使用它。一次性验证码永远不会保存。"
+        }
+        (Locale::English, CredentialStorage::Obscure) => {
+            "Return to rclone obscure storage? Vault secrets will be converted locally and saved in SSH MountMate's private configuration before vault entries are removed. This is less secure but more compatible."
+        }
+        (Locale::Chinese, CredentialStorage::Obscure) => {
+            "是否恢复为 rclone obscure 存储？系统凭据会先在本机转换并保存到 SSH MountMate 私有配置，之后才删除凭据库条目。这种方式安全性较低但兼容性更好。"
+        }
+    }
+}
+
+fn interactive_auth_help(locale: Locale) -> &'static str {
+    locale.text(TextKey::InteractiveTerminalHelp)
+}
+
+fn connection_method_allowed(
+    source: ConnectionSource,
+    managed_profile: bool,
+    method: ConnectionMethod,
+    windows: bool,
+) -> bool {
+    !(windows
+        && method == ConnectionMethod::Interactive
+        && (matches!(
+            source,
+            ConnectionSource::SshConfig | ConnectionSource::SshConfigBatch
+        ) || managed_profile))
+}
+
+fn interactive_ssh_config_unavailable(locale: Locale) -> &'static str {
+    match locale {
+        Locale::English => {
+            "Interactive shared SSH is unavailable on Windows for SSH-config or app-managed profiles because Plink cannot preserve the full OpenSSH configuration contract."
+        }
+        Locale::Chinese => {
+            "Windows 上的 SSH config 或应用托管配置不能使用交互式共享 SSH，因为 Plink 无法保留完整的 OpenSSH 配置语义。"
+        }
+    }
+}
+
+fn connection_settings_locked_help(locale: Locale) -> &'static str {
+    match locale {
+        Locale::English => {
+            "This connection is mounted or busy. Settings are read-only; unmount it to make changes. Changes take effect on the next mount."
+        }
+        Locale::Chinese => {
+            "此连接已挂载或正在执行操作。当前设置为只读；请先卸载再修改，变更会在下次挂载时生效。"
+        }
+    }
+}
+
+fn system_prefers_dark() -> bool {
+    match dark_light::detect() {
+        Ok(dark_light::Mode::Light) => false,
+        Ok(dark_light::Mode::Dark | dark_light::Mode::Unspecified) | Err(_) => true,
+    }
+}
+
+fn effective_appearance(
+    settings: &Settings,
+    draft: Option<&SettingsDraft>,
+) -> (AppearanceMode, AccentColor) {
+    draft.map_or((settings.appearance_mode, settings.accent_color), |draft| {
+        (draft.appearance_mode, draft.accent_color)
+    })
+}
+
+fn application_theme(mode: AppearanceMode, accent: AccentColor, system_dark: bool) -> Theme {
+    let dark = match mode {
+        AppearanceMode::System => system_dark,
+        AppearanceMode::Light => false,
+        AppearanceMode::Dark => true,
+    };
+    let mut palette = if dark { Palette::DARK } else { Palette::LIGHT };
+    palette.primary = match (accent, dark) {
+        (AccentColor::Blue, false) => Color::from_rgb8(52, 103, 209),
+        (AccentColor::Blue, true) => Color::from_rgb8(110, 168, 254),
+        (AccentColor::Green, false) => Color::from_rgb8(46, 125, 50),
+        (AccentColor::Green, true) => Color::from_rgb8(102, 187, 106),
+        (AccentColor::Amber, false) => Color::from_rgb8(154, 103, 0),
+        (AccentColor::Amber, true) => Color::from_rgb8(255, 200, 87),
+        (AccentColor::Purple, false) => Color::from_rgb8(123, 44, 191),
+        (AccentColor::Purple, true) => Color::from_rgb8(187, 134, 252),
+    };
+    Theme::custom("SSH MountMate", palette)
+}
+
+fn localized_yes_no(locale: Locale, value: bool) -> &'static str {
+    match (locale, value) {
+        (Locale::English, true) => "Yes",
+        (Locale::English, false) => "No",
+        (Locale::Chinese, true) => "是",
+        (Locale::Chinese, false) => "否",
+    }
+}
+
+fn connection_secret_state_label(locale: Locale, state: PreservedSecretState) -> &'static str {
+    match (locale, state) {
+        (Locale::English, PreservedSecretState::System) => "Stored in system credentials",
+        (Locale::English, PreservedSecretState::Obscured) => "Stored with rclone obscure",
+        (Locale::English, PreservedSecretState::Absent) => "Not stored",
+        (Locale::Chinese, PreservedSecretState::System) => "已存入系统凭据库",
+        (Locale::Chinese, PreservedSecretState::Obscured) => "已使用 rclone obscure 保存",
+        (Locale::Chinese, PreservedSecretState::Absent) => "未保存",
+    }
+}
+
+fn display_draft_mountpoint(draft: &ConnectionDraft, locale: Locale) -> &str {
+    if draft.mountpoint.is_empty()
+        || draft.mountpoint == HOME_MOUNTPOINT_VALUE
+        || draft.mountpoint.eq_ignore_ascii_case("auto")
+    {
+        locale.text(TextKey::AutoMountpoint)
+    } else {
+        &draft.mountpoint
+    }
+}
+
+fn openssh_command_preview(config_path: &str, host_alias: &str) -> String {
+    format!(
+        "ssh -F {} {}",
+        quote_command_preview_argument(config_path),
+        quote_command_preview_argument(host_alias)
+    )
+}
+
+fn quote_command_preview_argument(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "-._/:\\".contains(character))
+    {
+        value.into()
+    } else {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\""))
+    }
+}
+
+fn localize_service_error(locale: Locale, error: &ServiceError) -> String {
+    if locale == Locale::English {
+        return error.to_string();
+    }
+    match error {
+        ServiceError::InteractiveSsh(InteractiveSshError::SessionMissing) => {
+            "交互式 SSH 共享会话不可用。请在交互式 SSH 终端中完成登录，然后再次挂载。".into()
+        }
+        ServiceError::InteractiveSsh(InteractiveSshError::UnsupportedWindowsSshConfig) => {
+            "Windows 交互式 SSH 目前仅支持手动直连，不支持 SSH config、ProxyJump 或 ProxyCommand 转换。".into()
+        }
+        ServiceError::InteractiveSsh(InteractiveSshError::PlinkMissing) => {
+            "当前 Windows 程序包缺少已校验的 Plink。".into()
+        }
+        ServiceError::InteractiveSsh(InteractiveSshError::OpenSshMissing) => {
+            "未找到 OpenSSH。".into()
+        }
+        _ => error.to_string(),
+    }
+}
+
 fn settings_folder_input<'a>(
     label: &'a str,
     value: &'a str,
@@ -5101,6 +6680,7 @@ fn localized_draft_field(field: &str) -> &str {
         "Name" => "名称",
         "IP/Host" => "IP / 主机名",
         "User" => "用户",
+        "SSH config file" => "SSH 配置文件",
         _ => field,
     }
 }
@@ -5149,6 +6729,7 @@ fn read_mount_log(path: PathBuf) -> Result<LoadedMountLog, String> {
                 path,
                 content: String::new(),
                 truncated: false,
+                existed: false,
             });
         }
         Err(error) => return Err(format!("{}: {error}", path.display())),
@@ -5175,6 +6756,7 @@ fn read_mount_log(path: PathBuf) -> Result<LoadedMountLog, String> {
         path,
         content: String::from_utf8_lossy(&bytes).into_owned(),
         truncated: start > 0,
+        existed: true,
     })
 }
 
@@ -5248,13 +6830,288 @@ fn rollback_prepared_managed_profile(
     remove_managed_ssh_server(prepared).map_err(|error| error.to_string())
 }
 
-fn obscure_action(service: &MountService, action: &SecretAction) -> Result<Option<String>, String> {
-    match action {
-        SecretAction::Obscure(secret) => service
-            .obscure_secret(secret)
-            .map(Some)
-            .map_err(|error| error.to_string()),
-        SecretAction::Clear | SecretAction::Keep(_) => Ok(None),
+struct PreparedSecret {
+    kind: CredentialKind,
+    obscured: Option<String>,
+    credential: Option<String>,
+    change: Option<CredentialChange>,
+}
+
+impl PreparedSecret {
+    fn apply(&self, server: &mut ServerConfig) {
+        let Some(reference) = &self.credential else {
+            return;
+        };
+        match self.kind {
+            CredentialKind::Password => {
+                server.password_credential.clone_from(reference);
+            }
+            CredentialKind::KeyPassphrase => {
+                server.key_pass_credential.clone_from(reference);
+            }
+        }
+    }
+}
+
+fn prepare_secret_action(
+    service: &MountService,
+    storage: CredentialStorage,
+    server_id: &str,
+    kind: CredentialKind,
+    action: &SecretAction,
+) -> Result<PreparedSecret, String> {
+    let SecretAction::Obscure(secret) = action else {
+        return Ok(PreparedSecret {
+            kind,
+            obscured: None,
+            credential: None,
+            change: None,
+        });
+    };
+    let obscured = service
+        .obscure_secret(secret)
+        .map_err(|error| error.to_string())?;
+    if storage == CredentialStorage::Obscure {
+        return Ok(PreparedSecret {
+            kind,
+            obscured: Some(obscured),
+            credential: None,
+            change: None,
+        });
+    }
+    let reference = credential_reference(server_id, kind);
+    let change = replace_verified(&SystemCredentialStore, &reference, secret)
+        .map_err(|error| error.to_string())?;
+    Ok(PreparedSecret {
+        kind,
+        obscured: Some(obscured),
+        credential: Some(reference),
+        change: Some(change),
+    })
+}
+
+fn rollback_prepared_secret(secret: &PreparedSecret) -> Result<(), String> {
+    if let Some(change) = &secret.change {
+        rollback_change(&SystemCredentialStore, change).map_err(|error| error.to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn rollback_prepared_secrets<'a>(
+    secrets: impl IntoIterator<Item = &'a PreparedSecret>,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for secret in secrets {
+        if let Err(error) = rollback_prepared_secret(secret) {
+            errors.push(error);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+struct CredentialStorageMigration {
+    servers: Vec<ServerConfig>,
+    migrations: Vec<CredentialMigration>,
+    retired_references: Vec<String>,
+}
+
+impl CredentialStorageMigration {
+    fn retire_system_references(&self) -> Result<(), String> {
+        delete_credential_references(&SystemCredentialStore, &self.retired_references)
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn rollback_credential_storage_change(
+    paths: &AppPaths,
+    previous_servers: &[ServerConfig],
+    migration: Option<&CredentialStorageMigration>,
+    message: String,
+) -> String {
+    let Some(migration) = migration else {
+        return message;
+    };
+    rollback_migrations_after_persistence(paths, previous_servers, &migration.migrations, message)
+}
+
+fn credential_presence_summary(stage: &str, servers: &[ServerConfig]) -> String {
+    let records = servers
+        .iter()
+        .map(|server| {
+            format!(
+                "{}[password_obscured={},password_reference={},key_pass_obscured={},key_pass_reference={}]",
+                server.id,
+                !server.password_obscured.is_empty(),
+                !server.password_credential.is_empty(),
+                !server.key_pass_obscured.is_empty(),
+                !server.key_pass_credential.is_empty(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("credential migration {stage}: {records}")
+}
+
+fn rollback_migrations_after_persistence(
+    paths: &AppPaths,
+    previous_servers: &[ServerConfig],
+    migrations: &[CredentialMigration],
+    mut message: String,
+) -> String {
+    match storage::save_servers(paths, previous_servers) {
+        Ok(()) => {
+            for migration in migrations.iter().rev() {
+                if let Err(rollback) = migration.rollback(&SystemCredentialStore) {
+                    message.push_str(&format!("; credential rollback failed: {rollback}"));
+                }
+            }
+        }
+        Err(rollback) => {
+            // Keep the verified system representation when the server record
+            // could not be restored; deleting it here could remove the last
+            // usable copy referenced by the persisted record.
+            message.push_str(&format!("; server rollback failed: {rollback}"));
+        }
+    }
+    message
+}
+
+fn migrate_servers_for_storage(
+    paths: &AppPaths,
+    service: &MountService,
+    servers: &[ServerConfig],
+    target: CredentialStorage,
+) -> Result<CredentialStorageMigration, String> {
+    let mut migrations = Vec::with_capacity(servers.len());
+    for server in servers {
+        let result = match target {
+            CredentialStorage::System => {
+                prepare_server_to_system(server, &SystemCredentialStore, |obscured| {
+                    service
+                        .reveal_secret(obscured)
+                        .map_err(|error| CredentialError::Reveal(error.to_string()))
+                })
+            }
+            CredentialStorage::Obscure => {
+                prepare_server_to_obscure(server, &SystemCredentialStore, |secret| {
+                    service
+                        .obscure_secret(secret)
+                        .map_err(|error| CredentialError::Obscure(error.to_string()))
+                })
+            }
+        };
+        match result {
+            Ok(migration) => migrations.push(migration),
+            Err(error) => {
+                let mut message = error.to_string();
+                for migration in migrations.iter().rev() {
+                    if let Err(rollback) = migration.rollback(&SystemCredentialStore) {
+                        message.push_str(&format!("; credential rollback failed: {rollback}"));
+                    }
+                }
+                return Err(message);
+            }
+        }
+    }
+    let candidates = migrations
+        .iter()
+        .map(|migration| migration.candidate().clone())
+        .collect::<Vec<_>>();
+    let persisted_candidates =
+        persist_and_reload_servers(paths, &candidates, servers, &migrations)?;
+    let mut finalized = Vec::with_capacity(migrations.len());
+    let mut retired_references = Vec::new();
+    for migration in &migrations {
+        let Some(persisted) = persisted_candidates
+            .iter()
+            .find(|server| server.id == migration.candidate().id)
+        else {
+            return Err(rollback_migrations_after_persistence(
+                paths,
+                servers,
+                &migrations,
+                "credential migration persistence verification failed".into(),
+            ));
+        };
+        let finalized_server = match target {
+            CredentialStorage::System => migration
+                .finalize_to_system(persisted)
+                .map(|server| (server, Vec::new())),
+            CredentialStorage::Obscure => migration.finalize_to_obscure(persisted).map(|commit| {
+                let retired = commit.retired_references().to_vec();
+                (commit.into_server(), retired)
+            }),
+        };
+        match finalized_server {
+            Ok((server, retired)) => {
+                finalized.push(server);
+                retired_references.extend(retired);
+            }
+            Err(error) => {
+                return Err(rollback_migrations_after_persistence(
+                    paths,
+                    servers,
+                    &migrations,
+                    error.to_string(),
+                ));
+            }
+        }
+    }
+    let servers = persist_and_reload_servers(paths, &finalized, servers, &migrations)?;
+    Ok(CredentialStorageMigration {
+        servers,
+        migrations,
+        retired_references,
+    })
+}
+
+fn persist_and_reload_servers(
+    paths: &AppPaths,
+    candidate: &[ServerConfig],
+    original: &[ServerConfig],
+    migrations: &[CredentialMigration],
+) -> Result<Vec<ServerConfig>, String> {
+    let result = storage::save_servers(paths, candidate)
+        .map_err(|error| error.to_string())
+        .and_then(|_| storage::load_servers(paths).map_err(|error| error.to_string()))
+        .and_then(|persisted| {
+            (persisted == candidate)
+                .then_some(persisted)
+                .ok_or_else(|| "credential migration persistence verification failed".to_owned())
+        });
+    match result {
+        Ok(persisted) => Ok(persisted),
+        Err(error) => Err(rollback_migrations_after_persistence(
+            paths, original, migrations, error,
+        )),
+    }
+}
+
+fn delete_retired_connection_credentials(
+    previous: &ServerConfig,
+    current: &ServerConfig,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for (old_reference, new_reference) in [
+        (&previous.password_credential, &current.password_credential),
+        (&previous.key_pass_credential, &current.key_pass_credential),
+    ] {
+        if !old_reference.is_empty()
+            && old_reference != new_reference
+            && let Err(error) = SystemCredentialStore.delete(old_reference)
+        {
+            errors.push(error.to_string());
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
     }
 }
 
@@ -5575,6 +7432,13 @@ fn diagnostic_trace(message: &str) {
     }
 }
 
+fn automatic_install_blocked_message(locale: Locale, error: &UpdateTrustError) -> String {
+    match locale {
+        Locale::English => format!("Automatic installation blocked: {error}"),
+        Locale::Chinese => format!("自动安装已被签名验证阻止：{error}"),
+    }
+}
+
 fn main_window_settings() -> window::Settings {
     window::Settings {
         size: Size::new(980.0, 720.0),
@@ -5591,6 +7455,52 @@ fn log_window_settings() -> window::Settings {
         exit_on_close_request: false,
         ..window::Settings::default()
     }
+}
+
+fn terminal_window_settings() -> window::Settings {
+    window::Settings {
+        size: Size::new(980.0, 680.0),
+        position: window::Position::Centered,
+        exit_on_close_request: false,
+        ..window::Settings::default()
+    }
+}
+
+fn strict_terminal_command(
+    command: &InteractiveSshLoginCommand,
+) -> Result<(String, Vec<String>), String> {
+    let program = strict_terminal_text(command.program().as_os_str(), "executable path")?;
+    let mut arguments = Vec::with_capacity(command.arguments().len());
+    for argument in command.arguments() {
+        arguments.push(strict_terminal_text(argument, "argument")?);
+    }
+    Ok((program, arguments))
+}
+
+fn strict_terminal_text(value: &OsStr, kind: &str) -> Result<String, String> {
+    value
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("interactive SSH {kind} is not valid Unicode"))
+}
+
+fn interactive_mount_resume_once(queued: bool, resumed: bool, ready: bool) -> bool {
+    queued && !resumed && ready
+}
+
+fn interactive_mount_poll_eligible(id: &str, queued: bool, saving_id: Option<&str>) -> bool {
+    queued && saving_id != Some(id)
+}
+
+fn interactive_terminal_is_live(lifecycle: InteractiveTerminalLifecycle) -> bool {
+    matches!(
+        lifecycle,
+        InteractiveTerminalLifecycle::Starting | InteractiveTerminalLifecycle::Ready
+    )
+}
+
+fn interactive_session_config_compatible(previous: &ServerConfig, next: &ServerConfig) -> bool {
+    previous == next && next.connection_method == ConnectionMethod::Interactive
 }
 
 fn transfer_window_settings() -> window::Settings {
@@ -5792,6 +7702,62 @@ mod localization_tests {
     use super::*;
 
     #[test]
+    fn mount_error_summary_is_bounded_to_two_lines_and_compact_content() {
+        let cause = "first detail\nsecond detail\nthird detail that should stay in the log";
+        let summary = mount_error_summary(Locale::English, cause);
+        assert_eq!(summary.lines().count(), MOUNT_ERROR_SUMMARY_MAX_LINES);
+        assert!(summary.ends_with('…'));
+        assert!(summary.chars().count() <= MOUNT_ERROR_SUMMARY_MAX_CHARS);
+        assert!(summary.contains("first detail"));
+        assert!(summary.contains("second detail"));
+        assert!(!summary.contains("third detail"));
+
+        let long_line = "x".repeat(MOUNT_ERROR_SUMMARY_LINE_MAX_CHARS + 40);
+        let summary = mount_error_summary(Locale::Chinese, &long_line);
+        assert_eq!(summary.lines().count(), 1);
+        assert!(summary.chars().count() <= MOUNT_ERROR_SUMMARY_MAX_CHARS);
+        assert!(summary.ends_with('…'));
+    }
+
+    #[test]
+    fn mount_error_buttons_route_to_durable_actions() {
+        let retry = mount_error_message(
+            "alpha".into(),
+            MountOperation::Mount,
+            MountErrorAction::Retry,
+        );
+        assert!(matches!(
+            retry,
+            Message::RetryOperation(id, MountOperation::Mount) if id == "alpha"
+        ));
+
+        let view_log = mount_error_message(
+            "alpha".into(),
+            MountOperation::Unmount,
+            MountErrorAction::ViewLog,
+        );
+        assert!(matches!(view_log, Message::OpenOperationLog(id) if id == "alpha"));
+
+        let dismiss = mount_error_message(
+            "alpha".into(),
+            MountOperation::Unmount,
+            MountErrorAction::Dismiss,
+        );
+        assert!(matches!(dismiss, Message::DismissOperationError(id) if id == "alpha"));
+    }
+
+    #[test]
+    fn unsigned_updates_have_explicit_bilingual_block_reasons() {
+        let error = UpdateTrustError::MissingSignature;
+        let english = automatic_install_blocked_message(Locale::English, &error);
+        let chinese = automatic_install_blocked_message(Locale::Chinese, &error);
+        assert!(english.contains("Automatic installation blocked"));
+        assert!(english.contains("signature is missing"));
+        assert!(chinese.contains("自动安装已被签名验证阻止"));
+        assert!(chinese.contains("signature is missing"));
+    }
+
+    #[test]
     fn draft_errors_are_localized_structurally() {
         assert_eq!(
             localize_draft_error(Locale::Chinese, &DraftError::Required("Name")),
@@ -5848,6 +7814,170 @@ mod localization_tests {
         assert!(file_manager_settings_visible("macos"));
         assert!(!file_manager_settings_visible("freebsd"));
         assert!(!file_manager_settings_visible("android"));
+        assert!(mount_backend_settings_visible("macos"));
+        assert!(!mount_backend_settings_visible("windows"));
+        assert!(!mount_backend_settings_visible("linux"));
+    }
+
+    #[test]
+    fn nfs_ui_copy_explains_experimental_loopback_and_semantic_differences() {
+        for locale in [Locale::English, Locale::Chinese] {
+            let label = locale.mount_backend(MountBackend::Nfs);
+            let help = mount_backend_help(locale);
+            assert!(label.contains("NFS"));
+            assert!(help.contains("NFS"));
+            assert!(help.contains("FUSE"));
+        }
+        let english = mount_backend_help(Locale::English);
+        assert!(english.contains("loopback-only"));
+        assert!(english.contains("Experimental"));
+        assert!(english.contains("next mount"));
+        let chinese = mount_backend_help(Locale::Chinese);
+        assert!(chinese.contains("回环"));
+        assert!(chinese.contains("实验"));
+        assert!(chinese.contains("下一次挂载"));
+    }
+
+    #[test]
+    fn credential_ui_keeps_obscure_as_default_and_explains_verified_opt_in() {
+        assert_eq!(
+            Settings::default().credential_storage,
+            CredentialStorage::Obscure
+        );
+        for locale in [Locale::English, Locale::Chinese] {
+            let help = credential_storage_help(locale);
+            let confirmation = credential_storage_confirmation(locale, CredentialStorage::System);
+            assert!(help.contains("rclone obscure"));
+            assert!(confirmation.contains("SSH MountMate"));
+        }
+        assert!(credential_storage_help(Locale::English).contains("write-and-read verification"));
+        assert!(credential_storage_help(Locale::Chinese).contains("回读验证"));
+        assert!(
+            credential_storage_confirmation(Locale::English, CredentialStorage::System)
+                .contains("compatibility copy")
+        );
+        assert!(
+            credential_storage_confirmation(Locale::Chinese, CredentialStorage::System)
+                .contains("兼容副本")
+        );
+    }
+
+    #[test]
+    fn credential_migration_diagnostics_include_only_presence_state() {
+        let server = ServerConfig {
+            id: "alpha".into(),
+            password_obscured: "password-secret-sentinel".into(),
+            key_pass_credential: "credential-secret-sentinel".into(),
+            ..ServerConfig::default()
+        };
+        let summary = credential_presence_summary("before", &[server]);
+        assert!(summary.contains("password_obscured=true"));
+        assert!(summary.contains("password_reference=false"));
+        assert!(summary.contains("key_pass_reference=true"));
+        assert!(!summary.contains("password-secret-sentinel"));
+        assert!(!summary.contains("credential-secret-sentinel"));
+    }
+
+    #[test]
+    fn system_secret_replacement_retains_the_obscured_compatibility_copy() {
+        let mut server = ServerConfig {
+            password_obscured: "obscured-password".into(),
+            key_pass_obscured: "obscured-passphrase".into(),
+            ..ServerConfig::default()
+        };
+        PreparedSecret {
+            kind: CredentialKind::Password,
+            obscured: Some("obscured-password".into()),
+            credential: Some("password-reference".into()),
+            change: None,
+        }
+        .apply(&mut server);
+        PreparedSecret {
+            kind: CredentialKind::KeyPassphrase,
+            obscured: Some("obscured-passphrase".into()),
+            credential: Some("passphrase-reference".into()),
+            change: None,
+        }
+        .apply(&mut server);
+
+        assert_eq!(server.password_obscured, "obscured-password");
+        assert_eq!(server.key_pass_obscured, "obscured-passphrase");
+        assert_eq!(server.password_credential, "password-reference");
+        assert_eq!(server.key_pass_credential, "passphrase-reference");
+    }
+
+    #[test]
+    fn windows_filters_interactive_transport_when_openssh_semantics_are_authoritative() {
+        assert!(!connection_method_allowed(
+            ConnectionSource::SshConfig,
+            false,
+            ConnectionMethod::Interactive,
+            true,
+        ));
+        assert!(!connection_method_allowed(
+            ConnectionSource::Manual,
+            true,
+            ConnectionMethod::Interactive,
+            true,
+        ));
+        assert!(connection_method_allowed(
+            ConnectionSource::SshConfig,
+            false,
+            ConnectionMethod::Openssh,
+            true,
+        ));
+        assert!(connection_method_allowed(
+            ConnectionSource::SshConfig,
+            false,
+            ConnectionMethod::Interactive,
+            false,
+        ));
+    }
+
+    #[test]
+    fn mounted_connection_settings_copy_is_read_only_and_never_reveals_secrets() {
+        assert_eq!(Locale::English.text(TextKey::Edit), "Settings");
+        assert_eq!(Locale::Chinese.text(TextKey::Edit), "设置");
+        assert!(connection_settings_locked_help(Locale::English).contains("read-only"));
+        assert!(connection_settings_locked_help(Locale::Chinese).contains("只读"));
+        assert_eq!(
+            connection_secret_state_label(Locale::English, PreservedSecretState::System),
+            "Stored in system credentials"
+        );
+        assert_eq!(
+            connection_secret_state_label(Locale::Chinese, PreservedSecretState::Obscured),
+            "已使用 rclone obscure 保存"
+        );
+        assert_eq!(localized_yes_no(Locale::English, true), "Yes");
+        assert_eq!(localized_yes_no(Locale::Chinese, false), "否");
+    }
+
+    #[test]
+    fn read_only_settings_use_the_same_mountpoint_display_rules_as_cards() {
+        let mut draft = ConnectionDraft::default();
+        assert_eq!(
+            display_draft_mountpoint(&draft, Locale::English),
+            Locale::English.text(TextKey::AutoMountpoint)
+        );
+        draft.mountpoint = HOME_MOUNTPOINT_VALUE.into();
+        assert_eq!(
+            display_draft_mountpoint(&draft, Locale::Chinese),
+            Locale::Chinese.text(TextKey::AutoMountpoint)
+        );
+        draft.mountpoint = "Z:".into();
+        assert_eq!(display_draft_mountpoint(&draft, Locale::English), "Z:");
+    }
+
+    #[test]
+    fn openssh_command_preview_quotes_unsafe_arguments_without_interpreting_them() {
+        assert_eq!(
+            openssh_command_preview("C:\\Users\\A B\\.ssh\\config", "host alias"),
+            "ssh -F \"C:\\\\Users\\\\A B\\\\.ssh\\\\config\" \"host alias\""
+        );
+        assert_eq!(
+            openssh_command_preview("C:\\Users\\me\\.ssh\\config", "host-a"),
+            "ssh -F C:\\Users\\me\\.ssh\\config host-a"
+        );
     }
 
     #[test]
@@ -5873,6 +8003,7 @@ mod localization_tests {
         assert_eq!(empty.path, missing);
         assert!(empty.content.is_empty());
         assert!(!empty.truncated);
+        assert!(!empty.existed);
 
         let path = temp.path().join("large.log");
         let mut bytes = vec![b'x'; LOG_VIEW_LIMIT as usize + 32];
@@ -5881,6 +8012,7 @@ mod localization_tests {
         let loaded = read_mount_log(path.clone()).unwrap();
         assert_eq!(loaded.path, path);
         assert!(loaded.truncated);
+        assert!(loaded.existed);
         assert_eq!(loaded.content, "final log line\n");
     }
 
@@ -6103,17 +8235,197 @@ mod localization_tests {
         let original = Settings {
             cache_root: PathBuf::from("cache"),
             vfs_upload_transfers: 12,
+            macos_mount_backend: MountBackend::Nfs,
+            credential_storage: CredentialStorage::System,
+            appearance_mode: AppearanceMode::Light,
+            accent_color: AccentColor::Green,
             ..Settings::default()
         };
         let draft = SettingsDraft::from_settings(&original);
         assert_eq!(draft.upload_transfers, "12");
+        assert_eq!(draft.mount_backend, MountBackend::Nfs);
+        assert_eq!(draft.credential_storage, CredentialStorage::System);
+        assert_eq!(draft.appearance_mode, AppearanceMode::Light);
+        assert_eq!(draft.accent_color, AccentColor::Green);
+        let rebuilt = draft.build(&original, Locale::English).unwrap();
+        assert_eq!(rebuilt.vfs_upload_transfers, 12);
+        assert_eq!(rebuilt.macos_mount_backend, MountBackend::Nfs);
+        assert_eq!(rebuilt.credential_storage, CredentialStorage::System);
+        assert_eq!(rebuilt.appearance_mode, AppearanceMode::Light);
+        assert_eq!(rebuilt.accent_color, AccentColor::Green);
+    }
+
+    #[test]
+    fn appearance_choices_are_bilingual_and_generate_contrasting_palettes() {
+        for locale in [Locale::English, Locale::Chinese] {
+            for mode in AppearanceMode::ALL {
+                assert!(!locale.appearance_mode(mode).is_empty());
+            }
+            for accent in AccentColor::ALL {
+                assert!(!locale.accent_color(accent).is_empty());
+            }
+        }
+
+        let followed_light =
+            application_theme(AppearanceMode::System, AccentColor::Amber, false).palette();
+        assert_eq!(followed_light.background, Palette::LIGHT.background);
+
+        for accent in AccentColor::ALL {
+            for mode in [AppearanceMode::Light, AppearanceMode::Dark] {
+                let palette = application_theme(mode, accent, false).palette();
+                let expected_background = if mode == AppearanceMode::Light {
+                    Palette::LIGHT.background
+                } else {
+                    Palette::DARK.background
+                };
+                assert_eq!(palette.background, expected_background);
+                assert!(contrast_ratio(palette.text, palette.background) >= 4.5);
+                assert!(contrast_ratio(palette.primary, palette.background) >= 3.0);
+                assert!(
+                    contrast_ratio(palette.primary, Color::BLACK)
+                        .max(contrast_ratio(palette.primary, Color::WHITE))
+                        >= 4.5
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn appearance_preview_cancel_and_save_select_the_expected_source() {
+        let persisted = Settings {
+            cache_root: PathBuf::from("cache"),
+            appearance_mode: AppearanceMode::Dark,
+            accent_color: AccentColor::Blue,
+            ..Settings::default()
+        };
         assert_eq!(
-            draft
-                .build(&original, Locale::English)
-                .unwrap()
-                .vfs_upload_transfers,
-            12
+            effective_appearance(&persisted, None),
+            (AppearanceMode::Dark, AccentColor::Blue)
         );
+
+        let mut draft = SettingsDraft::from_settings(&persisted);
+        draft.appearance_mode = AppearanceMode::Light;
+        draft.accent_color = AccentColor::Purple;
+        assert_eq!(
+            effective_appearance(&persisted, Some(&draft)),
+            (AppearanceMode::Light, AccentColor::Purple)
+        );
+
+        // Cancel removes the draft, while a successful save replaces the persisted settings.
+        assert_eq!(
+            effective_appearance(&persisted, None),
+            (AppearanceMode::Dark, AccentColor::Blue)
+        );
+        let saved = draft.build(&persisted, Locale::English).unwrap();
+        assert_eq!(
+            effective_appearance(&saved, None),
+            (AppearanceMode::Light, AccentColor::Purple)
+        );
+    }
+
+    fn contrast_ratio(first: Color, second: Color) -> f32 {
+        let lighter = relative_luminance(first).max(relative_luminance(second));
+        let darker = relative_luminance(first).min(relative_luminance(second));
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    fn relative_luminance(color: Color) -> f32 {
+        fn channel(value: f32) -> f32 {
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b)
+    }
+
+    #[test]
+    fn interactive_login_states_are_explained_in_chinese() {
+        let missing = ServiceError::InteractiveSsh(InteractiveSshError::SessionMissing);
+        assert!(localize_service_error(Locale::Chinese, &missing).contains("交互式 SSH 终端"));
+
+        let unsupported =
+            ServiceError::InteractiveSsh(InteractiveSshError::UnsupportedWindowsSshConfig);
+        let message = localize_service_error(Locale::Chinese, &unsupported);
+        assert!(message.contains("手动直连"));
+        assert!(message.contains("ProxyJump"));
+    }
+
+    #[test]
+    fn terminal_event_debug_never_exposes_payload_bytes() {
+        let event = RedactedTerminalEvent(iced_term::Event::BackendCall(
+            7,
+            iced_term::BackendCommand::Write(b"super-secret-password".to_vec()),
+        ));
+        let debug = format!("{event:?}");
+        assert_eq!(debug, "TerminalEvent(<redacted>)");
+        assert!(!debug.contains("super-secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_command_conversion_rejects_non_unicode_without_lossy_fallback() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid = OsString::from_vec(vec![b's', b's', 0xff]);
+        let error = strict_terminal_text(&invalid, "argument").unwrap_err();
+        assert!(error.contains("not valid Unicode"));
+        assert!(!error.contains("ff"));
+    }
+
+    #[test]
+    fn queued_interactive_mount_resumes_once_after_readiness() {
+        assert!(interactive_mount_resume_once(true, false, true));
+        assert!(!interactive_mount_resume_once(true, true, true));
+        assert!(!interactive_mount_resume_once(true, false, false));
+        assert!(!interactive_mount_resume_once(false, false, true));
+    }
+
+    #[test]
+    fn queued_interactive_mount_pauses_while_its_connection_is_saving() {
+        assert!(!interactive_mount_poll_eligible(
+            "editing",
+            true,
+            Some("editing")
+        ));
+        assert!(interactive_mount_poll_eligible(
+            "other",
+            true,
+            Some("editing")
+        ));
+        assert!(interactive_mount_poll_eligible("editing", true, None));
+        assert!(!interactive_mount_poll_eligible("editing", false, None));
+    }
+
+    #[test]
+    fn interactive_session_lifecycle_and_config_changes_require_explicit_cleanup() {
+        assert!(interactive_terminal_is_live(
+            InteractiveTerminalLifecycle::Starting
+        ));
+        assert!(interactive_terminal_is_live(
+            InteractiveTerminalLifecycle::Ready
+        ));
+        assert!(!interactive_terminal_is_live(
+            InteractiveTerminalLifecycle::Exited
+        ));
+
+        let previous = ServerConfig {
+            id: "interactive".into(),
+            connection_method: ConnectionMethod::Interactive,
+            host: "old.example".into(),
+            ..ServerConfig::default()
+        };
+        assert!(interactive_session_config_compatible(&previous, &previous));
+
+        let mut changed = previous.clone();
+        changed.host = "new.example".into();
+        assert!(!interactive_session_config_compatible(&previous, &changed));
+
+        let mut native = previous.clone();
+        native.connection_method = ConnectionMethod::Native;
+        assert!(!interactive_session_config_compatible(&previous, &native));
     }
 
     #[test]

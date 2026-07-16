@@ -11,12 +11,14 @@ use thiserror::Error;
 
 use crate::capacity::{CapacityError, CapacityInfo, mounted_capacity};
 use crate::connection::{SshImportPlan, plan_ssh_imports};
+use crate::credential::{CredentialError, SystemCredentialStore, hydrate_server_from_system};
+use crate::interactive_ssh::{InteractiveSshError, InteractiveSshSession};
 use crate::mountpoint::{HOME_MOUNTPOINT_VALUE, MountpointAllocator, SystemMountpointProbe};
 use crate::paths::AppPaths;
 use crate::process::MountStatus;
 use crate::rc::{HttpRcClient, RcError, RefreshResult};
 use crate::rclone::{
-    RcloneConfigError, RcloneRemote, normalize_explorer_refresh_path,
+    RcloneConfigError, RcloneRemote, clear_rclone_remote_secrets, normalize_explorer_refresh_path,
     normalize_refresh_relative_path, write_rclone_remote,
 };
 use crate::rclone_binary::{RcloneBinaryError, resolve_rclone};
@@ -51,6 +53,10 @@ pub enum ServiceError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Capacity(#[from] CapacityError),
+    #[error(transparent)]
+    Credential(#[from] CredentialError),
+    #[error(transparent)]
+    InteractiveSsh(#[from] InteractiveSshError),
     #[error("rclone obscure failed: {0}")]
     Obscure(String),
     #[error("the selected path is not inside an active SSH MountMate mount: {0}")]
@@ -81,9 +87,11 @@ impl MountService {
         server: &ServerConfig,
         settings: &Settings,
     ) -> Result<MountState, ServiceError> {
+        let external_ssh = self.interactive_ssh_arguments(server)?;
         let rclone = resolve_rclone(&self.paths, &self.app_root, None)?
             .ok_or(ServiceError::RcloneMissing)?;
-        self.ensure_remote(server)?;
+        let prepared_server = self.prepare_server_credentials(server)?;
+        self.ensure_remote(&prepared_server, external_ssh.as_deref())?;
 
         let home = directories::BaseDirs::new()
             .map(|directories| directories.home_dir().to_owned())
@@ -99,17 +107,16 @@ impl MountService {
             expand_home_path(&settings.cache_root).join(server.remote_name())
         };
 
-        self.with_runtime(|runtime| {
+        let result = self.with_runtime(|runtime| {
             loop {
-                let mountpoint =
-                    allocator
-                        .resolve(server)
-                        .map_err(|error| RuntimeError::InvalidMountpoint {
-                            path: PathBuf::from(&server.mountpoint),
-                            message: error.to_string(),
-                        })?;
+                let mountpoint = allocator.resolve(&prepared_server).map_err(|error| {
+                    RuntimeError::InvalidMountpoint {
+                        path: PathBuf::from(&server.mountpoint),
+                        message: error.to_string(),
+                    }
+                })?;
                 match runtime.mount(MountRequest {
-                    server,
+                    server: &prepared_server,
                     settings,
                     rclone: &rclone.path,
                     mountpoint: &mountpoint,
@@ -119,7 +126,9 @@ impl MountService {
                     result => return result.map_err(ServiceError::from),
                 }
             }
-        })
+        });
+        self.finish_secret_use(server, &result)?;
+        result
     }
 
     pub fn unmount(&self, server_id: &str) -> Result<(), ServiceError> {
@@ -146,7 +155,13 @@ impl MountService {
             return Ok(None);
         }
         let state: MountState = read_json(&self.paths.state_file(&server.id))?;
-        mounted_capacity(server, &state, &self.paths.rclone_config()).map_err(ServiceError::from)
+        let external_ssh = self.interactive_ssh_arguments(server)?;
+        let prepared_server = self.prepare_server_credentials(server)?;
+        self.ensure_remote(&prepared_server, external_ssh.as_deref())?;
+        let result = mounted_capacity(&prepared_server, &state, &self.paths.rclone_config())
+            .map_err(ServiceError::from);
+        self.finish_secret_use(server, &result)?;
+        result
     }
 
     pub fn refresh(
@@ -248,6 +263,45 @@ impl MountService {
         }
     }
 
+    pub fn reveal_secret(&self, obscured: &str) -> Result<String, ServiceError> {
+        if obscured.is_empty() {
+            return Err(ServiceError::Obscure("obscured secret is empty".into()));
+        }
+        let rclone = resolve_rclone(&self.paths, &self.app_root, None)?
+            .ok_or(ServiceError::RcloneMissing)?;
+        let mut command = Command::new(&rclone.path);
+        command
+            .args(["reveal", "--"])
+            .arg(obscured)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(windows)]
+        command.creation_flags(0x0800_0000);
+        let output = command
+            .output()
+            .map_err(|error| ServiceError::Obscure(error.to_string()))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            return Err(ServiceError::Obscure(if stderr.is_empty() {
+                format!("process exited with {}", output.status)
+            } else {
+                stderr
+            }));
+        }
+        let plaintext = String::from_utf8(output.stdout)
+            .map_err(|error| ServiceError::Obscure(error.to_string()))?
+            .trim_end_matches(['\r', '\n'])
+            .to_owned();
+        if plaintext.is_empty() {
+            Err(ServiceError::Obscure(
+                "rclone returned an empty revealed value".into(),
+            ))
+        } else {
+            Ok(plaintext)
+        }
+    }
+
     pub fn ssh_import_plan(
         &self,
         config_path: &Path,
@@ -272,9 +326,13 @@ impl MountService {
         Ok(plan_ssh_imports(imports, existing, protected_ids))
     }
 
-    fn ensure_remote(&self, server: &ServerConfig) -> Result<(), ServiceError> {
+    fn ensure_remote(
+        &self,
+        server: &ServerConfig,
+        external_ssh_arguments: Option<&[String]>,
+    ) -> Result<(), ServiceError> {
         let resolved = if server.mode == "ssh_config"
-            && server.connection_method != ConnectionMethod::Openssh
+            && server.connection_method == ConnectionMethod::Native
         {
             let config_value = if !server.ssh_config_path.trim().is_empty() {
                 &server.ssh_config_path
@@ -291,18 +349,75 @@ impl MountService {
         } else {
             None
         };
-        let known_hosts = if server.connection_method == ConnectionMethod::Openssh {
+        let known_hosts = if server.connection_method != ConnectionMethod::Native {
             None
         } else {
             self.known_hosts_for(server, resolved.as_ref())?
         };
-        let remote = RcloneRemote::for_server(
+        let remote = RcloneRemote::for_server_with_external_ssh(
             server,
             resolved.as_ref(),
             known_hosts.as_deref(),
             cfg!(windows),
+            external_ssh_arguments,
         )?;
         write_rclone_remote(&self.paths, &remote)?;
+        Ok(())
+    }
+
+    fn interactive_ssh_arguments(
+        &self,
+        server: &ServerConfig,
+    ) -> Result<Option<Vec<String>>, ServiceError> {
+        if server.connection_method != ConnectionMethod::Interactive {
+            return Ok(None);
+        }
+        let session = InteractiveSshSession::for_server(&self.paths, &self.app_root, server)?;
+        if !session.is_ready() {
+            return Err(InteractiveSshError::SessionMissing.into());
+        }
+        Ok(Some(session.verified_connector_arguments()?.to_vec()))
+    }
+
+    fn hydrate_server_credentials(
+        &self,
+        server: &ServerConfig,
+    ) -> Result<ServerConfig, ServiceError> {
+        if server.password_credential.is_empty() && server.key_pass_credential.is_empty() {
+            return Ok(server.clone());
+        }
+        hydrate_server_from_system(server, &SystemCredentialStore, |secret| {
+            self.obscure_secret(secret)
+                .map_err(|error| CredentialError::Obscure(error.to_string()))
+        })
+        .map_err(ServiceError::from)
+    }
+
+    fn prepare_server_credentials(
+        &self,
+        server: &ServerConfig,
+    ) -> Result<ServerConfig, ServiceError> {
+        if server.connection_method == ConnectionMethod::Native {
+            self.hydrate_server_credentials(server)
+        } else {
+            Ok(server.clone())
+        }
+    }
+
+    fn finish_secret_use<T>(
+        &self,
+        server: &ServerConfig,
+        operation: &Result<T, ServiceError>,
+    ) -> Result<(), ServiceError> {
+        if server.password_credential.is_empty() && server.key_pass_credential.is_empty() {
+            return Ok(());
+        }
+        if let Err(cleanup_error) = clear_rclone_remote_secrets(&self.paths, server.remote_name()) {
+            if operation.is_ok() {
+                let _ = self.unmount(&server.id);
+            }
+            return Err(cleanup_error.into());
+        }
         Ok(())
     }
 
@@ -488,7 +603,7 @@ mod tests {
         fs::create_dir_all(binary.parent().unwrap()).unwrap();
         fs::write(
             &binary,
-            b"#!/bin/sh\n[ \"$1\" = obscure ]\n[ \"$2\" = - ]\nIFS= read -r secret || true\n[ \"$secret\" = 'top secret' ]\nprintf 'obscured-value\\n'\n",
+            b"#!/bin/sh\nif [ \"$1\" = obscure ]; then\n  [ \"$2\" = - ]\n  IFS= read -r secret || true\n  [ \"$secret\" = 'top secret' ]\n  printf 'obscured-value\\n'\nelif [ \"$1\" = reveal ]; then\n  [ \"$2\" = -- ]\n  [ \"$3\" = obscured-value ]\n  printf 'top secret\\n'\nelse\n  exit 1\nfi\n",
         )
         .unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
@@ -505,6 +620,10 @@ mod tests {
         assert_eq!(
             service.obscure_secret("top secret").unwrap(),
             "obscured-value"
+        );
+        assert_eq!(
+            service.reveal_secret("obscured-value").unwrap(),
+            "top secret"
         );
     }
 
@@ -565,5 +684,41 @@ mod tests {
             Some("Folder/Child".into())
         );
         assert_eq!(relative_refresh_dir("Z:\\Folder", "Y:", true), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_interactive_session_does_not_start_a_login_process() {
+        if crate::rclone_binary::find_system_executable("ssh").is_none() {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: temp.path().join("config"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            data_dir: temp.path().join("data"),
+        };
+        let service = MountService::new(paths.clone(), temp.path().join("app"));
+        let server = ServerConfig {
+            id: "missing-session".into(),
+            host: "host.example".into(),
+            user: "alice".into(),
+            connection_method: ConnectionMethod::Interactive,
+            ..ServerConfig::default()
+        };
+
+        let error = service.mount(&server, &Settings::default()).unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::InteractiveSsh(InteractiveSshError::SessionMissing)
+        ));
+        let preferred_control_dir = paths.state_dir.join("ssh-control");
+        if preferred_control_dir.is_dir() {
+            assert_eq!(fs::read_dir(preferred_control_dir).unwrap().count(), 0);
+        }
+        assert!(!paths.config_dir.exists());
+        assert!(!paths.cache_dir.exists());
+        assert!(!paths.data_dir.exists());
     }
 }

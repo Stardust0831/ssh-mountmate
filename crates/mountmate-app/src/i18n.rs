@@ -2,7 +2,9 @@ use std::fmt;
 
 use mountmate_core::connection::{ConnectionSource, ImportAction, ImportStatus};
 use mountmate_core::rc::RefreshResult;
-use mountmate_core::{AuthMethod, ConnectionMethod};
+use mountmate_core::{
+    AccentColor, AppearanceMode, AuthMethod, ConnectionMethod, CredentialStorage, MountBackend,
+};
 
 use super::CacheMode;
 
@@ -81,8 +83,52 @@ impl Locale {
         match (self, value) {
             (Self::English, ConnectionMethod::Native) => "Native SFTP",
             (Self::English, ConnectionMethod::Openssh) => "OpenSSH",
+            (Self::English, ConnectionMethod::Interactive) => "Interactive shared SSH",
             (Self::Chinese, ConnectionMethod::Native) => "原生 SFTP",
             (Self::Chinese, ConnectionMethod::Openssh) => "OpenSSH",
+            (Self::Chinese, ConnectionMethod::Interactive) => "交互式共享 SSH",
+        }
+    }
+
+    pub(crate) fn mount_backend(self, value: MountBackend) -> &'static str {
+        match (self, value) {
+            (Self::English, MountBackend::Fuse) => "FUSE (macFUSE / FUSE-T, default)",
+            (Self::English, MountBackend::Nfs) => "rclone built-in NFS (Experimental)",
+            (Self::Chinese, MountBackend::Fuse) => "FUSE（macFUSE / FUSE-T，默认）",
+            (Self::Chinese, MountBackend::Nfs) => "rclone 内置 NFS（实验性）",
+        }
+    }
+
+    pub(crate) fn credential_storage(self, value: CredentialStorage) -> &'static str {
+        match (self, value) {
+            (Self::English, CredentialStorage::Obscure) => "rclone obscure (compatible default)",
+            (Self::English, CredentialStorage::System) => "System credential store",
+            (Self::Chinese, CredentialStorage::Obscure) => "rclone obscure（兼容默认）",
+            (Self::Chinese, CredentialStorage::System) => "系统凭据库",
+        }
+    }
+
+    pub(crate) fn appearance_mode(self, value: AppearanceMode) -> &'static str {
+        match (self, value) {
+            (Self::English, AppearanceMode::System) => "Follow system",
+            (Self::English, AppearanceMode::Light) => "Light",
+            (Self::English, AppearanceMode::Dark) => "Dark",
+            (Self::Chinese, AppearanceMode::System) => "跟随系统",
+            (Self::Chinese, AppearanceMode::Light) => "浅色",
+            (Self::Chinese, AppearanceMode::Dark) => "深色",
+        }
+    }
+
+    pub(crate) fn accent_color(self, value: AccentColor) -> &'static str {
+        match (self, value) {
+            (Self::English, AccentColor::Blue) => "Blue",
+            (Self::English, AccentColor::Green) => "Green",
+            (Self::English, AccentColor::Amber) => "Amber",
+            (Self::English, AccentColor::Purple) => "Purple",
+            (Self::Chinese, AccentColor::Blue) => "蓝色",
+            (Self::Chinese, AccentColor::Green) => "绿色",
+            (Self::Chinese, AccentColor::Amber) => "琥珀色",
+            (Self::Chinese, AccentColor::Purple) => "紫色",
         }
     }
 
@@ -228,13 +274,18 @@ impl Locale {
         }
     }
 
-    pub(crate) fn exit_warning(self, active: usize, unknown: usize) -> String {
+    pub(crate) fn exit_warning(
+        self,
+        active: usize,
+        unknown: usize,
+        interactive_sessions: usize,
+    ) -> String {
         match self {
             Self::English => format!(
-                "{active} mounted connection(s) still have queued or active uploads, and {unknown} mounted connection(s) have an unknown cloud state. Exiting the interface leaves rclone mounts running, but you will no longer see transfer status. Exit anyway?"
+                "{active} mounted connection(s) still have queued or active uploads, {unknown} mounted connection(s) have an unknown cloud state, and {interactive_sessions} interactive SSH session(s) will end. Exiting the interface leaves rclone mounts running, but you will no longer see transfer status. Exit anyway?"
             ),
             Self::Chinese => format!(
-                "仍有 {active} 个挂载连接存在排队或正在进行的上传，另有 {unknown} 个挂载连接的云端状态未知。退出界面不会停止 rclone 挂载，但你将无法继续查看传输状态。仍要退出吗？"
+                "仍有 {active} 个挂载连接存在排队或正在进行的上传，另有 {unknown} 个挂载连接的云端状态未知，并且 {interactive_sessions} 个交互式 SSH 会话将结束。退出界面不会停止 rclone 挂载，但你将无法继续查看传输状态。仍要退出吗？"
             ),
         }
     }
@@ -382,6 +433,16 @@ pub(crate) enum TextKey {
     TransferCompleted,
     TransferStateUnavailable,
     Transfers,
+    InteractiveTerminal,
+    InteractiveTerminalHelp,
+    InteractiveTerminalStarting,
+    InteractiveTerminalReady,
+    InteractiveTerminalExited,
+    InteractiveTerminalFailed,
+    OpenInteractiveTerminal,
+    RetryTerminal,
+    HideTerminal,
+    EndInteractiveSession,
     Transport,
     Unmount,
     UnmountAll,
@@ -417,8 +478,8 @@ fn english(key: TextKey) -> &'static str {
         TextKey::CopyLog => "Copy log",
         TextKey::CopyPrivateKey => "Copy the private key into ~/.ssh",
         TextKey::DirectoryCacheTime => "Directory cache time",
-        TextKey::Edit => "Edit",
-        TextKey::EditConnection => "Edit connection",
+        TextKey::Edit => "Settings",
+        TextKey::EditConnection => "Connection settings",
         TextKey::Exit => "Exit",
         TextKey::FileManagerIntegration => "File manager integration",
         TextKey::FileManagerIntegrationHelp => {
@@ -503,6 +564,18 @@ fn english(key: TextKey) -> &'static str {
         TextKey::TransferCompleted => "Transfer completed",
         TextKey::TransferStateUnavailable => "Transfer state unavailable",
         TextKey::Transfers => "Transfers",
+        TextKey::InteractiveTerminal => "Interactive SSH terminal",
+        TextKey::InteractiveTerminalHelp => {
+            "Complete SSH authentication in this terminal. Input and output stay in memory only."
+        }
+        TextKey::InteractiveTerminalStarting => "Starting interactive SSH...",
+        TextKey::InteractiveTerminalReady => "SSH session ready; mount will resume automatically",
+        TextKey::InteractiveTerminalExited => "SSH terminal exited",
+        TextKey::InteractiveTerminalFailed => "SSH terminal failed",
+        TextKey::OpenInteractiveTerminal => "Open terminal",
+        TextKey::RetryTerminal => "Retry",
+        TextKey::HideTerminal => "Hide",
+        TextKey::EndInteractiveSession => "End session",
         TextKey::Transport => "Transport",
         TextKey::Unmount => "Unmount",
         TextKey::UnmountAll => "Unmount all",
@@ -539,8 +612,8 @@ fn chinese(key: TextKey) -> &'static str {
         TextKey::CopyLog => "复制日志",
         TextKey::CopyPrivateKey => "将私钥复制到 ~/.ssh",
         TextKey::DirectoryCacheTime => "目录缓存时间",
-        TextKey::Edit => "编辑",
-        TextKey::EditConnection => "编辑连接",
+        TextKey::Edit => "设置",
+        TextKey::EditConnection => "连接设置",
         TextKey::Exit => "退出",
         TextKey::FileManagerIntegration => "文件管理器集成",
         TextKey::FileManagerIntegrationHelp => "为当前用户的文件管理器添加刷新与传输中心命令。",
@@ -621,6 +694,18 @@ fn chinese(key: TextKey) -> &'static str {
         TextKey::TransferCompleted => "传输已完成",
         TextKey::TransferStateUnavailable => "传输状态不可用",
         TextKey::Transfers => "传输",
+        TextKey::InteractiveTerminal => "交互式 SSH 终端",
+        TextKey::InteractiveTerminalHelp => {
+            "请在此终端中完成 SSH 身份验证。输入和输出仅保留在内存中。"
+        }
+        TextKey::InteractiveTerminalStarting => "正在启动交互式 SSH…",
+        TextKey::InteractiveTerminalReady => "SSH 会话已就绪；挂载将自动继续",
+        TextKey::InteractiveTerminalExited => "SSH 终端已退出",
+        TextKey::InteractiveTerminalFailed => "SSH 终端启动失败",
+        TextKey::OpenInteractiveTerminal => "打开终端",
+        TextKey::RetryTerminal => "重试",
+        TextKey::HideTerminal => "隐藏",
+        TextKey::EndInteractiveSession => "结束会话",
         TextKey::Transport => "传输方式",
         TextKey::Unmount => "卸载",
         TextKey::UnmountAll => "全部卸载",
@@ -665,6 +750,27 @@ mod tests {
         let choice = Locale::Chinese.choice(AuthMethod::Key, "私钥");
         assert_eq!(choice.value, AuthMethod::Key);
         assert_eq!(choice.to_string(), "私钥");
+    }
+
+    #[test]
+    fn interactive_connection_method_has_bilingual_labels() {
+        assert_eq!(ConnectionMethod::ALL.len(), 3);
+        assert_eq!(
+            Locale::English.connection_method(ConnectionMethod::Interactive),
+            "Interactive shared SSH"
+        );
+        assert_eq!(
+            Locale::Chinese.connection_method(ConnectionMethod::Interactive),
+            "交互式共享 SSH"
+        );
+    }
+
+    #[test]
+    fn exit_warning_counts_interactive_sessions_in_both_languages() {
+        let english = Locale::English.exit_warning(1, 2, 3);
+        assert!(english.contains("3 interactive SSH session(s) will end"));
+        let chinese = Locale::Chinese.exit_warning(1, 2, 3);
+        assert!(chinese.contains("3 个交互式 SSH 会话将结束"));
     }
 
     #[test]

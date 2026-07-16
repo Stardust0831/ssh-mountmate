@@ -76,6 +76,25 @@ pub struct ConnectionDraft {
     existing: Option<ServerConfig>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreservedSecretState {
+    Absent,
+    Obscured,
+    System,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionRequirements {
+    pub name: bool,
+    pub host_alias: bool,
+    pub host: bool,
+    pub user: bool,
+    pub port: bool,
+    pub ssh_config_path: bool,
+    pub password: bool,
+    pub key_file: bool,
+}
+
 impl fmt::Debug for ConnectionDraft {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -123,6 +142,47 @@ impl Default for ConnectionDraft {
 }
 
 impl ConnectionDraft {
+    pub fn requirements(&self) -> ConnectionRequirements {
+        let native = self.connection_method == ConnectionMethod::Native;
+        let ssh_config_source = matches!(
+            self.source,
+            ConnectionSource::SshConfig | ConnectionSource::SshConfigBatch
+        );
+        ConnectionRequirements {
+            name: true,
+            host_alias: ssh_config_source,
+            host: true,
+            user: true,
+            port: true,
+            ssh_config_path: ssh_config_source,
+            password: native
+                && self.auth == AuthMethod::Password
+                && !self.preserves_password_for_current_target(),
+            key_file: native && self.auth == AuthMethod::Key && !ssh_config_source,
+        }
+    }
+
+    fn preserves_password_for_current_target(&self) -> bool {
+        let Some(existing) = self.existing.as_ref().filter(|existing| {
+            !existing.password_obscured.is_empty() || !existing.password_credential.is_empty()
+        }) else {
+            return false;
+        };
+        let Ok(mountpoint) = normalize_mountpoint(&self.mountpoint) else {
+            return false;
+        };
+        existing.source == self.source.as_str()
+            && existing.auth == AuthMethod::Password
+            && existing.connection_method == ConnectionMethod::Native
+            && existing.host.trim().eq_ignore_ascii_case(self.host.trim())
+            && existing.user.trim() == self.user.trim()
+            && normalize_port(&existing.port) == normalize_port(&self.port)
+            && normalize_remote_path(&existing.remote_path)
+                == normalize_remote_path(&self.remote_path)
+            && normalize_mountpoint(&existing.mountpoint).ok().as_deref()
+                == Some(mountpoint.as_str())
+    }
+
     pub fn from_server(server: &ServerConfig) -> Self {
         Self {
             editing_id: Some(server.id.clone()),
@@ -143,6 +203,51 @@ impl ConnectionDraft {
             copy_key_to_ssh_dir: server.copy_key_to_ssh_dir,
             ssh_config_path: server.ssh_config_path.clone(),
             existing: Some(server.clone()),
+        }
+    }
+
+    /// Explicitly forget a preserved secret while editing. Text inputs remain
+    /// blank for both "keep" and "clear", so the UI must call this method for
+    /// an intentional clear instead of inferring it from an empty input.
+    pub fn clear_preserved_secret(&mut self, kind: crate::credential::CredentialKind) {
+        let Some(existing) = &mut self.existing else {
+            return;
+        };
+        match kind {
+            crate::credential::CredentialKind::Password => {
+                self.password.clear();
+                existing.password_obscured.clear();
+                existing.password_credential.clear();
+            }
+            crate::credential::CredentialKind::KeyPassphrase => {
+                self.key_passphrase.clear();
+                existing.key_pass_obscured.clear();
+                existing.key_pass_credential.clear();
+            }
+        }
+    }
+
+    pub fn preserved_secret_state(
+        &self,
+        kind: crate::credential::CredentialKind,
+    ) -> PreservedSecretState {
+        let Some(existing) = &self.existing else {
+            return PreservedSecretState::Absent;
+        };
+        let (obscured, credential) = match kind {
+            crate::credential::CredentialKind::Password => {
+                (&existing.password_obscured, &existing.password_credential)
+            }
+            crate::credential::CredentialKind::KeyPassphrase => {
+                (&existing.key_pass_obscured, &existing.key_pass_credential)
+            }
+        };
+        if !credential.is_empty() {
+            PreservedSecretState::System
+        } else if !obscured.is_empty() {
+            PreservedSecretState::Obscured
+        } else {
+            PreservedSecretState::Absent
         }
     }
 
@@ -188,22 +293,23 @@ impl ConnectionDraft {
     }
 
     pub fn validate(&self, servers: &[ServerConfig]) -> Result<ValidatedConnection, DraftError> {
+        let requirements = self.requirements();
         let name = required_display_name(&self.name)?;
         let host = required_scalar(&self.host, "IP/Host")?;
         let user = required_scalar(&self.user, "User")?;
         let port = normalize_port(&self.port).ok_or(DraftError::InvalidPort)?;
         let connection_method = self.connection_method;
-        let auth = if connection_method == ConnectionMethod::Openssh {
+        let auth = if connection_method != ConnectionMethod::Native {
             AuthMethod::Key
         } else {
             self.auth
         };
         let key_file = self.key_file.trim().to_owned();
-        if connection_method == ConnectionMethod::Native
-            && auth == AuthMethod::Key
-            && self.source != ConnectionSource::SshConfig
-        {
+        if requirements.key_file {
             validate_private_key(&key_file)?;
+        }
+        if requirements.ssh_config_path && self.ssh_config_path.trim().is_empty() {
+            return Err(DraftError::Required("SSH config file"));
         }
         let mountpoint = normalize_mountpoint(&self.mountpoint)?;
         let remote_path = normalize_remote_path(&self.remote_path);
@@ -251,6 +357,14 @@ impl ConnectionDraft {
             key_file,
             password_obscured: String::new(),
             key_pass_obscured: String::new(),
+            password_credential: self
+                .existing
+                .as_ref()
+                .map_or_else(String::new, |server| server.password_credential.clone()),
+            key_pass_credential: self
+                .existing
+                .as_ref()
+                .map_or_else(String::new, |server| server.key_pass_credential.clone()),
             connection_method,
             remote_path,
             mountpoint,
@@ -292,13 +406,13 @@ impl ConnectionDraft {
             AuthMethod::Password if !self.password.is_empty() => {
                 SecretAction::Obscure(self.password.clone())
             }
-            AuthMethod::Password => self
+            AuthMethod::Password if !requirements.password => self
                 .existing
                 .as_ref()
                 .filter(|existing| same_password_target(existing, &server))
                 .map(|existing| SecretAction::Keep(existing.password_obscured.clone()))
-                .filter(|action| !matches!(action, SecretAction::Keep(value) if value.is_empty()))
                 .ok_or(DraftError::PasswordRequired)?,
+            AuthMethod::Password => return Err(DraftError::PasswordRequired),
             AuthMethod::Key => SecretAction::Clear,
         };
         let key_passphrase =
@@ -310,7 +424,9 @@ impl ConnectionDraft {
                         .as_ref()
                         .filter(|existing| same_key_target(existing, &server))
                         .map_or(SecretAction::Clear, |existing| {
-                            if existing.key_pass_obscured.is_empty() {
+                            if existing.key_pass_obscured.is_empty()
+                                && existing.key_pass_credential.is_empty()
+                            {
                                 SecretAction::Clear
                             } else {
                                 SecretAction::Keep(existing.key_pass_obscured.clone())
@@ -358,6 +474,12 @@ impl ValidatedConnection {
         password: Option<String>,
         key_passphrase: Option<String>,
     ) -> Result<ServerConfig, DraftError> {
+        if !matches!(self.password, SecretAction::Keep(_)) {
+            self.server.password_credential.clear();
+        }
+        if !matches!(self.key_passphrase, SecretAction::Keep(_)) {
+            self.server.key_pass_credential.clear();
+        }
         self.server.password_obscured = resolved_secret(self.password, password)?;
         self.server.key_pass_obscured = resolved_secret(self.key_passphrase, key_passphrase)?;
         Ok(self.server)
@@ -774,9 +896,11 @@ fn merge_imported_connection(existing: &ServerConfig, imported: &ServerConfig) -
     };
     if merged.auth != AuthMethod::Password || !same_password_target(existing, &merged) {
         merged.password_obscured.clear();
+        merged.password_credential.clear();
     }
     if merged.auth != AuthMethod::Key || !same_key_target(existing, &merged) {
         merged.key_pass_obscured.clear();
+        merged.key_pass_credential.clear();
     }
     merged
 }
@@ -817,6 +941,68 @@ mod tests {
     }
 
     #[test]
+    fn editor_requirements_follow_connection_semantics() {
+        let manual_key = ConnectionDraft::default();
+        assert_eq!(
+            manual_key.requirements(),
+            ConnectionRequirements {
+                name: true,
+                host_alias: false,
+                host: true,
+                user: true,
+                port: true,
+                ssh_config_path: false,
+                password: false,
+                key_file: true,
+            }
+        );
+
+        let ssh_config = ConnectionDraft {
+            source: ConnectionSource::SshConfig,
+            ..ConnectionDraft::default()
+        };
+        assert!(ssh_config.requirements().host_alias);
+        assert!(ssh_config.requirements().ssh_config_path);
+        assert!(!ssh_config.requirements().key_file);
+
+        let openssh = ConnectionDraft {
+            connection_method: ConnectionMethod::Openssh,
+            ..ConnectionDraft::default()
+        };
+        assert!(!openssh.requirements().key_file);
+        assert!(!openssh.requirements().password);
+    }
+
+    #[test]
+    fn password_requirement_tracks_whether_the_saved_target_is_still_valid() {
+        let existing = password_server();
+        let mut draft = ConnectionDraft::from_server(&existing);
+        assert!(!draft.requirements().password);
+
+        draft.host = "other.example".into();
+        assert!(draft.requirements().password);
+
+        draft.password = "replacement".into();
+        assert!(draft.requirements().password);
+    }
+
+    #[test]
+    fn ssh_config_path_requirement_is_enforced_by_validation() {
+        let draft = ConnectionDraft {
+            source: ConnectionSource::SshConfig,
+            name: "Alpha".into(),
+            host_alias: "alpha".into(),
+            host: "host.example".into(),
+            user: "alice".into(),
+            ..ConnectionDraft::default()
+        };
+        assert_eq!(
+            draft.validate(&[]),
+            Err(DraftError::Required("SSH config file"))
+        );
+    }
+
+    #[test]
     fn unchanged_password_target_preserves_obscured_secret() {
         let existing = password_server();
         let draft = ConnectionDraft::from_server(&existing);
@@ -828,6 +1014,44 @@ mod tests {
                 .unwrap()
                 .password_obscured,
             "kept-secret"
+        );
+    }
+
+    #[test]
+    fn unchanged_password_target_preserves_system_credential_reference() {
+        let mut existing = password_server();
+        existing.password_obscured.clear();
+        existing.password_credential = "ssh-mountmate:alpha:password".into();
+        let draft = ConnectionDraft::from_server(&existing);
+        let validated = draft.validate(std::slice::from_ref(&existing)).unwrap();
+        assert_eq!(validated.password, SecretAction::Keep(String::new()));
+        let saved = validated.apply_secrets(None, None).unwrap();
+        assert!(saved.password_obscured.is_empty());
+        assert_eq!(saved.password_credential, "ssh-mountmate:alpha:password");
+    }
+
+    #[test]
+    fn explicit_secret_clear_is_distinct_from_a_blank_keep_input() {
+        let mut existing = password_server();
+        existing.password_obscured.clear();
+        existing.password_credential = "ssh-mountmate:alpha:password".into();
+        let mut draft = ConnectionDraft::from_server(&existing);
+
+        assert_eq!(
+            draft.preserved_secret_state(crate::credential::CredentialKind::Password),
+            PreservedSecretState::System
+        );
+
+        draft.clear_preserved_secret(crate::credential::CredentialKind::Password);
+
+        assert_eq!(
+            draft.preserved_secret_state(crate::credential::CredentialKind::Password),
+            PreservedSecretState::Absent
+        );
+
+        assert_eq!(
+            draft.validate(std::slice::from_ref(&existing)),
+            Err(DraftError::PasswordRequired)
         );
     }
 
@@ -936,6 +1160,25 @@ mod tests {
     }
 
     #[test]
+    fn interactive_ssh_does_not_require_or_persist_noninteractive_secrets() {
+        let draft = ConnectionDraft {
+            name: "Interactive".into(),
+            host: "host.example".into(),
+            user: "alice".into(),
+            auth: AuthMethod::Password,
+            password: "one-time-token".into(),
+            key_passphrase: "temporary-passphrase".into(),
+            connection_method: ConnectionMethod::Interactive,
+            ..ConnectionDraft::default()
+        };
+        let validated = draft.validate(&[]).unwrap();
+
+        assert_eq!(validated.server.auth, AuthMethod::Key);
+        assert_eq!(validated.password, SecretAction::Clear);
+        assert_eq!(validated.key_passphrase, SecretAction::Clear);
+    }
+
+    #[test]
     fn new_ids_never_collide() {
         let existing = ServerConfig {
             id: "Alpha".into(),
@@ -1040,6 +1283,8 @@ mod tests {
             auth: AuthMethod::Password,
             password_obscured: "old-password".into(),
             key_pass_obscured: "old-passphrase".into(),
+            password_credential: "old-password-reference".into(),
+            key_pass_credential: "old-passphrase-reference".into(),
             host: "old.example".into(),
             user: "alice".into(),
             ..password_server()
@@ -1056,5 +1301,7 @@ mod tests {
 
         assert!(merged.password_obscured.is_empty());
         assert!(merged.key_pass_obscured.is_empty());
+        assert!(merged.password_credential.is_empty());
+        assert!(merged.key_pass_credential.is_empty());
     }
 }

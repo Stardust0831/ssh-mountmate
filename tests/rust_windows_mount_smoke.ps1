@@ -12,12 +12,19 @@ Get-ChildItem -LiteralPath $sourcePackageRoot -Force |
   Copy-Item -Destination $packageRoot -Recurse -Force
 $binary = Join-Path $packageRoot 'SSHMountMate.exe'
 $rclone = $null
+$plink = $null
+$plinkMaster = $null
+$plinkMasterStdout = $null
+$plinkMasterStderr = $null
 $serverRclone = Join-Path $testRoot 'server-rclone.exe'
 $remoteRoot = Join-Path $testRoot 'remote'
 $serverLog = Join-Path $testRoot 'sftp-server.log'
+$hostKey = Join-Path $testRoot 'sftp-host-key'
+$hostKeyBlob = $null
 $winFspLog = Join-Path $testRoot 'winfsp-install.log'
 $server = $null
 $mounted = $false
+$mountedId = $null
 $succeeded = $false
 
 function Invoke-SSHMountMate([string[]] $Arguments, [switch] $NoCapture) {
@@ -67,9 +74,25 @@ try {
   if (-not (Test-Path $binary -PathType Leaf)) { throw 'Packaged SSH MountMate is missing' }
   $rclone = (Invoke-SSHMountMate @('--rclone-path')).Trim()
   if (-not (Test-Path $rclone -PathType Leaf)) { throw 'Packaged rclone is missing' }
+  $plink = (Invoke-SSHMountMate @('--plink-path')).Trim()
+  if (-not (Test-Path $plink -PathType Leaf)) { throw 'Packaged Plink is missing' }
   Copy-Item $rclone $serverRclone
   New-Item -ItemType Directory -Force $remoteRoot | Out-Null
   Set-Content -Path (Join-Path $remoteRoot 'initial.txt') -Value 'initial remote content' -NoNewline
+
+  $hostKeyInfo = [System.Diagnostics.ProcessStartInfo]::new('ssh-keygen.exe')
+  $hostKeyInfo.UseShellExecute = $false
+  $hostKeyInfo.CreateNoWindow = $true
+  @('-q', '-t', 'ecdsa', '-b', '256', '-N', '', '-f', $hostKey) |
+    ForEach-Object { $hostKeyInfo.ArgumentList.Add($_) }
+  $hostKeyProcess = [System.Diagnostics.Process]::Start($hostKeyInfo)
+  $hostKeyProcess.WaitForExit()
+  if ($hostKeyProcess.ExitCode -ne 0) { throw 'ssh-keygen could not create the test host key' }
+  $hostKeyFields = (Get-Content "$hostKey.pub" -Raw).Trim() -split '\s+'
+  if ($hostKeyFields.Count -lt 2 -or -not $hostKeyFields[1]) {
+    throw 'ssh-keygen produced an invalid public host key'
+  }
+  $hostKeyBlob = $hostKeyFields[1]
 
   Write-Host '[windows-mount-e2e] installing WinFsp'
   $winFspUrl = 'https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi'
@@ -90,38 +113,54 @@ try {
   Get-Service 'WinFsp.Launcher' -ErrorAction Stop | Out-Null
 
   Write-Host '[windows-mount-e2e] starting local SFTP server'
-  $listener = [System.Net.Sockets.TcpListener]::new(
-    [System.Net.IPAddress]::Loopback,
-    0
-  )
-  $listener.Start()
-  $port = ([System.Net.IPEndPoint] $listener.LocalEndpoint).Port
-  $listener.Stop()
+  $serverReady = $false
+  for ($attempt = 0; $attempt -lt 20 -and -not $serverReady; $attempt++) {
+    $listener = [System.Net.Sockets.TcpListener]::new(
+      [System.Net.IPAddress]::Loopback,
+      0
+    )
+    $listener.Start()
+    $port = ([System.Net.IPEndPoint] $listener.LocalEndpoint).Port
+    $listener.Stop()
 
-  $serverInfo = [System.Diagnostics.ProcessStartInfo]::new($serverRclone)
-  $serverInfo.UseShellExecute = $false
-  $serverInfo.CreateNoWindow = $true
-  @(
-    '--cache-dir', (Join-Path $testRoot 'server-cache'),
-    '--log-file', $serverLog,
-    '-vv', 'serve', 'sftp', $remoteRoot,
-    '--addr', "127.0.0.1:$port",
-    '--user', 'mountmate', '--pass', 'test-only-password',
-    '--dir-cache-time', '0s', '--poll-interval', '0'
-  ) | ForEach-Object { $serverInfo.ArgumentList.Add($_) }
-  $server = [System.Diagnostics.Process]::Start($serverInfo)
-  Wait-Until {
-    if ($server.HasExited) { throw "SFTP server exited with $($server.ExitCode)" }
-    $client = [System.Net.Sockets.TcpClient]::new()
-    try {
-      $client.Connect('127.0.0.1', $port)
-      return $true
-    } catch {
-      return $false
-    } finally {
-      $client.Dispose()
+    $serverInfo = [System.Diagnostics.ProcessStartInfo]::new($serverRclone)
+    $serverInfo.UseShellExecute = $false
+    $serverInfo.CreateNoWindow = $true
+    @(
+      '--cache-dir', (Join-Path $testRoot 'server-cache'),
+      '--log-file', $serverLog,
+      '-vv', 'serve', 'sftp', $remoteRoot,
+      '--addr', "127.0.0.1:$port",
+      '--key', $hostKey,
+      '--user', 'mountmate', '--pass', 'test-only-password',
+      '--dir-cache-time', '0s', '--poll-interval', '0'
+    ) | ForEach-Object { $serverInfo.ArgumentList.Add($_) }
+    $server = [System.Diagnostics.Process]::Start($serverInfo)
+    for ($probe = 0; $probe -lt 50; $probe++) {
+      if ($server.HasExited) { break }
+      $client = [System.Net.Sockets.TcpClient]::new()
+      try {
+        $client.Connect('127.0.0.1', $port)
+        $serverReady = $true
+        break
+      } catch {
+        # The listener may still be starting; retry while the child is alive.
+      } finally {
+        $client.Dispose()
+      }
+      Start-Sleep -Milliseconds 100
     }
-  } 50
+    if (-not $serverReady) {
+      if ($server -and -not $server.HasExited) {
+        $server.Kill($true)
+        $server.WaitForExit()
+      }
+      $server = $null
+    }
+  }
+  if (-not $serverReady) {
+    throw 'Failed to start the SFTP server on an available loopback port'
+  }
 
   $drive = @('R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z') |
     Where-Object { -not (Test-Path "${_}:\") } |
@@ -166,6 +205,7 @@ try {
   Write-Host '[windows-mount-e2e] mounting drive'
   Invoke-SSHMountMate -Arguments @('--mount-id', 'local-sftp') -NoCapture | Out-Null
   $mounted = $true
+  $mountedId = 'local-sftp'
   Wait-Until { Test-Path "${mountpoint}\initial.txt" }
   if ((Get-Content "${mountpoint}\initial.txt" -Raw) -ne 'initial remote content') {
     throw 'Mounted initial file content did not match the SFTP source'
@@ -214,23 +254,98 @@ try {
   Write-Host '[windows-mount-e2e] unmounting drive'
   Invoke-SSHMountMate -Arguments @('--unmount-id', 'local-sftp') -NoCapture | Out-Null
   $mounted = $false
+  $mountedId = $null
   Wait-Until { -not (Test-Path "${mountpoint}\") }
   $state = Join-Path $env:LOCALAPPDATA 'rsshmount/State/local-sftp.json'
   if (Test-Path $state) { throw 'Mount state remained after unmount' }
+
+  Write-Host '[windows-mount-e2e] establishing verified Plink connection sharing'
+  $masterInfo = [System.Diagnostics.ProcessStartInfo]::new($plink)
+  $masterInfo.UseShellExecute = $false
+  $masterInfo.CreateNoWindow = $true
+  $masterInfo.RedirectStandardOutput = $true
+  $masterInfo.RedirectStandardError = $true
+  @('-batch', '-ssh', '-share', '-N', '-P', "$port", '-l', 'mountmate', '-pw', 'test-only-password') |
+    ForEach-Object { $masterInfo.ArgumentList.Add($_) }
+  $masterInfo.ArgumentList.Add('-hostkey')
+  $masterInfo.ArgumentList.Add($hostKeyBlob)
+  $masterInfo.ArgumentList.Add('127.0.0.1')
+  $plinkMaster = [System.Diagnostics.Process]::Start($masterInfo)
+  $plinkMasterStdout = $plinkMaster.StandardOutput.ReadToEndAsync()
+  $plinkMasterStderr = $plinkMaster.StandardError.ReadToEndAsync()
+  Wait-Until {
+    if ($plinkMaster.HasExited) {
+      $masterOutput = $plinkMasterStdout.GetAwaiter().GetResult()
+      $masterError = $plinkMasterStderr.GetAwaiter().GetResult()
+      throw "Plink sharing master exited with $($plinkMaster.ExitCode)`n$masterOutput$masterError"
+    }
+    $check = Start-Process -FilePath $plink -ArgumentList @(
+      '-batch', '-ssh', '-shareexists', '-P', "$port", '-l', 'mountmate', '127.0.0.1'
+    ) -Wait -PassThru -WindowStyle Hidden
+    return $check.ExitCode -eq 0
+  } 100
+
+  $interactiveServers = @(
+    [ordered]@{
+      id = 'interactive-sftp'
+      name = 'Interactive SFTP'
+      mode = 'manual'
+      source = 'manual'
+      host = '127.0.0.1'
+      user = 'mountmate'
+      port = "$port"
+      auth = 'key'
+      connection_method = 'interactive'
+      remote_path = ''
+      mountpoint = $mountpoint
+      cache_mode = 'full'
+    }
+  )
+  ConvertTo-Json -InputObject $interactiveServers -Depth 4 |
+    Set-Content (Join-Path $configDir 'servers.json')
+  Invoke-SSHMountMate -Arguments @('--mount-id', 'interactive-sftp') -NoCapture | Out-Null
+  $mounted = $true
+  $mountedId = 'interactive-sftp'
+  Wait-Until { Test-Path "${mountpoint}\initial.txt" }
+  if ((Get-Content "${mountpoint}\initial.txt" -Raw) -ne 'initial remote content') {
+    throw 'Plink-shared mount did not read the SFTP source'
+  }
+  $interactiveRemote = Get-Content (Join-Path $configDir 'rclone.conf') -Raw
+  if ($interactiveRemote -notmatch 'plink[^\r\n]*-batch[^\r\n]*-share') {
+    throw 'Interactive rclone remote did not use Plink sharing'
+  }
+  if ($interactiveRemote -match 'test-only-password') {
+    throw 'Interactive rclone remote leaked the test password'
+  }
+  Invoke-SSHMountMate -Arguments @('--unmount-id', 'interactive-sftp') -NoCapture | Out-Null
+  $mounted = $false
+  $mountedId = $null
+  Wait-Until { -not (Test-Path "${mountpoint}\") }
+  $plinkMaster.Kill($true)
+  $plinkMaster.WaitForExit()
+  $null = $plinkMasterStdout.GetAwaiter().GetResult()
+  $null = $plinkMasterStderr.GetAwaiter().GetResult()
+  $plinkMaster = $null
   Write-Host '[windows-mount-e2e] lifecycle passed'
   $succeeded = $true
 } finally {
   if ($mounted) {
     try {
-      Invoke-SSHMountMate -Arguments @('--unmount-id', 'local-sftp') -NoCapture | Out-Null
+      Invoke-SSHMountMate -Arguments @('--unmount-id', $mountedId) -NoCapture | Out-Null
     } catch {
-      Write-Warning "Failed to unmount local-sftp during cleanup: $($_.Exception.Message)"
+      Write-Warning "Failed to unmount $mountedId during cleanup: $($_.Exception.Message)"
     }
   }
   if ($server -and -not $server.HasExited) {
     $server.Kill($true)
     $server.WaitForExit()
   }
+  if ($plinkMaster -and -not $plinkMaster.HasExited) {
+    $plinkMaster.Kill($true)
+    $plinkMaster.WaitForExit()
+  }
+  if ($plinkMasterStdout) { $null = $plinkMasterStdout.GetAwaiter().GetResult() }
+  if ($plinkMasterStderr) { $null = $plinkMasterStderr.GetAwaiter().GetResult() }
   if (-not $succeeded) {
     if (Test-Path $winFspLog) {
       Write-Host '--- WinFsp installer log ---'

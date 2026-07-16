@@ -11,6 +11,29 @@ server_pid=""
 gui_pid=""
 window_manager_pid=""
 server_ids=(native-a native-b openssh-a openssh-b)
+interactive_id="interactive-a"
+control_candidates=()
+
+allocate_loopback_port() {
+  python3 - <<'PY'
+import socket
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+    listener.bind(("127.0.0.1", 0))
+    print(listener.getsockname()[1])
+PY
+}
+
+locate_control_socket() {
+  local candidate
+  for candidate in "${control_candidates[@]}"; do
+    if [[ -S "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+  return 1
+}
 
 cleanup() {
   status=$?
@@ -44,12 +67,19 @@ cleanup() {
     "${binary}" --unmount-all >/dev/null 2>&1 || true
     "${binary}" --unregister-login-startup >/dev/null 2>&1 || true
   fi
-  for server_id in "${server_ids[@]}"; do
+  for server_id in "${server_ids[@]}" "${interactive_id}"; do
     mountpoint="${mount_root}/${server_id}"
     if mountpoint -q "${mountpoint}"; then
       fusermount3 -u "${mountpoint}" 2>/dev/null || sudo umount "${mountpoint}" 2>/dev/null || true
     fi
   done
+  if [[ -n "${XDG_STATE_HOME:-}" ]]; then
+    control="$(locate_control_socket || true)"
+    if [[ -n "${control}" ]]; then
+      ssh -F "${test_root}/ssh-config" -S "${control}" -O exit local-openssh-a \
+        >/dev/null 2>&1 || true
+    fi
+  fi
   if [[ -n "${server_pid}" ]]; then
     kill "${server_pid}" 2>/dev/null || true
     wait "${server_pid}" 2>/dev/null || true
@@ -100,32 +130,35 @@ cp "${client_key}.pub" "${authorized_keys}"
 chmod 600 "${client_key}" "${host_key}" "${authorized_keys}"
 
 port=""
-for candidate in $(seq 42200 42300); do
-  if ! ss -H -ltn "sport = :${candidate}" | grep -q .; then
-    port="${candidate}"
-    break
+start_server() {
+  if [[ -z "${port}" ]]; then
+    port="$(allocate_loopback_port)"
   fi
-done
-test -n "${port}"
-
-"${rclone}" --cache-dir "${test_root}/server-cache" \
-  --log-file "${test_root}/sftp-server.log" -vv \
-  serve sftp "${remote_root}" --addr "127.0.0.1:${port}" \
-  --authorized-keys "${authorized_keys}" --key "${host_key}" \
-  --dir-cache-time 0s --poll-interval 0 &
-server_pid=$!
-server_ready=false
-for _ in $(seq 1 50); do
-  if ! kill -0 "${server_pid}" 2>/dev/null; then
-    break
-  fi
-  if ss -H -ltn "sport = :${port}" | grep -q .; then
-    server_ready=true
-    break
-  fi
-  sleep 0.1
-done
-test "${server_ready}" == true
+  for _ in $(seq 1 20); do
+    "${rclone}" --cache-dir "${test_root}/server-cache" \
+      --log-file "${test_root}/sftp-server.log" -vv \
+      serve sftp "${remote_root}" --addr "127.0.0.1:${port}" \
+      --authorized-keys "${authorized_keys}" --key "${host_key}" \
+      --dir-cache-time 0s --poll-interval 0 &
+    server_pid=$!
+    for _ in $(seq 1 50); do
+      if ! kill -0 "${server_pid}" 2>/dev/null; then
+        break
+      fi
+      if ss -H -ltn "sport = :${port}" | grep -q .; then
+        return 0
+      fi
+      sleep 0.1
+    done
+    kill "${server_pid}" 2>/dev/null || true
+    wait "${server_pid}" 2>/dev/null || true
+    server_pid=""
+    port="$(allocate_loopback_port)"
+  done
+  echo 'failed to start the SFTP server on an available loopback port' >&2
+  return 1
+}
+start_server
 
 ssh-keyscan -T 5 -t ecdsa -p "${port}" 127.0.0.1 >"${known_hosts}" 2>/dev/null
 test -s "${known_hosts}"
@@ -145,6 +178,15 @@ chmod 600 "${ssh_config}"
 
 config_dir="${XDG_CONFIG_HOME}/rsshmount"
 state_dir="${XDG_STATE_HOME}/rsshmount"
+interactive_digest="$(printf '%s' "${interactive_id}" | sha256sum)"
+interactive_digest="${interactive_digest%% *}"
+state_digest="$(printf '%s' "${state_dir}" | sha256sum)"
+state_digest="${state_digest%% *}"
+control_name="${interactive_digest:0:16}.sock"
+control_candidates=(
+  "${state_dir}/ssh-control/${control_name}"
+  "${TMPDIR:-/tmp}/ssh-mountmate-${state_digest:0:16}/${control_name}"
+)
 mkdir -p "${config_dir}"
 
 jq -n \
@@ -208,6 +250,79 @@ for server_id in "${server_ids[@]}"; do
   test "$(jq -r '.phase' "${state_dir}/${server_id}.json")" = 'mounted'
 done
 
+mkdir -p "${remote_root}/${interactive_id}" "${mount_root}/${interactive_id}"
+printf '%s\n' "content from ${interactive_id}" >"${remote_root}/${interactive_id}/identity.txt"
+interactive_config="${config_dir}/servers.interactive.json"
+jq \
+  --arg ssh_config "${ssh_config}" \
+  --arg port "${port}" \
+  --arg mountpoint "${mount_root}/${interactive_id}" \
+  '. + [{
+    id: "interactive-a", name: "Interactive A", mode: "ssh_config", source: "ssh_config",
+    host_alias: "local-openssh-a", host: "127.0.0.1", user: "mountmate",
+    port: $port, auth: "key", connection_method: "interactive",
+    ssh_config_path: $ssh_config, remote_path: "interactive-a",
+    mountpoint: $mountpoint, cache_mode: "full"
+  }]' "${config_dir}/servers.json" >"${interactive_config}"
+mv "${interactive_config}" "${config_dir}/servers.json"
+
+openbox >"${test_root}/openbox.log" 2>&1 &
+window_manager_pid=$!
+sleep 0.3
+kill -0 "${window_manager_pid}"
+export SSH_MOUNTMATE_TRACE_FILE="${test_root}/gui.trace"
+"${binary}" >"${test_root}/gui.stdout" 2>"${test_root}/gui.stderr" &
+gui_pid=$!
+
+app_command_state="${state_dir}/app-command.json"
+command_ready=false
+for _ in $(seq 1 100); do
+  if ! kill -0 "${gui_pid}" 2>/dev/null; then
+    echo 'SSH MountMate GUI exited before its command endpoint became ready' >&2
+    exit 1
+  fi
+  if [[ -f "${app_command_state}" ]] \
+    && [[ "$(jq -r '.pid // empty' "${app_command_state}" 2>/dev/null || true)" == "${gui_pid}" ]]; then
+    command_ready=true
+    break
+  fi
+  sleep 0.1
+done
+test "${command_ready}" == true
+"${binary}" --mount-id "${interactive_id}"
+shared_ready=false
+terminal_windows=()
+for _ in $(seq 1 200); do
+  if ! kill -0 "${gui_pid}" 2>/dev/null; then
+    echo 'SSH MountMate GUI exited before the interactive terminal became ready' >&2
+    exit 1
+  fi
+  mapfile -t terminal_windows < <(
+    xdotool search --onlyvisible --name 'Interactive SSH terminal' 2>/dev/null || true
+  )
+  control="$(locate_control_socket || true)"
+  if [[ -n "${control}" ]] \
+    && ssh -F "${ssh_config}" -S "${control}" -O check local-openssh-a >/dev/null 2>&1 \
+    && mountpoint -q "${mount_root}/${interactive_id}"; then
+    shared_ready=true
+    break
+  fi
+  sleep 0.1
+done
+if [[ "${shared_ready}" != true ]]; then
+  echo "interactive session did not become ready and mount automatically; visible terminal windows: ${#terminal_windows[@]}" >&2
+  exit 1
+fi
+if [[ "${#terminal_windows[@]}" -ne 1 ]]; then
+  echo "expected one visible interactive terminal window, found ${#terminal_windows[@]}" >&2
+  exit 1
+fi
+mountpoint -q "${mount_root}/${interactive_id}"
+test "$(cat "${mount_root}/${interactive_id}/identity.txt")" = "content from ${interactive_id}"
+grep -F '[interactive-a]' "${config_dir}/rclone.conf"
+grep -F "ControlMaster=no" "${config_dir}/rclone.conf"
+grep -F "BatchMode=yes" "${config_dir}/rclone.conf"
+
 rclone_config="${config_dir}/rclone.conf"
 grep -F '[local-openssh-a]' "${rclone_config}"
 grep -F "ssh = ssh -o BatchMode=yes -F ${ssh_config} local-openssh-a" "${rclone_config}"
@@ -231,13 +346,6 @@ fi
 
 dd if=/dev/zero of="${mount_root}/native-a/popup-upload.bin" bs=1M count=4 conv=fsync status=none
 dd if=/dev/zero of="${mount_root}/openssh-a/popup-upload.bin" bs=1M count=4 conv=fsync status=none
-openbox >"${test_root}/openbox.log" 2>&1 &
-window_manager_pid=$!
-sleep 0.3
-kill -0 "${window_manager_pid}"
-export SSH_MOUNTMATE_TRACE_FILE="${test_root}/gui.trace"
-"${binary}" >"${test_root}/gui.stdout" 2>"${test_root}/gui.stderr" &
-gui_pid=$!
 
 popup_windows=()
 for _ in $(seq 1 150); do

@@ -276,6 +276,28 @@ mod tests {
     }
 
     #[test]
+    fn server_restart_round_trip_preserves_dual_credential_representations() {
+        let temp = tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: temp.path().join("config"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            data_dir: temp.path().join("data"),
+        };
+        let server = ServerConfig {
+            id: "alpha".into(),
+            name: "alpha".into(),
+            key_pass_obscured: "obscured-key-passphrase".into(),
+            key_pass_credential: "ssh-mountmate:alpha:key-passphrase".into(),
+            ..ServerConfig::default()
+        };
+
+        save_servers(&paths, std::slice::from_ref(&server)).unwrap();
+
+        assert_eq!(load_servers(&paths).unwrap(), vec![server]);
+    }
+
+    #[test]
     fn transactional_upsert_preserves_other_connections() {
         let temp = tempdir().unwrap();
         let paths = AppPaths {

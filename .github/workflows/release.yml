@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, for example v0.4.0"
+        description: "Existing release tag, for example v0.4.1-alpha.1"
         required: true
         type: string
       publish:
@@ -26,6 +26,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
+          ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: 1.97.0
@@ -47,12 +48,14 @@ jobs:
           command-arguments: licenses sources
           arguments: --all-features
       - name: Install Linux GUI dependencies
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgtk-3-dev libayatana-appindicator3-dev
+        run: sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 update && sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgtk-3-dev libayatana-appindicator3-dev
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
       - name: Verify live stable and prerelease update channels
-        run: cargo test --package mountmate-core live_release_channels_decode_and_select_expected_versions --all-features -- --ignored --test-threads=1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cargo test --package mountmate-core update_live_ --all-features -- --ignored --test-threads=1
       - name: Install stable Cargo for cross-target license metadata
         run: rustup toolchain install 1.88.0 --profile minimal
       - name: Verify generated Rust license inventory
@@ -87,11 +90,15 @@ jobs:
             rclone_platform: windows
             rclone_arch: amd64
             rclone_sha256: ef097ef9de37a57feb7d9f9c7afb34148ad3c65be8025f1d8f7f521554a701ea
+            plink_arch: w64
+            plink_sha256: e5621ffe4879f0ec39ed40f688db9399c2d43054d41ef14472fa335c4693b915
           - os: windows-11-arm
             asset: SSHMountMate-windows-arm64
             rclone_platform: windows
             rclone_arch: arm64
             rclone_sha256: 72194ad0aaf210d7a55808801191fecc7e175444dab7be7491b7a63074521f3a
+            plink_arch: wa64
+            plink_sha256: 998011ef455dabbb66c176913ea897a58e176402d53dc01607a5b36610a7f5fa
           - os: macos-15-intel
             asset: SSHMountMate-macos-x64
             rclone_platform: osx
@@ -118,6 +125,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
+          ref: ${{ inputs.tag || github.ref }}
       - name: Validate release version
         shell: bash
         env:
@@ -137,7 +145,18 @@ jobs:
           toolchain: 1.97.0
       - name: Install Linux GUI dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dri libgtk-3-dev libayatana-appindicator3-dev zip xvfb xdotool openbox dbus-x11 dunst haskell-gtk-sni-tray-utils weston fuse3 jq kmod openssh-client
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$(dpkg --print-architecture)" = arm64 ]; then
+            sudo find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
+              -exec sed -i \
+                's|http://ports.ubuntu.com/ubuntu-ports|https://mirror.leaseweb.com/ubuntu-ports|g' \
+                {} +
+            grep -Rqs 'https://mirror.leaseweb.com/ubuntu-ports' /etc/apt
+          fi
+          sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dri libgtk-3-dev libayatana-appindicator3-dev zip xvfb xdotool openbox xterm dbus-x11 dunst haskell-gtk-sni-tray-utils weston fuse3 jq kmod openssh-client
       - name: Install verified FUSE-T for macOS mount integration
         if: runner.os == 'macOS'
         shell: bash
@@ -154,6 +173,9 @@ jobs:
           sudo installer -pkg "${RUNNER_TEMP}/${package}" -target /
           test -e /usr/local/lib/libfuse-t.dylib
       - run: cargo test --workspace --all-features
+      - name: Exercise native system credential store
+        if: runner.os == 'Windows' || runner.os == 'macOS'
+        run: cargo test --package mountmate-core live_system_credential_roundtrip --all-features -- --ignored --exact --test-threads=1
       - run: cargo build --release --package ssh-mountmate
 
       - name: Verify Windows execution manifest
@@ -223,7 +245,7 @@ jobs:
           chmod 755 target/release/bin/rclone
           shasum -a 256 target/release/bin/rclone | awk '{print $1}' > target/release/bin/rclone.sha256
 
-      - name: Bundle verified rclone
+      - name: Bundle verified rclone and Plink
         if: runner.os == 'Windows'
         shell: pwsh
         env:
@@ -231,6 +253,9 @@ jobs:
           RCLONE_PLATFORM: ${{ matrix.rclone_platform }}
           RCLONE_ARCH: ${{ matrix.rclone_arch }}
           RCLONE_SHA256: ${{ matrix.rclone_sha256 }}
+          PLINK_VERSION: '0.84'
+          PLINK_ARCH: ${{ matrix.plink_arch }}
+          PLINK_SHA256: ${{ matrix.plink_sha256 }}
         run: |
           $archive = "rclone-$env:RCLONE_VERSION-$env:RCLONE_PLATFORM-$env:RCLONE_ARCH.zip"
           $archivePath = Join-Path $env:RUNNER_TEMP $archive
@@ -245,6 +270,11 @@ jobs:
           Copy-Item $binary.FullName target/release/bin/rclone.exe
           (Get-FileHash -Algorithm SHA256 target/release/bin/rclone.exe).Hash.ToLowerInvariant() |
             Set-Content -NoNewline target/release/bin/rclone.exe.sha256
+          $plinkUrl = "https://the.earth.li/~sgtatham/putty/$env:PLINK_VERSION/$env:PLINK_ARCH/plink.exe"
+          Invoke-WebRequest $plinkUrl -OutFile target/release/bin/plink.exe
+          $plinkActual = (Get-FileHash -Algorithm SHA256 target/release/bin/plink.exe).Hash.ToLowerInvariant()
+          if ($plinkActual -ne $env:PLINK_SHA256) { throw "Plink SHA-256 mismatch: $plinkActual" }
+          $plinkActual | Set-Content -NoNewline target/release/bin/plink.exe.sha256
 
       - name: Assemble directory bundle
         if: runner.os == 'Linux'
@@ -266,10 +296,12 @@ jobs:
           $root = 'target/package/SSHMountMate'
           New-Item -ItemType Directory -Force "$root/bin" | Out-Null
           Copy-Item target/release/SSHMountMate.exe "$root/SSHMountMate.exe"
-          Copy-Item target/release/bin/rclone.exe, target/release/bin/rclone.exe.sha256 "$root/bin/"
+          Copy-Item target/release/bin/rclone.exe, target/release/bin/rclone.exe.sha256, target/release/bin/plink.exe, target/release/bin/plink.exe.sha256 "$root/bin/"
           Copy-Item THIRD_PARTY_NOTICES.md, licenses/*.txt, distribution/SSHMountMate.install-layout $root
           $process = Start-Process -FilePath "$root/SSHMountMate.exe" -ArgumentList '--version' -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "release executable smoke test failed" }
+          $plink = Start-Process -FilePath "$root/bin/plink.exe" -ArgumentList '-V' -Wait -PassThru
+          if ($plink.ExitCode -ne 0) { throw "release Plink smoke test failed" }
 
       - name: Assemble macOS application bundle
         if: runner.os == 'macOS'
@@ -352,6 +384,8 @@ jobs:
         run: |
           $env:SSH_MOUNTMATE_EMBED_RCLONE_PATH = (Resolve-Path 'target/release/bin/rclone.exe').Path
           $env:SSH_MOUNTMATE_EMBED_RCLONE_SHA256 = (Get-Content 'target/release/bin/rclone.exe.sha256' -Raw).Trim()
+          $env:SSH_MOUNTMATE_EMBED_PLINK_PATH = (Resolve-Path 'target/release/bin/plink.exe').Path
+          $env:SSH_MOUNTMATE_EMBED_PLINK_SHA256 = (Get-Content 'target/release/bin/plink.exe.sha256' -Raw).Trim()
           cargo build --release --package ssh-mountmate
           if ($LASTEXITCODE -ne 0) { throw "onefile build failed" }
           New-Item -ItemType Directory -Force target/onefile, release | Out-Null
@@ -385,6 +419,21 @@ jobs:
           }
           $rclone = Start-Process -FilePath $rclonePath -ArgumentList 'version' -Wait -PassThru
           if ($rclone.ExitCode -ne 0) { throw "materialized onefile rclone failed" }
+          $plinkStdout = Join-Path $env:RUNNER_TEMP 'onefile-plink-path.txt'
+          $plinkApp = Start-Process `
+            -FilePath "$test/SSHMountMate.exe" `
+            -ArgumentList '--plink-path' `
+            -RedirectStandardOutput $plinkStdout `
+            -RedirectStandardError $stderr `
+            -Wait -PassThru
+          if ($plinkApp.ExitCode -ne 0) { throw "onefile Plink resolution failed" }
+          $plinkPath = (Get-Content $plinkStdout -Raw).Trim()
+          $plinkActual = (Get-FileHash -Algorithm SHA256 $plinkPath).Hash.ToLowerInvariant()
+          if ($plinkActual -ne $env:SSH_MOUNTMATE_EMBED_PLINK_SHA256) {
+            throw "materialized onefile Plink digest mismatch: $plinkActual"
+          }
+          $plink = Start-Process -FilePath $plinkPath -ArgumentList '-V' -Wait -PassThru
+          if ($plink.ExitCode -ne 0) { throw "materialized onefile Plink failed" }
 
       - name: Extract final Unix release artifact for integration tests
         if: runner.os != 'Windows'
@@ -448,11 +497,17 @@ jobs:
         shell: pwsh
         run: ./tests/rust_windows_mount_smoke.ps1 -PackageRoot (Join-Path $env:RUNNER_TEMP 'shipping-package')
 
-      - name: Exercise real SFTP mount, refresh, upload, and unmount
+      - name: Exercise real macOS FUSE mount lifecycle and performance record
         if: runner.os == 'macOS'
-        timeout-minutes: 5
+        timeout-minutes: 7
         shell: bash
-        run: bash tests/rust_macos_mount_smoke.sh "${RUNNER_TEMP}/shipping-package/SSH MountMate.app"
+        run: bash tests/rust_macos_mount_smoke.sh "${RUNNER_TEMP}/shipping-package/SSH MountMate.app" fuse
+
+      - name: Exercise real macOS NFS mount lifecycle and performance record
+        if: runner.os == 'macOS'
+        timeout-minutes: 7
+        shell: bash
+        run: bash tests/rust_macos_mount_smoke.sh "${RUNNER_TEMP}/shipping-package/SSH MountMate.app" nfs
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -460,16 +515,15 @@ jobs:
           path: release/${{ matrix.asset }}.zip
           if-no-files-found: error
 
-  release:
+  release-set:
     needs: build
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
+          ref: ${{ inputs.tag || github.ref }}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: release-assets
@@ -493,8 +547,111 @@ jobs:
           (cd release-assets && sha256sum SSHMountMate-*.zip > SHA256SUMS.txt)
           (cd release-assets && sha256sum --check SHA256SUMS.txt)
 
-      - name: Create GitHub release
-        if: github.event_name == 'push' || inputs.publish
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: 1.97.0
+
+      - name: Install signing tool system dependencies
+        run: |
+          sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 install -y libdbus-1-dev pkg-config
+
+      - name: Exercise signed release set with an ephemeral test key
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          channel=stable
+          case "${version}" in
+            *-*) channel=prerelease ;;
+          esac
+          cargo build --release --package mountmate-core --bin update-signing
+          target/release/update-signing exercise-local release-assets "${version}" "${channel}"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: SSHMountMate-release-set
+          path: release-assets/
+          if-no-files-found: error
+
+  publish:
+    needs: release-set
+    if: github.event_name == 'push' || inputs.publish
+    runs-on: ubuntu-latest
+    environment: production-update-signing
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: 1.97.0
+      - name: Install signing tool system dependencies
+        run: |
+          sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 install -y libdbus-1-dev pkg-config
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: SSHMountMate-release-set
+          path: release-assets
+
+      - name: Verify the existing tag identifies this exact build
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          git fetch --force origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          tag_commit="$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")"
+          checked_out_commit="$(git rev-parse HEAD)"
+          test "${tag_commit}" = "${checked_out_commit}"
+          if [ "${GITHUB_EVENT_NAME}" = push ]; then
+            test "${tag_commit}" = "${GITHUB_SHA}"
+          fi
+
+      - name: Build signing tool before exposing the private key
+        run: cargo build --release --package mountmate-core --bin update-signing
+
+      - name: Create and verify signed update manifest
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          UPDATE_ED25519_PRIVATE_KEY_PKCS8_B64: ${{ secrets.UPDATE_ED25519_PRIVATE_KEY_PKCS8_B64 }}
+          UPDATE_ED25519_KEY_ID: ${{ vars.UPDATE_ED25519_KEY_ID }}
+        run: |
+          set -euo pipefail
+          test -n "${UPDATE_ED25519_PRIVATE_KEY_PKCS8_B64}"
+          test -n "${UPDATE_ED25519_KEY_ID}"
+          version="${RELEASE_TAG#v}"
+          channel=stable
+          case "${version}" in
+            *-*) channel=prerelease ;;
+          esac
+          env -u UPDATE_ED25519_PRIVATE_KEY_PKCS8_B64 \
+            jq -e --arg key_id "${UPDATE_ED25519_KEY_ID}" \
+            '.keys | any(.key_id == $key_id)' distribution/update-public-keys.json >/dev/null
+          env -u UPDATE_ED25519_PRIVATE_KEY_PKCS8_B64 \
+            target/release/update-signing manifest \
+              release-assets "${version}" "${channel}" "${UPDATE_ED25519_KEY_ID}" \
+              release-assets/SSHMountMate-update-manifest-v1.json
+          printf '%s' "${UPDATE_ED25519_PRIVATE_KEY_PKCS8_B64}" \
+            | env -u UPDATE_ED25519_PRIVATE_KEY_PKCS8_B64 \
+                target/release/update-signing sign \
+                  release-assets/SSHMountMate-update-manifest-v1.json \
+                  release-assets/SSHMountMate-update-manifest-v1.sig
+          unset UPDATE_ED25519_PRIVATE_KEY_PKCS8_B64
+          target/release/update-signing verify-local \
+            release-assets/SSHMountMate-update-manifest-v1.json \
+            release-assets/SSHMountMate-update-manifest-v1.sig \
+            distribution/update-public-keys.json release-assets
+
+      - name: Create draft, verify GitHub metadata, and publish
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -511,16 +668,89 @@ jobs:
             notes=(--notes-file "release-notes/${tag}.md")
           fi
           prerelease=()
+          prerelease_value=false
           case "${tag}" in
-            *-rc*|*-pre*|*-beta*|*-alpha*) prerelease=(--prerelease) ;;
+            *-rc*|*-pre*|*-beta*|*-alpha*) prerelease=(--prerelease); prerelease_value=true ;;
           esac
           mapfile -t files < <(find release-assets -maxdepth 1 -type f | sort)
-          if gh release view "${tag}" --repo "${GH_REPO}" >/dev/null 2>&1; then
-            gh release upload "${tag}" "${files[@]}" --clobber --repo "${GH_REPO}"
-            gh release edit "${tag}" "${notes[@]}" "${prerelease[@]}" --repo "${GH_REPO}"
-          else
-            gh release create "${tag}" "${files[@]}" --repo "${GH_REPO}" \
-              --title "SSH MountMate ${tag}" "${prerelease[@]}" "${notes[@]}"
+          drafts="${RUNNER_TEMP}/github-draft-releases.tsv"
+          gh api --paginate "repos/${GH_REPO}/releases?per_page=100" \
+            --jq '.[] | select(.draft) | [.id, .tag_name] | @tsv' >"${drafts}"
+          draft_count="$(awk -F '\t' -v tag="${tag}" '$2 == tag { count++ } END { print count + 0 }' \
+            "${drafts}")"
+          if gh api "repos/${GH_REPO}/releases/tags/${tag}" >/dev/null 2>&1 \
+            || [ "${draft_count}" -ne 0 ]; then
+            echo "refusing to replace existing GitHub Release ${tag}" >&2
+            exit 1
           fi
-          release_id="$(gh release view "${tag}" --repo "${GH_REPO}" --json databaseId --jq .databaseId)"
-          gh api -X PATCH "repos/${GH_REPO}/releases/${release_id}" -f draft=false >/dev/null
+          release_id=""
+          published=false
+          rollback() {
+            status=$?
+            trap - ERR
+            set +e
+            if [ -z "${release_id}" ]; then
+              gh api --paginate "repos/${GH_REPO}/releases?per_page=100" \
+                --jq '.[] | select(.draft) | [.id, .tag_name] | @tsv' >"${drafts}"
+              release_id="$(awk -F '\t' -v tag="${tag}" \
+                '$2 == tag { count++; id = $1 } END { if (count == 1) print id }' "${drafts}")"
+            fi
+            if [ -n "${release_id}" ]; then
+              if [ "${published}" = true ]; then
+                gh api -X PATCH "repos/${GH_REPO}/releases/${release_id}" \
+                  -F draft=true -F prerelease="${prerelease_value}" >/dev/null
+              else
+                gh api -X DELETE "repos/${GH_REPO}/releases/${release_id}" >/dev/null
+              fi
+            fi
+            exit "${status}"
+          }
+          trap rollback ERR
+          gh release create "${tag}" "${files[@]}" --repo "${GH_REPO}" --draft \
+            --title "SSH MountMate ${tag}" "${prerelease[@]}" "${notes[@]}"
+          metadata="${RUNNER_TEMP}/github-release.json"
+          for _ in $(seq 1 30); do
+            gh api --paginate "repos/${GH_REPO}/releases?per_page=100" \
+              --jq '.[] | select(.draft) | [.id, .tag_name] | @tsv' >"${drafts}"
+            release_id="$(awk -F '\t' -v tag="${tag}" \
+              '$2 == tag { count++; id = $1 } END { if (count == 1) print id }' "${drafts}")"
+            if [ -n "${release_id}" ]; then
+              gh api "repos/${GH_REPO}/releases/${release_id}" >"${metadata}"
+            fi
+            if [ -n "${release_id}" ] && jq -e '
+              [.assets[] | select(.name | startswith("SSHMountMate-") and endswith(".zip"))]
+              | length == 6 and all(.[]; (.digest // "") | startswith("sha256:"))
+            ' "${metadata}" >/dev/null; then
+              break
+            fi
+            release_id=""
+            sleep 2
+          done
+          test -n "${release_id}"
+          expected_metadata="${RUNNER_TEMP}/expected-published-release.json"
+          canonical_base="https://github.com/${GH_REPO}/releases/download/${tag}/"
+          jq --arg canonical_base "${canonical_base}" \
+            '.assets |= map(.browser_download_url = ($canonical_base + .name))' \
+            "${metadata}" >"${expected_metadata}"
+          target/release/update-signing verify-published \
+            release-assets/SSHMountMate-update-manifest-v1.json \
+            release-assets/SSHMountMate-update-manifest-v1.sig \
+            distribution/update-public-keys.json "${expected_metadata}"
+          published=true
+          gh api -X PATCH "repos/${GH_REPO}/releases/${release_id}" \
+            -F draft=false -F prerelease="${prerelease_value}" >/dev/null
+          verified=false
+          for _ in $(seq 1 30); do
+            gh api "repos/${GH_REPO}/releases/${release_id}" >"${metadata}"
+            if target/release/update-signing verify-published \
+              release-assets/SSHMountMate-update-manifest-v1.json \
+              release-assets/SSHMountMate-update-manifest-v1.sig \
+              distribution/update-public-keys.json "${metadata}"; then
+              verified=true
+              break
+            fi
+            sleep 2
+          done
+          test "${verified}" = true
+          test "$(gh api "repos/${GH_REPO}/releases/tags/${tag}" --jq .id)" = "${release_id}"
+          trap - ERR
