@@ -274,6 +274,21 @@ export SSH_MOUNTMATE_TRACE_FILE="${test_root}/gui.trace"
 "${binary}" >"${test_root}/gui.stdout" 2>"${test_root}/gui.stderr" &
 gui_pid=$!
 
+app_command_state="${state_dir}/app-command.json"
+command_ready=false
+for _ in $(seq 1 100); do
+  if ! kill -0 "${gui_pid}" 2>/dev/null; then
+    echo 'SSH MountMate GUI exited before its command endpoint became ready' >&2
+    exit 1
+  fi
+  if [[ -f "${app_command_state}" ]] \
+    && [[ "$(jq -r '.pid // empty' "${app_command_state}" 2>/dev/null || true)" == "${gui_pid}" ]]; then
+    command_ready=true
+    break
+  fi
+  sleep 0.1
+done
+test "${command_ready}" == true
 "${binary}" --mount-id "${interactive_id}"
 shared_ready=false
 terminal_windows=()

@@ -87,9 +87,9 @@ impl MountService {
         server: &ServerConfig,
         settings: &Settings,
     ) -> Result<MountState, ServiceError> {
+        let external_ssh = self.interactive_ssh_arguments(server)?;
         let rclone = resolve_rclone(&self.paths, &self.app_root, None)?
             .ok_or(ServiceError::RcloneMissing)?;
-        let external_ssh = self.interactive_ssh_arguments(server)?;
         let prepared_server = self.prepare_server_credentials(server)?;
         self.ensure_remote(&prepared_server, external_ssh.as_deref())?;
 
@@ -708,7 +708,7 @@ mod tests {
             ..ServerConfig::default()
         };
 
-        let error = service.interactive_ssh_arguments(&server).unwrap_err();
+        let error = service.mount(&server, &Settings::default()).unwrap_err();
         assert!(matches!(
             error,
             ServiceError::InteractiveSsh(InteractiveSshError::SessionMissing)

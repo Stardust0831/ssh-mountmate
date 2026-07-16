@@ -918,6 +918,7 @@ enum Message {
     InteractiveTick,
     TerminalEvent(RedactedTerminalEvent),
     TerminalWindowOpened(window::Id),
+    OpenInteractiveTerminal(String),
     HideTerminal,
     EndInteractiveSession,
     RetryTerminal,
@@ -1274,6 +1275,7 @@ impl App {
                     return Task::none();
                 }
             }
+            Message::OpenInteractiveTerminal(id) => return self.open_terminal_window(id),
             Message::HideTerminal => {
                 if let Some(id) = self.terminal_window.take() {
                     self.terminal_server_id = None;
@@ -2682,7 +2684,7 @@ impl App {
             }
             AppCommand::ExitForReplacement => {
                 if self.busy.is_empty() {
-                    iced::exit()
+                    self.request_exit()
                 } else {
                     self.status = match self.locale() {
                         Locale::English => {
@@ -3753,10 +3755,21 @@ impl App {
     }
 
     fn poll_interactive_terminals(&mut self) -> Task<Message> {
+        let saving_id = self
+            .editor_saving
+            .then(|| {
+                self.connection_draft
+                    .as_ref()
+                    .and_then(|draft| draft.editing_id.clone())
+            })
+            .flatten();
         let ids = self
             .interactive_terminals
             .iter()
-            .filter_map(|(id, session)| session.queued_mount.then_some(id.clone()))
+            .filter_map(|(id, session)| {
+                interactive_mount_poll_eligible(id, session.queued_mount, saving_id.as_deref())
+                    .then_some(id.clone())
+            })
             .collect::<Vec<_>>();
         let mut resume = Vec::new();
         for id in ids {
@@ -4208,6 +4221,9 @@ impl App {
                         confirming_remove: self.pending_delete.as_deref() == Some(&server.id),
                         waiting_unmount: self.pending_unmount_after_sync.contains(&server.id),
                         operation_error: self.operation_errors.get(&server.id),
+                        has_interactive_terminal: self
+                            .interactive_terminals
+                            .contains_key(&server.id),
                     },
                     locale,
                 ));
@@ -5695,6 +5711,7 @@ struct ConnectionCardState<'a> {
     confirming_remove: bool,
     waiting_unmount: bool,
     operation_error: Option<&'a ConnectionOperationError>,
+    has_interactive_terminal: bool,
 }
 
 fn capacity_progress_view(
@@ -5774,6 +5791,7 @@ fn connection_card<'a>(
         confirming_remove,
         waiting_unmount,
         operation_error,
+        has_interactive_terminal,
     } = state;
     let id = server.id.clone();
     let host = format!("{}@{}:{}", server.user, server.host, server.port);
@@ -5878,13 +5896,19 @@ fn connection_card<'a>(
         .spacing(8)
         .into()
     } else {
-        row![
-            edit,
-            button(locale.text(TextKey::Remove))
-                .on_press_maybe(can_modify.then_some(Message::Remove(id))),
-        ]
-        .spacing(8)
-        .into()
+        let mut actions = row![edit].spacing(8);
+        if has_interactive_terminal {
+            actions = actions.push(
+                button(locale.text(TextKey::OpenInteractiveTerminal))
+                    .on_press(Message::OpenInteractiveTerminal(id.clone())),
+            );
+        }
+        actions
+            .push(
+                button(locale.text(TextKey::Remove))
+                    .on_press_maybe(can_modify.then_some(Message::Remove(id))),
+            )
+            .into()
     };
     container(
         row![details, operation, open, actions]
@@ -7429,6 +7453,10 @@ fn interactive_mount_resume_once(queued: bool, resumed: bool, ready: bool) -> bo
     queued && !resumed && ready
 }
 
+fn interactive_mount_poll_eligible(id: &str, queued: bool, saving_id: Option<&str>) -> bool {
+    queued && saving_id != Some(id)
+}
+
 fn interactive_terminal_is_live(lifecycle: InteractiveTerminalLifecycle) -> bool {
     matches!(
         lifecycle,
@@ -8318,6 +8346,22 @@ mod localization_tests {
         assert!(!interactive_mount_resume_once(true, true, true));
         assert!(!interactive_mount_resume_once(true, false, false));
         assert!(!interactive_mount_resume_once(false, false, true));
+    }
+
+    #[test]
+    fn queued_interactive_mount_pauses_while_its_connection_is_saving() {
+        assert!(!interactive_mount_poll_eligible(
+            "editing",
+            true,
+            Some("editing")
+        ));
+        assert!(interactive_mount_poll_eligible(
+            "other",
+            true,
+            Some("editing")
+        ));
+        assert!(interactive_mount_poll_eligible("editing", true, None));
+        assert!(!interactive_mount_poll_eligible("editing", false, None));
     }
 
     #[test]
