@@ -2,7 +2,9 @@ use std::fmt;
 
 use mountmate_core::connection::{ConnectionSource, ImportAction, ImportStatus};
 use mountmate_core::rc::RefreshResult;
-use mountmate_core::{AuthMethod, ConnectionMethod, CredentialStorage, MountBackend};
+use mountmate_core::{
+    AccentColor, AppearanceMode, AuthMethod, ConnectionMethod, CredentialStorage, MountBackend,
+};
 
 use super::CacheMode;
 
@@ -103,6 +105,30 @@ impl Locale {
             (Self::English, CredentialStorage::System) => "System credential store",
             (Self::Chinese, CredentialStorage::Obscure) => "rclone obscure（兼容默认）",
             (Self::Chinese, CredentialStorage::System) => "系统凭据库",
+        }
+    }
+
+    pub(crate) fn appearance_mode(self, value: AppearanceMode) -> &'static str {
+        match (self, value) {
+            (Self::English, AppearanceMode::System) => "Follow system",
+            (Self::English, AppearanceMode::Light) => "Light",
+            (Self::English, AppearanceMode::Dark) => "Dark",
+            (Self::Chinese, AppearanceMode::System) => "跟随系统",
+            (Self::Chinese, AppearanceMode::Light) => "浅色",
+            (Self::Chinese, AppearanceMode::Dark) => "深色",
+        }
+    }
+
+    pub(crate) fn accent_color(self, value: AccentColor) -> &'static str {
+        match (self, value) {
+            (Self::English, AccentColor::Blue) => "Blue",
+            (Self::English, AccentColor::Green) => "Green",
+            (Self::English, AccentColor::Amber) => "Amber",
+            (Self::English, AccentColor::Purple) => "Purple",
+            (Self::Chinese, AccentColor::Blue) => "蓝色",
+            (Self::Chinese, AccentColor::Green) => "绿色",
+            (Self::Chinese, AccentColor::Amber) => "琥珀色",
+            (Self::Chinese, AccentColor::Purple) => "紫色",
         }
     }
 
