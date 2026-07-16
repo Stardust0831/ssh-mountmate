@@ -14,7 +14,8 @@ use iced::widget::{
     text, text_editor, text_input, toggler, tooltip,
 };
 use iced::{
-    Center, Element, Fill, Length, Point, Size, Subscription, Task, Theme, clipboard, window,
+    Center, Color, Element, Fill, Length, Point, Size, Subscription, Task, Theme, clipboard,
+    window,
 };
 use mountmate_core::app_command::{
     AppCommand, AppCommandError, AppCommandServer, InstanceLock, running_instance,
@@ -4060,6 +4061,7 @@ impl App {
         {
             return self.read_only_connection_settings_view(draft, title);
         }
+        let requirements = draft.requirements();
         let header = row![
             text(title).size(28),
             Space::new().width(Fill),
@@ -4104,6 +4106,7 @@ impl App {
                         locale.text(TextKey::SshConfigFile),
                         &draft.ssh_config_path,
                         ConnectionField::SshConfigPath,
+                        requirements.ssh_config_path,
                     ),
                     button(locale.text(TextKey::Browse)).on_press(Message::BrowseSshConfig),
                     button(if self.ssh_import_loading {
@@ -4207,12 +4210,14 @@ impl App {
             connection_input(
                 locale.text(TextKey::Name),
                 &draft.name,
-                ConnectionField::Name
+                ConnectionField::Name,
+                requirements.name,
             ),
             connection_input(
                 locale.text(TextKey::SshHostAlias),
                 &draft.host_alias,
                 ConnectionField::HostAlias,
+                requirements.host_alias,
             ),
         ]
         .spacing(12);
@@ -4231,17 +4236,20 @@ impl App {
                 connection_input(
                     locale.text(TextKey::IpHost),
                     &draft.host,
-                    ConnectionField::Host
+                    ConnectionField::Host,
+                    requirements.host,
                 ),
                 connection_input(
                     locale.text(TextKey::User),
                     &draft.user,
-                    ConnectionField::User
+                    ConnectionField::User,
+                    requirements.user,
                 ),
                 connection_input(
                     locale.text(TextKey::Port),
                     &draft.port,
-                    ConnectionField::Port
+                    ConnectionField::Port,
+                    requirements.port,
                 )
                 .width(Length::Fixed(150.0)),
             ]
@@ -4354,6 +4362,7 @@ impl App {
                         draft.preserved_secret_state(CredentialKind::Password),
                         CredentialKind::Password,
                         locale,
+                        requirements.password,
                     ));
                 }
                 AuthMethod::Key => {
@@ -4365,6 +4374,7 @@ impl App {
                                 ConnectionField::KeyFile,
                                 Message::BrowsePrivateKey,
                                 locale.text(TextKey::Browse),
+                                requirements.key_file,
                             ),
                             secret_input_control(
                                 locale.text(TextKey::KeyPassphrase),
@@ -4373,6 +4383,7 @@ impl App {
                                 draft.preserved_secret_state(CredentialKind::KeyPassphrase),
                                 CredentialKind::KeyPassphrase,
                                 locale,
+                                false,
                             ),
                         ]
                         .spacing(12),
@@ -4420,7 +4431,7 @@ impl App {
         let custom_mountpoint = mountpoint_choice == "custom";
         let mut mountpoint = column![
             row![
-                text(locale.text(TextKey::Mountpoint)).size(13),
+                connection_field_label(locale.text(TextKey::Mountpoint), custom_mountpoint),
                 settings_help(mountpoint_help(locale)),
             ]
             .spacing(5),
@@ -5406,13 +5417,16 @@ fn connection_input<'a>(
     label: &'a str,
     value: &'a str,
     field: ConnectionField,
+    required: bool,
 ) -> iced::widget::Column<'a, Message> {
-    labeled_control(
-        label,
+    column![
+        connection_field_label(label, required),
         text_input(label, value)
             .on_input(move |value| Message::ConnectionFieldChanged(field, value))
             .width(Fill),
-    )
+    ]
+    .spacing(5)
+    .width(Fill)
 }
 
 fn connection_read_only_field<'a>(
@@ -5429,6 +5443,7 @@ fn secret_input_control<'a>(
     state: PreservedSecretState,
     kind: CredentialKind,
     locale: Locale,
+    required: bool,
 ) -> iced::widget::Column<'a, Message> {
     let input = text_input(placeholder, value)
         .secure(true)
@@ -5437,7 +5452,9 @@ fn secret_input_control<'a>(
             CredentialKind::KeyPassphrase => Message::KeyPassphraseChanged(SecretInput(value)),
         })
         .width(Fill);
-    let mut control = labeled_control(label, input);
+    let mut control = column![connection_field_label(label, required), input]
+        .spacing(5)
+        .width(Fill);
     if state != PreservedSecretState::Absent {
         let state_text = match (locale, state) {
             (Locale::English, PreservedSecretState::System) => {
@@ -5476,9 +5493,10 @@ fn connection_file_input<'a>(
     field: ConnectionField,
     browse: Message,
     browse_label: &'a str,
+    required: bool,
 ) -> iced::widget::Column<'a, Message> {
-    labeled_control(
-        label,
+    column![
+        connection_field_label(label, required),
         row![
             text_input(label, value)
                 .on_input(move |value| Message::ConnectionFieldChanged(field, value))
@@ -5486,7 +5504,20 @@ fn connection_file_input<'a>(
             button(browse_label).on_press(browse),
         ]
         .spacing(8),
-    )
+    ]
+    .spacing(5)
+    .width(Fill)
+}
+
+fn connection_field_label<'a>(
+    label: &'a str,
+    required: bool,
+) -> iced::widget::Row<'a, Message> {
+    let mut content = row![text(label).size(13)].spacing(3).align_y(Center);
+    if required {
+        content = content.push(text("*").size(13).color(Color::from_rgb8(210, 48, 48)));
+    }
+    content
 }
 
 fn setting_picker<'a>(
@@ -6092,6 +6123,7 @@ fn localized_draft_field(field: &str) -> &str {
         "Name" => "名称",
         "IP/Host" => "IP / 主机名",
         "User" => "用户",
+        "SSH config file" => "SSH 配置文件",
         _ => field,
     }
 }

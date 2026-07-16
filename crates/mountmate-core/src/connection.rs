@@ -83,6 +83,18 @@ pub enum PreservedSecretState {
     System,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionRequirements {
+    pub name: bool,
+    pub host_alias: bool,
+    pub host: bool,
+    pub user: bool,
+    pub port: bool,
+    pub ssh_config_path: bool,
+    pub password: bool,
+    pub key_file: bool,
+}
+
 impl fmt::Debug for ConnectionDraft {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -130,6 +142,47 @@ impl Default for ConnectionDraft {
 }
 
 impl ConnectionDraft {
+    pub fn requirements(&self) -> ConnectionRequirements {
+        let native = self.connection_method == ConnectionMethod::Native;
+        let ssh_config_source = matches!(
+            self.source,
+            ConnectionSource::SshConfig | ConnectionSource::SshConfigBatch
+        );
+        ConnectionRequirements {
+            name: true,
+            host_alias: ssh_config_source,
+            host: true,
+            user: true,
+            port: true,
+            ssh_config_path: ssh_config_source,
+            password: native
+                && self.auth == AuthMethod::Password
+                && !self.preserves_password_for_current_target(),
+            key_file: native && self.auth == AuthMethod::Key && !ssh_config_source,
+        }
+    }
+
+    fn preserves_password_for_current_target(&self) -> bool {
+        let Some(existing) = self.existing.as_ref().filter(|existing| {
+            !existing.password_obscured.is_empty() || !existing.password_credential.is_empty()
+        }) else {
+            return false;
+        };
+        let Ok(mountpoint) = normalize_mountpoint(&self.mountpoint) else {
+            return false;
+        };
+        existing.source == self.source.as_str()
+            && existing.auth == AuthMethod::Password
+            && existing.connection_method == ConnectionMethod::Native
+            && existing.host.trim().eq_ignore_ascii_case(self.host.trim())
+            && existing.user.trim() == self.user.trim()
+            && normalize_port(&existing.port) == normalize_port(&self.port)
+            && normalize_remote_path(&existing.remote_path)
+                == normalize_remote_path(&self.remote_path)
+            && normalize_mountpoint(&existing.mountpoint).ok().as_deref()
+                == Some(mountpoint.as_str())
+    }
+
     pub fn from_server(server: &ServerConfig) -> Self {
         Self {
             editing_id: Some(server.id.clone()),
@@ -240,6 +293,7 @@ impl ConnectionDraft {
     }
 
     pub fn validate(&self, servers: &[ServerConfig]) -> Result<ValidatedConnection, DraftError> {
+        let requirements = self.requirements();
         let name = required_display_name(&self.name)?;
         let host = required_scalar(&self.host, "IP/Host")?;
         let user = required_scalar(&self.user, "User")?;
@@ -251,11 +305,11 @@ impl ConnectionDraft {
             self.auth
         };
         let key_file = self.key_file.trim().to_owned();
-        if connection_method == ConnectionMethod::Native
-            && auth == AuthMethod::Key
-            && self.source != ConnectionSource::SshConfig
-        {
+        if requirements.key_file {
             validate_private_key(&key_file)?;
+        }
+        if requirements.ssh_config_path && self.ssh_config_path.trim().is_empty() {
+            return Err(DraftError::Required("SSH config file"));
         }
         let mountpoint = normalize_mountpoint(&self.mountpoint)?;
         let remote_path = normalize_remote_path(&self.remote_path);
@@ -352,18 +406,13 @@ impl ConnectionDraft {
             AuthMethod::Password if !self.password.is_empty() => {
                 SecretAction::Obscure(self.password.clone())
             }
-            AuthMethod::Password => self
+            AuthMethod::Password if !requirements.password => self
                 .existing
                 .as_ref()
                 .filter(|existing| same_password_target(existing, &server))
                 .map(|existing| SecretAction::Keep(existing.password_obscured.clone()))
-                .filter(|_| {
-                    self.existing.as_ref().is_some_and(|existing| {
-                        !existing.password_obscured.is_empty()
-                            || !existing.password_credential.is_empty()
-                    })
-                })
                 .ok_or(DraftError::PasswordRequired)?,
+            AuthMethod::Password => return Err(DraftError::PasswordRequired),
             AuthMethod::Key => SecretAction::Clear,
         };
         let key_passphrase =
@@ -889,6 +938,68 @@ mod tests {
             password_obscured: "kept-secret".into(),
             ..ServerConfig::default()
         }
+    }
+
+    #[test]
+    fn editor_requirements_follow_connection_semantics() {
+        let manual_key = ConnectionDraft::default();
+        assert_eq!(
+            manual_key.requirements(),
+            ConnectionRequirements {
+                name: true,
+                host_alias: false,
+                host: true,
+                user: true,
+                port: true,
+                ssh_config_path: false,
+                password: false,
+                key_file: true,
+            }
+        );
+
+        let ssh_config = ConnectionDraft {
+            source: ConnectionSource::SshConfig,
+            ..ConnectionDraft::default()
+        };
+        assert!(ssh_config.requirements().host_alias);
+        assert!(ssh_config.requirements().ssh_config_path);
+        assert!(!ssh_config.requirements().key_file);
+
+        let openssh = ConnectionDraft {
+            connection_method: ConnectionMethod::Openssh,
+            ..ConnectionDraft::default()
+        };
+        assert!(!openssh.requirements().key_file);
+        assert!(!openssh.requirements().password);
+    }
+
+    #[test]
+    fn password_requirement_tracks_whether_the_saved_target_is_still_valid() {
+        let existing = password_server();
+        let mut draft = ConnectionDraft::from_server(&existing);
+        assert!(!draft.requirements().password);
+
+        draft.host = "other.example".into();
+        assert!(draft.requirements().password);
+
+        draft.password = "replacement".into();
+        assert!(draft.requirements().password);
+    }
+
+    #[test]
+    fn ssh_config_path_requirement_is_enforced_by_validation() {
+        let draft = ConnectionDraft {
+            source: ConnectionSource::SshConfig,
+            name: "Alpha".into(),
+            host_alias: "alpha".into(),
+            host: "host.example".into(),
+            user: "alice".into(),
+            ..ConnectionDraft::default()
+        };
+        assert_eq!(
+            draft.validate(&[]),
+            Err(DraftError::Required("SSH config file"))
+        );
     }
 
     #[test]
