@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const SETTINGS_SCHEMA_VERSION: u32 = 12;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 13;
 pub const DEFAULT_VFS_UPLOAD_TRANSFERS: u16 = 4;
 pub const MIN_VFS_UPLOAD_TRANSFERS: u16 = 1;
 pub const MAX_VFS_UPLOAD_TRANSFERS: u16 = 32;
@@ -49,6 +49,14 @@ fn default_credential_storage() -> CredentialStorage {
     CredentialStorage::Obscure
 }
 
+fn default_appearance_mode() -> AppearanceMode {
+    AppearanceMode::System
+}
+
+fn default_accent_color() -> AccentColor {
+    AccentColor::Blue
+}
+
 fn default_true() -> bool {
     true
 }
@@ -59,6 +67,33 @@ pub enum AuthMethod {
     #[default]
     Key,
     Password,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppearanceMode {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl AppearanceMode {
+    pub const ALL: [Self; 3] = [Self::System, Self::Light, Self::Dark];
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccentColor {
+    #[default]
+    Blue,
+    Green,
+    Amber,
+    Purple,
+}
+
+impl AccentColor {
+    pub const ALL: [Self; 4] = [Self::Blue, Self::Green, Self::Amber, Self::Purple];
 }
 
 impl AuthMethod {
@@ -331,6 +366,10 @@ pub struct Settings {
     pub auto_check_updates: bool,
     #[serde(default = "default_language")]
     pub language: String,
+    #[serde(default = "default_appearance_mode")]
+    pub appearance_mode: AppearanceMode,
+    #[serde(default = "default_accent_color")]
+    pub accent_color: AccentColor,
 }
 
 fn schema_version() -> u32 {
@@ -360,6 +399,8 @@ impl Default for Settings {
             auto_show_transfers: true,
             auto_check_updates: true,
             language: default_language(),
+            appearance_mode: default_appearance_mode(),
+            accent_color: default_accent_color(),
         }
     }
 }
@@ -590,6 +631,25 @@ mod tests {
         };
         let json = serde_json::to_value(&settings).unwrap();
         assert_eq!(json["credential_storage"], "system");
+    }
+
+    #[test]
+    fn appearance_settings_are_typed_persisted_and_migrated() {
+        let legacy: Settings = serde_json::from_str(r#"{"settings_schema_version":12}"#).unwrap();
+        let migrated = legacy.migrate();
+        assert_eq!(migrated.settings_schema_version, SETTINGS_SCHEMA_VERSION);
+        assert_eq!(migrated.appearance_mode, AppearanceMode::System);
+        assert_eq!(migrated.accent_color, AccentColor::Blue);
+
+        let settings = Settings {
+            appearance_mode: AppearanceMode::Dark,
+            accent_color: AccentColor::Purple,
+            ..Settings::default()
+        };
+        let json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(json["appearance_mode"], "dark");
+        assert_eq!(json["accent_color"], "purple");
+        assert_eq!(serde_json::from_value::<Settings>(json).unwrap(), settings);
     }
 
     #[test]

@@ -14,7 +14,8 @@ use iced::widget::{
     text, text_editor, text_input, toggler, tooltip,
 };
 use iced::{
-    Center, Color, Element, Fill, Length, Point, Size, Subscription, Task, Theme, clipboard, window,
+    Center, Color, Element, Fill, Length, Point, Size, Subscription, Task, Theme, clipboard,
+    theme::Palette, window,
 };
 use mountmate_core::app_command::{
     AppCommand, AppCommandError, AppCommandServer, InstanceLock, running_instance,
@@ -53,8 +54,8 @@ use mountmate_core::update_helper::{
 use mountmate_core::update_manifest::UpdateTrustError;
 use mountmate_core::update_workflow::{PreparedUpdateLaunch, prepare_update_install};
 use mountmate_core::{
-    APP_NAME, AuthMethod, ConnectionMethod, CredentialStorage, MountBackend, MountState,
-    ServerConfig, Settings, VERSION,
+    APP_NAME, AccentColor, AppearanceMode, AuthMethod, ConnectionMethod, CredentialStorage,
+    MountBackend, MountState, ServerConfig, Settings, VERSION,
 };
 #[cfg(windows)]
 use mountmate_platform::NativeWindowHandle;
@@ -454,6 +455,7 @@ struct App {
     settings: Settings,
     settings_load_error: Option<String>,
     system_locale: Locale,
+    system_theme_dark: bool,
     servers: Vec<ServerConfig>,
     service: MountService,
     mount_statuses: HashMap<String, MountStatus>,
@@ -789,6 +791,8 @@ struct SettingsDraft {
     auto_show_transfers: bool,
     auto_check_updates: bool,
     language: Language,
+    appearance_mode: AppearanceMode,
+    accent_color: AccentColor,
 }
 
 impl SettingsDraft {
@@ -809,6 +813,8 @@ impl SettingsDraft {
             auto_show_transfers: settings.auto_show_transfers,
             auto_check_updates: settings.auto_check_updates,
             language: Language::from_value(&settings.language),
+            appearance_mode: settings.appearance_mode,
+            accent_color: settings.accent_color,
         }
     }
 
@@ -860,6 +866,8 @@ impl SettingsDraft {
         settings.auto_show_transfers = self.auto_show_transfers;
         settings.auto_check_updates = self.auto_check_updates;
         settings.language = self.language.value().into();
+        settings.appearance_mode = self.appearance_mode;
+        settings.accent_color = self.accent_color;
         Ok(settings)
     }
 }
@@ -959,6 +967,8 @@ enum Message {
     CapacityTick,
     CapacitiesLoaded(Vec<(String, Result<Option<CapacityInfo>, String>)>),
     LanguageChanged(Language),
+    AppearanceModeChanged(AppearanceMode),
+    AccentColorChanged(AccentColor),
     RegisterFileManagerMenu,
     UnregisterFileManagerMenu,
     FileManagerMenuFinished(Result<bool, String>),
@@ -1035,7 +1045,11 @@ impl App {
     }
 
     fn theme(&self, _window: window::Id) -> Theme {
-        Theme::Dark
+        let (mode, accent) = self.settings_draft.as_ref().map_or(
+            (self.settings.appearance_mode, self.settings.accent_color),
+            |draft| (draft.appearance_mode, draft.accent_color),
+        );
+        application_theme(mode, accent, self.system_theme_dark)
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -1061,6 +1075,7 @@ impl App {
             update_health,
         } = bootstrap;
         let system_locale = Locale::system();
+        let system_theme_dark = system_prefers_dark();
         let service = MountService::new(paths.clone(), application_root());
         let (settings, settings_load_error) = match storage::load_settings(&paths) {
             Ok(settings) => (settings, None),
@@ -1105,6 +1120,7 @@ impl App {
             settings,
             settings_load_error,
             system_locale,
+            system_theme_dark,
             servers,
             service,
             mount_statuses: HashMap::new(),
@@ -2179,6 +2195,16 @@ impl App {
                 }
                 self.status = self.locale().text(TextKey::Settings).into();
                 self.sync_tray();
+            }
+            Message::AppearanceModeChanged(mode) => {
+                if let Some(draft) = &mut self.settings_draft {
+                    draft.appearance_mode = mode;
+                }
+            }
+            Message::AccentColorChanged(accent) => {
+                if let Some(draft) = &mut self.settings_draft {
+                    draft.accent_color = accent;
+                }
             }
             Message::RegisterFileManagerMenu => return self.file_manager_menu_task(true),
             Message::UnregisterFileManagerMenu => return self.file_manager_menu_task(false),
@@ -4677,6 +4703,61 @@ impl App {
         ]
         .spacing(8)
         .max_width(640);
+        let appearance = column![
+            text(match locale {
+                Locale::English => "Appearance",
+                Locale::Chinese => "外观",
+            })
+            .size(20),
+            row![
+                labeled_control(
+                    match locale {
+                        Locale::English => "Theme",
+                        Locale::Chinese => "主题",
+                    },
+                    pick_list(
+                        localized_choices(
+                            AppearanceMode::ALL,
+                            locale,
+                            Locale::appearance_mode,
+                        ),
+                        Some(locale.choice(
+                            draft.appearance_mode,
+                            locale.appearance_mode(draft.appearance_mode),
+                        )),
+                        |mode| Message::AppearanceModeChanged(mode.value),
+                    )
+                    .width(Fill),
+                ),
+                labeled_control(
+                    match locale {
+                        Locale::English => "Accent",
+                        Locale::Chinese => "强调色",
+                    },
+                    pick_list(
+                        localized_choices(AccentColor::ALL, locale, Locale::accent_color),
+                        Some(locale.choice(
+                            draft.accent_color,
+                            locale.accent_color(draft.accent_color),
+                        )),
+                        |accent| Message::AccentColorChanged(accent.value),
+                    )
+                    .width(Fill),
+                ),
+            ]
+            .spacing(12),
+            text(match locale {
+                Locale::English => {
+                    "Follow system is detected when the app starts. Theme and accent previews apply immediately; Save makes them persistent."
+                }
+                Locale::Chinese => {
+                    "跟随系统会在应用启动时检测。主题和强调色会立即预览，保存后持久生效。"
+                }
+            })
+            .size(14),
+        ]
+        .spacing(8)
+        .max_width(640);
         let cache_limits = row![
             setting_picker(
                 SettingKind::MaxSize,
@@ -4928,6 +5009,7 @@ impl App {
         let content = column![
             mount_backend,
             credential_storage,
+            appearance,
             cache_profile,
             cache_limits,
             cache_timing,
@@ -5947,6 +6029,33 @@ fn connection_settings_locked_help(locale: Locale) -> &'static str {
             "此连接已挂载或正在执行操作。当前设置为只读；请先卸载再修改，变更会在下次挂载时生效。"
         }
     }
+}
+
+fn system_prefers_dark() -> bool {
+    match dark_light::detect() {
+        Ok(dark_light::Mode::Light) => false,
+        Ok(dark_light::Mode::Dark | dark_light::Mode::Unspecified) | Err(_) => true,
+    }
+}
+
+fn application_theme(mode: AppearanceMode, accent: AccentColor, system_dark: bool) -> Theme {
+    let dark = match mode {
+        AppearanceMode::System => system_dark,
+        AppearanceMode::Light => false,
+        AppearanceMode::Dark => true,
+    };
+    let mut palette = if dark { Palette::DARK } else { Palette::LIGHT };
+    palette.primary = match (accent, dark) {
+        (AccentColor::Blue, false) => Color::from_rgb8(52, 103, 209),
+        (AccentColor::Blue, true) => Color::from_rgb8(110, 168, 254),
+        (AccentColor::Green, false) => Color::from_rgb8(46, 125, 50),
+        (AccentColor::Green, true) => Color::from_rgb8(102, 187, 106),
+        (AccentColor::Amber, false) => Color::from_rgb8(154, 103, 0),
+        (AccentColor::Amber, true) => Color::from_rgb8(255, 200, 87),
+        (AccentColor::Purple, false) => Color::from_rgb8(123, 44, 191),
+        (AccentColor::Purple, true) => Color::from_rgb8(187, 134, 252),
+    };
+    Theme::custom("SSH MountMate", palette)
 }
 
 fn localized_yes_no(locale: Locale, value: bool) -> &'static str {
@@ -7630,16 +7739,40 @@ mod localization_tests {
             vfs_upload_transfers: 12,
             macos_mount_backend: MountBackend::Nfs,
             credential_storage: CredentialStorage::System,
+            appearance_mode: AppearanceMode::Light,
+            accent_color: AccentColor::Green,
             ..Settings::default()
         };
         let draft = SettingsDraft::from_settings(&original);
         assert_eq!(draft.upload_transfers, "12");
         assert_eq!(draft.mount_backend, MountBackend::Nfs);
         assert_eq!(draft.credential_storage, CredentialStorage::System);
+        assert_eq!(draft.appearance_mode, AppearanceMode::Light);
+        assert_eq!(draft.accent_color, AccentColor::Green);
         let rebuilt = draft.build(&original, Locale::English).unwrap();
         assert_eq!(rebuilt.vfs_upload_transfers, 12);
         assert_eq!(rebuilt.macos_mount_backend, MountBackend::Nfs);
         assert_eq!(rebuilt.credential_storage, CredentialStorage::System);
+        assert_eq!(rebuilt.appearance_mode, AppearanceMode::Light);
+        assert_eq!(rebuilt.accent_color, AccentColor::Green);
+    }
+
+    #[test]
+    fn appearance_choices_are_bilingual_and_generate_contrasting_palettes() {
+        assert_eq!(
+            Locale::English.appearance_mode(AppearanceMode::System),
+            "Follow system"
+        );
+        assert_eq!(Locale::Chinese.accent_color(AccentColor::Purple), "紫色");
+
+        let light = application_theme(AppearanceMode::Light, AccentColor::Amber, true).palette();
+        let dark = application_theme(AppearanceMode::Dark, AccentColor::Amber, false).palette();
+        let followed_light =
+            application_theme(AppearanceMode::System, AccentColor::Amber, false).palette();
+        assert_eq!(light.background, Palette::LIGHT.background);
+        assert_eq!(dark.background, Palette::DARK.background);
+        assert_eq!(followed_light.background, Palette::LIGHT.background);
+        assert_ne!(light.primary, dark.primary);
     }
 
     #[test]
