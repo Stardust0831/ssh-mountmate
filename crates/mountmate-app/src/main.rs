@@ -3755,7 +3755,7 @@ impl App {
     }
 
     fn open_terminal_window(&mut self, id: String) -> Task<Message> {
-        self.terminal_server_id = Some(id);
+        self.terminal_server_id = Some(id.clone());
         if let Some(window) = self.terminal_window {
             diagnostic_trace(&format!(
                 "focusing interactive terminal window {window:?} for {id}"
