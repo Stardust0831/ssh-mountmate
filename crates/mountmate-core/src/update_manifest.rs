@@ -335,6 +335,24 @@ pub fn verify_release_manifest(
     release_prerelease: bool,
     published_assets: &[PublishedAsset],
 ) -> Result<VerifiedUpdateManifest, UpdateTrustError> {
+    let verified = verify_release_manifest_identity(
+        manifest_bytes,
+        signature_bytes,
+        trusted_keys,
+        release_tag,
+        release_prerelease,
+    )?;
+    validate_published_assets(&verified.manifest, release_tag, published_assets)?;
+    Ok(verified)
+}
+
+pub(crate) fn verify_release_manifest_identity(
+    manifest_bytes: &[u8],
+    signature_bytes: &[u8],
+    trusted_keys: &TrustedUpdateKeySet,
+    release_tag: &str,
+    release_prerelease: bool,
+) -> Result<VerifiedUpdateManifest, UpdateTrustError> {
     if manifest_bytes.is_empty() {
         return Err(UpdateTrustError::MissingManifest);
     }
@@ -366,7 +384,6 @@ pub fn verify_release_manifest(
 
     validate_manifest(&manifest)?;
     validate_release_identity(&manifest, release_tag, release_prerelease)?;
-    validate_published_assets(&manifest, release_tag, published_assets)?;
     Ok(VerifiedUpdateManifest { manifest })
 }
 

@@ -161,6 +161,18 @@ fn release_metadata_and_channel_must_match_signed_manifest() {
 }
 
 #[test]
+fn identity_verification_rejects_a_signed_manifest_without_every_platform() {
+    let (private, public) = test_key();
+    let mut manifest = manifest_for(&public.key_id);
+    manifest.assets.pop();
+    let bytes = serde_json::to_vec(&manifest).unwrap();
+    assert!(matches!(
+        sign_manifest(&private, &bytes),
+        Err(UpdateTrustError::InvalidAssetSet(_))
+    ));
+}
+
+#[test]
 fn multiple_public_keys_support_rotation() {
     let (old_private, old_public) = test_key();
     let (new_private, new_public) = test_key();

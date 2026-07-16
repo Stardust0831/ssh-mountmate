@@ -44,7 +44,7 @@ jobs:
       - name: Verify live stable and prerelease update channels
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: cargo test --package mountmate-core live_release_channels_decode_and_select_expected_versions --all-features -- --ignored --test-threads=1
+        run: cargo test --package mountmate-core update_live_ --all-features -- --ignored --test-threads=1
       - name: Install stable Cargo for cross-target license metadata
         run: rustup toolchain install 1.88.0 --profile minimal
       - name: Verify generated Rust license inventory
