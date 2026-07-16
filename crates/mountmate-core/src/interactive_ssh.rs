@@ -24,7 +24,7 @@ pub enum InteractiveSshError {
     PlinkMissing,
     #[error("OpenSSH was not found")]
     OpenSshMissing,
-    #[error("interactive login is required; start the shared SSH login and mount again")]
+    #[error("interactive SSH shared session is not ready; complete login in the app terminal")]
     SessionMissing,
     #[error("could not start interactive SSH: {0}")]
     Process(String),

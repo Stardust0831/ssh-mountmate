@@ -1991,13 +1991,14 @@ impl App {
                 self.editor_saving = false;
                 match result {
                     Ok(outcome) => {
+                        let terminal_task = self.reconcile_interactive_sessions(&outcome.servers);
                         self.servers = outcome.servers;
                         self.connection_draft = None;
                         self.screen = Screen::Connections;
                         self.status = outcome
                             .warning
                             .unwrap_or_else(|| locale.text(TextKey::ConnectionSaved).into());
-                        return self.status_task();
+                        return Task::batch([terminal_task, self.status_task()]);
                     }
                     Err(error) => self.status = error,
                 }
@@ -2513,10 +2514,12 @@ impl App {
                 self.busy.remove(&id);
                 match result {
                     Ok(outcome) => {
+                        let terminal_task = self.reconcile_interactive_sessions(&outcome.servers);
                         self.servers = outcome.servers;
                         self.status = outcome
                             .warning
                             .unwrap_or_else(|| locale.text(TextKey::ConnectionRemoved).into());
+                        return terminal_task;
                     }
                     Err(error) => self.status = error,
                 }
@@ -2776,11 +2779,18 @@ impl App {
                     || !self.transfers.contains_key(&server.id)
             })
             .count();
-        if active == 0 && unknown == 0 {
+        let interactive_sessions = self
+            .interactive_terminals
+            .values()
+            .filter(|session| interactive_terminal_is_live(session.lifecycle))
+            .count();
+        if active == 0 && unknown == 0 && interactive_sessions == 0 {
             return iced::exit();
         }
         self.exit_confirmation_open = true;
-        let description = self.locale().exit_warning(active, unknown);
+        let description = self
+            .locale()
+            .exit_warning(active, unknown, interactive_sessions);
         Task::perform(
             async move {
                 rfd::AsyncMessageDialog::new()
@@ -3643,9 +3653,10 @@ impl App {
 
     fn interactive_session_ready(&self, id: &str) -> bool {
         self.interactive_terminals.get(id).is_some_and(|session| {
-            session.lifecycle == InteractiveTerminalLifecycle::Ready
-                || (session.lifecycle == InteractiveTerminalLifecycle::Starting
-                    && session.ssh.is_ready())
+            !matches!(
+                session.lifecycle,
+                InteractiveTerminalLifecycle::Exited | InteractiveTerminalLifecycle::Failed
+            ) && session.ssh.is_ready()
         })
     }
 
@@ -3653,7 +3664,9 @@ impl App {
         if self.interactive_terminals.get(&id).is_some_and(|session| {
             matches!(
                 session.lifecycle,
-                InteractiveTerminalLifecycle::Exited | InteractiveTerminalLifecycle::Failed
+                InteractiveTerminalLifecycle::Ready
+                    | InteractiveTerminalLifecycle::Exited
+                    | InteractiveTerminalLifecycle::Failed
             )
         }) {
             self.interactive_terminals.remove(&id);
@@ -3664,7 +3677,9 @@ impl App {
         } else {
             if let Some(session) = self.interactive_terminals.get_mut(&id) {
                 session.queued_mount = true;
+                session.resume_sent = false;
             }
+            self.terminal_error = None;
             self.status = self
                 .locale()
                 .text(TextKey::InteractiveTerminalStarting)
@@ -3820,6 +3835,36 @@ impl App {
         };
         self.interactive_terminals.remove(&id);
         self.open_interactive_terminal(id, server)
+    }
+
+    fn reconcile_interactive_sessions(&mut self, next_servers: &[ServerConfig]) -> Task<Message> {
+        let compatible = self
+            .servers
+            .iter()
+            .filter_map(|previous| {
+                next_servers
+                    .iter()
+                    .find(|next| next.id == previous.id)
+                    .filter(|next| interactive_session_config_compatible(previous, next))
+                    .map(|next| next.id.clone())
+            })
+            .collect::<HashSet<_>>();
+        self.interactive_terminals
+            .retain(|id, _| compatible.contains(id));
+
+        let visible_is_compatible = self
+            .terminal_server_id
+            .as_deref()
+            .is_none_or(|id| compatible.contains(id));
+        if visible_is_compatible {
+            return Task::none();
+        }
+
+        self.terminal_server_id = None;
+        self.terminal_error = None;
+        self.terminal_window
+            .take()
+            .map_or_else(Task::none, window::close)
     }
 
     fn start_mount_operation(
@@ -7384,6 +7429,17 @@ fn interactive_mount_resume_once(queued: bool, resumed: bool, ready: bool) -> bo
     queued && !resumed && ready
 }
 
+fn interactive_terminal_is_live(lifecycle: InteractiveTerminalLifecycle) -> bool {
+    matches!(
+        lifecycle,
+        InteractiveTerminalLifecycle::Starting | InteractiveTerminalLifecycle::Ready
+    )
+}
+
+fn interactive_session_config_compatible(previous: &ServerConfig, next: &ServerConfig) -> bool {
+    previous == next && next.connection_method == ConnectionMethod::Interactive
+}
+
 fn transfer_window_settings() -> window::Settings {
     let settings = window::Settings {
         size: transfer_popup_size(false),
@@ -8247,6 +8303,7 @@ mod localization_tests {
     #[cfg(unix)]
     #[test]
     fn terminal_command_conversion_rejects_non_unicode_without_lossy_fallback() {
+        use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
 
         let invalid = OsString::from_vec(vec![b's', b's', 0xff]);
@@ -8261,6 +8318,35 @@ mod localization_tests {
         assert!(!interactive_mount_resume_once(true, true, true));
         assert!(!interactive_mount_resume_once(true, false, false));
         assert!(!interactive_mount_resume_once(false, false, true));
+    }
+
+    #[test]
+    fn interactive_session_lifecycle_and_config_changes_require_explicit_cleanup() {
+        assert!(interactive_terminal_is_live(
+            InteractiveTerminalLifecycle::Starting
+        ));
+        assert!(interactive_terminal_is_live(
+            InteractiveTerminalLifecycle::Ready
+        ));
+        assert!(!interactive_terminal_is_live(
+            InteractiveTerminalLifecycle::Exited
+        ));
+
+        let previous = ServerConfig {
+            id: "interactive".into(),
+            connection_method: ConnectionMethod::Interactive,
+            host: "old.example".into(),
+            ..ServerConfig::default()
+        };
+        assert!(interactive_session_config_compatible(&previous, &previous));
+
+        let mut changed = previous.clone();
+        changed.host = "new.example".into();
+        assert!(!interactive_session_config_compatible(&previous, &changed));
+
+        let mut native = previous.clone();
+        native.connection_method = ConnectionMethod::Native;
+        assert!(!interactive_session_config_compatible(&previous, &native));
     }
 
     #[test]

@@ -274,13 +274,18 @@ impl Locale {
         }
     }
 
-    pub(crate) fn exit_warning(self, active: usize, unknown: usize) -> String {
+    pub(crate) fn exit_warning(
+        self,
+        active: usize,
+        unknown: usize,
+        interactive_sessions: usize,
+    ) -> String {
         match self {
             Self::English => format!(
-                "{active} mounted connection(s) still have queued or active uploads, and {unknown} mounted connection(s) have an unknown cloud state. Exiting the interface leaves rclone mounts running, but you will no longer see transfer status. Exit anyway?"
+                "{active} mounted connection(s) still have queued or active uploads, {unknown} mounted connection(s) have an unknown cloud state, and {interactive_sessions} interactive SSH session(s) will end. Exiting the interface leaves rclone mounts running, but you will no longer see transfer status. Exit anyway?"
             ),
             Self::Chinese => format!(
-                "仍有 {active} 个挂载连接存在排队或正在进行的上传，另有 {unknown} 个挂载连接的云端状态未知。退出界面不会停止 rclone 挂载，但你将无法继续查看传输状态。仍要退出吗？"
+                "仍有 {active} 个挂载连接存在排队或正在进行的上传，另有 {unknown} 个挂载连接的云端状态未知，并且 {interactive_sessions} 个交互式 SSH 会话将结束。退出界面不会停止 rclone 挂载，但你将无法继续查看传输状态。仍要退出吗？"
             ),
         }
     }
@@ -755,6 +760,14 @@ mod tests {
             Locale::Chinese.connection_method(ConnectionMethod::Interactive),
             "交互式共享 SSH"
         );
+    }
+
+    #[test]
+    fn exit_warning_counts_interactive_sessions_in_both_languages() {
+        let english = Locale::English.exit_warning(1, 2, 3);
+        assert!(english.contains("3 interactive SSH session(s) will end"));
+        let chinese = Locale::Chinese.exit_warning(1, 2, 3);
+        assert!(chinese.contains("3 个交互式 SSH 会话将结束"));
     }
 
     #[test]

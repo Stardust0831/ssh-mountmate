@@ -61,6 +61,27 @@ private-key contents into this document or an issue. Attach only sanitized logs.
 6. Repeat the Settings flow in Chinese and English and check labels, wrapping, keyboard focus, and
    mounted read-only Settings presentation.
 
+## App-managed interactive SSH terminal
+
+1. On Linux and macOS, use direct OpenSSH profiles to exercise password, private-key passphrase,
+   keyboard-interactive/2FA, host-key confirmation, and an OAuth/device-login URL. Confirm no
+   external terminal opens and the queued mount resumes exactly once after the shared session is
+   ready.
+2. On Windows x64 and ARM64, repeat the lifecycle with a direct manual Plink profile. Confirm no
+   visible console is created and SSH-config/app-managed profiles still cannot select Interactive.
+3. Confirm Unicode input/output, IME input, resize, scrolling, explicit selection/copy, explicit URL
+   opening, EOF, and child exit behave without terminal input or output appearing in app logs.
+4. Click Mount repeatedly while authentication is pending. Confirm one PTY exists for that
+   connection and only one mount starts when login succeeds.
+5. Hide and reopen the terminal. Confirm the PTY and shared session remain alive. Close the window
+   using its window control and confirm the same behavior.
+6. Use End session and confirm the PTY is terminated and later mounts request a new login. Use Retry
+   after a failed/exited child and confirm stale output/events do not resume the old queued mount.
+7. With a live or authenticating terminal, exit from the tray. Confirm the bilingual warning counts
+   the interactive session and Cancel leaves it alive.
+8. While a terminal exists, change or delete its connection after it is safe to edit. Confirm the
+   obsolete PTY is ended and its terminal window closes rather than using stale connection data.
+
 ## Evidence to record after testing
 
 - App version and exact platform architecture.
