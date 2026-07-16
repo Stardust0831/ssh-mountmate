@@ -613,9 +613,11 @@ mod tests {
                 .any(|pair| pair == [OsString::from("-o"), OsString::from("BatchMode=no")])
         );
         assert!(!arguments.iter().any(|argument| argument == "BatchMode=yes"));
-        assert!(!arguments
-            .iter()
-            .any(|argument| argument.to_string_lossy().starts_with("ControlPersist=")));
+        assert!(
+            !arguments
+                .iter()
+                .any(|argument| argument.to_string_lossy().starts_with("ControlPersist="))
+        );
         assert_eq!(
             arguments.last().and_then(|argument| argument.to_str()),
             Some("cluster")
