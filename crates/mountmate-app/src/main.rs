@@ -3821,6 +3821,19 @@ impl App {
 
     fn handle_terminal_event(&mut self, event: RedactedTerminalEvent) -> Task<Message> {
         let iced_term::Event::BackendCall(generation, command) = event.0;
+        match &command {
+            iced_term::BackendCommand::ProcessAlacrittyEvent(
+                iced_term::AlacrittyEvent::ChildExit(code),
+            ) => diagnostic_trace(&format!(
+                "interactive terminal child exited for generation {generation} with code {code}"
+            )),
+            iced_term::BackendCommand::ProcessAlacrittyEvent(iced_term::AlacrittyEvent::Exit) => {
+                diagnostic_trace(&format!(
+                    "interactive terminal backend exited for generation {generation}"
+                ));
+            }
+            _ => {}
+        }
         let Some(session) = self
             .interactive_terminals
             .values_mut()
