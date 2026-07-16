@@ -47,6 +47,20 @@ private-key contents into this document or an issue. Attach only sanitized logs.
 - Check connection search, sorting, and folders/groups only after that low-priority feature reaches
   an implementation branch; it is not part of alpha.3 acceptance.
 
+## Appearance settings
+
+1. In Settings, switch between System, Light, and Dark. Confirm the whole app previews the choice
+   immediately, including secondary windows, without requiring Save or a restart.
+2. Cancel after changing the appearance. Confirm the previously saved theme and accent return.
+3. Save each appearance mode, restart the app, and confirm the saved choice is restored.
+4. With System selected, change the Windows host theme while the app is closed, then reopen it and
+   confirm the matching light or dark palette is selected.
+5. Try Blue, Green, Amber, and Purple accents in both light and dark modes. Confirm primary buttons,
+   selections, focus states, text, disabled controls, warnings, errors, and required markers remain
+   distinguishable at 100%, 150%, and 200% scaling.
+6. Repeat the Settings flow in Chinese and English and check labels, wrapping, keyboard focus, and
+   mounted read-only Settings presentation.
+
 ## Evidence to record after testing
 
 - App version and exact platform architecture.
