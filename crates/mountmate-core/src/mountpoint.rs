@@ -16,6 +16,9 @@ const WINDOWS_AUTO_DRIVES: &str = "ZYXWVUTSRQPONMLKJIHGFED";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowsVolumeKind {
     Fixed,
+    Mounted,
+    Reparse,
+    NonNtfs,
     Remote,
     Removable,
     CdRom,
@@ -29,6 +32,9 @@ impl std::fmt::Display for WindowsVolumeKind {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let value = match self {
             Self::Fixed => "fixed local",
+            Self::Mounted => "mounted volume",
+            Self::Reparse => "reparse-backed",
+            Self::NonNtfs => "non-NTFS",
             Self::Remote => "remote",
             Self::Removable => "removable",
             Self::CdRom => "CD-ROM",
@@ -183,7 +189,13 @@ fn windows_drive_in_use(drive: char) -> bool {
 fn system_windows_volume_kind(path: &Path) -> WindowsVolumeKind {
     use std::os::windows::ffi::OsStrExt;
 
-    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetVolumePathNameW};
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileAttributeTagInfo, GetDriveTypeW,
+        GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumePathNameW, OPEN_EXISTING,
+    };
 
     // GetDriveTypeW's documented return values are stable Win32 ABI values.
     const DRIVE_UNKNOWN: u32 = 0;
@@ -205,15 +217,120 @@ fn system_windows_volume_kind(path: &Path) -> WindowsVolumeKind {
     if resolved == 0 {
         return WindowsVolumeKind::Missing;
     }
+    let volume_end = volume
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(volume.len());
+    if !ordinary_windows_volume_root(&volume[..volume_end], path) {
+        return WindowsVolumeKind::Mounted;
+    }
     match unsafe { GetDriveTypeW(volume.as_ptr()) } {
-        DRIVE_FIXED => WindowsVolumeKind::Fixed,
-        DRIVE_REMOTE => WindowsVolumeKind::Remote,
-        DRIVE_REMOVABLE => WindowsVolumeKind::Removable,
-        DRIVE_CDROM => WindowsVolumeKind::CdRom,
-        DRIVE_RAMDISK => WindowsVolumeKind::RamDisk,
-        DRIVE_NO_ROOT_DIR => WindowsVolumeKind::NoRoot,
-        DRIVE_UNKNOWN => WindowsVolumeKind::Unknown,
-        _ => WindowsVolumeKind::Unknown,
+        DRIVE_FIXED => {}
+        DRIVE_REMOTE => return WindowsVolumeKind::Remote,
+        DRIVE_REMOVABLE => return WindowsVolumeKind::Removable,
+        DRIVE_CDROM => return WindowsVolumeKind::CdRom,
+        DRIVE_RAMDISK => return WindowsVolumeKind::RamDisk,
+        DRIVE_NO_ROOT_DIR => return WindowsVolumeKind::NoRoot,
+        DRIVE_UNKNOWN => return WindowsVolumeKind::Unknown,
+        _ => return WindowsVolumeKind::Unknown,
+    }
+    for prefix in existing_windows_prefixes(path) {
+        let mut wide: Vec<u16> = prefix.as_os_str().encode_wide().collect();
+        wide.push(0);
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return WindowsVolumeKind::Missing;
+        }
+        let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
+        let inspected = unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                FileAttributeTagInfo,
+                (&mut info as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+                std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+            )
+        };
+        unsafe { CloseHandle(handle) };
+        if inspected == 0 {
+            return WindowsVolumeKind::Missing;
+        }
+        if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return WindowsVolumeKind::Reparse;
+        }
+    }
+    let mut filesystem = [0u16; 64];
+    let volume_read = unsafe {
+        GetVolumeInformationW(
+            volume.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            filesystem.as_mut_ptr(),
+            filesystem.len() as u32,
+        )
+    };
+    if volume_read == 0 {
+        return WindowsVolumeKind::Missing;
+    }
+    let filesystem_end = filesystem
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(filesystem.len());
+    if !String::from_utf16_lossy(&filesystem[..filesystem_end]).eq_ignore_ascii_case("NTFS") {
+        return WindowsVolumeKind::NonNtfs;
+    }
+    WindowsVolumeKind::Fixed
+}
+
+#[cfg(windows)]
+fn existing_windows_prefixes(path: &Path) -> Vec<PathBuf> {
+    let mut prefixes = Vec::new();
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if current.has_root() && current.exists() {
+            prefixes.push(current.clone());
+        }
+    }
+    prefixes
+}
+
+#[cfg(windows)]
+fn ordinary_windows_volume_root(volume: &[u16], path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut path_wide = path.as_os_str().encode_wide();
+    let Some(path_drive) = path_wide.next() else {
+        return false;
+    };
+    let Some(colon) = path_wide.next() else {
+        return false;
+    };
+    volume.len() == 3
+        && colon == u16::from(b':')
+        && windows_ascii_upper(volume[0]) == windows_ascii_upper(path_drive)
+        && volume[1] == u16::from(b':')
+        && matches!(volume[2], value if value == u16::from(b'\\') || value == u16::from(b'/'))
+}
+
+#[cfg(windows)]
+fn windows_ascii_upper(value: u16) -> u16 {
+    if (u16::from(b'a')..=u16::from(b'z')).contains(&value) {
+        value - u16::from(b'a') + u16::from(b'A')
+    } else {
+        value
     }
 }
 
@@ -649,6 +766,29 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn windows_folder_rejects_mounted_reparse_and_non_ntfs_backing_paths() {
+        for kind in [
+            WindowsVolumeKind::Mounted,
+            WindowsVolumeKind::Reparse,
+            WindowsVolumeKind::NonNtfs,
+        ] {
+            let mut probe = FakeProbe::default();
+            probe.existing.insert("c:/mounts".into());
+            probe.volumes.insert("c:/mounts".into(), kind);
+            let mut allocator =
+                MountpointAllocator::new(PathBuf::from("C:/Users/me"), true, &probe);
+
+            assert_eq!(
+                allocator.resolve(&server("C:\\mounts\\alpha")),
+                Err(MountpointError::WindowsVolumeUnsupported {
+                    path: PathBuf::from("C:\\mounts"),
+                    kind,
+                })
+            );
+        }
     }
 
     #[test]

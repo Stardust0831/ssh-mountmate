@@ -1,5 +1,6 @@
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -299,7 +300,8 @@ impl InteractiveSshSession {
 }
 
 fn reject_windows_proxy_config(server: &ServerConfig) -> Result<(), InteractiveSshError> {
-    if !matches!(server.source.as_str(), "ssh_config" | "ssh_config_batch")
+    if (!matches!(server.source.as_str(), "ssh_config" | "ssh_config_batch")
+        && !server.ssh_config_managed)
         || server.host_alias.trim().is_empty()
     {
         return Ok(());
@@ -611,11 +613,21 @@ fn plink_target_arguments(server: &ServerConfig) -> Vec<String> {
         "-l".into(),
         server.user.clone(),
     ];
-    if !server.key_file.is_empty() {
+    if plink_private_key_supported(&server.key_file) {
         arguments.extend(["-i".into(), server.key_file.clone()]);
     }
     arguments.push(server.host.clone());
     arguments
+}
+
+fn plink_private_key_supported(key_file: &str) -> bool {
+    if key_file.trim().is_empty() {
+        return false;
+    }
+    File::open(key_file)
+        .ok()
+        .and_then(|file| BufReader::new(file).lines().next()?.ok())
+        .is_some_and(|header| header.starts_with("PuTTY-User-Key-File-"))
 }
 
 fn plink_login_arguments(target: &[String]) -> Vec<OsString> {
@@ -727,17 +739,40 @@ mod tests {
 
     #[test]
     fn plink_connector_is_direct_and_never_contains_a_secret() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = temp.path().join("id.ppk");
+        fs::write(&key, "PuTTY-User-Key-File-3: ssh-ed25519\n").unwrap();
+        let configured = ServerConfig {
+            key_file: key.display().to_string(),
+            ..server()
+        };
         assert_eq!(
-            plink_target_arguments(&server()),
+            plink_target_arguments(&configured),
             vec![
                 "-P",
                 "2202",
                 "-l",
                 "alice",
                 "-i",
-                "/keys/id with space",
+                key.to_str().unwrap(),
                 "host.example",
             ]
+        );
+    }
+
+    #[test]
+    fn plink_omits_openssh_private_keys_and_leaves_authentication_interactive() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = temp.path().join("id_ed25519");
+        fs::write(&key, "-----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
+        let configured = ServerConfig {
+            key_file: key.display().to_string(),
+            ..server()
+        };
+
+        assert_eq!(
+            plink_target_arguments(&configured),
+            vec!["-P", "2202", "-l", "alice", "host.example"]
         );
     }
 
@@ -860,7 +895,14 @@ mod tests {
 
     #[test]
     fn login_command_exposes_exact_plink_program_and_argv() {
-        let target = plink_target_arguments(&server());
+        let temp = tempfile::tempdir().unwrap();
+        let key = temp.path().join("id with space.ppk");
+        fs::write(&key, "PuTTY-User-Key-File-3: ssh-ed25519\n").unwrap();
+        let configured = ServerConfig {
+            key_file: key.display().to_string(),
+            ..server()
+        };
+        let target = plink_target_arguments(&configured);
         let command = InteractiveSshLoginCommand::new(
             PathBuf::from("C:/MountMate/bin/plink.exe"),
             plink_login_arguments(&target),
@@ -878,7 +920,7 @@ mod tests {
                 OsString::from("-l"),
                 OsString::from("alice"),
                 OsString::from("-i"),
-                OsString::from("/keys/id with space"),
+                key.into_os_string(),
                 OsString::from("host.example"),
             ]
         );

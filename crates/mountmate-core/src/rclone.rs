@@ -452,6 +452,9 @@ impl MountCommand<'_> {
             &self.settings.dir_cache_time,
         );
         push_option(&mut command, "--buffer-size", &self.settings.buffer_size);
+        if self.platform == MountPlatform::Windows {
+            command.push("--no-console".into());
+        }
         if self.platform == MountPlatform::Windows
             && self.server.network_mode
             && is_windows_drive(self.mountpoint)
@@ -549,6 +552,7 @@ mod tests {
     fn mount_command_keeps_reliability_flags_and_defaults() {
         let command = command("");
         assert!(command.contains(&"--links".into()));
+        assert!(command.contains(&"--no-console".into()));
         assert!(!command.contains(&"--rc-no-auth".into()));
         assert!(
             command
@@ -619,6 +623,31 @@ mod tests {
             );
             assert!(command.windows(2).any(|item| item == ["--transfers", "12"]));
         }
+    }
+
+    #[test]
+    fn no_console_is_windows_only() {
+        let mut windows = command("");
+        assert!(windows.iter().any(|argument| argument == "--no-console"));
+
+        let server = ServerConfig::default();
+        let settings = Settings::default();
+        windows = MountCommand {
+            rclone: Path::new("rclone"),
+            config: Path::new("rclone.conf"),
+            server: &server,
+            settings: &settings,
+            remote: "alpha:",
+            mountpoint: Path::new("/mnt/alpha"),
+            cache_dir: Path::new("cache"),
+            log_path: Path::new("alpha.log"),
+            rc_addr: "127.0.0.1:1234",
+            rc_user: "mountmate",
+            rc_pass: "secret",
+            platform: MountPlatform::Linux,
+        }
+        .build();
+        assert!(!windows.iter().any(|argument| argument == "--no-console"));
     }
 
     #[test]

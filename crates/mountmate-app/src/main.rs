@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use iced::widget::{
-    Space, button, checkbox, column, container, pick_list, progress_bar, responsive, row,
-    scrollable, stack, text, text_editor, text_input, toggler, tooltip,
+    Space, button, checkbox, column, container, keyed_column, pick_list, progress_bar, responsive,
+    row, scrollable, stack, text, text_editor, text_input, toggler, tooltip,
 };
 use iced::{
     Center, Color, Element, Fill, Length, Point, Size, Subscription, Task, Theme, clipboard,
@@ -518,7 +518,7 @@ struct App {
     terminal_server_id: Option<String>,
     interactive_terminals: HashMap<String, InteractiveTerminalSession>,
     next_terminal_generation: u64,
-    terminal_error: Option<String>,
+    terminal_error: Option<(String, String)>,
     custom_setting: Option<CustomSettingDraft>,
     editor_saving: bool,
     ssh_import_loading: bool,
@@ -1387,7 +1387,7 @@ impl App {
                         ));
                         session.lifecycle = InteractiveTerminalLifecycle::Failed;
                         session.queued_mount = false;
-                        self.terminal_error = Some(error);
+                        self.terminal_error = Some((id, error));
                         self.status = locale.text(TextKey::InteractiveTerminalFailed).into();
                     }
                 }
@@ -1965,19 +1965,9 @@ impl App {
             }
             Message::ConnectionMethodChanged(method) => {
                 if let Some(draft) = &mut self.connection_draft {
-                    if connection_method_allowed(
-                        draft.source,
-                        draft.ssh_config_managed,
-                        draft.connection_method,
-                        method,
-                        cfg!(windows),
-                    ) {
-                        draft.connection_method = method;
-                        if method != ConnectionMethod::Native {
-                            draft.auth = AuthMethod::Key;
-                        }
-                    } else {
-                        self.status = interactive_ssh_config_unavailable(locale).into();
+                    draft.connection_method = method;
+                    if method != ConnectionMethod::Native {
+                        draft.auth = AuthMethod::Key;
                     }
                 }
             }
@@ -1999,19 +1989,6 @@ impl App {
             Message::ManagedSshChanged(value) => {
                 if let Some(draft) = &mut self.connection_draft {
                     draft.ssh_config_managed = value;
-                    if value
-                        && !connection_method_allowed(
-                            draft.source,
-                            true,
-                            draft.connection_method,
-                            draft.connection_method,
-                            cfg!(windows),
-                        )
-                    {
-                        draft.connection_method = ConnectionMethod::Openssh;
-                        draft.auth = AuthMethod::Key;
-                        self.status = interactive_ssh_config_unavailable(locale).into();
-                    }
                     if !value {
                         draft.copy_key_to_ssh_dir = false;
                     }
@@ -3971,7 +3948,7 @@ impl App {
                 diagnostic_trace(&format!(
                     "interactive terminal session creation failed for {id} generation {generation}"
                 ));
-                self.terminal_error = Some(error);
+                self.terminal_error = Some((id.clone(), error));
                 self.status = self
                     .locale()
                     .text(TextKey::InteractiveTerminalFailed)
@@ -4081,10 +4058,21 @@ impl App {
     }
 
     fn end_interactive_session(&mut self) -> Task<Message> {
-        let window = self.terminal_window.take();
-        if let Some(id) = self.terminal_server_id.take() {
-            self.interactive_terminals.remove(&id);
+        let Some(id) = self.terminal_server_id.clone() else {
+            return Task::none();
+        };
+        if !interactive_session_can_restart_or_end(self.mount_statuses.get(&id).copied()) {
+            self.status = match self.locale() {
+                Locale::English => {
+                    "Unmount this connection before ending its shared SSH session".into()
+                }
+                Locale::Chinese => "请先卸载此连接，再结束共享 SSH 会话".into(),
+            };
+            return Task::none();
         }
+        let window = self.terminal_window.take();
+        self.terminal_server_id = None;
+        self.interactive_terminals.remove(&id);
         self.terminal_error = None;
         if let Some(window) = window {
             window::close(window)
@@ -4100,6 +4088,15 @@ impl App {
         let Some(server) = self.servers.iter().find(|server| server.id == id).cloned() else {
             return self.end_interactive_session();
         };
+        if !interactive_session_can_restart_or_end(self.mount_statuses.get(&id).copied()) {
+            self.status = match self.locale() {
+                Locale::English => {
+                    "Unmount this connection before restarting its shared SSH session".into()
+                }
+                Locale::Chinese => "请先卸载此连接，再重试共享 SSH 会话".into(),
+            };
+            return Task::none();
+        }
         self.interactive_terminals.remove(&id);
         self.open_interactive_terminal(id, server)
     }
@@ -4971,28 +4968,9 @@ impl App {
                 .width(Fill)
                 .into()
             };
-        let interactive_disabled = !connection_method_allowed(
-            draft.source,
-            draft.ssh_config_managed,
-            draft.connection_method,
-            ConnectionMethod::Interactive,
-            cfg!(windows),
-        );
-        let mut transport_choice = column![
+        let transport_choice = column![
             pick_list(
-                localized_choices(
-                    ConnectionMethod::ALL.into_iter().filter(|method| {
-                        connection_method_allowed(
-                            draft.source,
-                            draft.ssh_config_managed,
-                            draft.connection_method,
-                            *method,
-                            cfg!(windows),
-                        )
-                    }),
-                    locale,
-                    Locale::connection_method,
-                ),
+                localized_choices(ConnectionMethod::ALL, locale, Locale::connection_method),
                 Some(locale.choice(
                     draft.connection_method,
                     locale.connection_method(draft.connection_method),
@@ -5002,10 +4980,6 @@ impl App {
             .width(Fill)
         ]
         .spacing(5);
-        if interactive_disabled {
-            transport_choice =
-                transport_choice.push(text(interactive_ssh_config_unavailable(locale)).size(12));
-        }
         let transport = row![
             labeled_control(locale.text(TextKey::Transport), transport_choice,),
             labeled_control(locale.text(TextKey::Authentication), authentication),
@@ -5898,16 +5872,20 @@ impl App {
                 .height(Fill)
                 .into();
         };
-        if let Some(error) = &self.terminal_error {
+        if let Some(error) = interactive_terminal_error(&self.terminal_error, server_id) {
+            let can_restart_or_end =
+                interactive_session_can_restart_or_end(self.mount_statuses.get(server_id).copied());
             return column![
                 text(locale.text(TextKey::InteractiveTerminal)).size(24),
                 text(locale.text(TextKey::InteractiveTerminalHelp)).size(13),
                 text(error),
                 row![
-                    button(locale.text(TextKey::RetryTerminal)).on_press(Message::RetryTerminal),
+                    button(locale.text(TextKey::RetryTerminal))
+                        .on_press_maybe(can_restart_or_end.then_some(Message::RetryTerminal)),
                     button(locale.text(TextKey::HideTerminal)).on_press(Message::HideTerminal),
-                    button(locale.text(TextKey::EndInteractiveSession))
-                        .on_press(Message::EndInteractiveSession),
+                    button(locale.text(TextKey::EndInteractiveSession)).on_press_maybe(
+                        can_restart_or_end.then_some(Message::EndInteractiveSession)
+                    ),
                 ]
                 .spacing(10),
             ]
@@ -5929,18 +5907,21 @@ impl App {
             InteractiveTerminalLifecycle::Exited => locale.text(TextKey::InteractiveTerminalExited),
             InteractiveTerminalLifecycle::Failed => locale.text(TextKey::InteractiveTerminalFailed),
         };
-        let terminal = iced_term::TerminalView::show(&session.terminal)
+        let terminal: Element<'_, Message> = iced_term::TerminalView::show(&session.terminal)
             .map(|event| Message::TerminalEvent(RedactedTerminalEvent(event)));
+        let terminal = keyed_column([(session.generation, terminal)]).height(Fill);
+        let can_restart_or_end =
+            interactive_session_can_restart_or_end(self.mount_statuses.get(server_id).copied());
         let controls = row![
             text(lifecycle),
             Space::new().width(Fill),
             button(locale.text(TextKey::RetryTerminal)).on_press_maybe(
-                (session.lifecycle != InteractiveTerminalLifecycle::Starting)
+                (session.lifecycle != InteractiveTerminalLifecycle::Starting && can_restart_or_end)
                     .then_some(Message::RetryTerminal),
             ),
             button(locale.text(TextKey::HideTerminal)).on_press(Message::HideTerminal),
             button(locale.text(TextKey::EndInteractiveSession))
-                .on_press(Message::EndInteractiveSession),
+                .on_press_maybe(can_restart_or_end.then_some(Message::EndInteractiveSession)),
         ]
         .spacing(10)
         .align_y(Center);
@@ -6853,33 +6834,6 @@ fn credential_storage_confirmation(locale: Locale, target: CredentialStorage) ->
 
 fn interactive_auth_help(locale: Locale) -> &'static str {
     locale.text(TextKey::InteractiveTerminalHelp)
-}
-
-fn connection_method_allowed(
-    source: ConnectionSource,
-    _managed_profile: bool,
-    current: ConnectionMethod,
-    method: ConnectionMethod,
-    windows: bool,
-) -> bool {
-    !(windows
-        && matches!(
-            source,
-            ConnectionSource::SshConfig | ConnectionSource::SshConfigBatch
-        )
-        && current == ConnectionMethod::Openssh
-        && method == ConnectionMethod::Interactive)
-}
-
-fn interactive_ssh_config_unavailable(locale: Locale) -> &'static str {
-    match locale {
-        Locale::English => {
-            "Interactive shared SSH uses the resolved HostName, User, and Port from this profile. ProxyJump and ProxyCommand profiles should continue using OpenSSH transport."
-        }
-        Locale::Chinese => {
-            "交互式共享 SSH 会使用此配置已解析的 HostName、User 和 Port。包含 ProxyJump 或 ProxyCommand 的配置应继续使用 OpenSSH 传输。"
-        }
-    }
 }
 
 fn connection_settings_locked_help(locale: Locale) -> &'static str {
@@ -7926,6 +7880,20 @@ fn interactive_terminal_is_live(lifecycle: InteractiveTerminalLifecycle) -> bool
     )
 }
 
+fn interactive_session_can_restart_or_end(status: Option<MountStatus>) -> bool {
+    !matches!(status, Some(MountStatus::Mounted | MountStatus::Starting))
+}
+
+fn interactive_terminal_error<'a>(
+    error: &'a Option<(String, String)>,
+    server_id: &str,
+) -> Option<&'a str> {
+    error
+        .as_ref()
+        .filter(|(error_id, _)| error_id == server_id)
+        .map(|(_, message)| message.as_str())
+}
+
 fn interactive_session_config_compatible(previous: &ServerConfig, next: &ServerConfig) -> bool {
     previous == next && next.connection_method == ConnectionMethod::Interactive
 }
@@ -8335,41 +8303,7 @@ mod localization_tests {
 
     #[test]
     fn windows_allows_resolved_config_profiles_to_use_interactive_transport() {
-        assert!(connection_method_allowed(
-            ConnectionSource::SshConfig,
-            false,
-            ConnectionMethod::Native,
-            ConnectionMethod::Interactive,
-            true,
-        ));
-        assert!(!connection_method_allowed(
-            ConnectionSource::SshConfig,
-            false,
-            ConnectionMethod::Openssh,
-            ConnectionMethod::Interactive,
-            true,
-        ));
-        assert!(connection_method_allowed(
-            ConnectionSource::Manual,
-            true,
-            ConnectionMethod::Native,
-            ConnectionMethod::Interactive,
-            true,
-        ));
-        assert!(connection_method_allowed(
-            ConnectionSource::SshConfig,
-            false,
-            ConnectionMethod::Openssh,
-            ConnectionMethod::Openssh,
-            true,
-        ));
-        assert!(connection_method_allowed(
-            ConnectionSource::SshConfig,
-            false,
-            ConnectionMethod::Native,
-            ConnectionMethod::Interactive,
-            false,
-        ));
+        assert!(ConnectionMethod::ALL.contains(&ConnectionMethod::Interactive));
     }
 
     #[test]
@@ -9008,6 +8942,30 @@ mod localization_tests {
             InteractiveTerminalLifecycle::Starting,
             false
         ));
+    }
+
+    #[test]
+    fn mounted_or_starting_interactive_sessions_cannot_be_restarted_or_ended() {
+        assert!(!interactive_session_can_restart_or_end(Some(
+            MountStatus::Mounted
+        )));
+        assert!(!interactive_session_can_restart_or_end(Some(
+            MountStatus::Starting
+        )));
+        assert!(interactive_session_can_restart_or_end(Some(
+            MountStatus::Unmounted
+        )));
+        assert!(interactive_session_can_restart_or_end(None));
+    }
+
+    #[test]
+    fn terminal_errors_are_visible_only_for_their_own_connection() {
+        let error = Some(("failed".into(), "authentication failed".into()));
+        assert_eq!(
+            interactive_terminal_error(&error, "failed"),
+            Some("authentication failed")
+        );
+        assert_eq!(interactive_terminal_error(&error, "mounted"), None);
     }
 
     #[test]
