@@ -89,7 +89,7 @@ impl MountService {
     ) -> Result<MountState, ServiceError> {
         let rclone = resolve_rclone(&self.paths, &self.app_root, None)?
             .ok_or(ServiceError::RcloneMissing)?;
-        let external_ssh = self.interactive_ssh_arguments(server, true)?;
+        let external_ssh = self.interactive_ssh_arguments(server)?;
         let prepared_server = self.prepare_server_credentials(server)?;
         self.ensure_remote(&prepared_server, external_ssh.as_deref())?;
 
@@ -155,7 +155,7 @@ impl MountService {
             return Ok(None);
         }
         let state: MountState = read_json(&self.paths.state_file(&server.id))?;
-        let external_ssh = self.interactive_ssh_arguments(server, false)?;
+        let external_ssh = self.interactive_ssh_arguments(server)?;
         let prepared_server = self.prepare_server_credentials(server)?;
         self.ensure_remote(&prepared_server, external_ssh.as_deref())?;
         let result = mounted_capacity(&prepared_server, &state, &self.paths.rclone_config())
@@ -368,17 +368,12 @@ impl MountService {
     fn interactive_ssh_arguments(
         &self,
         server: &ServerConfig,
-        start_if_missing: bool,
     ) -> Result<Option<Vec<String>>, ServiceError> {
         if server.connection_method != ConnectionMethod::Interactive {
             return Ok(None);
         }
         let session = InteractiveSshSession::for_server(&self.paths, &self.app_root, server)?;
         if !session.is_ready() {
-            if start_if_missing {
-                session.start_login()?;
-                return Err(InteractiveSshError::LoginStarted.into());
-            }
             return Err(InteractiveSshError::SessionMissing.into());
         }
         Ok(Some(session.verified_connector_arguments()?.to_vec()))
@@ -689,5 +684,38 @@ mod tests {
             Some("Folder/Child".into())
         );
         assert_eq!(relative_refresh_dir("Z:\\Folder", "Y:", true), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_interactive_session_does_not_start_a_login_process() {
+        if crate::rclone_binary::find_system_executable("ssh").is_none() {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: temp.path().join("config"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            data_dir: temp.path().join("data"),
+        };
+        let service = MountService::new(paths.clone(), temp.path().join("app"));
+        let server = ServerConfig {
+            id: "missing-session".into(),
+            host: "host.example".into(),
+            user: "alice".into(),
+            connection_method: ConnectionMethod::Interactive,
+            ..ServerConfig::default()
+        };
+
+        let error = service.interactive_ssh_arguments(&server).unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::InteractiveSsh(InteractiveSshError::SessionMissing)
+        ));
+
+        let control_dir = paths.state_dir.join("ssh-control");
+        assert!(control_dir.is_dir());
+        assert_eq!(fs::read_dir(control_dir).unwrap().count(), 0);
     }
 }
