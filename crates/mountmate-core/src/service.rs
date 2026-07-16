@@ -713,9 +713,12 @@ mod tests {
             error,
             ServiceError::InteractiveSsh(InteractiveSshError::SessionMissing)
         ));
-
-        let control_dir = paths.state_dir.join("ssh-control");
-        assert!(control_dir.is_dir());
-        assert_eq!(fs::read_dir(control_dir).unwrap().count(), 0);
+        let preferred_control_dir = paths.state_dir.join("ssh-control");
+        if preferred_control_dir.is_dir() {
+            assert_eq!(fs::read_dir(preferred_control_dir).unwrap().count(), 0);
+        }
+        assert!(!paths.config_dir.exists());
+        assert!(!paths.cache_dir.exists());
+        assert!(!paths.data_dir.exists());
     }
 }

@@ -266,22 +266,36 @@ jq \
   }]' "${config_dir}/servers.json" >"${interactive_config}"
 mv "${interactive_config}" "${config_dir}/servers.json"
 
-if "${binary}" --mount-id "${interactive_id}"; then
-  echo 'interactive mount unexpectedly succeeded before the shared login was established' >&2
-  exit 1
-fi
+openbox >"${test_root}/openbox.log" 2>&1 &
+window_manager_pid=$!
+sleep 0.3
+kill -0 "${window_manager_pid}"
+export SSH_MOUNTMATE_TRACE_FILE="${test_root}/gui.trace"
+"${binary}" >"${test_root}/gui.stdout" 2>"${test_root}/gui.stderr" &
+gui_pid=$!
+
+"${binary}" --mount-id "${interactive_id}"
 shared_ready=false
-for _ in $(seq 1 100); do
+terminal_windows=()
+for _ in $(seq 1 200); do
+  if ! kill -0 "${gui_pid}" 2>/dev/null; then
+    echo 'SSH MountMate GUI exited before the interactive terminal became ready' >&2
+    exit 1
+  fi
+  mapfile -t terminal_windows < <(
+    xdotool search --onlyvisible --name 'Interactive SSH terminal' 2>/dev/null || true
+  )
   control="$(locate_control_socket || true)"
   if [[ -n "${control}" ]] \
-    && ssh -F "${ssh_config}" -S "${control}" -O check local-openssh-a >/dev/null 2>&1; then
+    && ssh -F "${ssh_config}" -S "${control}" -O check local-openssh-a >/dev/null 2>&1 \
+    && mountpoint -q "${mount_root}/${interactive_id}"; then
     shared_ready=true
     break
   fi
   sleep 0.1
 done
 test "${shared_ready}" == true
-"${binary}" --mount-id "${interactive_id}"
+test "${#terminal_windows[@]}" -eq 1
 mountpoint -q "${mount_root}/${interactive_id}"
 test "$(cat "${mount_root}/${interactive_id}/identity.txt")" = "content from ${interactive_id}"
 grep -F '[interactive-a]' "${config_dir}/rclone.conf"
@@ -311,13 +325,6 @@ fi
 
 dd if=/dev/zero of="${mount_root}/native-a/popup-upload.bin" bs=1M count=4 conv=fsync status=none
 dd if=/dev/zero of="${mount_root}/openssh-a/popup-upload.bin" bs=1M count=4 conv=fsync status=none
-openbox >"${test_root}/openbox.log" 2>&1 &
-window_manager_pid=$!
-sleep 0.3
-kill -0 "${window_manager_pid}"
-export SSH_MOUNTMATE_TRACE_FILE="${test_root}/gui.trace"
-"${binary}" >"${test_root}/gui.stdout" 2>"${test_root}/gui.stderr" &
-gui_pid=$!
 
 popup_windows=()
 for _ in $(seq 1 150); do
