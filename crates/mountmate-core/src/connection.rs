@@ -59,6 +59,7 @@ pub struct ConnectionDraft {
     pub editing_id: Option<String>,
     pub source: ConnectionSource,
     pub name: String,
+    pub folder: String,
     pub host_alias: String,
     pub host: String,
     pub user: String,
@@ -122,6 +123,7 @@ impl Default for ConnectionDraft {
             editing_id: None,
             source: ConnectionSource::Manual,
             name: String::new(),
+            folder: String::new(),
             host_alias: String::new(),
             host: String::new(),
             user: String::new(),
@@ -188,6 +190,7 @@ impl ConnectionDraft {
             editing_id: Some(server.id.clone()),
             source: ConnectionSource::from_server(server),
             name: server.name.clone(),
+            folder: server.folder.clone(),
             host_alias: server.host_alias.clone(),
             host: server.host.clone(),
             user: server.user.clone(),
@@ -295,6 +298,7 @@ impl ConnectionDraft {
     pub fn validate(&self, servers: &[ServerConfig]) -> Result<ValidatedConnection, DraftError> {
         let requirements = self.requirements();
         let name = required_display_name(&self.name)?;
+        let folder = validate_folder(&self.folder)?;
         let host = required_scalar(&self.host, "IP/Host")?;
         let user = required_scalar(&self.user, "User")?;
         let port = normalize_port(&self.port).ok_or(DraftError::InvalidPort)?;
@@ -340,6 +344,7 @@ impl ConnectionDraft {
         let mut server = ServerConfig {
             id,
             name,
+            folder,
             mode: if matches!(
                 self.source,
                 ConnectionSource::SshConfig | ConnectionSource::SshConfigBatch
@@ -504,6 +509,8 @@ pub enum DraftError {
     InvalidScalar(&'static str),
     #[error("Name must not contain control characters")]
     InvalidName,
+    #[error("Folder must not contain control characters")]
+    InvalidFolder,
     #[error("Port must be a number from 1 to 65535")]
     InvalidPort,
     #[error("Select a private key file")]
@@ -549,6 +556,14 @@ fn required_display_name(value: &str) -> Result<String, DraftError> {
     }
     if value.chars().any(char::is_control) {
         return Err(DraftError::InvalidName);
+    }
+    Ok(value.into())
+}
+
+fn validate_folder(value: &str) -> Result<String, DraftError> {
+    let value = value.trim();
+    if value.chars().any(char::is_control) {
+        return Err(DraftError::InvalidFolder);
     }
     Ok(value.into())
 }
@@ -1110,6 +1125,41 @@ mod tests {
         let mut invalid = draft;
         invalid.name = "Alpha\nBeta".into();
         assert_eq!(invalid.validate(&[]), Err(DraftError::InvalidName));
+    }
+
+    #[test]
+    fn folder_round_trip_trims_whitespace_and_rejects_controls() {
+        let mut draft = ConnectionDraft {
+            name: "Alpha".into(),
+            folder: "  Projects / Research  ".into(),
+            host: "host.example".into(),
+            user: "alice".into(),
+            auth: AuthMethod::Password,
+            password: "secret".into(),
+            ..ConnectionDraft::default()
+        };
+        let server = draft.validate(&[]).unwrap().server;
+        assert_eq!(server.folder, "Projects / Research");
+        assert_eq!(ConnectionDraft::from_server(&server).folder, server.folder);
+
+        draft.folder = "Projects\nResearch".into();
+        assert_eq!(draft.validate(&[]), Err(DraftError::InvalidFolder));
+    }
+
+    #[test]
+    fn refreshing_an_ssh_import_preserves_user_folder() {
+        let mut draft = ConnectionDraft {
+            folder: "Research".into(),
+            ..ConnectionDraft::default()
+        };
+        draft.apply_imported_server(&ServerConfig {
+            name: "Cluster".into(),
+            host_alias: "cluster".into(),
+            host: "cluster.example".into(),
+            user: "alice".into(),
+            ..ServerConfig::default()
+        });
+        assert_eq!(draft.folder, "Research");
     }
 
     #[test]

@@ -461,6 +461,8 @@ struct App {
     system_locale: Locale,
     system_theme_dark: bool,
     servers: Vec<ServerConfig>,
+    connection_search: String,
+    connection_sort: ConnectionSort,
     service: MountService,
     mount_statuses: HashMap<String, MountStatus>,
     busy: HashSet<String>,
@@ -728,12 +730,25 @@ impl std::fmt::Display for LogChoice {
 #[derive(Debug, Clone, Copy)]
 enum ConnectionField {
     Name,
+    Folder,
     HostAlias,
     Host,
     User,
     Port,
     KeyFile,
     SshConfigPath,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ConnectionSort {
+    #[default]
+    SavedOrder,
+    Name,
+    Host,
+}
+
+impl ConnectionSort {
+    const ALL: [Self; 3] = [Self::SavedOrder, Self::Name, Self::Host];
 }
 
 #[derive(Clone)]
@@ -936,6 +951,8 @@ enum Message {
     ExitDecision(bool),
     WindowClosed(window::Id),
     AddConnection,
+    ConnectionSearchChanged(String),
+    ConnectionSortChanged(ConnectionSort),
     OpenTransfers,
     CloseTransfers,
     CloseTransfersDecision(rfd::MessageDialogResult),
@@ -1183,6 +1200,8 @@ impl App {
             system_locale,
             system_theme_dark,
             servers,
+            connection_search: String::new(),
+            connection_sort: ConnectionSort::default(),
             service,
             mount_statuses: HashMap::new(),
             busy: HashSet::new(),
@@ -1581,6 +1600,8 @@ impl App {
                 self.screen = Screen::ConnectionEditor;
                 self.status = locale.text(TextKey::NewConnection).into();
             }
+            Message::ConnectionSearchChanged(value) => self.connection_search = value,
+            Message::ConnectionSortChanged(value) => self.connection_sort = value,
             Message::OpenTransfers => {
                 self.screen = Screen::TransferCenter;
                 self.status = locale.text(TextKey::TransferCenter).into();
@@ -1726,6 +1747,7 @@ impl App {
                 if let Some(draft) = &mut self.connection_draft {
                     match field {
                         ConnectionField::Name => draft.name = value,
+                        ConnectionField::Folder => draft.folder = value,
                         ConnectionField::HostAlias => draft.host_alias = value,
                         ConnectionField::Host => draft.host = value,
                         ConnectionField::User => {
@@ -4213,6 +4235,28 @@ impl App {
         ]
         .spacing(10);
 
+        let sort_options = localized_choices(ConnectionSort::ALL, locale, Locale::connection_sort);
+        let organization = row![
+            text_input(
+                locale.text(TextKey::SearchConnections),
+                &self.connection_search,
+            )
+            .on_input(Message::ConnectionSearchChanged)
+            .width(Fill),
+            pick_list(
+                sort_options,
+                Some(locale.choice(
+                    self.connection_sort,
+                    locale.connection_sort(self.connection_sort),
+                )),
+                |choice| Message::ConnectionSortChanged(choice.value),
+            )
+            .placeholder(locale.text(TextKey::SortConnections))
+            .width(Length::Fixed(180.0)),
+        ]
+        .spacing(10)
+        .align_y(Center);
+
         let mut connections = column![].spacing(8);
         if self.servers.is_empty() {
             connections = connections.push(
@@ -4236,32 +4280,52 @@ impl App {
                 .center_x(Fill),
             );
         } else {
-            for server in &self.servers {
-                connections = connections.push(connection_card(
-                    server,
-                    ConnectionCardState {
-                        status: self
-                            .mount_statuses
-                            .get(&server.id)
-                            .copied()
-                            .unwrap_or(MountStatus::Unmounted),
-                        busy: self.busy.contains(&server.id),
-                        transfer: self.transfers.get(&server.id),
-                        transfer_unavailable: self.transfer_errors.contains_key(&server.id),
-                        capacity: self.capacities.get(&server.id),
-                        capacity_checking: self.capacity_refreshing
-                            && !self.capacities.contains_key(&server.id)
-                            && !self.capacity_errors.contains(&server.id),
-                        can_modify: self.can_modify(&server.id),
-                        confirming_remove: self.pending_delete.as_deref() == Some(&server.id),
-                        waiting_unmount: self.pending_unmount_after_sync.contains(&server.id),
-                        operation_error: self.operation_errors.get(&server.id),
-                        has_interactive_terminal: self
-                            .interactive_terminals
-                            .contains_key(&server.id),
-                    },
-                    locale,
-                ));
+            let groups =
+                organized_connections(&self.servers, &self.connection_search, self.connection_sort);
+            if groups.is_empty() {
+                connections = connections.push(
+                    container(text(locale.text(TextKey::NoMatchingConnections)).size(16))
+                        .padding(24)
+                        .width(Fill)
+                        .center_x(Fill),
+                );
+            }
+            for (folder, servers) in groups {
+                connections = connections.push(
+                    text(if folder.is_empty() {
+                        locale.text(TextKey::Uncategorized).to_owned()
+                    } else {
+                        folder
+                    })
+                    .size(16),
+                );
+                for server in servers {
+                    connections = connections.push(connection_card(
+                        server,
+                        ConnectionCardState {
+                            status: self
+                                .mount_statuses
+                                .get(&server.id)
+                                .copied()
+                                .unwrap_or(MountStatus::Unmounted),
+                            busy: self.busy.contains(&server.id),
+                            transfer: self.transfers.get(&server.id),
+                            transfer_unavailable: self.transfer_errors.contains_key(&server.id),
+                            capacity: self.capacities.get(&server.id),
+                            capacity_checking: self.capacity_refreshing
+                                && !self.capacities.contains_key(&server.id)
+                                && !self.capacity_errors.contains(&server.id),
+                            can_modify: self.can_modify(&server.id),
+                            confirming_remove: self.pending_delete.as_deref() == Some(&server.id),
+                            waiting_unmount: self.pending_unmount_after_sync.contains(&server.id),
+                            operation_error: self.operation_errors.get(&server.id),
+                            has_interactive_terminal: self
+                                .interactive_terminals
+                                .contains_key(&server.id),
+                        },
+                        locale,
+                    ));
+                }
             }
         }
 
@@ -4269,6 +4333,7 @@ impl App {
             column![
                 toolbar,
                 batch_actions,
+                organization,
                 scrollable(connections).height(Fill),
                 row![text(&self.status), Space::new().width(Fill), text(VERSION)],
             ]
@@ -4626,6 +4691,12 @@ impl App {
                 &draft.name,
                 ConnectionField::Name,
                 requirements.name,
+            ),
+            connection_input(
+                locale.text(TextKey::Folder),
+                &draft.folder,
+                ConnectionField::Folder,
+                false,
             ),
             connection_input(
                 locale.text(TextKey::SshHostAlias),
@@ -5956,6 +6027,75 @@ fn connection_card<'a>(
     .into()
 }
 
+fn organized_connections<'a>(
+    servers: &'a [ServerConfig],
+    search: &str,
+    sort: ConnectionSort,
+) -> Vec<(String, Vec<&'a ServerConfig>)> {
+    let query = search.trim().to_lowercase();
+    let matches = servers
+        .iter()
+        .enumerate()
+        .filter(|(_, server)| {
+            query.is_empty()
+                || [
+                    server.display_name(),
+                    server.folder.as_str(),
+                    server.host_alias.as_str(),
+                    server.host.as_str(),
+                    server.user.as_str(),
+                    server.remote_path.as_str(),
+                    server.mountpoint.as_str(),
+                ]
+                .into_iter()
+                .any(|value| value.to_lowercase().contains(&query))
+        })
+        .collect::<Vec<_>>();
+
+    let mut groups: Vec<(String, Vec<(usize, &ServerConfig)>)> = Vec::new();
+    for (index, server) in matches {
+        let folder = server.folder.trim().to_owned();
+        if let Some((_, group)) = groups.iter_mut().find(|(name, _)| *name == folder) {
+            group.push((index, server));
+        } else {
+            groups.push((folder, vec![(index, server)]));
+        }
+    }
+    for (_, group) in &mut groups {
+        group.sort_by(|(left_index, left), (right_index, right)| {
+            let ordering = match sort {
+                ConnectionSort::SavedOrder => std::cmp::Ordering::Equal,
+                ConnectionSort::Name => left
+                    .display_name()
+                    .to_lowercase()
+                    .cmp(&right.display_name().to_lowercase()),
+                ConnectionSort::Host => left
+                    .host
+                    .to_lowercase()
+                    .cmp(&right.host.to_lowercase())
+                    .then_with(|| left.user.to_lowercase().cmp(&right.user.to_lowercase())),
+            };
+            ordering.then_with(|| left_index.cmp(right_index))
+        });
+    }
+    if sort != ConnectionSort::SavedOrder {
+        groups.sort_by(|(left, _), (right, _)| {
+            left.is_empty()
+                .cmp(&right.is_empty())
+                .then_with(|| left.to_lowercase().cmp(&right.to_lowercase()))
+        });
+    }
+    groups
+        .into_iter()
+        .map(|(folder, group)| {
+            (
+                folder,
+                group.into_iter().map(|(_, server)| server).collect(),
+            )
+        })
+        .collect()
+}
+
 fn connection_input<'a>(
     label: &'a str,
     value: &'a str,
@@ -6659,6 +6799,7 @@ fn localize_draft_error(locale: Locale, error: &DraftError) -> String {
             format!("{}不能包含空白字符或控制字符", localized_draft_field(field))
         }
         DraftError::InvalidName => "名称不能包含控制字符".into(),
+        DraftError::InvalidFolder => "文件夹不能包含控制字符".into(),
         DraftError::InvalidPort => "端口必须是 1 到 65535 之间的数字".into(),
         DraftError::KeyRequired => "请选择私钥文件".into(),
         DraftError::KeyMissing(path) => format!("找不到私钥文件：{path}"),
@@ -8441,6 +8582,52 @@ mod localization_tests {
         );
         assert_eq!(compose_remote_path("/", "srv/data"), "/srv/data");
         assert_eq!(compose_remote_path("/", ""), "/");
+    }
+
+    #[test]
+    fn connection_organization_filters_groups_and_sorts_stably() {
+        let servers = vec![
+            ServerConfig {
+                id: "zeta".into(),
+                name: "Zeta".into(),
+                folder: "Work".into(),
+                host: "b.example".into(),
+                ..ServerConfig::default()
+            },
+            ServerConfig {
+                id: "alpha".into(),
+                name: "Alpha".into(),
+                folder: "Work".into(),
+                host: "a.example".into(),
+                ..ServerConfig::default()
+            },
+            ServerConfig {
+                id: "home".into(),
+                name: "Home".into(),
+                host: "home.example".into(),
+                ..ServerConfig::default()
+            },
+        ];
+        let grouped = organized_connections(&servers, "work", ConnectionSort::Name);
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[0].0, "Work");
+        assert_eq!(
+            grouped[0]
+                .1
+                .iter()
+                .map(|server| server.id.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "zeta"]
+        );
+
+        let saved = organized_connections(&servers, "", ConnectionSort::SavedOrder);
+        assert_eq!(saved[0].1[0].id, "zeta");
+        assert_eq!(saved[1].0, "");
+
+        let by_host = organized_connections(&servers, "", ConnectionSort::Host);
+        assert_eq!(by_host[0].0, "Work");
+        assert_eq!(by_host[0].1[0].id, "alpha");
+        assert_eq!(by_host[1].0, "");
     }
 
     #[test]

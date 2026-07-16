@@ -7,6 +7,7 @@ use mountmate_core::{
 };
 
 use super::CacheMode;
+use super::ConnectionSort;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Locale {
@@ -168,6 +169,17 @@ impl Locale {
             (Self::Chinese, CacheMode::Minimal) => "最小",
             (Self::Chinese, CacheMode::Writes) => "仅写入",
             (Self::Chinese, CacheMode::Full) => "完整",
+        }
+    }
+
+    pub(crate) fn connection_sort(self, value: ConnectionSort) -> &'static str {
+        match (self, value) {
+            (Self::English, ConnectionSort::SavedOrder) => "Saved order",
+            (Self::English, ConnectionSort::Name) => "Name",
+            (Self::English, ConnectionSort::Host) => "Host",
+            (Self::Chinese, ConnectionSort::SavedOrder) => "保存顺序",
+            (Self::Chinese, ConnectionSort::Name) => "名称",
+            (Self::Chinese, ConnectionSort::Host) => "主机",
         }
     }
 
@@ -361,6 +373,7 @@ pub(crate) enum TextKey {
     FileManagerMenuRegistered,
     FileManagerMenuRemoved,
     FileTransfer,
+    Folder,
     HideDetails,
     Import,
     ImportSshConfig,
@@ -391,6 +404,7 @@ pub(crate) enum TextKey {
     NoMountedConnections,
     NoLogContent,
     NoSavedConnections,
+    NoMatchingConnections,
     Open,
     OpenedMountpoint,
     Optional,
@@ -421,10 +435,12 @@ pub(crate) enum TextKey {
     Settings,
     SettingsSaved,
     SettingsUnavailable,
+    SearchConnections,
     ShowTransferPopup,
     ShowDetails,
     ShowMainWindow,
     Source,
+    SortConnections,
     SshConfigFile,
     SshConfigPathRequired,
     SshHost,
@@ -447,6 +463,7 @@ pub(crate) enum TextKey {
     Unmount,
     UnmountAll,
     UnmountBeforeRemove,
+    Uncategorized,
     User,
     VfsCacheMode,
     ViewLog,
@@ -488,6 +505,7 @@ fn english(key: TextKey) -> &'static str {
         TextKey::FileManagerMenuRegistered => "File-manager commands registered",
         TextKey::FileManagerMenuRemoved => "File-manager commands removed",
         TextKey::FileTransfer => "File transfer",
+        TextKey::Folder => "Folder",
         TextKey::HideDetails => "Hide details",
         TextKey::Import => "Import",
         TextKey::ImportSshConfig => "Import SSH config",
@@ -522,6 +540,7 @@ fn english(key: TextKey) -> &'static str {
         TextKey::NoMountedConnections => "No mounted connections",
         TextKey::NoLogContent => "No log content is available yet",
         TextKey::NoSavedConnections => "No saved connections",
+        TextKey::NoMatchingConnections => "No connections match this search",
         TextKey::Open => "Open",
         TextKey::OpenedMountpoint => "Opened mountpoint",
         TextKey::Optional => "Optional",
@@ -552,10 +571,12 @@ fn english(key: TextKey) -> &'static str {
         TextKey::Settings => "Settings",
         TextKey::SettingsSaved => "Settings saved",
         TextKey::SettingsUnavailable => "Settings unavailable",
+        TextKey::SearchConnections => "Search connections",
         TextKey::ShowTransferPopup => "Show transfer popup automatically",
         TextKey::ShowDetails => "Details",
         TextKey::ShowMainWindow => "Show SSH MountMate",
         TextKey::Source => "Source",
+        TextKey::SortConnections => "Sort connections",
         TextKey::SshConfigFile => "SSH config file",
         TextKey::SshConfigPathRequired => "SSH config path is required",
         TextKey::SshHost => "SSH Host",
@@ -580,6 +601,7 @@ fn english(key: TextKey) -> &'static str {
         TextKey::Unmount => "Unmount",
         TextKey::UnmountAll => "Unmount all",
         TextKey::UnmountBeforeRemove => "Unmount the connection before removing it",
+        TextKey::Uncategorized => "Uncategorized",
         TextKey::User => "User",
         TextKey::VfsCacheMode => "VFS cache mode",
         TextKey::ViewLog => "View log",
@@ -620,6 +642,7 @@ fn chinese(key: TextKey) -> &'static str {
         TextKey::FileManagerMenuRegistered => "文件管理器命令已注册",
         TextKey::FileManagerMenuRemoved => "文件管理器命令已移除",
         TextKey::FileTransfer => "文件传输",
+        TextKey::Folder => "文件夹",
         TextKey::HideDetails => "收起详情",
         TextKey::Import => "导入",
         TextKey::ImportSshConfig => "导入 SSH 配置",
@@ -652,6 +675,7 @@ fn chinese(key: TextKey) -> &'static str {
         TextKey::NoMountedConnections => "没有已挂载的连接",
         TextKey::NoLogContent => "暂时没有可显示的日志内容",
         TextKey::NoSavedConnections => "没有已保存的连接",
+        TextKey::NoMatchingConnections => "没有符合搜索条件的连接",
         TextKey::Open => "打开",
         TextKey::OpenedMountpoint => "已打开挂载点",
         TextKey::Optional => "可选",
@@ -682,10 +706,12 @@ fn chinese(key: TextKey) -> &'static str {
         TextKey::Settings => "设置",
         TextKey::SettingsSaved => "设置已保存",
         TextKey::SettingsUnavailable => "设置不可用",
+        TextKey::SearchConnections => "搜索连接",
         TextKey::ShowTransferPopup => "自动显示传输进度弹窗",
         TextKey::ShowDetails => "展开详情",
         TextKey::ShowMainWindow => "显示 SSH MountMate",
         TextKey::Source => "来源",
+        TextKey::SortConnections => "连接排序",
         TextKey::SshConfigFile => "SSH 配置文件",
         TextKey::SshConfigPathRequired => "必须填写 SSH 配置路径",
         TextKey::SshHost => "SSH Host",
@@ -710,6 +736,7 @@ fn chinese(key: TextKey) -> &'static str {
         TextKey::Unmount => "卸载",
         TextKey::UnmountAll => "全部卸载",
         TextKey::UnmountBeforeRemove => "请先卸载连接再删除",
+        TextKey::Uncategorized => "未分类",
         TextKey::User => "用户",
         TextKey::VfsCacheMode => "VFS 缓存模式",
         TextKey::ViewLog => "查看日志",
