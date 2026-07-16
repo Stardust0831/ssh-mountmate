@@ -14,6 +14,16 @@ server_ids=(native-a native-b openssh-a openssh-b)
 interactive_id="interactive-a"
 control_candidates=()
 
+allocate_loopback_port() {
+  python3 - <<'PY'
+import socket
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+    listener.bind(("127.0.0.1", 0))
+    print(listener.getsockname()[1])
+PY
+}
+
 locate_control_socket() {
   local candidate
   for candidate in "${control_candidates[@]}"; do
@@ -120,32 +130,35 @@ cp "${client_key}.pub" "${authorized_keys}"
 chmod 600 "${client_key}" "${host_key}" "${authorized_keys}"
 
 port=""
-for candidate in $(seq 42200 42300); do
-  if ! ss -H -ltn "sport = :${candidate}" | grep -q .; then
-    port="${candidate}"
-    break
+start_server() {
+  if [[ -z "${port}" ]]; then
+    port="$(allocate_loopback_port)"
   fi
-done
-test -n "${port}"
-
-"${rclone}" --cache-dir "${test_root}/server-cache" \
-  --log-file "${test_root}/sftp-server.log" -vv \
-  serve sftp "${remote_root}" --addr "127.0.0.1:${port}" \
-  --authorized-keys "${authorized_keys}" --key "${host_key}" \
-  --dir-cache-time 0s --poll-interval 0 &
-server_pid=$!
-server_ready=false
-for _ in $(seq 1 50); do
-  if ! kill -0 "${server_pid}" 2>/dev/null; then
-    break
-  fi
-  if ss -H -ltn "sport = :${port}" | grep -q .; then
-    server_ready=true
-    break
-  fi
-  sleep 0.1
-done
-test "${server_ready}" == true
+  for _ in $(seq 1 20); do
+    "${rclone}" --cache-dir "${test_root}/server-cache" \
+      --log-file "${test_root}/sftp-server.log" -vv \
+      serve sftp "${remote_root}" --addr "127.0.0.1:${port}" \
+      --authorized-keys "${authorized_keys}" --key "${host_key}" \
+      --dir-cache-time 0s --poll-interval 0 &
+    server_pid=$!
+    for _ in $(seq 1 50); do
+      if ! kill -0 "${server_pid}" 2>/dev/null; then
+        break
+      fi
+      if ss -H -ltn "sport = :${port}" | grep -q .; then
+        return 0
+      fi
+      sleep 0.1
+    done
+    kill "${server_pid}" 2>/dev/null || true
+    wait "${server_pid}" 2>/dev/null || true
+    server_pid=""
+    port="$(allocate_loopback_port)"
+  done
+  echo 'failed to start the SFTP server on an available loopback port' >&2
+  return 1
+}
+start_server
 
 ssh-keyscan -T 5 -t ecdsa -p "${port}" 127.0.0.1 >"${known_hosts}" 2>/dev/null
 test -s "${known_hosts}"

@@ -113,39 +113,54 @@ try {
   Get-Service 'WinFsp.Launcher' -ErrorAction Stop | Out-Null
 
   Write-Host '[windows-mount-e2e] starting local SFTP server'
-  $listener = [System.Net.Sockets.TcpListener]::new(
-    [System.Net.IPAddress]::Loopback,
-    0
-  )
-  $listener.Start()
-  $port = ([System.Net.IPEndPoint] $listener.LocalEndpoint).Port
-  $listener.Stop()
+  $serverReady = $false
+  for ($attempt = 0; $attempt -lt 20 -and -not $serverReady; $attempt++) {
+    $listener = [System.Net.Sockets.TcpListener]::new(
+      [System.Net.IPAddress]::Loopback,
+      0
+    )
+    $listener.Start()
+    $port = ([System.Net.IPEndPoint] $listener.LocalEndpoint).Port
+    $listener.Stop()
 
-  $serverInfo = [System.Diagnostics.ProcessStartInfo]::new($serverRclone)
-  $serverInfo.UseShellExecute = $false
-  $serverInfo.CreateNoWindow = $true
-  @(
-    '--cache-dir', (Join-Path $testRoot 'server-cache'),
-    '--log-file', $serverLog,
-    '-vv', 'serve', 'sftp', $remoteRoot,
-    '--addr', "127.0.0.1:$port",
-    '--key', $hostKey,
-    '--user', 'mountmate', '--pass', 'test-only-password',
-    '--dir-cache-time', '0s', '--poll-interval', '0'
-  ) | ForEach-Object { $serverInfo.ArgumentList.Add($_) }
-  $server = [System.Diagnostics.Process]::Start($serverInfo)
-  Wait-Until {
-    if ($server.HasExited) { throw "SFTP server exited with $($server.ExitCode)" }
-    $client = [System.Net.Sockets.TcpClient]::new()
-    try {
-      $client.Connect('127.0.0.1', $port)
-      return $true
-    } catch {
-      return $false
-    } finally {
-      $client.Dispose()
+    $serverInfo = [System.Diagnostics.ProcessStartInfo]::new($serverRclone)
+    $serverInfo.UseShellExecute = $false
+    $serverInfo.CreateNoWindow = $true
+    @(
+      '--cache-dir', (Join-Path $testRoot 'server-cache'),
+      '--log-file', $serverLog,
+      '-vv', 'serve', 'sftp', $remoteRoot,
+      '--addr', "127.0.0.1:$port",
+      '--key', $hostKey,
+      '--user', 'mountmate', '--pass', 'test-only-password',
+      '--dir-cache-time', '0s', '--poll-interval', '0'
+    ) | ForEach-Object { $serverInfo.ArgumentList.Add($_) }
+    $server = [System.Diagnostics.Process]::Start($serverInfo)
+    for ($probe = 0; $probe -lt 50; $probe++) {
+      if ($server.HasExited) { break }
+      $client = [System.Net.Sockets.TcpClient]::new()
+      try {
+        $client.Connect('127.0.0.1', $port)
+        $serverReady = $true
+        break
+      } catch {
+        # The listener may still be starting; retry while the child is alive.
+      } finally {
+        $client.Dispose()
+      }
+      Start-Sleep -Milliseconds 100
     }
-  } 50
+    if (-not $serverReady) {
+      if ($server -and -not $server.HasExited) {
+        $server.Kill($true)
+        $server.WaitForExit()
+      }
+      $server = $null
+    }
+  }
+  if (-not $serverReady) {
+    throw 'Failed to start the SFTP server on an available loopback port'
+  }
 
   $drive = @('R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z') |
     Where-Object { -not (Test-Path "${_}:\") } |
