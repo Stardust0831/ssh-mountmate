@@ -378,9 +378,19 @@ fn fetch_prerelease_from_atom(
 ) -> Result<UpdateInfo, String> {
     let feed = fetch_bounded_url(client, RELEASES_ATOM, MAX_RELEASE_FEED_BYTES)?;
     let releases = releases_from_atom(&feed)?;
-    let release =
-        select_release_for_channel(current_version, releases).map_err(|error| error.to_string())?;
-    update_info_from_signed_tag(client, current_version, release).map_err(|error| error.to_string())
+    let candidates = release_candidates_for_channel(current_version, releases)
+        .map_err(|error| error.to_string())?;
+    let mut failures = Vec::new();
+    for release in candidates {
+        match update_info_from_signed_tag(client, current_version, release.clone()) {
+            Ok(info) => return Ok(info),
+            Err(error) => failures.push(format!("{}: {error}", release.tag_name)),
+        }
+    }
+    Err(format!(
+        "no release-feed candidate had a valid signed update: {}",
+        failures.join("; ")
+    ))
 }
 
 fn releases_from_atom(feed: &[u8]) -> Result<Vec<GithubRelease>, String> {
@@ -464,6 +474,16 @@ fn select_release_for_channel(
     current_version: &str,
     releases: Vec<GithubRelease>,
 ) -> Result<GithubRelease, UpdateError> {
+    release_candidates_for_channel(current_version, releases)?
+        .into_iter()
+        .next()
+        .ok_or(UpdateError::MissingReleaseTag)
+}
+
+fn release_candidates_for_channel(
+    current_version: &str,
+    releases: Vec<GithubRelease>,
+) -> Result<Vec<GithubRelease>, UpdateError> {
     let include_prereleases = current_is_prerelease(current_version)?;
     let mut candidates = releases
         .into_iter()
@@ -474,11 +494,11 @@ fn select_release_for_channel(
             (include_prereleases || !is_prerelease).then_some((version, release))
         })
         .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| left.0.cmp(&right.0));
-    candidates
-        .pop()
-        .map(|(_, release)| release)
-        .ok_or(UpdateError::MissingReleaseTag)
+    candidates.sort_by(|left, right| right.0.cmp(&left.0));
+    if candidates.is_empty() {
+        return Err(UpdateError::MissingReleaseTag);
+    }
+    Ok(candidates.into_iter().map(|(_, release)| release).collect())
 }
 
 fn update_info_from_release(
@@ -1184,6 +1204,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selected.tag_name, "v0.4.0-alpha.3");
+    }
+
+    #[test]
+    fn prerelease_fallback_candidates_are_newest_first() {
+        let candidates = release_candidates_for_channel(
+            "v0.4.1-alpha.4",
+            vec![
+                release("v0.4.1-alpha.5", true, false),
+                release("v0.4.1-alpha.7", true, false),
+                release("v0.4.1-alpha.6", true, false),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            candidates
+                .into_iter()
+                .map(|release| release.tag_name)
+                .collect::<Vec<_>>(),
+            ["v0.4.1-alpha.7", "v0.4.1-alpha.6", "v0.4.1-alpha.5"]
+        );
     }
 
     #[test]
