@@ -601,11 +601,13 @@ mod tests {
         let app_root = temp.path().join("app");
         let binary = app_root.join("bin/rclone");
         fs::create_dir_all(binary.parent().unwrap()).unwrap();
-        fs::write(
-            &binary,
-            b"#!/bin/sh\nif [ \"$1\" = obscure ]; then\n  [ \"$2\" = - ]\n  IFS= read -r secret || true\n  [ \"$secret\" = 'top secret' ]\n  printf 'obscured-value\\n'\nelif [ \"$1\" = reveal ]; then\n  [ \"$2\" = -- ]\n  [ \"$3\" = obscured-value ]\n  printf 'top secret\\n'\nelse\n  exit 1\nfi\n",
-        )
-        .unwrap();
+        {
+            let mut script = fs::File::create(&binary).unwrap();
+            script
+                .write_all(b"#!/bin/sh\nif [ \"$1\" = obscure ]; then\n  [ \"$2\" = - ]\n  IFS= read -r secret || true\n  [ \"$secret\" = 'top secret' ]\n  printf 'obscured-value\\n'\nelif [ \"$1\" = reveal ]; then\n  [ \"$2\" = -- ]\n  [ \"$3\" = obscured-value ]\n  printf 'top secret\\n'\nelse\n  exit 1\nfi\n")
+                .unwrap();
+            script.sync_all().unwrap();
+        }
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
         let digest = crate::rclone_binary::file_sha256(&binary).unwrap();
         fs::write(binary.with_file_name("rclone.sha256"), digest).unwrap();

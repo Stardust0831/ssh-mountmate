@@ -171,6 +171,8 @@ pub struct ServerConfig {
     pub id: String,
     #[serde(default)]
     pub name: String,
+    #[serde(default)]
+    pub folder: String,
     #[serde(default = "default_mode")]
     pub mode: String,
     #[serde(default = "default_source")]
@@ -228,6 +230,7 @@ impl Default for ServerConfig {
         Self {
             id: String::new(),
             name: String::new(),
+            folder: String::new(),
             mode: default_mode(),
             source: default_source(),
             host_alias: String::new(),
@@ -683,6 +686,12 @@ mod tests {
         };
 
         assert_eq!(server.remote_name(), "cluster-login");
+    }
+
+    #[test]
+    fn legacy_server_defaults_to_no_folder() {
+        let server: ServerConfig = serde_json::from_str(r#"{"id":"legacy"}"#).unwrap();
+        assert!(server.folder.is_empty());
     }
 
     #[test]
