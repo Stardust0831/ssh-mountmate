@@ -1,7 +1,12 @@
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -26,6 +31,8 @@ pub enum InteractiveSshError {
     OpenSshMissing,
     #[error("interactive SSH shared session is not ready; complete login in the app terminal")]
     SessionMissing,
+    #[error("interactive SSH readiness check timed out after {timeout:?}")]
+    ReadinessTimeout { timeout: Duration },
     #[error("could not start interactive SSH: {0}")]
     Process(String),
     #[error(transparent)]
@@ -111,6 +118,8 @@ impl UnixMetadataProvider for SystemUnixMetadata {
 }
 
 impl InteractiveSshSession {
+    const DEFAULT_READINESS_TIMEOUT: Duration = Duration::from_secs(2);
+
     pub fn for_server(
         paths: &AppPaths,
         app_root: &Path,
@@ -148,25 +157,50 @@ impl InteractiveSshSession {
     }
 
     pub fn is_ready(&self) -> bool {
+        self.check_ready(Self::DEFAULT_READINESS_TIMEOUT)
+            .unwrap_or(false)
+    }
+
+    /// Check whether the app-owned SSH session is ready, with a hard deadline.
+    ///
+    /// The check is intended to run from a blocking worker (for example,
+    /// `spawn_blocking`) because it polls a child process. A successful exit
+    /// returns `Ok(true)`, a normal nonzero exit returns `Ok(false)`, and
+    /// spawning, polling, termination, or timeout failures return an error.
+    /// On Unix, control-path validation runs before spawning and a failed
+    /// check attempts the same safe stale-socket cleanup as [`Self::is_ready`].
+    pub fn check_ready(&self, timeout: Duration) -> Result<bool, InteractiveSshError> {
         #[cfg(unix)]
-        if self.validate_control_paths().is_err() {
-            return false;
-        }
-        let ready = Command::new(&self.check_program)
+        self.validate_control_paths()?;
+
+        let mut command = Command::new(&self.check_program);
+        command
             .args(&self.check_arguments)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
-        #[cfg(unix)]
-        if !ready {
-            // A verified socket that no longer answers is stale. Never remove
-            // an object unless it passes the same identity checks used above.
-            let _ = cleanup_control_socket(&self.control_socket);
+            .stderr(Stdio::null());
+        configure_readiness_command(&mut command);
+        let result = run_readiness_command(&mut command, timeout);
+        if !matches!(result, Ok(true)) {
+            self.cleanup_failed_readiness();
         }
-        ready
+        result
     }
+
+    /// Return the default bounded readiness timeout used by [`Self::is_ready`].
+    pub const fn default_readiness_timeout() -> Duration {
+        Self::DEFAULT_READINESS_TIMEOUT
+    }
+
+    #[cfg(unix)]
+    fn cleanup_failed_readiness(&self) {
+        // A verified socket that no longer answers is stale. Never remove an
+        // object unless it passes the same identity checks used above.
+        let _ = cleanup_control_socket(&self.control_socket);
+    }
+
+    #[cfg(not(unix))]
+    fn cleanup_failed_readiness(&self) {}
 
     /// Remove this server's stale OpenSSH control socket when it is safe to do
     /// so. Invalid, replaced, or foreign-owned paths are left untouched.
@@ -254,6 +288,90 @@ impl InteractiveSshSession {
             #[cfg(unix)]
             control_socket: PathBuf::new(),
         })
+    }
+}
+
+fn run_readiness_command(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<bool, InteractiveSshError> {
+    let mut child = command.spawn().map_err(|error| {
+        InteractiveSshError::Process(format!("could not spawn SSH readiness check: {error}"))
+    })?;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status.success()),
+            Ok(None) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    terminate_readiness_child(&mut child)?;
+                    return Err(InteractiveSshError::ReadinessTimeout { timeout });
+                }
+                thread::sleep(
+                    deadline
+                        .saturating_duration_since(now)
+                        .min(Duration::from_millis(10)),
+                );
+            }
+            Err(error) => {
+                terminate_readiness_child(&mut child)?;
+                return Err(InteractiveSshError::Process(format!(
+                    "could not poll SSH readiness check: {error}"
+                )));
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+#[cfg(windows)]
+const fn readiness_creation_flags() -> u32 {
+    CREATE_NO_WINDOW
+}
+
+#[cfg(all(not(windows), test))]
+const fn readiness_creation_flags() -> u32 {
+    0
+}
+
+#[cfg(windows)]
+fn configure_readiness_command(command: &mut Command) {
+    command.creation_flags(readiness_creation_flags());
+}
+
+#[cfg(not(windows))]
+fn configure_readiness_command(_command: &mut Command) {}
+
+fn terminate_readiness_child(child: &mut Child) -> Result<(), InteractiveSshError> {
+    if let Err(error) = child.kill() {
+        return match child.try_wait() {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) | Err(_) => Err(InteractiveSshError::Process(format!(
+                "could not terminate SSH readiness check: {error}"
+            ))),
+        };
+    }
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                return Err(InteractiveSshError::Process(
+                    "SSH readiness check did not exit after termination".into(),
+                ));
+            }
+            Err(error) => {
+                return Err(InteractiveSshError::Process(format!(
+                    "could not reap SSH readiness check: {error}"
+                )));
+            }
+        }
     }
 }
 
@@ -867,5 +985,65 @@ mod tests {
 
         assert!(cleanup_control_socket(&object).is_err());
         assert!(object.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readiness_check_reports_success_for_zero_exit() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]);
+        assert!(matches!(
+            run_readiness_command(&mut command, Duration::from_secs(1)),
+            Ok(true)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readiness_check_reports_false_for_normal_nonzero_exit() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 7"]);
+        assert!(matches!(
+            run_readiness_command(&mut command, Duration::from_secs(1)),
+            Ok(false)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readiness_check_terminates_a_hung_child_at_the_deadline() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "while :; do :; done"]);
+        let timeout = Duration::from_millis(200);
+
+        let started = Instant::now();
+        let result = run_readiness_command(&mut command, timeout);
+        let elapsed = started.elapsed();
+
+        assert!(matches!(
+            result,
+            Err(InteractiveSshError::ReadinessTimeout { timeout: observed })
+                if observed == timeout
+        ));
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "readiness probe exceeded its bounded deadline: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn readiness_creation_flags_are_platform_specific() {
+        #[cfg(windows)]
+        assert_eq!(readiness_creation_flags(), CREATE_NO_WINDOW);
+        #[cfg(not(windows))]
+        assert_eq!(readiness_creation_flags(), 0);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn readiness_command_configuration_is_a_noop_without_windows_creation_flags() {
+        let mut command = Command::new("true");
+        configure_readiness_command(&mut command);
+        assert_eq!(command.get_program(), std::ffi::OsStr::new("true"));
     }
 }

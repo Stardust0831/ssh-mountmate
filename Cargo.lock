@@ -2982,7 +2982,7 @@ dependencies = [
 
 [[package]]
 name = "mountmate-core"
-version = "0.4.1-alpha.7"
+version = "0.4.2-alpha.1"
 dependencies = [
  "base64",
  "configparser",
@@ -3013,7 +3013,7 @@ dependencies = [
 
 [[package]]
 name = "mountmate-platform"
-version = "0.4.1-alpha.7"
+version = "0.4.2-alpha.1"
 dependencies = [
  "mountmate-core",
  "notify-rust",
@@ -5005,10 +5005,11 @@ dependencies = [
 
 [[package]]
 name = "ssh-mountmate"
-version = "0.4.1-alpha.7"
+version = "0.4.2-alpha.1"
 dependencies = [
  "async-channel 2.5.0",
  "dark-light",
+ "directories",
  "gtk",
  "iced",
  "iced_term",

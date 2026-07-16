@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+directories.workspace = true
 async-channel.workspace = true
 dark-light.workspace = true
 iced.workspace = true

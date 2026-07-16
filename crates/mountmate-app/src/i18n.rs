@@ -3,7 +3,8 @@ use std::fmt;
 use mountmate_core::connection::{ConnectionSource, ImportAction, ImportStatus};
 use mountmate_core::rc::RefreshResult;
 use mountmate_core::{
-    AccentColor, AppearanceMode, AuthMethod, ConnectionMethod, CredentialStorage, MountBackend,
+    AccentColor, AppearanceMode, AuthMethod, ConnectionMethod, CredentialStorage, FontScale,
+    MountBackend,
 };
 
 use super::CacheMode;
@@ -130,6 +131,19 @@ impl Locale {
             (Self::Chinese, AccentColor::Green) => "绿色",
             (Self::Chinese, AccentColor::Amber) => "琥珀色",
             (Self::Chinese, AccentColor::Purple) => "紫色",
+        }
+    }
+
+    pub(crate) fn font_scale(self, value: FontScale) -> &'static str {
+        match (self, value) {
+            (Self::English, FontScale::Small) => "Small",
+            (Self::English, FontScale::Standard) => "Standard",
+            (Self::English, FontScale::Large) => "Large",
+            (Self::English, FontScale::ExtraLarge) => "Extra large",
+            (Self::Chinese, FontScale::Small) => "小",
+            (Self::Chinese, FontScale::Standard) => "标准",
+            (Self::Chinese, FontScale::Large) => "大",
+            (Self::Chinese, FontScale::ExtraLarge) => "特大",
         }
     }
 

@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use iced::widget::{
-    Space, button, checkbox, column, container, pick_list, progress_bar, row, scrollable, stack,
-    text, text_editor, text_input, toggler, tooltip,
+    Space, button, checkbox, column, container, pick_list, progress_bar, responsive, row,
+    scrollable, stack, text, text_editor, text_input, toggler, tooltip,
 };
 use iced::{
     Center, Color, Element, Fill, Length, Point, Size, Subscription, Task, Theme, clipboard,
@@ -39,7 +39,7 @@ use mountmate_core::interactive_ssh::{
     InteractiveSshError, InteractiveSshLoginCommand, InteractiveSshSession,
 };
 use mountmate_core::model::{MAX_VFS_UPLOAD_TRANSFERS, MIN_VFS_UPLOAD_TRANSFERS};
-use mountmate_core::mountpoint::HOME_MOUNTPOINT_VALUE;
+use mountmate_core::mountpoint::{HOME_MOUNTPOINT_VALUE, preflight_custom_mountpoint};
 use mountmate_core::paths::AppPaths;
 use mountmate_core::plink_binary::resolve_plink;
 use mountmate_core::process::MountStatus;
@@ -59,7 +59,7 @@ use mountmate_core::update_manifest::UpdateTrustError;
 use mountmate_core::update_workflow::{PreparedUpdateLaunch, prepare_update_install};
 use mountmate_core::{
     APP_NAME, AccentColor, AppearanceMode, AuthMethod, ConnectionMethod, CredentialStorage,
-    MountBackend, MountState, ServerConfig, Settings, VERSION,
+    FontScale, MountBackend, MountState, ServerConfig, Settings, VERSION,
 };
 #[cfg(windows)]
 use mountmate_platform::NativeWindowHandle;
@@ -285,6 +285,7 @@ fn run() -> Result<(), String> {
             iced::daemon(move || App::new(bootstrap.clone()), App::update, App::view)
                 .title(App::title)
                 .theme(App::theme)
+                .scale_factor(|app, _window| app.effective_font_scale().factor())
                 .subscription(App::subscription)
                 .run()
                 .map_err(|error| error.to_string())
@@ -493,6 +494,8 @@ struct App {
     screen: Screen,
     connection_draft: Option<ConnectionDraft>,
     connection_custom_mountpoint: String,
+    mountpoint_preflight: MountpointPreflight,
+    mountpoint_preflight_generation: u64,
     settings_draft: Option<SettingsDraft>,
     log_view: Option<MountLogView>,
     log_window: Option<window::Id>,
@@ -629,7 +632,6 @@ enum InteractiveTerminalLifecycle {
     Starting,
     Ready,
     Exited,
-    Failed,
 }
 
 struct InteractiveTerminalSession {
@@ -639,6 +641,7 @@ struct InteractiveTerminalSession {
     lifecycle: InteractiveTerminalLifecycle,
     queued_mount: bool,
     resume_sent: bool,
+    readiness_check_in_flight: bool,
 }
 
 /// Keep a failed mount from turning a connection card into a full-page error
@@ -653,6 +656,33 @@ enum MountErrorAction {
     Retry,
     ViewLog,
     Dismiss,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum MountpointPreflight {
+    #[default]
+    NotRequired,
+    Checking(String),
+    Valid(String),
+    Invalid {
+        value: String,
+        error: String,
+    },
+}
+
+impl MountpointPreflight {
+    fn allows_save(&self) -> bool {
+        matches!(self, Self::NotRequired | Self::Valid(_))
+    }
+}
+
+fn mountpoint_preflight_result_is_current(
+    result_generation: u64,
+    current_generation: u64,
+    result_value: &str,
+    current_value: Option<&str>,
+) -> bool {
+    result_generation == current_generation && current_value == Some(result_value)
 }
 
 fn mount_error_summary(locale: Locale, cause: &str) -> String {
@@ -846,6 +876,7 @@ struct SettingsDraft {
     language: Language,
     appearance_mode: AppearanceMode,
     accent_color: AccentColor,
+    font_scale: FontScale,
 }
 
 impl SettingsDraft {
@@ -868,6 +899,7 @@ impl SettingsDraft {
             language: Language::from_value(&settings.language),
             appearance_mode: settings.appearance_mode,
             accent_color: settings.accent_color,
+            font_scale: settings.font_scale,
         }
     }
 
@@ -921,6 +953,7 @@ impl SettingsDraft {
         settings.language = self.language.value().into();
         settings.appearance_mode = self.appearance_mode;
         settings.accent_color = self.accent_color;
+        settings.font_scale = self.font_scale;
         Ok(settings)
     }
 }
@@ -931,6 +964,11 @@ enum Message {
     TrayAction(TrayAction),
     TrayTick,
     InteractiveTick,
+    InteractiveReadinessChecked {
+        id: String,
+        generation: u64,
+        result: Result<bool, String>,
+    },
     TerminalEvent(RedactedTerminalEvent),
     TerminalWindowOpened(window::Id),
     OpenInteractiveTerminal(String),
@@ -977,6 +1015,11 @@ enum Message {
     CustomMountpointChanged(String),
     BrowseMountpoint,
     MountpointPicked(Option<PathBuf>),
+    MountpointPreflightFinished {
+        generation: u64,
+        value: String,
+        result: Result<(), String>,
+    },
     ConnectionAuthChanged(AuthMethod),
     ConnectionMethodChanged(ConnectionMethod),
     PasswordChanged(SecretInput),
@@ -1031,6 +1074,7 @@ enum Message {
     LanguageChanged(Language),
     AppearanceModeChanged(AppearanceMode),
     AccentColorChanged(AccentColor),
+    FontScaleChanged(FontScale),
     RegisterFileManagerMenu,
     UnregisterFileManagerMenu,
     FileManagerMenuFinished(Result<bool, String>),
@@ -1232,6 +1276,8 @@ impl App {
             screen,
             connection_draft: None,
             connection_custom_mountpoint: String::new(),
+            mountpoint_preflight: MountpointPreflight::NotRequired,
+            mountpoint_preflight_generation: 0,
             settings_draft: None,
             log_view: None,
             log_window: None,
@@ -1288,6 +1334,42 @@ impl App {
             }
             Message::TrayAction(action) => return self.handle_tray_action(action),
             Message::InteractiveTick => return self.poll_interactive_terminals(),
+            Message::InteractiveReadinessChecked {
+                id,
+                generation,
+                result,
+            } => {
+                let Some(session) = self.interactive_terminals.get_mut(&id) else {
+                    return Task::none();
+                };
+                if session.generation != generation {
+                    return Task::none();
+                }
+                session.readiness_check_in_flight = false;
+                if !interactive_readiness_result_is_current(session.lifecycle, session.queued_mount)
+                {
+                    return Task::none();
+                }
+                match result {
+                    Ok(true) => {
+                        session.lifecycle = InteractiveTerminalLifecycle::Ready;
+                        self.status = locale.text(TextKey::InteractiveTerminalReady).into();
+                        if interactive_mount_resume_once(
+                            session.queued_mount,
+                            session.resume_sent,
+                            true,
+                        ) {
+                            session.resume_sent = true;
+                            session.queued_mount = false;
+                            return self.start_mount_operation(id, Some(MountOperation::Mount));
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => diagnostic_trace(&format!(
+                        "interactive readiness check failed for {id} generation {generation}: {error}"
+                    )),
+                }
+            }
             Message::TerminalEvent(event) => return self.handle_terminal_event(event),
             Message::TerminalWindowOpened(id) => {
                 if self.terminal_window == Some(id) {
@@ -1595,6 +1677,7 @@ impl App {
                 draft.ssh_config_path = default_ssh_config_path().display().to_string();
                 self.connection_draft = Some(draft);
                 self.connection_custom_mountpoint.clear();
+                self.mountpoint_preflight = MountpointPreflight::NotRequired;
                 self.ssh_import_plan = None;
                 self.ssh_import_actions.clear();
                 self.screen = Screen::ConnectionEditor;
@@ -1721,6 +1804,7 @@ impl App {
                     self.settings_draft = None;
                     self.ssh_import_plan = None;
                     self.ssh_import_actions.clear();
+                    self.mountpoint_preflight = MountpointPreflight::NotRequired;
                     self.screen = Screen::Connections;
                     self.status = self.locale().text(TextKey::Ready).into();
                     self.sync_tray();
@@ -1779,27 +1863,23 @@ impl App {
             Message::MountpointChoiceChanged(choice) => {
                 if let Some(draft) = &mut self.connection_draft {
                     if mountpoint_choice(&draft.mountpoint) == "custom" {
-                        self.connection_custom_mountpoint = draft.mountpoint.clone();
+                        self.connection_custom_mountpoint =
+                            custom_mountpoint_value(&draft.mountpoint);
                     }
-                    draft.mountpoint = match choice.as_str() {
-                        "auto" => String::new(),
-                        "home" => HOME_MOUNTPOINT_VALUE.into(),
-                        "custom" => {
-                            if self.connection_custom_mountpoint.is_empty() {
-                                CUSTOM_MOUNTPOINT_PENDING.into()
-                            } else {
-                                self.connection_custom_mountpoint.clone()
-                            }
-                        }
-                        drive => drive.to_owned(),
-                    };
+                    draft.mountpoint =
+                        mountpoint_value_for_choice(&choice, &self.connection_custom_mountpoint);
                 }
+                if choice == "custom" {
+                    return self.start_mountpoint_preflight();
+                }
+                self.mountpoint_preflight = MountpointPreflight::NotRequired;
             }
             Message::CustomMountpointChanged(value) => {
                 self.connection_custom_mountpoint = value.clone();
                 if let Some(draft) = &mut self.connection_draft {
-                    draft.mountpoint = value;
+                    draft.mountpoint = custom_mountpoint_draft_value(value);
                 }
+                return self.start_mountpoint_preflight();
             }
             Message::BrowseMountpoint => {
                 let title = match locale {
@@ -1828,8 +1908,34 @@ impl App {
                 if let Some(draft) = &mut self.connection_draft {
                     draft.mountpoint = path;
                 }
+                return self.start_mountpoint_preflight();
             }
             Message::MountpointPicked(None) => {}
+            Message::MountpointPreflightFinished {
+                generation,
+                value,
+                result,
+            } => {
+                let current = self.connection_draft.as_ref().map(|draft| {
+                    if draft.mountpoint == CUSTOM_MOUNTPOINT_PENDING {
+                        self.connection_custom_mountpoint.trim()
+                    } else {
+                        draft.mountpoint.trim()
+                    }
+                });
+                if !mountpoint_preflight_result_is_current(
+                    generation,
+                    self.mountpoint_preflight_generation,
+                    &value,
+                    current,
+                ) {
+                    return Task::none();
+                }
+                self.mountpoint_preflight = match result {
+                    Ok(()) => MountpointPreflight::Valid(value),
+                    Err(error) => MountpointPreflight::Invalid { value, error },
+                };
+            }
             Message::ConnectionAuthChanged(auth) => {
                 if let Some(draft) = &mut self.connection_draft {
                     draft.auth = auth;
@@ -2022,6 +2128,7 @@ impl App {
                         let terminal_task = self.reconcile_interactive_sessions(&outcome.servers);
                         self.servers = outcome.servers;
                         self.connection_draft = None;
+                        self.mountpoint_preflight = MountpointPreflight::NotRequired;
                         self.screen = Screen::Connections;
                         self.status = outcome
                             .warning
@@ -2323,6 +2430,11 @@ impl App {
                     draft.accent_color = accent;
                 }
             }
+            Message::FontScaleChanged(font_scale) => {
+                if let Some(draft) = &mut self.settings_draft {
+                    draft.font_scale = font_scale;
+                }
+            }
             Message::RegisterFileManagerMenu => return self.file_manager_menu_task(true),
             Message::UnregisterFileManagerMenu => return self.file_manager_menu_task(false),
             Message::FileManagerMenuFinished(result) => match result {
@@ -2459,6 +2571,10 @@ impl App {
                     } else {
                         connection_settings_locked_help(locale).into()
                     };
+                    if can_modify && mountpoint_choice(&server.mountpoint) == "custom" {
+                        return self.start_mountpoint_preflight();
+                    }
+                    self.mountpoint_preflight = MountpointPreflight::NotRequired;
                 }
             }
             Message::Remove(id) => {
@@ -2884,9 +3000,18 @@ impl App {
             .and_then(|id| self.servers.iter().find(|server| server.id == id))
             .cloned();
         let credential_storage = self.settings.credential_storage;
+        let custom_mountpoint = (mountpoint_choice(&validated.server.mountpoint) == "custom")
+            .then(|| validated.server.mountpoint.clone());
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
+                    if let Some(mountpoint) = custom_mountpoint {
+                        let home = directories::BaseDirs::new()
+                            .map(|directories| directories.home_dir().to_owned())
+                            .unwrap_or_else(|| PathBuf::from("."));
+                        preflight_custom_mountpoint(&mountpoint, &home)
+                            .map_err(|error| error.to_string())?;
+                    }
                     let server_id = validated.server.id.clone();
                     let password = prepare_secret_action(
                         &service,
@@ -3008,6 +3133,58 @@ impl App {
                 .unwrap_or_else(|error| Err(error.to_string()))
             },
             Message::ConnectionSaved,
+        )
+    }
+
+    fn start_mountpoint_preflight(&mut self) -> Task<Message> {
+        let Some(draft) = &self.connection_draft else {
+            self.mountpoint_preflight = MountpointPreflight::NotRequired;
+            return Task::none();
+        };
+        if mountpoint_choice(&draft.mountpoint) != "custom" {
+            self.mountpoint_preflight = MountpointPreflight::NotRequired;
+            return Task::none();
+        }
+        let value = if draft.mountpoint == CUSTOM_MOUNTPOINT_PENDING {
+            self.connection_custom_mountpoint.trim().to_owned()
+        } else {
+            draft.mountpoint.trim().to_owned()
+        };
+        if value.is_empty() {
+            self.mountpoint_preflight = MountpointPreflight::Invalid {
+                value,
+                error: match self.locale() {
+                    Locale::English => "Select a custom mountpoint".into(),
+                    Locale::Chinese => "请选择自定义挂载点".into(),
+                },
+            };
+            return Task::none();
+        }
+        self.mountpoint_preflight = MountpointPreflight::Checking(value.clone());
+        self.mountpoint_preflight_generation =
+            self.mountpoint_preflight_generation.saturating_add(1);
+        let generation = self.mountpoint_preflight_generation;
+        let checked_value = value.clone();
+        let failed_value = value.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let home = directories::BaseDirs::new()
+                        .map(|directories| directories.home_dir().to_owned())
+                        .unwrap_or_else(|| PathBuf::from("."));
+                    let result = preflight_custom_mountpoint(&checked_value, &home)
+                        .map(|_| ())
+                        .map_err(|error| error.to_string());
+                    (checked_value, result)
+                })
+                .await
+                .unwrap_or_else(|error| (failed_value, Err(error.to_string())))
+            },
+            move |(value, result)| Message::MountpointPreflightFinished {
+                generation,
+                value,
+                result,
+            },
         )
     }
 
@@ -3680,21 +3857,22 @@ impl App {
     }
 
     fn interactive_session_ready(&self, id: &str) -> bool {
-        self.interactive_terminals.get(id).is_some_and(|session| {
-            !matches!(
-                session.lifecycle,
-                InteractiveTerminalLifecycle::Exited | InteractiveTerminalLifecycle::Failed
-            ) && session.ssh.is_ready()
-        })
+        self.interactive_terminals
+            .get(id)
+            .is_some_and(|session| session.lifecycle == InteractiveTerminalLifecycle::Ready)
+    }
+
+    fn effective_font_scale(&self) -> FontScale {
+        self.settings_draft
+            .as_ref()
+            .map_or(self.settings.font_scale, |draft| draft.font_scale)
     }
 
     fn queue_interactive_mount(&mut self, id: String, server: ServerConfig) -> Task<Message> {
         if self.interactive_terminals.get(&id).is_some_and(|session| {
             matches!(
                 session.lifecycle,
-                InteractiveTerminalLifecycle::Ready
-                    | InteractiveTerminalLifecycle::Exited
-                    | InteractiveTerminalLifecycle::Failed
+                InteractiveTerminalLifecycle::Ready | InteractiveTerminalLifecycle::Exited
             )
         }) {
             self.interactive_terminals.remove(&id);
@@ -3755,6 +3933,7 @@ impl App {
                         lifecycle: InteractiveTerminalLifecycle::Starting,
                         queued_mount: true,
                         resume_sent: false,
+                        readiness_check_in_flight: false,
                     },
                 );
                 self.status = self
@@ -3807,38 +3986,35 @@ impl App {
                     .and_then(|draft| draft.editing_id.clone())
             })
             .flatten();
-        let ids = self
-            .interactive_terminals
-            .iter()
-            .filter_map(|(id, session)| {
-                interactive_mount_poll_eligible(id, session.queued_mount, saving_id.as_deref())
-                    .then_some(id.clone())
-            })
-            .collect::<Vec<_>>();
-        let mut resume = Vec::new();
-        for id in ids {
-            let Some(session) = self.interactive_terminals.get_mut(&id) else {
-                continue;
-            };
-            if !interactive_mount_resume_once(
-                session.queued_mount,
-                session.resume_sent,
-                session.lifecycle != InteractiveTerminalLifecycle::Exited
-                    && session.lifecycle != InteractiveTerminalLifecycle::Failed
-                    && session.ssh.is_ready(),
-            ) {
+        let mut checks = Vec::new();
+        for (id, session) in &mut self.interactive_terminals {
+            if !interactive_mount_poll_eligible(id, session.queued_mount, saving_id.as_deref())
+                || session.readiness_check_in_flight
+                || session.lifecycle != InteractiveTerminalLifecycle::Starting
+            {
                 continue;
             }
-            session.lifecycle = InteractiveTerminalLifecycle::Ready;
-            session.resume_sent = true;
-            session.queued_mount = false;
-            resume.push(id);
+            session.readiness_check_in_flight = true;
+            let id = id.clone();
+            let generation = session.generation;
+            let ssh = session.ssh.clone();
+            checks.push(Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        ssh.check_ready(Duration::from_secs(2))
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .unwrap_or_else(|error| Err(error.to_string()))
+                },
+                move |result| Message::InteractiveReadinessChecked {
+                    id: id.clone(),
+                    generation,
+                    result,
+                },
+            ));
         }
-        Task::batch(
-            resume
-                .into_iter()
-                .map(|id| self.start_mount_operation(id, Some(MountOperation::Mount))),
-        )
+        Task::batch(checks)
     }
 
     fn handle_terminal_event(&mut self, event: RedactedTerminalEvent) -> Task<Message> {
@@ -3874,11 +4050,6 @@ impl App {
                 .locale()
                 .text(TextKey::InteractiveTerminalExited)
                 .into();
-        } else if session.lifecycle == InteractiveTerminalLifecycle::Starting
-            && session.ssh.is_ready()
-        {
-            session.lifecycle = InteractiveTerminalLifecycle::Ready;
-            self.status = self.locale().text(TextKey::InteractiveTerminalReady).into();
         }
         Task::none()
     }
@@ -4216,16 +4387,22 @@ impl App {
                     Some(MountStatus::Mounted | MountStatus::Starting)
                 ) || self.paths.state_file(&server.id).exists())
         });
-        let toolbar = row![
-            text(APP_NAME).size(28),
-            Space::new().width(Fill),
-            button(locale.text(TextKey::Refresh)).on_press(Message::Refresh),
-            button(text(transfers_label)).on_press(Message::OpenTransfers),
-            button(locale.text(TextKey::AddConnection)).on_press(Message::AddConnection),
-            button(locale.text(TextKey::Settings)).on_press(Message::OpenSettings),
-        ]
-        .spacing(10)
-        .align_y(Center);
+        let toolbar = responsive(move |size| {
+            let actions = row![
+                button(locale.text(TextKey::Refresh)).on_press(Message::Refresh),
+                button(text(transfers_label.clone())).on_press(Message::OpenTransfers),
+                button(locale.text(TextKey::AddConnection)).on_press(Message::AddConnection),
+                button(locale.text(TextKey::Settings)).on_press(Message::OpenSettings),
+            ]
+            .spacing(10);
+            if size.width < 760.0 {
+                column![text(APP_NAME).size(28), actions].spacing(10).into()
+            } else {
+                row![text(APP_NAME).size(28), Space::new().width(Fill), actions]
+                    .align_y(Center)
+                    .into()
+            }
+        });
         let batch_actions = row![
             button(locale.text(TextKey::MountAll))
                 .on_press_maybe(can_mount_all.then_some(Message::AppCommand(AppCommand::MountAll))),
@@ -4236,26 +4413,31 @@ impl App {
         .spacing(10);
 
         let sort_options = localized_choices(ConnectionSort::ALL, locale, Locale::connection_sort);
-        let organization = row![
-            text_input(
+        let organization = responsive(move |size| {
+            let search = text_input(
                 locale.text(TextKey::SearchConnections),
                 &self.connection_search,
             )
             .on_input(Message::ConnectionSearchChanged)
-            .width(Fill),
-            pick_list(
-                sort_options,
+            .width(Fill);
+            let sort = pick_list(
+                sort_options.clone(),
                 Some(locale.choice(
                     self.connection_sort,
                     locale.connection_sort(self.connection_sort),
                 )),
                 |choice| Message::ConnectionSortChanged(choice.value),
             )
-            .placeholder(locale.text(TextKey::SortConnections))
-            .width(Length::Fixed(180.0)),
-        ]
-        .spacing(10)
-        .align_y(Center);
+            .placeholder(locale.text(TextKey::SortConnections));
+            if size.width < 620.0 {
+                column![search, sort.width(Fill)].spacing(10).into()
+            } else {
+                row![search, sort.width(Length::Fixed(180.0))]
+                    .spacing(10)
+                    .align_y(Center)
+                    .into()
+            }
+        });
 
         let mut connections = column![].spacing(8);
         if self.servers.is_empty() {
@@ -4541,6 +4723,8 @@ impl App {
             return self.read_only_connection_settings_view(draft, title);
         }
         let requirements = draft.requirements();
+        let mountpoint_allows_save = mountpoint_choice(&draft.mountpoint) != "custom"
+            || self.mountpoint_preflight.allows_save();
         let header = row![
             text(title).size(28),
             Space::new().width(Fill),
@@ -4553,7 +4737,9 @@ impl App {
             } else {
                 locale.text(TextKey::Save)
             })
-            .on_press_maybe((!self.editor_saving).then_some(Message::SaveConnection)),
+            .on_press_maybe(
+                (!self.editor_saving && mountpoint_allows_save).then_some(Message::SaveConnection),
+            ),
         ]
         .spacing(10)
         .align_y(Center);
@@ -4946,6 +5132,30 @@ impl App {
                 ]
                 .spacing(8),
             );
+            let preflight_text = match &self.mountpoint_preflight {
+                MountpointPreflight::Checking(_) => Some(
+                    match locale {
+                        Locale::English => "Checking mountpoint availability...",
+                        Locale::Chinese => "正在检查挂载点可用性……",
+                    }
+                    .to_owned(),
+                ),
+                MountpointPreflight::Valid(_) => Some(
+                    match locale {
+                        Locale::English => "Mountpoint is available",
+                        Locale::Chinese => "挂载点可用",
+                    }
+                    .to_owned(),
+                ),
+                MountpointPreflight::Invalid { error, .. } => Some(match locale {
+                    Locale::English => format!("Mountpoint unavailable: {error}"),
+                    Locale::Chinese => format!("挂载点不可用：{error}"),
+                }),
+                MountpointPreflight::NotRequired => None,
+            };
+            if let Some(message) = preflight_text {
+                mountpoint = mountpoint.push(text(message).size(13));
+            }
         }
         let paths = row![remote_path, mountpoint].spacing(12);
         let content = column![
@@ -5204,14 +5414,26 @@ impl App {
                     )
                     .width(Fill),
                 ),
+                labeled_control(
+                    match locale {
+                        Locale::English => "Text size",
+                        Locale::Chinese => "字号",
+                    },
+                    pick_list(
+                        localized_choices(FontScale::ALL, locale, Locale::font_scale),
+                        Some(locale.choice(draft.font_scale, locale.font_scale(draft.font_scale))),
+                        |font_scale| Message::FontScaleChanged(font_scale.value),
+                    )
+                    .width(Fill),
+                ),
             ]
             .spacing(12),
             text(match locale {
                 Locale::English => {
-                    "Follow system is detected when the app starts. Theme and accent previews apply immediately; Save makes them persistent."
+                    "Theme, accent, and text size preview immediately; Save makes them persistent. Follow system is detected when the app starts."
                 }
                 Locale::Chinese => {
-                    "跟随系统会在应用启动时检测。主题和强调色会立即预览，保存后持久生效。"
+                    "主题、强调色和字号会立即预览，保存后持久生效；跟随系统会在应用启动时检测。"
                 }
             })
             .size(14),
@@ -5675,7 +5897,6 @@ impl App {
             }
             InteractiveTerminalLifecycle::Ready => locale.text(TextKey::InteractiveTerminalReady),
             InteractiveTerminalLifecycle::Exited => locale.text(TextKey::InteractiveTerminalExited),
-            InteractiveTerminalLifecycle::Failed => locale.text(TextKey::InteractiveTerminalFailed),
         };
         let terminal = iced_term::TerminalView::show(&session.terminal)
             .map(|event| Message::TerminalEvent(RedactedTerminalEvent(event)));
@@ -6078,13 +6299,15 @@ fn organized_connections<'a>(
             ordering.then_with(|| left_index.cmp(right_index))
         });
     }
-    if sort != ConnectionSort::SavedOrder {
-        groups.sort_by(|(left, _), (right, _)| {
-            left.is_empty()
-                .cmp(&right.is_empty())
-                .then_with(|| left.to_lowercase().cmp(&right.to_lowercase()))
-        });
-    }
+    groups.sort_by(|(left, _), (right, _)| {
+        left.is_empty().cmp(&right.is_empty()).then_with(|| {
+            if sort == ConnectionSort::SavedOrder {
+                std::cmp::Ordering::Equal
+            } else {
+                left.to_lowercase().cmp(&right.to_lowercase())
+            }
+        })
+    });
     groups
         .into_iter()
         .map(|(folder, group)| {
@@ -6450,6 +6673,23 @@ fn custom_mountpoint_value(value: &str) -> String {
         String::new()
     } else {
         value.into()
+    }
+}
+
+fn custom_mountpoint_draft_value(value: String) -> String {
+    if value.trim().is_empty() {
+        CUSTOM_MOUNTPOINT_PENDING.into()
+    } else {
+        value
+    }
+}
+
+fn mountpoint_value_for_choice(choice: &str, custom_mountpoint: &str) -> String {
+    match choice {
+        "auto" => String::new(),
+        "home" => HOME_MOUNTPOINT_VALUE.into(),
+        "custom" => custom_mountpoint_draft_value(custom_mountpoint.into()),
+        drive => drive.to_owned(),
     }
 }
 
@@ -7582,7 +7822,8 @@ fn automatic_install_blocked_message(locale: Locale, error: &UpdateTrustError) -
 
 fn main_window_settings() -> window::Settings {
     window::Settings {
-        size: Size::new(980.0, 720.0),
+        size: Size::new(1120.0, 800.0),
+        min_size: Some(Size::new(760.0, 560.0)),
         position: window::Position::Centered,
         exit_on_close_request: false,
         ..window::Settings::default()
@@ -7591,7 +7832,8 @@ fn main_window_settings() -> window::Settings {
 
 fn log_window_settings() -> window::Settings {
     window::Settings {
-        size: Size::new(900.0, 620.0),
+        size: Size::new(980.0, 680.0),
+        min_size: Some(Size::new(680.0, 480.0)),
         position: window::Position::Centered,
         exit_on_close_request: false,
         ..window::Settings::default()
@@ -7600,7 +7842,8 @@ fn log_window_settings() -> window::Settings {
 
 fn terminal_window_settings() -> window::Settings {
     window::Settings {
-        size: Size::new(980.0, 680.0),
+        size: Size::new(1080.0, 740.0),
+        min_size: Some(Size::new(720.0, 520.0)),
         position: window::Position::Centered,
         exit_on_close_request: false,
         ..window::Settings::default()
@@ -7627,6 +7870,13 @@ fn strict_terminal_text(value: &OsStr, kind: &str) -> Result<String, String> {
 
 fn interactive_mount_resume_once(queued: bool, resumed: bool, ready: bool) -> bool {
     queued && !resumed && ready
+}
+
+fn interactive_readiness_result_is_current(
+    lifecycle: InteractiveTerminalLifecycle,
+    queued_mount: bool,
+) -> bool {
+    lifecycle == InteractiveTerminalLifecycle::Starting && queued_mount
 }
 
 fn interactive_mount_poll_eligible(id: &str, queued: bool, saving_id: Option<&str>) -> bool {
@@ -8388,12 +8638,14 @@ mod localization_tests {
         assert_eq!(draft.credential_storage, CredentialStorage::System);
         assert_eq!(draft.appearance_mode, AppearanceMode::Light);
         assert_eq!(draft.accent_color, AccentColor::Green);
+        assert_eq!(draft.font_scale, FontScale::Standard);
         let rebuilt = draft.build(&original, Locale::English).unwrap();
         assert_eq!(rebuilt.vfs_upload_transfers, 12);
         assert_eq!(rebuilt.macos_mount_backend, MountBackend::Nfs);
         assert_eq!(rebuilt.credential_storage, CredentialStorage::System);
         assert_eq!(rebuilt.appearance_mode, AppearanceMode::Light);
         assert_eq!(rebuilt.accent_color, AccentColor::Green);
+        assert_eq!(rebuilt.font_scale, FontScale::Standard);
     }
 
     #[test]
@@ -8404,6 +8656,10 @@ mod localization_tests {
             }
             for accent in AccentColor::ALL {
                 assert!(!locale.accent_color(accent).is_empty());
+            }
+            for scale in FontScale::ALL {
+                assert!(!locale.font_scale(scale).is_empty());
+                assert!((0.9..=1.3).contains(&scale.factor()));
             }
         }
 
@@ -8621,13 +8877,86 @@ mod localization_tests {
         );
 
         let saved = organized_connections(&servers, "", ConnectionSort::SavedOrder);
+        assert_eq!(saved[0].0, "Work");
         assert_eq!(saved[0].1[0].id, "zeta");
+        assert_eq!(saved.last().unwrap().0, "");
         assert_eq!(saved[1].0, "");
 
         let by_host = organized_connections(&servers, "", ConnectionSort::Host);
         assert_eq!(by_host[0].0, "Work");
         assert_eq!(by_host[0].1[0].id, "alpha");
         assert_eq!(by_host[1].0, "");
+    }
+
+    #[test]
+    fn mountpoint_preflight_blocks_save_until_current_value_is_valid() {
+        assert!(MountpointPreflight::NotRequired.allows_save());
+        assert!(!MountpointPreflight::Checking("C:\\mount".into()).allows_save());
+        assert!(MountpointPreflight::Valid("C:\\mount".into()).allows_save());
+        assert!(
+            !MountpointPreflight::Invalid {
+                value: "Z:\\mount".into(),
+                error: "remote volume".into(),
+            }
+            .allows_save()
+        );
+    }
+
+    #[test]
+    fn mountpoint_preflight_rejects_stale_generations_even_for_the_same_path() {
+        assert!(mountpoint_preflight_result_is_current(
+            3,
+            3,
+            "C:\\mount",
+            Some("C:\\mount")
+        ));
+        assert!(!mountpoint_preflight_result_is_current(
+            1,
+            3,
+            "C:\\mount",
+            Some("C:\\mount")
+        ));
+        assert!(!mountpoint_preflight_result_is_current(
+            3,
+            3,
+            "C:\\old",
+            Some("C:\\mount")
+        ));
+    }
+
+    #[test]
+    fn clearing_custom_mountpoint_preserves_custom_selection() {
+        let cleared = custom_mountpoint_draft_value("  ".into());
+        assert_eq!(cleared, CUSTOM_MOUNTPOINT_PENDING);
+        assert_eq!(mountpoint_choice(&cleared), "custom");
+
+        let cached_custom = custom_mountpoint_value(&cleared);
+        assert_eq!(cached_custom, "");
+        assert_eq!(mountpoint_value_for_choice("auto", &cached_custom), "");
+        assert_eq!(
+            mountpoint_value_for_choice("custom", &cached_custom),
+            CUSTOM_MOUNTPOINT_PENDING
+        );
+        assert_eq!(
+            custom_mountpoint_draft_value("C:\\mount".into()),
+            "C:\\mount"
+        );
+    }
+
+    #[test]
+    fn readiness_results_require_a_starting_queued_session() {
+        assert!(interactive_readiness_result_is_current(
+            InteractiveTerminalLifecycle::Starting,
+            true
+        ));
+        assert!(!interactive_readiness_result_is_current(
+            InteractiveTerminalLifecycle::Exited,
+            true
+        ));
+        assert!(!interactive_readiness_result_is_current(
+            InteractiveTerminalLifecycle::Starting,
+            false
+        ));
     }
 
     #[test]

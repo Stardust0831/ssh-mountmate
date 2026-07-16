@@ -229,6 +229,22 @@ pub struct MountpointAllocator<'a> {
     reserved: HashSet<String>,
 }
 
+/// Validate a configured custom mountpoint against the current host.
+///
+/// The configured value may use `~` to refer to `home`; the returned path is
+/// always the expanded value.  Automatic mountpoint values and drive-letter
+/// allocation are intentionally outside this API: callers should invoke this
+/// only after selecting a custom path.
+pub fn preflight_custom_mountpoint(
+    configured: &str,
+    home: &Path,
+) -> Result<PathBuf, MountpointError> {
+    let probe = SystemMountpointProbe;
+    let path = expand_home(Path::new(configured.trim()), home);
+    validate_custom_path(&path, cfg!(windows), &probe, |_| false)?;
+    Ok(path)
+}
+
 impl<'a> MountpointAllocator<'a> {
     pub fn new(home: PathBuf, windows: bool, probe: &'a dyn MountpointProbe) -> Self {
         Self {
@@ -307,41 +323,52 @@ impl<'a> MountpointAllocator<'a> {
     }
 
     fn validate_custom(&self, path: &Path) -> Result<(), MountpointError> {
-        if !path_is_absolute(path, self.windows) {
-            return Err(MountpointError::NotAbsolute(path.to_owned()));
-        }
-        if self.windows && is_windows_unc(path) {
-            return Err(MountpointError::WindowsUncPath(path.to_owned()));
-        }
-        if self.is_reserved(path) || self.probe.path_is_mount(path) {
-            return Err(MountpointError::AlreadyReserved(path.to_owned()));
-        }
-        if self.windows {
-            let parent = windows_parent(path);
-            if !self.probe.path_exists(&parent) {
-                return Err(MountpointError::ParentMissing(parent));
-            }
-            if self.probe.path_exists(path) {
-                return Err(MountpointError::WindowsTargetExists(path.to_owned()));
-            }
-            match self.probe.windows_volume_kind(&parent) {
-                WindowsVolumeKind::Fixed => {}
-                WindowsVolumeKind::Missing => {
-                    return Err(MountpointError::WindowsVolumeMissing(parent));
-                }
-                kind => {
-                    return Err(MountpointError::WindowsVolumeUnsupported { path: parent, kind });
-                }
-            }
-        } else if self.probe.path_exists(path) && !self.probe.path_is_dir(path) {
-            return Err(MountpointError::NotDirectory(path.to_owned()));
-        }
-        Ok(())
+        validate_custom_path(path, self.windows, self.probe, |candidate| {
+            self.is_reserved(candidate)
+        })
     }
 
     fn is_reserved(&self, path: &Path) -> bool {
         self.reserved.contains(&path_key(path, self.windows))
     }
+}
+
+fn validate_custom_path(
+    path: &Path,
+    windows: bool,
+    probe: &dyn MountpointProbe,
+    is_reserved: impl Fn(&Path) -> bool,
+) -> Result<(), MountpointError> {
+    if !path_is_absolute(path, windows) {
+        return Err(MountpointError::NotAbsolute(path.to_owned()));
+    }
+    if windows && is_windows_unc(path) {
+        return Err(MountpointError::WindowsUncPath(path.to_owned()));
+    }
+    if is_reserved(path) || probe.path_is_mount(path) {
+        return Err(MountpointError::AlreadyReserved(path.to_owned()));
+    }
+    if windows {
+        let parent = windows_parent(path);
+        if !probe.path_exists(&parent) {
+            return Err(MountpointError::ParentMissing(parent));
+        }
+        if probe.path_exists(path) {
+            return Err(MountpointError::WindowsTargetExists(path.to_owned()));
+        }
+        match probe.windows_volume_kind(&parent) {
+            WindowsVolumeKind::Fixed => {}
+            WindowsVolumeKind::Missing => {
+                return Err(MountpointError::WindowsVolumeMissing(parent));
+            }
+            kind => {
+                return Err(MountpointError::WindowsVolumeUnsupported { path: parent, kind });
+            }
+        }
+    } else if probe.path_exists(path) && !probe.path_is_dir(path) {
+        return Err(MountpointError::NotDirectory(path.to_owned()));
+    }
+    Ok(())
 }
 
 fn windows_drive(value: &str) -> Option<char> {
@@ -517,6 +544,60 @@ mod tests {
         assert_eq!(
             allocator.resolve(&server("C:\\mounts\\alpha")).unwrap(),
             PathBuf::from("C:\\mounts\\alpha")
+        );
+    }
+
+    #[test]
+    fn windows_folder_rejects_existing_target() {
+        let mut probe = FakeProbe::default();
+        probe.existing.insert("c:/mounts".into());
+        probe.existing.insert("c:/mounts/alpha".into());
+        probe
+            .volumes
+            .insert("c:/mounts".into(), WindowsVolumeKind::Fixed);
+        let mut allocator = MountpointAllocator::new(PathBuf::from("C:/Users/me"), true, &probe);
+
+        assert_eq!(
+            allocator.resolve(&server("C:\\mounts\\alpha")),
+            Err(MountpointError::WindowsTargetExists(PathBuf::from(
+                "C:\\mounts\\alpha"
+            )))
+        );
+    }
+
+    #[test]
+    fn windows_folder_rejects_missing_parent() {
+        let probe = FakeProbe::default();
+        let mut allocator = MountpointAllocator::new(PathBuf::from("C:/Users/me"), true, &probe);
+
+        assert_eq!(
+            allocator.resolve(&server("C:\\missing\\alpha")),
+            Err(MountpointError::ParentMissing(PathBuf::from("C:\\missing")))
+        );
+    }
+
+    #[test]
+    fn custom_mountpoint_rejects_nonabsolute_path() {
+        let probe = FakeProbe::default();
+        let mut allocator = MountpointAllocator::new(PathBuf::from("/home/me"), false, &probe);
+
+        assert_eq!(
+            allocator.resolve(&server("relative/mount")),
+            Err(MountpointError::NotAbsolute(PathBuf::from(
+                "relative/mount"
+            )))
+        );
+    }
+
+    #[test]
+    fn non_windows_custom_mountpoint_rejects_existing_non_directory() {
+        let mut probe = FakeProbe::default();
+        probe.existing.insert("/tmp/mount".into());
+        let mut allocator = MountpointAllocator::new(PathBuf::from("/home/me"), false, &probe);
+
+        assert_eq!(
+            allocator.resolve(&server("/tmp/mount")),
+            Err(MountpointError::NotDirectory(PathBuf::from("/tmp/mount")))
         );
     }
 
