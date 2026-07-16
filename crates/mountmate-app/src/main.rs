@@ -7801,6 +7801,7 @@ mod localization_tests {
     #[test]
     fn appearance_preview_cancel_and_save_select_the_expected_source() {
         let persisted = Settings {
+            cache_root: PathBuf::from("cache"),
             appearance_mode: AppearanceMode::Dark,
             accent_color: AccentColor::Blue,
             ..Settings::default()
