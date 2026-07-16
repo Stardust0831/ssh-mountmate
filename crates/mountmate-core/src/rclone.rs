@@ -147,6 +147,24 @@ impl RcloneRemote {
         }
         Ok(Self { name, options })
     }
+
+    pub fn wrap_external_ssh(
+        &mut self,
+        proxy: &Path,
+        windows: bool,
+    ) -> Result<(), RcloneConfigError> {
+        let Some((_, ssh)) = self.options.iter_mut().find(|(key, _)| key == "ssh") else {
+            return Ok(());
+        };
+        let proxy = proxy.display().to_string();
+        validate_scalar(&proxy, "SSH connector proxy")?;
+        *ssh = format!(
+            "{} --run-ssh-connector {}",
+            quote_command_argument(&proxy, windows),
+            ssh
+        );
+        Ok(())
+    }
 }
 
 pub fn write_rclone_remote(
@@ -961,6 +979,24 @@ mod tests {
                 field: "external SSH argument"
             })
         ));
+    }
+
+    #[test]
+    fn windows_external_ssh_is_wrapped_by_the_app_connector_proxy() {
+        let mut remote = RcloneRemote {
+            name: "alpha".into(),
+            options: vec![(
+                "ssh".into(),
+                "\"C:\\Program Files\\PuTTY\\plink.exe\" -batch host".into(),
+            )],
+        };
+        remote
+            .wrap_external_ssh(Path::new("C:\\Apps\\SSH MountMate.exe"), true)
+            .unwrap();
+        assert_eq!(
+            remote.options[0].1,
+            "\"C:\\Apps\\SSH MountMate.exe\" --run-ssh-connector \"C:\\Program Files\\PuTTY\\plink.exe\" -batch host"
+        );
     }
 
     #[test]

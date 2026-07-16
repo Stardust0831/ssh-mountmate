@@ -7,7 +7,7 @@ use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -177,6 +177,21 @@ fn run() -> Result<(), String> {
             run_update_helper(&authorization.plan_path, &authorization.token, &executable)
                 .map_err(|error| error.to_string())?;
             return Ok(());
+        }
+        LaunchAction::RunSshConnector { program, arguments } => {
+            let mut command = Command::new(program);
+            command
+                .args(arguments)
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x0800_0000);
+            }
+            let status = command.status().map_err(|error| error.to_string())?;
+            std::process::exit(status.code().unwrap_or(1));
         }
         LaunchAction::Gui { .. } | LaunchAction::Headless(_) => {}
     }
@@ -1953,6 +1968,7 @@ impl App {
                     if connection_method_allowed(
                         draft.source,
                         draft.ssh_config_managed,
+                        draft.connection_method,
                         method,
                         cfg!(windows),
                     ) {
@@ -1987,6 +2003,7 @@ impl App {
                         && !connection_method_allowed(
                             draft.source,
                             true,
+                            draft.connection_method,
                             draft.connection_method,
                             cfg!(windows),
                         )
@@ -4411,7 +4428,8 @@ impl App {
                     .align_y(Center)
                     .into()
             }
-        });
+        })
+        .height(Length::Shrink);
         let batch_actions = row![
             button(locale.text(TextKey::MountAll))
                 .on_press_maybe(can_mount_all.then_some(Message::AppCommand(AppCommand::MountAll))),
@@ -4446,7 +4464,8 @@ impl App {
                     .align_y(Center)
                     .into()
             }
-        });
+        })
+        .height(Length::Shrink);
 
         let mut connections = column![].spacing(8);
         if self.servers.is_empty() {
@@ -4955,6 +4974,7 @@ impl App {
         let interactive_disabled = !connection_method_allowed(
             draft.source,
             draft.ssh_config_managed,
+            draft.connection_method,
             ConnectionMethod::Interactive,
             cfg!(windows),
         );
@@ -4965,6 +4985,7 @@ impl App {
                         connection_method_allowed(
                             draft.source,
                             draft.ssh_config_managed,
+                            draft.connection_method,
                             *method,
                             cfg!(windows),
                         )
@@ -6836,25 +6857,27 @@ fn interactive_auth_help(locale: Locale) -> &'static str {
 
 fn connection_method_allowed(
     source: ConnectionSource,
-    managed_profile: bool,
+    _managed_profile: bool,
+    current: ConnectionMethod,
     method: ConnectionMethod,
     windows: bool,
 ) -> bool {
     !(windows
-        && method == ConnectionMethod::Interactive
-        && (matches!(
+        && matches!(
             source,
             ConnectionSource::SshConfig | ConnectionSource::SshConfigBatch
-        ) || managed_profile))
+        )
+        && current == ConnectionMethod::Openssh
+        && method == ConnectionMethod::Interactive)
 }
 
 fn interactive_ssh_config_unavailable(locale: Locale) -> &'static str {
     match locale {
         Locale::English => {
-            "Interactive shared SSH is unavailable on Windows for SSH-config or app-managed profiles because Plink cannot preserve the full OpenSSH configuration contract."
+            "Interactive shared SSH uses the resolved HostName, User, and Port from this profile. ProxyJump and ProxyCommand profiles should continue using OpenSSH transport."
         }
         Locale::Chinese => {
-            "Windows 上的 SSH config 或应用托管配置不能使用交互式共享 SSH，因为 Plink 无法保留完整的 OpenSSH 配置语义。"
+            "交互式共享 SSH 会使用此配置已解析的 HostName、User 和 Port。包含 ProxyJump 或 ProxyCommand 的配置应继续使用 OpenSSH 传输。"
         }
     }
 }
@@ -6966,7 +6989,10 @@ fn localize_service_error(locale: Locale, error: &ServiceError) -> String {
             "交互式 SSH 共享会话不可用。请在交互式 SSH 终端中完成登录，然后再次挂载。".into()
         }
         ServiceError::InteractiveSsh(InteractiveSshError::UnsupportedWindowsSshConfig) => {
-            "Windows 交互式 SSH 目前仅支持手动直连，不支持 SSH config、ProxyJump 或 ProxyCommand 转换。".into()
+            "此 SSH config 尚未解析出可用于 Windows 交互式 SSH 的 HostName、User 和别名。".into()
+        }
+        ServiceError::InteractiveSsh(InteractiveSshError::UnsupportedWindowsSshProxy) => {
+            "交互式共享 SSH 不能绕过 SSH config 中的 ProxyJump 或 ProxyCommand；请使用 OpenSSH 传输。".into()
         }
         ServiceError::InteractiveSsh(InteractiveSshError::PlinkMissing) => {
             "当前 Windows 程序包缺少已校验的 Plink。".into()
@@ -8308,16 +8334,25 @@ mod localization_tests {
     }
 
     #[test]
-    fn windows_filters_interactive_transport_when_openssh_semantics_are_authoritative() {
-        assert!(!connection_method_allowed(
+    fn windows_allows_resolved_config_profiles_to_use_interactive_transport() {
+        assert!(connection_method_allowed(
             ConnectionSource::SshConfig,
             false,
+            ConnectionMethod::Native,
             ConnectionMethod::Interactive,
             true,
         ));
         assert!(!connection_method_allowed(
+            ConnectionSource::SshConfig,
+            false,
+            ConnectionMethod::Openssh,
+            ConnectionMethod::Interactive,
+            true,
+        ));
+        assert!(connection_method_allowed(
             ConnectionSource::Manual,
             true,
+            ConnectionMethod::Native,
             ConnectionMethod::Interactive,
             true,
         ));
@@ -8325,11 +8360,13 @@ mod localization_tests {
             ConnectionSource::SshConfig,
             false,
             ConnectionMethod::Openssh,
+            ConnectionMethod::Openssh,
             true,
         ));
         assert!(connection_method_allowed(
             ConnectionSource::SshConfig,
             false,
+            ConnectionMethod::Native,
             ConnectionMethod::Interactive,
             false,
         ));
@@ -8753,9 +8790,9 @@ mod localization_tests {
         assert!(localize_service_error(Locale::Chinese, &missing).contains("交互式 SSH 终端"));
 
         let unsupported =
-            ServiceError::InteractiveSsh(InteractiveSshError::UnsupportedWindowsSshConfig);
+            ServiceError::InteractiveSsh(InteractiveSshError::UnsupportedWindowsSshProxy);
         let message = localize_service_error(Locale::Chinese, &unsupported);
-        assert!(message.contains("手动直连"));
+        assert!(message.contains("OpenSSH"));
         assert!(message.contains("ProxyJump"));
     }
 
