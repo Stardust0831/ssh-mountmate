@@ -18,6 +18,7 @@ use crate::ServerConfig;
 use crate::paths::AppPaths;
 use crate::plink_binary::resolve_plink;
 use crate::rclone_binary::{RcloneBinaryError, find_system_executable};
+use crate::ssh::resolve_ssh_config;
 
 #[derive(Debug, Error)]
 pub enum InteractiveSshError {
@@ -25,6 +26,10 @@ pub enum InteractiveSshError {
         "interactive SSH on Windows supports direct manual connections only; SSH-config profiles and proxy translation are not supported"
     )]
     UnsupportedWindowsSshConfig,
+    #[error(
+        "interactive shared SSH cannot bypass ProxyJump or ProxyCommand from the SSH config; use OpenSSH transport"
+    )]
+    UnsupportedWindowsSshProxy,
     #[error("verified Plink is missing from this Windows package")]
     PlinkMissing,
     #[error("OpenSSH was not found")]
@@ -265,6 +270,7 @@ impl InteractiveSshSession {
         app_root: &Path,
         server: &ServerConfig,
     ) -> Result<Self, InteractiveSshError> {
+        reject_windows_proxy_config(server)?;
         if !windows_direct_connection_supported(server) {
             return Err(InteractiveSshError::UnsupportedWindowsSshConfig);
         }
@@ -290,6 +296,29 @@ impl InteractiveSshSession {
             control_socket: PathBuf::new(),
         })
     }
+}
+
+fn reject_windows_proxy_config(server: &ServerConfig) -> Result<(), InteractiveSshError> {
+    if !matches!(server.source.as_str(), "ssh_config" | "ssh_config_batch")
+        || server.host_alias.trim().is_empty()
+    {
+        return Ok(());
+    }
+    let ssh = find_system_executable(if cfg!(windows) { "ssh.exe" } else { "ssh" })
+        .ok_or(InteractiveSshError::OpenSshMissing)?;
+    let config =
+        (!server.ssh_config_path.trim().is_empty()).then(|| Path::new(&server.ssh_config_path));
+    let resolved = resolve_ssh_config(&ssh, &server.host_alias, config)
+        .map_err(|error| InteractiveSshError::Process(error.to_string()))?;
+    if !windows_resolved_config_supported(&resolved) {
+        Err(InteractiveSshError::UnsupportedWindowsSshProxy)
+    } else {
+        Ok(())
+    }
+}
+
+fn windows_resolved_config_supported(resolved: &crate::ssh::ResolvedSshConfig) -> bool {
+    !resolved.needs_openssh_transport()
 }
 
 fn run_readiness_command(
@@ -600,8 +629,20 @@ fn plink_login_arguments(target: &[String]) -> Vec<OsString> {
 }
 
 fn windows_direct_connection_supported(server: &ServerConfig) -> bool {
-    !server.ssh_config_managed
+    if !server.ssh_config_managed
         && !matches!(server.source.as_str(), "ssh_config" | "ssh_config_batch")
+    {
+        return true;
+    }
+
+    // Imported OpenSSH profiles are already resolved into the self-contained
+    // HostName/User/Port fields on ServerConfig. Plink cannot consume the
+    // OpenSSH config language itself, but it can safely use that resolved
+    // direct target. A missing key is intentional: interactive login prompts
+    // for the password or other auth challenge in the app-owned terminal.
+    !server.host_alias.trim().is_empty()
+        && !server.host.trim().is_empty()
+        && !server.user.trim().is_empty()
 }
 
 fn openssh_login_arguments(control: &Path, target: &[String]) -> Vec<OsString> {
@@ -701,20 +742,65 @@ mod tests {
     }
 
     #[test]
-    fn windows_interactive_sharing_accepts_manual_and_rejects_ssh_config_sources() {
+    fn windows_interactive_sharing_accepts_resolved_direct_config_profiles() {
         assert!(windows_direct_connection_supported(&server()));
         for source in ["ssh_config", "ssh_config_batch"] {
             let configured = ServerConfig {
+                host_alias: "cluster".into(),
                 source: source.into(),
                 ..server()
             };
-            assert!(!windows_direct_connection_supported(&configured));
+            assert!(windows_direct_connection_supported(&configured));
         }
         let managed = ServerConfig {
+            host_alias: "managed".into(),
             ssh_config_managed: true,
             ..server()
         };
-        assert!(!windows_direct_connection_supported(&managed));
+        assert!(windows_direct_connection_supported(&managed));
+
+        for invalid in [
+            ServerConfig {
+                source: "ssh_config".into(),
+                host_alias: "cluster".into(),
+                host: String::new(),
+                ..server()
+            },
+            ServerConfig {
+                source: "ssh_config".into(),
+                host_alias: String::new(),
+                ..server()
+            },
+        ] {
+            assert!(!windows_direct_connection_supported(&invalid));
+        }
+    }
+
+    #[test]
+    fn windows_config_profile_overlays_resolved_target_without_a_key() {
+        let configured = ServerConfig {
+            source: "ssh_config".into(),
+            host_alias: "cluster".into(),
+            key_file: String::new(),
+            ..server()
+        };
+        assert!(windows_direct_connection_supported(&configured));
+        assert_eq!(
+            plink_target_arguments(&configured),
+            vec!["-P", "2202", "-l", "alice", "host.example"]
+        );
+    }
+
+    #[test]
+    fn windows_interactive_config_rejects_proxy_semantics() {
+        assert!(windows_resolved_config_supported(
+            &crate::ssh::ResolvedSshConfig::parse("hostname direct.example\nuser alice\n")
+        ));
+        for proxy in ["proxyjump gateway", "proxycommand ssh gateway -W %h:%p"] {
+            assert!(!windows_resolved_config_supported(
+                &crate::ssh::ResolvedSshConfig::parse(proxy)
+            ));
+        }
     }
 
     #[test]

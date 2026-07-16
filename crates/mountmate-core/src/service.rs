@@ -354,13 +354,21 @@ impl MountService {
         } else {
             self.known_hosts_for(server, resolved.as_ref())?
         };
-        let remote = RcloneRemote::for_server_with_external_ssh(
+        let mut remote = RcloneRemote::for_server_with_external_ssh(
             server,
             resolved.as_ref(),
             known_hosts.as_deref(),
             cfg!(windows),
             external_ssh_arguments,
         )?;
+        if cfg!(windows) && server.connection_method != ConnectionMethod::Native {
+            let executable =
+                std::env::current_exe().map_err(|error| RcloneConfigError::InvalidConfig {
+                    path: PathBuf::from("SSHMountMate.exe"),
+                    message: error.to_string(),
+                })?;
+            remote.wrap_external_ssh(&executable, true)?;
+        }
         write_rclone_remote(&self.paths, &remote)?;
         Ok(())
     }

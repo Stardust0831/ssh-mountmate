@@ -13329,9 +13329,9 @@ DEALINGS IN THE SOFTWARE.
 MIT License
 
 Used by:
-- ssh-mountmate 0.4.2-alpha.1 (https://github.com/Stardust0831/ssh-mountmate)
-- mountmate-core 0.4.2-alpha.1 (https://github.com/Stardust0831/ssh-mountmate)
-- mountmate-platform 0.4.2-alpha.1 (https://github.com/Stardust0831/ssh-mountmate)
+- ssh-mountmate 0.4.2-alpha.2 (https://github.com/Stardust0831/ssh-mountmate)
+- mountmate-core 0.4.2-alpha.2 (https://github.com/Stardust0831/ssh-mountmate)
+- mountmate-platform 0.4.2-alpha.2 (https://github.com/Stardust0831/ssh-mountmate)
 - block2 0.5.1 (https://github.com/madsmtm/objc2)
 - block2 0.6.2 (https://github.com/madsmtm/objc2)
 - block 0.1.6 (http://github.com/SSheldon/rust-block)

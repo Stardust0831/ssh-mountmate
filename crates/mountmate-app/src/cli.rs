@@ -12,6 +12,10 @@ pub(crate) enum LaunchAction {
     },
     Headless(AppCommand),
     RunUpdateHelper(UpdateHelperAuthorization),
+    RunSshConnector {
+        program: PathBuf,
+        arguments: Vec<String>,
+    },
     CheckUpdate,
     RclonePath,
     PlinkPath,
@@ -25,16 +29,28 @@ pub(crate) enum LaunchAction {
 }
 
 pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<LaunchAction, String> {
-    let arguments: Vec<_> = arguments
-        .into_iter()
-        .filter(|argument| !argument.starts_with("-psn_"))
-        .collect();
+    let arguments: Vec<_> = arguments.into_iter().collect();
     if arguments.is_empty() {
         return Ok(LaunchAction::Gui {
             command: AppCommand::ShowMain,
             update_health: None,
         });
     }
+    if arguments.first().map(String::as_str) == Some("--run-ssh-connector") {
+        let program = arguments
+            .get(1)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| "--run-ssh-connector requires a program".to_owned())?;
+        return Ok(LaunchAction::RunSshConnector {
+            program,
+            arguments: arguments[2..].to_vec(),
+        });
+    }
+    let arguments: Vec<_> = arguments
+        .into_iter()
+        .filter(|argument| !argument.starts_with("-psn_"))
+        .collect();
     let mut action = None;
     let mut relative_dir = String::new();
     let mut update_helper_token = None;
@@ -304,6 +320,28 @@ mod tests {
         assert_eq!(
             parse(args(&["--register-login-startup"])).unwrap(),
             LaunchAction::RegisterLoginStartup
+        );
+    }
+
+    #[test]
+    fn internal_ssh_connector_preserves_the_exact_argument_vector() {
+        assert_eq!(
+            parse(args(&[
+                "--run-ssh-connector",
+                "C:\\Program Files\\PuTTY\\plink.exe",
+                "-batch",
+                "-psn_payload",
+                "host with space",
+            ]))
+            .unwrap(),
+            LaunchAction::RunSshConnector {
+                program: PathBuf::from("C:\\Program Files\\PuTTY\\plink.exe"),
+                arguments: vec![
+                    "-batch".into(),
+                    "-psn_payload".into(),
+                    "host with space".into(),
+                ],
+            }
         );
     }
 

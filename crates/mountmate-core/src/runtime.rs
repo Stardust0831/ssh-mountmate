@@ -25,11 +25,14 @@ use crate::storage::{FileLock, StorageError, read_json, write_private_json};
 use crate::{MountPhase, MountState, ServerConfig, Settings};
 
 #[cfg(windows)]
-const DETACHED_PROCESS: u32 = 0x0000_0008;
-#[cfg(windows)]
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[cfg(windows)]
+const fn background_creation_flags() -> u32 {
+    CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+}
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -93,7 +96,7 @@ impl ProcessControl for SystemProcessControl {
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
         #[cfg(windows)]
-        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        command.creation_flags(background_creation_flags());
         #[cfg(unix)]
         command.process_group(0);
         let child = command.spawn().map_err(|error| error.to_string())?;
@@ -693,6 +696,13 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn background_processes_are_hidden_without_detaching_the_console() {
+        assert_ne!(background_creation_flags() & CREATE_NO_WINDOW, 0);
+        assert_eq!(background_creation_flags() & 0x0000_0008, 0);
+    }
 
     #[test]
     fn dead_and_zombie_processes_are_terminal() {
