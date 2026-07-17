@@ -975,7 +975,12 @@ fn set_login_startup(executable: &Path, enabled: bool) -> Result<(), PlatformErr
         .join("Library/LaunchAgents")
         .join("io.github.stardust0831.ssh-mountmate.plist");
     if !enabled {
-        return remove_if_present(&path);
+        return remove_if_present(&path).map_err(|error| {
+            PlatformError::Failed(format!(
+                "could not remove login startup file {}: {error}",
+                path.display()
+            ))
+        });
     }
     let executable = executable
         .to_str()
@@ -997,8 +1002,12 @@ fn set_login_startup(executable: &Path, enabled: bool) -> Result<(), PlatformErr
     let mut content = Vec::new();
     plist::to_writer_xml(&mut content, &Value::Dictionary(dictionary))
         .map_err(|error| PlatformError::Failed(error.to_string()))?;
-    mountmate_core::storage::atomic_write(&path, &content)
-        .map_err(|error| PlatformError::Failed(error.to_string()))
+    mountmate_core::storage::atomic_write(&path, &content).map_err(|error| {
+        PlatformError::Failed(format!(
+            "could not write login startup file {}: {error}",
+            path.display()
+        ))
+    })
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]

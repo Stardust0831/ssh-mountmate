@@ -113,10 +113,11 @@ pub fn save_settings(paths: &AppPaths, settings: &Settings) -> Result<(), Storag
 }
 
 pub fn load_settings(paths: &AppPaths) -> Result<Settings, StorageError> {
-    if !paths.settings_file().exists() {
-        return Ok(Settings::default());
-    }
-    let mut settings: Settings = read_json(&paths.settings_file())?;
+    let mut settings: Settings = if paths.settings_file().exists() {
+        read_json(&paths.settings_file())?
+    } else {
+        Settings::default()
+    };
     if settings.cache_root.as_os_str().is_empty() {
         settings.cache_root = paths.cache_dir.clone();
     }
@@ -377,5 +378,24 @@ mod tests {
         };
         save_settings(&paths, &settings).unwrap();
         assert_eq!(load_settings(&paths).unwrap(), settings);
+    }
+
+    #[test]
+    fn missing_settings_use_app_cache_directory_and_migrate_defaults() {
+        let temp = tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: temp.path().join("config"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            data_dir: temp.path().join("data"),
+        };
+
+        let settings = load_settings(&paths).unwrap();
+
+        assert_eq!(settings.cache_root, paths.cache_dir);
+        assert_eq!(
+            settings.settings_schema_version,
+            crate::model::SETTINGS_SCHEMA_VERSION
+        );
     }
 }

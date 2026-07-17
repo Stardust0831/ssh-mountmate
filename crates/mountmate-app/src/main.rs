@@ -841,6 +841,7 @@ struct CustomSettingDraft {
     kind: SettingKind,
     digits: String,
     unit: String,
+    raw_value: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2215,8 +2216,14 @@ impl App {
                     let (digits, unit) = split_custom_setting(option.kind, current);
                     self.custom_setting = Some(CustomSettingDraft {
                         kind: option.kind,
-                        digits,
+                        digits: if custom_setting_is_supported(option.kind, current) {
+                            digits
+                        } else {
+                            current.to_owned()
+                        },
                         unit,
+                        raw_value: (!custom_setting_is_supported(option.kind, current))
+                            .then(|| current.to_owned()),
                     });
                 } else if let Some(draft) = &mut self.settings_draft {
                     set_setting_value(draft, option.kind, option.value);
@@ -2224,10 +2231,15 @@ impl App {
             }
             Message::CustomSettingDigitsChanged(value) => {
                 if let Some(custom) = &mut self.custom_setting {
-                    custom.digits = value
-                        .chars()
-                        .filter(|character| character.is_ascii_digit())
-                        .collect();
+                    if custom.raw_value.is_some() {
+                        custom.digits = value.clone();
+                        custom.raw_value = Some(value);
+                    } else {
+                        custom.digits = value
+                            .chars()
+                            .filter(|character| character.is_ascii_digit())
+                            .collect();
+                    }
                 }
             }
             Message::CustomSettingUnitChanged(unit) => {
@@ -2241,26 +2253,16 @@ impl App {
             }
             Message::SaveCustomSetting => {
                 if let Some(custom) = self.custom_setting.take() {
-                    if custom.digits.is_empty() {
-                        self.status = match locale {
-                            Locale::English => "Custom value must contain digits".into(),
-                            Locale::Chinese => "自定义数值必须填写数字".into(),
-                        };
-                        self.custom_setting = Some(custom);
-                    } else if let Some(draft) = &mut self.settings_draft {
-                        let value = if custom.kind == SettingKind::Transfers {
-                            match validate_upload_transfers(&custom.digits, locale) {
-                                Ok(value) => value.to_string(),
-                                Err(error) => {
-                                    self.status = error;
-                                    self.custom_setting = Some(custom);
-                                    return Task::none();
-                                }
+                    match custom_setting_value(&custom, locale) {
+                        Ok(value) => {
+                            if let Some(draft) = &mut self.settings_draft {
+                                set_setting_value(draft, custom.kind, value);
                             }
-                        } else {
-                            format!("{}{}", custom.digits, custom.unit)
-                        };
-                        set_setting_value(draft, custom.kind, value);
+                        }
+                        Err(error) => {
+                            self.status = error;
+                            self.custom_setting = Some(custom);
+                        }
                     }
                 }
             }
@@ -3315,17 +3317,17 @@ impl App {
         let previous_servers = self.servers.clone();
         let service = self.service.clone();
         let locale = self.locale();
-        let executable = match std::env::current_exe() {
-            Ok(executable) => executable,
-            Err(error) => {
-                self.editor_saving = false;
-                self.status = error.to_string();
-                return Task::none();
-            }
-        };
+        let startup_changed = startup_setting_changed(&previous_settings, &settings);
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
+                    let executable = if startup_changed {
+                        Some(std::env::current_exe().map_err(|error| {
+                            format!("Could not locate the current executable: {error}")
+                        })?)
+                    } else {
+                        None
+                    };
                     let storage_changed =
                         settings.credential_storage != previous_settings.credential_storage;
                     if storage_changed {
@@ -3372,27 +3374,42 @@ impl App {
                             error.to_string(),
                         ));
                     }
-                    if let Err(error) =
-                        Platform.set_login_startup(&executable, settings.startup_all)
-                    {
-                        let settings_rollback = storage::save_settings(&paths, &previous_settings)
-                            .map_err(|rollback| rollback.to_string());
-                        let startup_rollback = Platform
-                            .set_login_startup(&executable, previous_settings.startup_all)
-                            .map_err(|rollback| rollback.to_string());
-                        let mut message = rollback_credential_storage_change(
-                            &paths,
-                            &previous_servers,
-                            credential_migration.as_ref(),
-                            error.to_string(),
+                    if let Some(executable) = executable {
+                        let startup_result = reconcile_startup_if_changed(
+                            previous_settings.startup_all,
+                            settings.startup_all,
+                            &executable,
+                            |executable, enabled| {
+                                Platform
+                                    .set_login_startup(executable, enabled)
+                                    .map_err(|error| {
+                                        format!("login startup integration failed: {error}")
+                                    })
+                            },
                         );
-                        if let Err(rollback) = settings_rollback {
-                            message.push_str(&format!("; settings rollback failed: {rollback}"));
+                        if let Err(error) = startup_result {
+                            let settings_rollback =
+                                storage::save_settings(&paths, &previous_settings)
+                                    .map_err(|rollback| rollback.to_string());
+                            let startup_rollback = Platform
+                                .set_login_startup(&executable, previous_settings.startup_all)
+                                .map_err(|rollback| rollback.to_string());
+                            let mut message = rollback_credential_storage_change(
+                                &paths,
+                                &previous_servers,
+                                credential_migration.as_ref(),
+                                error.to_string(),
+                            );
+                            if let Err(rollback) = settings_rollback {
+                                message
+                                    .push_str(&format!("; settings rollback failed: {rollback}"));
+                            }
+                            if let Err(rollback) = startup_rollback {
+                                message
+                                    .push_str(&format!("; startup rollback failed: {rollback}"));
+                            }
+                            return Err(message);
                         }
-                        if let Err(rollback) = startup_rollback {
-                            message.push_str(&format!("; startup rollback failed: {rollback}"));
-                        }
-                        return Err(message);
                     }
                     let warning = if storage_changed
                         && settings.credential_storage == CredentialStorage::Obscure
@@ -5719,12 +5736,19 @@ impl App {
                 Locale::Chinese => "自定义设置",
             };
             let mut custom_value = row![
-                text_input("0", &custom.digits)
-                    .on_input(Message::CustomSettingDigitsChanged)
-                    .width(Length::Fixed(180.0))
+                text_input(
+                    if custom.raw_value.is_some() {
+                        "value"
+                    } else {
+                        "0"
+                    },
+                    &custom.digits,
+                )
+                .on_input(Message::CustomSettingDigitsChanged)
+                .width(Length::Fixed(180.0))
             ]
             .spacing(10);
-            if !units.is_empty() {
+            if !units.is_empty() && custom.raw_value.is_none() {
                 custom_value = custom_value.push(
                     pick_list(
                         units,
@@ -6446,7 +6470,7 @@ fn setting_picker<'a>(
         .iter()
         .find(|option| !option.custom && option.value == value)
         .cloned()
-        .or_else(|| options.iter().find(|option| option.custom).cloned());
+        .or_else(|| Some(selected_custom_setting_option(kind, value, locale)));
     column![
         row![
             text(label).size(13),
@@ -6454,12 +6478,6 @@ fn setting_picker<'a>(
         ]
         .spacing(5),
         pick_list(options, selected, Message::SettingOptionChanged).width(Fill),
-        text(if setting_presets(kind).contains(&value) {
-            ""
-        } else {
-            value
-        })
-        .size(12),
     ]
     .spacing(5)
     .width(Fill)
@@ -6513,6 +6531,22 @@ fn preset_label(kind: SettingKind, value: &str, locale: Locale) -> String {
     value.to_owned()
 }
 
+fn custom_setting_label(locale: Locale, value: &str) -> String {
+    match locale {
+        Locale::English => format!("Custom: {value}"),
+        Locale::Chinese => format!("自定义：{value}"),
+    }
+}
+
+fn selected_custom_setting_option(kind: SettingKind, value: &str, locale: Locale) -> SettingOption {
+    SettingOption {
+        kind,
+        value: value.to_owned(),
+        label: custom_setting_label(locale, value),
+        custom: true,
+    }
+}
+
 fn setting_value(draft: &SettingsDraft, kind: SettingKind) -> &str {
     match kind {
         SettingKind::MaxSize => &draft.max_size,
@@ -6558,13 +6592,63 @@ fn split_custom_setting(kind: SettingKind, value: &str) -> (String, String) {
     if units.is_empty() {
         return (digits, String::new());
     }
-    let unit = units
-        .iter()
-        .find(|unit| **unit == suffix)
-        .copied()
-        .unwrap_or(units[0])
-        .to_owned();
-    (digits, unit)
+    if value.is_empty() {
+        return (String::new(), units[0].to_owned());
+    }
+    if let Some(unit) = units.iter().find(|unit| **unit == suffix) {
+        (digits, (*unit).to_owned())
+    } else {
+        (value.to_owned(), String::new())
+    }
+}
+
+fn custom_setting_is_supported(kind: SettingKind, value: &str) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+    if kind == SettingKind::Transfers {
+        return value.chars().all(|character| character.is_ascii_digit());
+    }
+    let (digits, unit) = split_custom_setting(kind, value);
+    !digits.is_empty()
+        && digits.len() + unit.len() == value.len()
+        && custom_units(kind).iter().any(|allowed| *allowed == unit)
+}
+
+fn custom_setting_value(custom: &CustomSettingDraft, locale: Locale) -> Result<String, String> {
+    if custom.digits.is_empty() {
+        return Err(match locale {
+            Locale::English => "Custom value must contain digits".into(),
+            Locale::Chinese => "自定义数值必须填写数字".into(),
+        });
+    }
+    if let Some(raw_value) = &custom.raw_value {
+        return Ok(raw_value.clone());
+    }
+    if custom.kind == SettingKind::Transfers {
+        return validate_upload_transfers(&custom.digits, locale).map(|value| value.to_string());
+    }
+    Ok(format!("{}{}", custom.digits, custom.unit))
+}
+
+fn startup_setting_changed(previous: &Settings, next: &Settings) -> bool {
+    previous.startup_all != next.startup_all
+}
+
+fn reconcile_startup_if_changed<F>(
+    previous_enabled: bool,
+    next_enabled: bool,
+    executable: &Path,
+    mut set_login_startup: F,
+) -> Result<(), String>
+where
+    F: FnMut(&Path, bool) -> Result<(), String>,
+{
+    if previous_enabled == next_enabled {
+        Ok(())
+    } else {
+        set_login_startup(executable, next_enabled)
+    }
 }
 
 fn setting_help(kind: SettingKind, locale: Locale) -> &'static str {
@@ -8580,12 +8664,98 @@ mod localization_tests {
         );
         assert_eq!(
             split_custom_setting(SettingKind::MaxAge, "1h30m"),
-            ("1".into(), "s".into())
+            ("1h30m".into(), String::new())
         );
         assert_eq!(
             split_custom_setting(SettingKind::Transfers, "24"),
             ("24".into(), String::new())
         );
+        assert!(!custom_setting_is_supported(SettingKind::MaxAge, "1h30m"));
+        assert!(!custom_setting_is_supported(SettingKind::MaxSize, "20G"));
+        assert!(custom_setting_is_supported(SettingKind::MaxAge, "90m"));
+        assert!(custom_setting_is_supported(SettingKind::MaxSize, "20Gi"));
+    }
+
+    #[test]
+    fn custom_picker_labels_preserve_exact_values_in_both_locales() {
+        let values = [
+            (SettingKind::MaxSize, "20G"),
+            (SettingKind::MaxAge, "1h30m"),
+            (SettingKind::MinFreeSpace, "20G"),
+            (SettingKind::WriteBack, "250ms"),
+            (SettingKind::DirCacheTime, "2h30m"),
+            (SettingKind::BufferSize, "20G"),
+            (SettingKind::Transfers, "24"),
+        ];
+        for (kind, value) in values {
+            for (locale, expected) in [
+                (Locale::English, format!("Custom: {value}")),
+                (Locale::Chinese, format!("自定义：{value}")),
+            ] {
+                let selected = selected_custom_setting_option(kind, value, locale);
+                assert!(selected.custom);
+                assert_eq!(selected.kind, kind);
+                assert_eq!(selected.value, value);
+                assert_eq!(selected.label, expected);
+                assert_eq!(
+                    setting_options(kind, locale)
+                        .into_iter()
+                        .find(|option| option.custom)
+                        .unwrap()
+                        .label,
+                    match locale {
+                        Locale::English => "Custom...",
+                        Locale::Chinese => "自定义...",
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_custom_values_round_trip_without_coercion() {
+        for (kind, value) in [
+            (SettingKind::MaxAge, "1h30m"),
+            (SettingKind::MaxSize, "20G"),
+        ] {
+            let draft = CustomSettingDraft {
+                kind,
+                digits: value.into(),
+                unit: String::new(),
+                raw_value: Some(value.into()),
+            };
+            assert_eq!(
+                custom_setting_value(&draft, Locale::English),
+                Ok(value.into())
+            );
+            assert_eq!(
+                custom_setting_value(&draft, Locale::Chinese),
+                Ok(value.into())
+            );
+        }
+    }
+
+    #[test]
+    fn unchanged_startup_skips_platform_integration() {
+        let mut calls = 0;
+        let result = reconcile_startup_if_changed(true, true, Path::new("mountmate"), |_, _| {
+            calls += 1;
+            Ok(())
+        });
+        assert_eq!(result, Ok(()));
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn changed_startup_preserves_requested_value_and_reports_failure() {
+        let mut requested = None;
+        let result =
+            reconcile_startup_if_changed(false, true, Path::new("mountmate"), |_, enabled| {
+                requested = Some(enabled);
+                Err("permission denied".into())
+            });
+        assert_eq!(requested, Some(true));
+        assert_eq!(result, Err("permission denied".into()));
     }
 
     #[test]
@@ -8627,6 +8797,22 @@ mod localization_tests {
         assert_eq!(rebuilt.appearance_mode, AppearanceMode::Light);
         assert_eq!(rebuilt.accent_color, AccentColor::Green);
         assert_eq!(rebuilt.font_scale, FontScale::Standard);
+    }
+
+    #[test]
+    fn fresh_profile_settings_can_be_saved_without_picking_a_cache_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: temp.path().join("config"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            data_dir: temp.path().join("data"),
+        };
+        let settings = storage::load_settings(&paths).unwrap();
+        let draft = SettingsDraft::from_settings(&settings);
+
+        assert_eq!(settings.cache_root, paths.cache_dir);
+        assert_eq!(draft.build(&settings, Locale::English), Ok(settings));
     }
 
     #[test]
