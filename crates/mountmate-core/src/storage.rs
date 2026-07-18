@@ -185,8 +185,10 @@ pub fn load_settings_recovering(paths: &AppPaths) -> RecoveredSettings {
             persistence_error: None,
         },
         Err(error) => {
-            let mut settings = Settings::default();
-            settings.cache_root = paths.cache_dir.clone();
+            let settings = Settings {
+                cache_root: paths.cache_dir.clone(),
+                ..Settings::default()
+            };
             let settings = settings.migrate();
             let recovery = recover_settings_file(paths, &settings);
             if let Some(settings) = recovery.reloaded_settings {

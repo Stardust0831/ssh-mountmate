@@ -536,6 +536,7 @@ struct App {
     ssh_import_actions: Vec<ImportAction>,
     pending_delete: Option<String>,
     status: String,
+    status_generation: u64,
     update_health: Option<UpdateHealthAuthorization>,
     update_info: Option<UpdateInfo>,
     update_checking: bool,
@@ -1035,11 +1036,13 @@ enum Message {
     MainWindowOpened(window::Id),
     Refresh,
     RefreshFinished {
+        generation: u64,
         expected_status: String,
         result: Result<mountmate_core::rc::RefreshResult, String>,
     },
     StatusesLoaded {
         policy: StatusPublishPolicy,
+        generation: Option<u64>,
         expected_status: Option<String>,
         results: Vec<(String, Result<MountStatus, String>)>,
     },
@@ -1271,7 +1274,6 @@ impl App {
         let recovered_settings = storage::load_settings_recovering(&paths);
         let mut settings_recovery_notice =
             settings_recovery_message(&recovered_settings, system_locale);
-        let settings_were_recovered = recovered_settings.load_error.is_some();
         let mut settings = recovered_settings.settings;
         let locale =
             Locale::from_preference(Language::from_value(&settings.language), system_locale);
@@ -1290,7 +1292,7 @@ impl App {
                 false,
             ),
         };
-        if settings_were_recovered && servers_require_system_credentials(&servers) {
+        if settings_need_system_credential_inference(&settings, &servers) {
             settings.credential_storage = CredentialStorage::System;
             if let Err(error) = storage::save_settings(&paths, &settings) {
                 let detail = match locale {
@@ -1406,6 +1408,7 @@ impl App {
             ssh_import_actions: Vec::new(),
             pending_delete: None,
             status,
+            status_generation: 0,
             update_health,
             update_info: None,
             update_checking: false,
@@ -1559,10 +1562,16 @@ impl App {
                 Err(error) => self.status = error.to_string(),
             },
             Message::RefreshFinished {
+                generation,
                 expected_status,
                 result,
             } => {
-                if self.status != expected_status {
+                if !status_publication_is_current(
+                    generation,
+                    self.status_generation,
+                    &expected_status,
+                    &self.status,
+                ) {
                     return Task::none();
                 }
                 match result {
@@ -1572,6 +1581,7 @@ impl App {
             }
             Message::StatusesLoaded {
                 policy,
+                generation,
                 expected_status,
                 results,
             } => {
@@ -1588,9 +1598,16 @@ impl App {
                         Err(error) => errors.push(error),
                     }
                 }
-                let can_publish = expected_status
-                    .as_ref()
-                    .is_none_or(|expected| self.status == *expected);
+                let can_publish = match (generation, expected_status.as_deref()) {
+                    (Some(generation), Some(expected_status)) => status_publication_is_current(
+                        generation,
+                        self.status_generation,
+                        expected_status,
+                        &self.status,
+                    ),
+                    (None, None) => true,
+                    _ => false,
+                };
                 if let Some(status) = status_completion_message(
                     policy,
                     &errors,
@@ -2684,6 +2701,7 @@ impl App {
                 operation,
                 result,
             } => {
+                self.invalidate_status_publications();
                 self.busy.remove(&id);
                 let mut tasks = Vec::new();
                 match result {
@@ -2944,6 +2962,7 @@ impl App {
             AppCommand::Open { id } => self.open_mountpoint(id),
             AppCommand::RefreshPath { path } => {
                 self.status = self.locale().text(TextKey::Refreshing).into();
+                let generation = self.claim_status_generation();
                 let expected_status = self.status.clone();
                 let service = self.service.clone();
                 let servers = self.servers.clone();
@@ -2958,6 +2977,7 @@ impl App {
                         .unwrap_or_else(|error| Err(error.to_string()))
                     },
                     move |result| Message::RefreshFinished {
+                        generation,
                         expected_status,
                         result,
                     },
@@ -2969,6 +2989,7 @@ impl App {
                     return Task::none();
                 }
                 self.status = self.locale().text(TextKey::Refreshing).into();
+                let generation = self.claim_status_generation();
                 let expected_status = self.status.clone();
                 let service = self.service.clone();
                 Task::perform(
@@ -2982,6 +3003,7 @@ impl App {
                         .unwrap_or_else(|error| Err(error.to_string()))
                     },
                     move |result| Message::RefreshFinished {
+                        generation,
                         expected_status,
                         result,
                     },
@@ -3920,11 +3942,12 @@ impl App {
         }
     }
 
-    fn status_task(&self, policy: StatusPublishPolicy) -> Task<Message> {
-        let expected_status = match policy {
-            StatusPublishPolicy::Silent => None,
+    fn status_task(&mut self, policy: StatusPublishPolicy) -> Task<Message> {
+        let (generation, expected_status) = match policy {
+            StatusPublishPolicy::Silent => (None, None),
             StatusPublishPolicy::Initial | StatusPublishPolicy::UserRefresh => {
-                Some(self.status.clone())
+                let generation = self.claim_status_generation();
+                (Some(generation), Some(self.status.clone()))
             }
         };
         let service = self.service.clone();
@@ -3948,10 +3971,20 @@ impl App {
             },
             move |results| Message::StatusesLoaded {
                 policy,
+                generation,
                 expected_status,
                 results,
             },
         )
+    }
+
+    fn claim_status_generation(&mut self) -> u64 {
+        self.status_generation = self.status_generation.wrapping_add(1);
+        self.status_generation
+    }
+
+    fn invalidate_status_publications(&mut self) {
+        self.claim_status_generation();
     }
 
     fn capacity_task(&mut self) -> Task<Message> {
@@ -7077,6 +7110,14 @@ fn servers_require_system_credentials(servers: &[ServerConfig]) -> bool {
     })
 }
 
+fn settings_need_system_credential_inference(
+    settings: &Settings,
+    servers: &[ServerConfig],
+) -> bool {
+    settings.credential_storage == CredentialStorage::Obscure
+        && servers_require_system_credentials(servers)
+}
+
 fn connection_preference_updates(
     draft: &SettingsDraft,
     locale: Locale,
@@ -8185,6 +8226,15 @@ fn status_completion_message(
     }
 }
 
+fn status_publication_is_current(
+    generation: u64,
+    current_generation: u64,
+    expected_status: &str,
+    current_status: &str,
+) -> bool {
+    generation == current_generation && expected_status == current_status
+}
+
 fn transfer_label(locale: Locale, snapshot: &TransferSnapshot) -> String {
     if snapshot.out_of_space {
         match locale {
@@ -8872,6 +8922,22 @@ mod localization_tests {
     }
 
     #[test]
+    fn repeated_status_text_does_not_make_an_older_generation_current() {
+        assert!(!status_publication_is_current(
+            1,
+            2,
+            "Refreshing",
+            "Refreshing",
+        ));
+        assert!(status_publication_is_current(
+            2,
+            2,
+            "Refreshing",
+            "Refreshing",
+        ));
+    }
+
+    #[test]
     fn unsigned_updates_have_explicit_bilingual_block_reasons() {
         let error = UpdateTrustError::MissingSignature;
         let english = automatic_install_blocked_message(Locale::English, &error);
@@ -9414,10 +9480,24 @@ mod localization_tests {
 
     #[test]
     fn recovered_settings_detect_existing_system_credential_references() {
-        assert!(servers_require_system_credentials(&[ServerConfig {
+        let system_only = ServerConfig {
             password_credential: "ssh-mountmate:alpha:password".into(),
             ..ServerConfig::default()
-        }]));
+        };
+        assert!(servers_require_system_credentials(std::slice::from_ref(
+            &system_only
+        )));
+        assert!(settings_need_system_credential_inference(
+            &Settings::default(),
+            std::slice::from_ref(&system_only),
+        ));
+        assert!(!settings_need_system_credential_inference(
+            &Settings {
+                credential_storage: CredentialStorage::System,
+                ..Settings::default()
+            },
+            &[system_only],
+        ));
         assert!(!servers_require_system_credentials(&[ServerConfig {
             password_obscured: "obscured".into(),
             password_credential: "retained-reference".into(),
