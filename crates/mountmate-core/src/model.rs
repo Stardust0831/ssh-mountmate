@@ -762,9 +762,11 @@ mod tests {
         };
         let json = serde_json::to_value(&server).unwrap();
         assert_eq!(json["auto_mount_at_login"], true);
-        assert!(serde_json::from_value::<ServerConfig>(json)
-            .unwrap()
-            .auto_mount_at_login);
+        assert!(
+            serde_json::from_value::<ServerConfig>(json)
+                .unwrap()
+                .auto_mount_at_login
+        );
     }
 
     #[test]

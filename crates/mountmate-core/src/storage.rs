@@ -140,9 +140,7 @@ pub fn load_settings(paths: &AppPaths) -> Result<Settings, StorageError> {
         Ok(settings) => settings,
         Err(StorageError::Io { source, .. })
             if source.kind() == std::io::ErrorKind::NotFound
-                && fs::symlink_metadata(paths.settings_file()).is_err_and(|metadata_error| {
-                    metadata_error.kind() == std::io::ErrorKind::NotFound
-                }) =>
+                && settings_path_is_genuinely_absent(&paths.settings_file()) =>
         {
             Settings::default()
         }
@@ -152,6 +150,20 @@ pub fn load_settings(paths: &AppPaths) -> Result<Settings, StorageError> {
         settings.cache_root = paths.cache_dir.clone();
     }
     Ok(settings.migrate())
+}
+
+fn settings_path_is_genuinely_absent(path: &Path) -> bool {
+    if !fs::symlink_metadata(path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return true;
+    };
+    match fs::symlink_metadata(parent) {
+        Ok(metadata) => metadata.is_dir(),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
 }
 
 #[derive(Debug)]
@@ -256,7 +268,9 @@ fn recover_settings_file(paths: &AppPaths, settings: &Settings) -> SettingsFileR
         if moved {
             let _ = fs::remove_file(&settings_file);
             if let Err(restore_error) = fs::rename(&backup, &settings_file) {
-                backup_error = Some(format!("could not restore original settings: {restore_error}"));
+                backup_error = Some(format!(
+                    "could not restore original settings: {restore_error}"
+                ));
                 backup_path = Some(backup);
             }
         }
@@ -626,7 +640,10 @@ mod tests {
         fs::create_dir_all(&paths.config_dir).unwrap();
         symlink("missing-settings.json", paths.settings_file()).unwrap();
 
-        assert!(matches!(load_settings(&paths), Err(StorageError::Io { .. })));
+        assert!(matches!(
+            load_settings(&paths),
+            Err(StorageError::Io { .. })
+        ));
     }
 
     #[test]
@@ -652,11 +669,8 @@ mod tests {
         };
         save_servers(&paths, &[alpha.clone(), beta.clone()]).unwrap();
 
-        let updated = update_server_preferences(
-            &paths,
-            &[("alpha".into(), "Work".into(), true)],
-        )
-        .unwrap();
+        let updated =
+            update_server_preferences(&paths, &[("alpha".into(), "Work".into(), true)]).unwrap();
 
         assert_eq!(updated[0].id, "alpha");
         assert_eq!(updated[0].host, alpha.host);

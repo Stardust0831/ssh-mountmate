@@ -803,6 +803,13 @@ enum ConnectionSort {
     Host,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusPublishPolicy {
+    Initial,
+    UserRefresh,
+    Silent,
+}
+
 impl ConnectionSort {
     const ALL: [Self; 3] = [Self::SavedOrder, Self::Name, Self::Host];
 }
@@ -1028,7 +1035,10 @@ enum Message {
     MainWindowOpened(window::Id),
     Refresh,
     RefreshFinished(Result<mountmate_core::rc::RefreshResult, String>),
-    StatusesLoaded(Vec<(String, Result<MountStatus, String>)>),
+    StatusesLoaded {
+        policy: StatusPublishPolicy,
+        results: Vec<(String, Result<MountStatus, String>)>,
+    },
     TransferTick,
     TransfersLoaded(Vec<(String, Result<TransferSnapshot, String>)>),
     NotificationFinished(Result<(), String>),
@@ -1283,9 +1293,9 @@ impl App {
                     Locale::English => format!(
                         "System credential references were detected, but their recovered storage setting could not be persisted: {error}"
                     ),
-                    Locale::Chinese => format!(
-                        "检测到系统凭据引用，但无法持久化恢复后的凭据存储设置：{error}"
-                    ),
+                    Locale::Chinese => {
+                        format!("检测到系统凭据引用，但无法持久化恢复后的凭据存储设置：{error}")
+                    }
                 };
                 settings_recovery_notice = Some(
                     settings_recovery_notice
@@ -1294,7 +1304,8 @@ impl App {
                 );
             }
         }
-        let startup_migration_notice = if legacy_startup_migration_needed(&settings, servers_loaded) {
+        let startup_migration_notice = if legacy_startup_migration_needed(&settings, servers_loaded)
+        {
             match migrate_legacy_startup_preferences(&paths, &settings, &servers) {
                 Ok((migrated_settings, migrated_servers)) => {
                     settings = migrated_settings;
@@ -1305,9 +1316,9 @@ impl App {
                     Locale::English => format!(
                         "Could not migrate the previous login startup selection; the legacy behavior remains active: {error}"
                     ),
-                    Locale::Chinese => format!(
-                        "无法迁移旧版登录自启选择，当前仍保留旧行为：{error}"
-                    ),
+                    Locale::Chinese => {
+                        format!("无法迁移旧版登录自启选择，当前仍保留旧行为：{error}")
+                    }
                 }),
             }
         } else {
@@ -1407,7 +1418,7 @@ impl App {
         };
         let mut tasks = vec![
             open_window.map(Message::MainWindowOpened),
-            app.status_task(),
+            app.status_task(StatusPublishPolicy::Initial),
         ];
         if screen == Screen::TransferCenter {
             tasks.push(app.transfer_task());
@@ -1539,7 +1550,7 @@ impl App {
                 Ok(servers) => {
                     self.servers = servers;
                     self.status = locale.text(TextKey::RefreshingMountStatus).into();
-                    return self.status_task();
+                    return self.status_task(StatusPublishPolicy::UserRefresh);
                 }
                 Err(error) => self.status = error.to_string(),
             },
@@ -1547,7 +1558,7 @@ impl App {
                 Ok(result) => self.status = locale.refresh_complete(&result),
                 Err(error) => self.status = error,
             },
-            Message::StatusesLoaded(results) => {
+            Message::StatusesLoaded { policy, results } => {
                 let mut errors = Vec::new();
                 let mut unmounted = Vec::new();
                 for (id, result) in results {
@@ -1561,11 +1572,11 @@ impl App {
                         Err(error) => errors.push(error),
                     }
                 }
-                self.status = errors.first().cloned().unwrap_or_else(|| {
-                    self.startup_notice
-                        .take()
-                        .unwrap_or_else(|| locale.text(TextKey::Ready).into())
-                });
+                if let Some(status) =
+                    status_completion_message(policy, &errors, &mut self.startup_notice, locale)
+                {
+                    self.status = status;
+                }
                 let mut tasks: Vec<_> = unmounted
                     .iter()
                     .map(|id| self.close_popups_for_server(id))
@@ -1789,30 +1800,22 @@ impl App {
             Message::ConnectionSearchChanged(value) => self.connection_search = value,
             Message::ConnectionSortChanged(value) => self.connection_sort = value,
             Message::SettingsConnectionFolderChanged(id, value) => {
-                if let Some(preference) = self
-                    .settings_draft
-                    .as_mut()
-                    .and_then(|draft| {
-                        draft
-                            .connection_preferences
-                            .iter_mut()
-                            .find(|preference| preference.id == id)
-                    })
-                {
+                if let Some(preference) = self.settings_draft.as_mut().and_then(|draft| {
+                    draft
+                        .connection_preferences
+                        .iter_mut()
+                        .find(|preference| preference.id == id)
+                }) {
                     preference.folder = value;
                 }
             }
             Message::SettingsConnectionStartupChanged(id, value) => {
-                if let Some(preference) = self
-                    .settings_draft
-                    .as_mut()
-                    .and_then(|draft| {
-                        draft
-                            .connection_preferences
-                            .iter_mut()
-                            .find(|preference| preference.id == id)
-                    })
-                    && preference.startup_available
+                if let Some(preference) = self.settings_draft.as_mut().and_then(|draft| {
+                    draft
+                        .connection_preferences
+                        .iter_mut()
+                        .find(|preference| preference.id == id)
+                }) && preference.startup_available
                 {
                     preference.auto_mount_at_login = value;
                 }
@@ -2264,7 +2267,7 @@ impl App {
                             .unwrap_or_else(|| locale.text(TextKey::ConnectionSaved).into());
                         return Task::batch([
                             terminal_task,
-                            self.status_task(),
+                            self.status_task(StatusPublishPolicy::Silent),
                             self.reconcile_startup_task(),
                         ]);
                     }
@@ -2284,7 +2287,7 @@ impl App {
                             Locale::English => "Connection organization saved".into(),
                             Locale::Chinese => "连接整理设置已保存".into(),
                         });
-                        return self.status_task();
+                        return self.status_task(StatusPublishPolicy::Silent);
                     }
                     Err(error) => self.status = error,
                 }
@@ -2689,7 +2692,7 @@ impl App {
                             },
                         );
                         self.status = error;
-                        tasks.push(self.status_task());
+                        tasks.push(self.status_task(StatusPublishPolicy::Silent));
                     }
                 }
                 if let Some(command) = self.take_pending_command(&id) {
@@ -3478,8 +3481,8 @@ impl App {
                 return Task::none();
             }
         };
-        let auto_mount_at_login = draft.auto_mount_at_login
-            && draft.connection_method != ConnectionMethod::Interactive;
+        let auto_mount_at_login =
+            draft.auto_mount_at_login && draft.connection_method != ConnectionMethod::Interactive;
         self.editor_saving = true;
         self.status = self.locale().text(TextKey::SavingSettings).into();
         let paths = self.paths.clone();
@@ -3734,8 +3737,8 @@ impl App {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || reconcile_login_startup(&paths, &startup_lock))
-                .await
-                .unwrap_or_else(|error| Err(error.to_string()))
+                    .await
+                    .unwrap_or_else(|error| Err(error.to_string()))
             },
             Message::StartupReconciled,
         )
@@ -3886,7 +3889,7 @@ impl App {
         }
     }
 
-    fn status_task(&self) -> Task<Message> {
+    fn status_task(&self, policy: StatusPublishPolicy) -> Task<Message> {
         let service = self.service.clone();
         let ids: Vec<_> = self
             .servers
@@ -3906,7 +3909,7 @@ impl App {
                 .await
                 .unwrap_or_else(|error| vec![(String::new(), Err(error.to_string()))])
             },
-            Message::StatusesLoaded,
+            move |results| Message::StatusesLoaded { policy, results },
         )
     }
 
@@ -5414,25 +5417,24 @@ impl App {
             }
         }
         let paths = row![remote_path, mountpoint].spacing(12);
-        let startup_control: Element<'_, Message> = if draft.connection_method
-            == ConnectionMethod::Interactive
-        {
-            container(text(match locale {
-                Locale::English => "Unavailable for interactive SSH",
-                Locale::Chinese => "交互式 SSH 不支持开机自动挂载",
-            }))
-            .padding(10)
-            .width(Fill)
-            .into()
-        } else {
-            toggler(draft.auto_mount_at_login)
-                .label(match locale {
-                    Locale::English => "Mount at login",
-                    Locale::Chinese => "登录时自动挂载",
-                })
-                .on_toggle(Message::ConnectionStartupChanged)
+        let startup_control: Element<'_, Message> =
+            if draft.connection_method == ConnectionMethod::Interactive {
+                container(text(match locale {
+                    Locale::English => "Unavailable for interactive SSH",
+                    Locale::Chinese => "交互式 SSH 不支持开机自动挂载",
+                }))
+                .padding(10)
+                .width(Fill)
                 .into()
-        };
+            } else {
+                toggler(draft.auto_mount_at_login)
+                    .label(match locale {
+                        Locale::English => "Mount at login",
+                        Locale::Chinese => "登录时自动挂载",
+                    })
+                    .on_toggle(Message::ConnectionStartupChanged)
+                    .into()
+            };
         let organization = row![
             connection_input(
                 locale.text(TextKey::Folder),
@@ -5480,9 +5482,7 @@ impl App {
             } else {
                 locale.text(TextKey::Save)
             })
-            .on_press_maybe(
-                (!self.editor_saving).then_some(Message::SaveConnectionPreferences)
-            ),
+            .on_press_maybe((!self.editor_saving).then_some(Message::SaveConnectionPreferences)),
         ]
         .spacing(10)
         .align_y(Center);
@@ -5868,15 +5868,10 @@ impl App {
             connection_preferences = connection_preferences.push(
                 container(
                     row![
-                        text(&preference.name)
-                            .size(14)
-                            .width(Length::Fixed(180.0)),
+                        text(&preference.name).size(14).width(Length::Fixed(180.0)),
                         text_input(locale.text(TextKey::Folder), &preference.folder)
                             .on_input(move |value| {
-                                Message::SettingsConnectionFolderChanged(
-                                    folder_id.clone(),
-                                    value,
-                                )
+                                Message::SettingsConnectionFolderChanged(folder_id.clone(), value)
                             })
                             .width(Fill),
                         container(startup).width(Length::Fixed(210.0)),
@@ -6567,10 +6562,13 @@ fn connection_card<'a>(
         .spacing(8)
         .align_y(Center);
     if auto_mount_at_login {
-        title = title.push(text(match locale {
-            Locale::English => "At login",
-            Locale::Chinese => "登录自启",
-        }).size(12));
+        title = title.push(
+            text(match locale {
+                Locale::English => "At login",
+                Locale::Chinese => "登录自启",
+            })
+            .size(12),
+        );
     }
     let mut details = column![
         title,
@@ -7095,8 +7093,7 @@ fn migrate_legacy_startup_preferences(
     }
     let mut migrated_servers = servers.to_vec();
     for server in &mut migrated_servers {
-        server.auto_mount_at_login =
-            server.connection_method != ConnectionMethod::Interactive;
+        server.auto_mount_at_login = server.connection_method != ConnectionMethod::Interactive;
     }
     storage::save_servers(paths, &migrated_servers).map_err(|error| error.to_string())?;
     let mut migrated_settings = settings.clone();
@@ -7402,8 +7399,7 @@ fn settings_recovery_message(
 ) -> Option<String> {
     let error = recovered.load_error.as_deref()?;
     let backup = recovered.backup_path.as_ref().map(|path| path.display());
-    let reset_persisted = recovered.backup_error.is_none()
-        && recovered.persistence_error.is_none();
+    let reset_persisted = recovered.backup_error.is_none() && recovered.persistence_error.is_none();
     Some(match locale {
         Locale::English => {
             let mut message = match (backup, reset_persisted) {
@@ -7432,9 +7428,9 @@ fn settings_recovery_message(
                 (Some(path), _) => format!(
                     "旧设置无法读取，已重置；原文件已备份到 {path}。现在可以正常保存新设置。原始错误：{error}"
                 ),
-                (None, true) => format!(
-                    "旧设置无法读取，已重置；现在可以正常保存新设置。原始错误：{error}"
-                ),
+                (None, true) => {
+                    format!("旧设置无法读取，已重置；现在可以正常保存新设置。原始错误：{error}")
+                }
                 (None, false) => format!(
                     "旧设置无法读取，当前仅在内存中加载默认值；设置文件尚未替换，点击保存时会重试。原始错误：{error}"
                 ),
@@ -8118,6 +8114,32 @@ fn status_label(locale: Locale, status: MountStatus) -> &'static str {
     }
 }
 
+fn status_completion_message(
+    policy: StatusPublishPolicy,
+    errors: &[String],
+    startup_notice: &mut Option<String>,
+    locale: Locale,
+) -> Option<String> {
+    match policy {
+        StatusPublishPolicy::Silent => None,
+        StatusPublishPolicy::UserRefresh => Some(
+            errors
+                .first()
+                .cloned()
+                .unwrap_or_else(|| locale.text(TextKey::Ready).into()),
+        ),
+        StatusPublishPolicy::Initial => {
+            let notice = startup_notice.take();
+            match (notice, errors.first()) {
+                (Some(notice), Some(error)) => Some(format!("{notice}; {error}")),
+                (Some(notice), None) => Some(notice),
+                (None, Some(error)) => Some(error.clone()),
+                (None, None) => Some(locale.text(TextKey::Ready).into()),
+            }
+        }
+    }
+}
+
 fn transfer_label(locale: Locale, snapshot: &TransferSnapshot) -> String {
     if snapshot.out_of_space {
         match locale {
@@ -8747,6 +8769,45 @@ mod localization_tests {
     }
 
     #[test]
+    fn silent_status_completion_cannot_overwrite_a_mount_failure() {
+        let mut startup_notice = Some("Recovered settings".into());
+
+        let message = status_completion_message(
+            StatusPublishPolicy::Silent,
+            &[],
+            &mut startup_notice,
+            Locale::English,
+        );
+
+        assert_eq!(message, None);
+        assert_eq!(startup_notice.as_deref(), Some("Recovered settings"));
+    }
+
+    #[test]
+    fn initial_and_user_status_completions_publish_intentionally() {
+        let mut startup_notice = Some("Recovered settings".into());
+        assert_eq!(
+            status_completion_message(
+                StatusPublishPolicy::Initial,
+                &[],
+                &mut startup_notice,
+                Locale::English,
+            ),
+            Some("Recovered settings".into())
+        );
+        assert!(startup_notice.is_none());
+        assert_eq!(
+            status_completion_message(
+                StatusPublishPolicy::UserRefresh,
+                &[],
+                &mut startup_notice,
+                Locale::English,
+            ),
+            Some("Ready".into())
+        );
+    }
+
+    #[test]
     fn unsigned_updates_have_explicit_bilingual_block_reasons() {
         let error = UpdateTrustError::MissingSignature;
         let english = automatic_install_blocked_message(Locale::English, &error);
@@ -9338,6 +9399,7 @@ mod localization_tests {
         };
         let servers = vec![ServerConfig {
             id: "alpha".into(),
+            name: "alpha".into(),
             ..ServerConfig::default()
         }];
         storage::save_settings(&paths, &settings).unwrap();

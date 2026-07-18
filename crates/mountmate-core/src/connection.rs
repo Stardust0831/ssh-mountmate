@@ -1055,11 +1055,13 @@ mod tests {
         existing.auto_mount_at_login = true;
         let draft = ConnectionDraft::from_server(&existing);
         assert!(draft.auto_mount_at_login);
-        assert!(draft
-            .validate(std::slice::from_ref(&existing))
-            .unwrap()
-            .server
-            .auto_mount_at_login);
+        assert!(
+            draft
+                .validate(std::slice::from_ref(&existing))
+                .unwrap()
+                .server
+                .auto_mount_at_login
+        );
     }
 
     #[test]
