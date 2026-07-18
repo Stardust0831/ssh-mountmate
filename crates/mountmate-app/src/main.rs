@@ -1034,9 +1034,13 @@ enum Message {
     RetryTerminal,
     MainWindowOpened(window::Id),
     Refresh,
-    RefreshFinished(Result<mountmate_core::rc::RefreshResult, String>),
+    RefreshFinished {
+        expected_status: String,
+        result: Result<mountmate_core::rc::RefreshResult, String>,
+    },
     StatusesLoaded {
         policy: StatusPublishPolicy,
+        expected_status: Option<String>,
         results: Vec<(String, Result<MountStatus, String>)>,
     },
     TransferTick,
@@ -1554,11 +1558,23 @@ impl App {
                 }
                 Err(error) => self.status = error.to_string(),
             },
-            Message::RefreshFinished(result) => match result {
-                Ok(result) => self.status = locale.refresh_complete(&result),
-                Err(error) => self.status = error,
-            },
-            Message::StatusesLoaded { policy, results } => {
+            Message::RefreshFinished {
+                expected_status,
+                result,
+            } => {
+                if self.status != expected_status {
+                    return Task::none();
+                }
+                match result {
+                    Ok(result) => self.status = locale.refresh_complete(&result),
+                    Err(error) => self.status = error,
+                }
+            }
+            Message::StatusesLoaded {
+                policy,
+                expected_status,
+                results,
+            } => {
                 let mut errors = Vec::new();
                 let mut unmounted = Vec::new();
                 for (id, result) in results {
@@ -1572,9 +1588,16 @@ impl App {
                         Err(error) => errors.push(error),
                     }
                 }
-                if let Some(status) =
-                    status_completion_message(policy, &errors, &mut self.startup_notice, locale)
-                {
+                let can_publish = expected_status
+                    .as_ref()
+                    .is_none_or(|expected| self.status == *expected);
+                if let Some(status) = status_completion_message(
+                    policy,
+                    &errors,
+                    &mut self.startup_notice,
+                    locale,
+                    can_publish,
+                ) {
                     self.status = status;
                 }
                 let mut tasks: Vec<_> = unmounted
@@ -2921,6 +2944,7 @@ impl App {
             AppCommand::Open { id } => self.open_mountpoint(id),
             AppCommand::RefreshPath { path } => {
                 self.status = self.locale().text(TextKey::Refreshing).into();
+                let expected_status = self.status.clone();
                 let service = self.service.clone();
                 let servers = self.servers.clone();
                 Task::perform(
@@ -2933,7 +2957,10 @@ impl App {
                         .await
                         .unwrap_or_else(|error| Err(error.to_string()))
                     },
-                    Message::RefreshFinished,
+                    move |result| Message::RefreshFinished {
+                        expected_status,
+                        result,
+                    },
                 )
             }
             AppCommand::Refresh { id, relative_dir } => {
@@ -2942,6 +2969,7 @@ impl App {
                     return Task::none();
                 }
                 self.status = self.locale().text(TextKey::Refreshing).into();
+                let expected_status = self.status.clone();
                 let service = self.service.clone();
                 Task::perform(
                     async move {
@@ -2953,7 +2981,10 @@ impl App {
                         .await
                         .unwrap_or_else(|error| Err(error.to_string()))
                     },
-                    Message::RefreshFinished,
+                    move |result| Message::RefreshFinished {
+                        expected_status,
+                        result,
+                    },
                 )
             }
             AppCommand::MountAll => {
@@ -3890,6 +3921,12 @@ impl App {
     }
 
     fn status_task(&self, policy: StatusPublishPolicy) -> Task<Message> {
+        let expected_status = match policy {
+            StatusPublishPolicy::Silent => None,
+            StatusPublishPolicy::Initial | StatusPublishPolicy::UserRefresh => {
+                Some(self.status.clone())
+            }
+        };
         let service = self.service.clone();
         let ids: Vec<_> = self
             .servers
@@ -3909,7 +3946,11 @@ impl App {
                 .await
                 .unwrap_or_else(|error| vec![(String::new(), Err(error.to_string()))])
             },
-            move |results| Message::StatusesLoaded { policy, results },
+            move |results| Message::StatusesLoaded {
+                policy,
+                expected_status,
+                results,
+            },
         )
     }
 
@@ -8119,7 +8160,11 @@ fn status_completion_message(
     errors: &[String],
     startup_notice: &mut Option<String>,
     locale: Locale,
+    can_publish: bool,
 ) -> Option<String> {
+    if !can_publish {
+        return None;
+    }
     match policy {
         StatusPublishPolicy::Silent => None,
         StatusPublishPolicy::UserRefresh => Some(
@@ -8777,6 +8822,7 @@ mod localization_tests {
             &[],
             &mut startup_notice,
             Locale::English,
+            true,
         );
 
         assert_eq!(message, None);
@@ -8792,6 +8838,7 @@ mod localization_tests {
                 &[],
                 &mut startup_notice,
                 Locale::English,
+                true,
             ),
             Some("Recovered settings".into())
         );
@@ -8802,9 +8849,26 @@ mod localization_tests {
                 &[],
                 &mut startup_notice,
                 Locale::English,
+                true,
             ),
             Some("Ready".into())
         );
+    }
+
+    #[test]
+    fn stale_status_completion_cannot_overwrite_a_newer_failure() {
+        let mut startup_notice = Some("Recovered settings".into());
+
+        let message = status_completion_message(
+            StatusPublishPolicy::Initial,
+            &[],
+            &mut startup_notice,
+            Locale::English,
+            false,
+        );
+
+        assert_eq!(message, None);
+        assert_eq!(startup_notice.as_deref(), Some("Recovered settings"));
     }
 
     #[test]
