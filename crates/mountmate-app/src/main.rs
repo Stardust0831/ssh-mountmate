@@ -1127,7 +1127,6 @@ enum Message {
     CustomSettingUnitChanged(String),
     SaveCustomSetting,
     CancelCustomSetting,
-    StartupAllChanged(bool),
     AutoTransfersChanged(bool),
     AutoTransfersDecision(rfd::MessageDialogResult),
     AutoUpdatesChanged(bool),
@@ -2459,11 +2458,6 @@ impl App {
                 }
             }
             Message::CancelCustomSetting => self.custom_setting = None,
-            Message::StartupAllChanged(value) => {
-                if let Some(draft) = &mut self.settings_draft {
-                    draft.startup_all = value;
-                }
-            }
             Message::AutoTransfersChanged(value) => {
                 if value {
                     if let Some(draft) = &mut self.settings_draft {
@@ -7969,7 +7963,6 @@ fn rollback_prepared_secrets<'a>(
 }
 
 struct CredentialStorageMigration {
-    servers: Vec<ServerConfig>,
     migrations: Vec<CredentialMigration>,
     retired_references: Vec<String>,
 }
@@ -8116,9 +8109,8 @@ fn migrate_servers_for_storage(
             }
         }
     }
-    let servers = persist_and_reload_servers(paths, &finalized, servers, &migrations)?;
+    persist_and_reload_servers(paths, &finalized, servers, &migrations)?;
     Ok(CredentialStorageMigration {
-        servers,
         migrations,
         retired_references,
     })
