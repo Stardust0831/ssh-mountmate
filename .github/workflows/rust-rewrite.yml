@@ -208,7 +208,7 @@ jobs:
           target/release/SSHMountMate --register-login-startup
           startup="${XDG_CONFIG_HOME}/autostart/ssh-mountmate.desktop"
           test -f "${startup}"
-          grep -F -- '--mount-startup-all' "${startup}"
+          grep -F -- '--mount-startup' "${startup}"
           target/release/SSHMountMate --unregister-login-startup
           test ! -e "${startup}"
       - name: Smoke-test macOS platform registration
@@ -240,7 +240,7 @@ jobs:
           startup="${HOME}/Library/LaunchAgents/io.github.stardust0831.ssh-mountmate.plist"
           plutil -lint "${startup}"
           test "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "${startup}")" = "${executable}"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:1' "${startup}")" = '--mount-startup-all'
+          test "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:1' "${startup}")" = '--mount-startup'
           target/release/SSHMountMate --unregister-login-startup
           test ! -e "${startup}"
       - name: Smoke-test command-line entry points
@@ -276,7 +276,7 @@ jobs:
             }
             Invoke-SSHMountMate '--register-login-startup'
             $startup = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run').SSHMountMate
-            if ($startup -ne "`"$exe`" --mount-startup-all") {
+            if ($startup -ne "`"$exe`" --mount-startup") {
               throw "Unexpected login startup command: $startup"
             }
           } finally {

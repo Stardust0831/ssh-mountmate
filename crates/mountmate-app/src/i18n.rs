@@ -410,7 +410,6 @@ pub(crate) enum TextKey {
     UploadConcurrency,
     Mount,
     MountAll,
-    MountAllAtLogin,
     MountConnectionForTransfers,
     Mountpoint,
     Name,
@@ -544,7 +543,6 @@ fn english(key: TextKey) -> &'static str {
         TextKey::UploadConcurrency => "Simultaneous uploads",
         TextKey::Mount => "Mount",
         TextKey::MountAll => "Mount all",
-        TextKey::MountAllAtLogin => "Mount all saved connections at login",
         TextKey::MountConnectionForTransfers => {
             "Mount a connection to inspect its cloud transfer state"
         }
@@ -681,7 +679,6 @@ fn chinese(key: TextKey) -> &'static str {
         TextKey::UploadConcurrency => "同时上传文件数",
         TextKey::Mount => "挂载",
         TextKey::MountAll => "全部挂载",
-        TextKey::MountAllAtLogin => "登录时挂载所有已保存连接",
         TextKey::MountConnectionForTransfers => "挂载连接后可查看其云端传输状态",
         TextKey::Mountpoint => "挂载点（默认自动选择）",
         TextKey::Name => "名称",

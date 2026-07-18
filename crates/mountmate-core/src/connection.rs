@@ -71,6 +71,7 @@ pub struct ConnectionDraft {
     pub connection_method: ConnectionMethod,
     pub remote_path: String,
     pub mountpoint: String,
+    pub auto_mount_at_login: bool,
     pub ssh_config_managed: bool,
     pub copy_key_to_ssh_dir: bool,
     pub ssh_config_path: String,
@@ -135,6 +136,7 @@ impl Default for ConnectionDraft {
             connection_method: ConnectionMethod::Native,
             remote_path: String::new(),
             mountpoint: String::new(),
+            auto_mount_at_login: false,
             ssh_config_managed: false,
             copy_key_to_ssh_dir: false,
             ssh_config_path: String::new(),
@@ -202,6 +204,7 @@ impl ConnectionDraft {
             connection_method: server.connection_method,
             remote_path: server.remote_path.clone(),
             mountpoint: server.mountpoint.clone(),
+            auto_mount_at_login: server.auto_mount_at_login,
             ssh_config_managed: server.ssh_config_managed,
             copy_key_to_ssh_dir: server.copy_key_to_ssh_dir,
             ssh_config_path: server.ssh_config_path.clone(),
@@ -373,6 +376,7 @@ impl ConnectionDraft {
             connection_method,
             remote_path,
             mountpoint,
+            auto_mount_at_login: self.auto_mount_at_login,
             cache_mode: self
                 .existing
                 .as_ref()
@@ -1043,6 +1047,21 @@ mod tests {
         let saved = validated.apply_secrets(None, None).unwrap();
         assert!(saved.password_obscured.is_empty());
         assert_eq!(saved.password_credential, "ssh-mountmate:alpha:password");
+    }
+
+    #[test]
+    fn auto_mount_at_login_survives_draft_validation() {
+        let mut existing = password_server();
+        existing.auto_mount_at_login = true;
+        let draft = ConnectionDraft::from_server(&existing);
+        assert!(draft.auto_mount_at_login);
+        assert!(
+            draft
+                .validate(std::slice::from_ref(&existing))
+                .unwrap()
+                .server
+                .auto_mount_at_login
+        );
     }
 
     #[test]

@@ -11,6 +11,8 @@ server_pid=""
 gui_pid=""
 window_manager_pid=""
 server_ids=(native-a native-b openssh-a openssh-b)
+startup_server_ids=(native-a openssh-a)
+manual_server_ids=(native-b openssh-b)
 interactive_id="interactive-a"
 control_candidates=()
 
@@ -202,7 +204,7 @@ jq -n \
       id: "native-a", name: "Native A", mode: "manual", source: "manual",
       host: "127.0.0.1", user: "mountmate", port: $port, auth: "key",
       key_file: $key, connection_method: "native", remote_path: "native-a",
-      mountpoint: $native_a_mount, cache_mode: "full"
+      mountpoint: $native_a_mount, auto_mount_at_login: true, cache_mode: "full"
     },
     {
       id: "native-b", name: "Native B", mode: "manual", source: "manual",
@@ -215,7 +217,7 @@ jq -n \
       host_alias: "local-openssh-a", host: "127.0.0.1", user: "mountmate",
       port: $port, auth: "key", connection_method: "openssh",
       ssh_config_path: $ssh_config, remote_path: "openssh-a",
-      mountpoint: $openssh_a_mount, cache_mode: "full"
+      mountpoint: $openssh_a_mount, auto_mount_at_login: true, cache_mode: "full"
     },
     {
       id: "openssh-b", name: "OpenSSH B", mode: "ssh_config", source: "ssh_config",
@@ -231,7 +233,7 @@ jq -n '{
   vfs_cache_max_age: "30m",
   vfs_write_back: "30s",
   dir_cache_time: "5m",
-  startup_all: true,
+  startup_all: false,
   auto_show_transfers: true,
   auto_check_updates: false,
   language: "en"
@@ -240,14 +242,22 @@ jq -n '{
 "${binary}" --register-login-startup
 startup="${XDG_CONFIG_HOME}/autostart/ssh-mountmate.desktop"
 test -f "${startup}"
-grep -Fx "Exec=\"${binary}\" --mount-startup-all" "${startup}"
+grep -Fx "Exec=\"${binary}\" --mount-startup" "${startup}"
 
-"${binary}" --mount-startup-all
-for server_id in "${server_ids[@]}"; do
+"${binary}" --mount-startup
+for server_id in "${startup_server_ids[@]}"; do
   mountpoint="${mount_root}/${server_id}"
   mountpoint -q "${mountpoint}"
   test "$(cat "${mountpoint}/identity.txt")" = "content from ${server_id}"
   test "$(jq -r '.phase' "${state_dir}/${server_id}.json")" = 'mounted'
+done
+for server_id in "${manual_server_ids[@]}"; do
+  if mountpoint -q "${mount_root}/${server_id}" || [[ -e "${state_dir}/${server_id}.json" ]]; then
+    echo "unselected login connection was mounted: ${server_id}" >&2
+    exit 1
+  fi
+  "${binary}" --mount-id "${server_id}"
+  mountpoint -q "${mount_root}/${server_id}"
 done
 
 mkdir -p "${remote_root}/${interactive_id}" "${mount_root}/${interactive_id}"
@@ -335,7 +345,7 @@ if sed -n '/\[local-openssh-a\]/,/^$/p;/\[local-openssh-b\]/,/^$/p' "${rclone_co
 fi
 
 state_files=()
-for server_id in "${server_ids[@]}"; do
+for server_id in "${startup_server_ids[@]}"; do
   state_files+=("${state_dir}/${server_id}.json")
 done
 start_spread="$(jq -s 'map(.process_started_at) as $starts | ($starts | max) - ($starts | min)' "${state_files[@]}")"
@@ -421,4 +431,4 @@ done
 "${binary}" --unregister-login-startup
 test ! -e "${startup}"
 printf 'OpenSSH and concurrent login mounts passed: spread=%ss mounts=%s\n' \
-  "${start_spread}" "${#server_ids[@]}"
+  "${start_spread}" "${#startup_server_ids[@]}"

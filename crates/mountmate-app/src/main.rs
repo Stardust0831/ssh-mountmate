@@ -389,6 +389,15 @@ fn run_headless(paths: &AppPaths, command: AppCommand) -> Result<(), String> {
                 .map(|_| ())
                 .map_err(|error| error.to_string())
         })?,
+        AppCommand::MountStartup => {
+            let selected = startup_servers(&settings, &servers);
+            run_headless_batch(&service, &selected, |service, server| {
+                service
+                    .mount(server, &settings)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })?
+        }
         AppCommand::UnmountAll => run_headless_batch(&service, &servers, |service, server| {
             if paths.state_file(&server.id).exists() {
                 service
@@ -473,7 +482,8 @@ struct App {
     command_receiver: CommandSubscription,
     pending_commands: VecDeque<AppCommand>,
     settings: Settings,
-    settings_load_error: Option<String>,
+    startup_integration_lock: Arc<Mutex<()>>,
+    startup_notice: Option<String>,
     system_locale: Locale,
     system_theme_dark: bool,
     servers: Vec<ServerConfig>,
@@ -526,6 +536,7 @@ struct App {
     ssh_import_actions: Vec<ImportAction>,
     pending_delete: Option<String>,
     status: String,
+    status_generation: u64,
     update_health: Option<UpdateHealthAuthorization>,
     update_info: Option<UpdateInfo>,
     update_checking: bool,
@@ -793,6 +804,13 @@ enum ConnectionSort {
     Host,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusPublishPolicy {
+    Initial,
+    UserRefresh,
+    Silent,
+}
+
 impl ConnectionSort {
     const ALL: [Self; 3] = [Self::SavedOrder, Self::Name, Self::Host];
 }
@@ -841,6 +859,7 @@ struct CustomSettingDraft {
     kind: SettingKind,
     digits: String,
     unit: String,
+    raw_value: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -887,12 +906,34 @@ struct SettingsDraft {
     mount_backend: MountBackend,
     credential_storage: CredentialStorage,
     startup_all: bool,
+    connection_preferences: Vec<ConnectionPreferenceDraft>,
     auto_show_transfers: bool,
     auto_check_updates: bool,
     language: Language,
     appearance_mode: AppearanceMode,
     accent_color: AccentColor,
     font_scale: FontScale,
+}
+
+#[derive(Debug, Clone)]
+struct ConnectionPreferenceDraft {
+    id: String,
+    name: String,
+    folder: String,
+    auto_mount_at_login: bool,
+    startup_available: bool,
+}
+
+impl ConnectionPreferenceDraft {
+    fn from_server(server: &ServerConfig, legacy_startup_all: bool) -> Self {
+        Self {
+            id: server.id.clone(),
+            name: server.display_name().to_owned(),
+            folder: server.folder.clone(),
+            auto_mount_at_login: legacy_startup_all || server.auto_mount_at_login,
+            startup_available: server.connection_method != ConnectionMethod::Interactive,
+        }
+    }
 }
 
 impl SettingsDraft {
@@ -910,6 +951,7 @@ impl SettingsDraft {
             mount_backend: settings.macos_mount_backend,
             credential_storage: settings.credential_storage,
             startup_all: settings.startup_all,
+            connection_preferences: Vec::new(),
             auto_show_transfers: settings.auto_show_transfers,
             auto_check_updates: settings.auto_check_updates,
             language: Language::from_value(&settings.language),
@@ -993,8 +1035,17 @@ enum Message {
     RetryTerminal,
     MainWindowOpened(window::Id),
     Refresh,
-    RefreshFinished(Result<mountmate_core::rc::RefreshResult, String>),
-    StatusesLoaded(Vec<(String, Result<MountStatus, String>)>),
+    RefreshFinished {
+        generation: u64,
+        expected_status: String,
+        result: Result<mountmate_core::rc::RefreshResult, String>,
+    },
+    StatusesLoaded {
+        policy: StatusPublishPolicy,
+        generation: Option<u64>,
+        expected_status: Option<String>,
+        results: Vec<(String, Result<MountStatus, String>)>,
+    },
     TransferTick,
     TransfersLoaded(Vec<(String, Result<TransferSnapshot, String>)>),
     NotificationFinished(Result<(), String>),
@@ -1007,6 +1058,8 @@ enum Message {
     AddConnection,
     ConnectionSearchChanged(String),
     ConnectionSortChanged(ConnectionSort),
+    SettingsConnectionFolderChanged(String, String),
+    SettingsConnectionStartupChanged(String, bool),
     OpenTransfers,
     CloseTransfers,
     CloseTransfersDecision(rfd::MessageDialogResult),
@@ -1043,6 +1096,7 @@ enum Message {
     ClearSecret(CredentialKind),
     ManagedSshChanged(bool),
     CopyKeyChanged(bool),
+    ConnectionStartupChanged(bool),
     LoadSshConfig,
     BrowseSshConfig,
     SshConfigPicked(Option<PathBuf>),
@@ -1056,6 +1110,8 @@ enum Message {
     SshImportActionChanged(usize, ImportAction),
     SaveConnection,
     ConnectionSaved(Result<ServerMutation, String>),
+    SaveConnectionPreferences,
+    ConnectionPreferencesSaved(Result<SettingsMutation, String>),
     SettingsFieldChanged(SettingsField, String),
     BrowseCacheRoot,
     CacheRootPicked(Option<PathBuf>),
@@ -1071,7 +1127,6 @@ enum Message {
     CustomSettingUnitChanged(String),
     SaveCustomSetting,
     CancelCustomSetting,
-    StartupAllChanged(bool),
     AutoTransfersChanged(bool),
     AutoTransfersDecision(rfd::MessageDialogResult),
     AutoUpdatesChanged(bool),
@@ -1215,33 +1270,75 @@ impl App {
         let system_locale = Locale::system();
         let system_theme_dark = system_prefers_dark();
         let service = MountService::new(paths.clone(), application_root());
-        let (settings, settings_load_error) = match storage::load_settings(&paths) {
-            Ok(settings) => (settings, None),
-            Err(error) => (
-                Settings::default(),
-                Some(match system_locale {
-                    Locale::English => format!(
-                        "Could not load settings; saving is disabled until this is fixed: {error}"
-                    ),
-                    Locale::Chinese => {
-                        format!("无法加载设置；修复前已禁用保存：{error}")
-                    }
-                }),
-            ),
-        };
+        let recovered_settings = storage::load_settings_recovering(&paths);
+        let mut settings_recovery_notice =
+            settings_recovery_message(&recovered_settings, system_locale);
+        let mut settings = recovered_settings.settings;
         let locale =
             Locale::from_preference(Language::from_value(&settings.language), system_locale);
-        let (servers, server_status) = match storage::load_servers(&paths) {
-            Ok(servers) => (servers, locale.text(TextKey::LoadingMountStatus).into()),
+        let (mut servers, server_status, servers_loaded) = match storage::load_servers(&paths) {
+            Ok(servers) => (
+                servers,
+                locale.text(TextKey::LoadingMountStatus).into(),
+                true,
+            ),
             Err(error) => (
                 Vec::new(),
                 match locale {
                     Locale::English => format!("Could not load existing configuration: {error}"),
                     Locale::Chinese => format!("无法加载现有配置：{error}"),
                 },
+                false,
             ),
         };
-        let status = settings_load_error.clone().unwrap_or(server_status);
+        if settings_need_system_credential_inference(&settings, &servers) {
+            settings.credential_storage = CredentialStorage::System;
+            if let Err(error) = storage::save_settings(&paths, &settings) {
+                let detail = match locale {
+                    Locale::English => format!(
+                        "System credential references were detected, but their recovered storage setting could not be persisted: {error}"
+                    ),
+                    Locale::Chinese => {
+                        format!("检测到系统凭据引用，但无法持久化恢复后的凭据存储设置：{error}")
+                    }
+                };
+                settings_recovery_notice = Some(
+                    settings_recovery_notice
+                        .map(|notice| format!("{notice}; {detail}"))
+                        .unwrap_or(detail),
+                );
+            }
+        }
+        let startup_migration_notice = if legacy_startup_migration_needed(&settings, servers_loaded)
+        {
+            match migrate_legacy_startup_preferences(&paths, &settings, &servers) {
+                Ok((migrated_settings, migrated_servers)) => {
+                    settings = migrated_settings;
+                    servers = migrated_servers;
+                    None
+                }
+                Err(error) => Some(match locale {
+                    Locale::English => format!(
+                        "Could not migrate the previous login startup selection; the legacy behavior remains active: {error}"
+                    ),
+                    Locale::Chinese => {
+                        format!("无法迁移旧版登录自启选择，当前仍保留旧行为：{error}")
+                    }
+                }),
+            }
+        } else {
+            None
+        };
+        let startup_notice = settings_recovery_notice
+            .or(startup_migration_notice)
+            .map(|notice| {
+                if servers_loaded {
+                    notice
+                } else {
+                    format!("{notice}; {server_status}")
+                }
+            });
+        let status = startup_notice.clone().unwrap_or(server_status);
         let (main_window, open_window) = window::open(main_window_settings());
         let screen = if initial_command == AppCommand::ShowTransfers {
             Screen::TransferCenter
@@ -1256,7 +1353,8 @@ impl App {
             command_receiver,
             pending_commands: VecDeque::new(),
             settings,
-            settings_load_error,
+            startup_integration_lock: Arc::new(Mutex::new(())),
+            startup_notice,
             system_locale,
             system_theme_dark,
             servers,
@@ -1309,6 +1407,7 @@ impl App {
             ssh_import_actions: Vec::new(),
             pending_delete: None,
             status,
+            status_generation: 0,
             update_health,
             update_info: None,
             update_checking: false,
@@ -1325,7 +1424,7 @@ impl App {
         };
         let mut tasks = vec![
             open_window.map(Message::MainWindowOpened),
-            app.status_task(),
+            app.status_task(StatusPublishPolicy::Initial),
         ];
         if screen == Screen::TransferCenter {
             tasks.push(app.transfer_task());
@@ -1334,9 +1433,7 @@ impl App {
             app.update_checking = true;
             tasks.push(app.check_update_task(false));
         }
-        if app.settings.startup_all {
-            tasks.push(app.reconcile_startup_task());
-        }
+        tasks.push(app.reconcile_startup_task());
         let task = Task::batch(tasks);
         (app, task)
     }
@@ -1459,15 +1556,34 @@ impl App {
                 Ok(servers) => {
                     self.servers = servers;
                     self.status = locale.text(TextKey::RefreshingMountStatus).into();
-                    return self.status_task();
+                    return self.status_task(StatusPublishPolicy::UserRefresh);
                 }
                 Err(error) => self.status = error.to_string(),
             },
-            Message::RefreshFinished(result) => match result {
-                Ok(result) => self.status = locale.refresh_complete(&result),
-                Err(error) => self.status = error,
-            },
-            Message::StatusesLoaded(results) => {
+            Message::RefreshFinished {
+                generation,
+                expected_status,
+                result,
+            } => {
+                if !status_publication_is_current(
+                    generation,
+                    self.status_generation,
+                    &expected_status,
+                    &self.status,
+                ) {
+                    return Task::none();
+                }
+                match result {
+                    Ok(result) => self.status = locale.refresh_complete(&result),
+                    Err(error) => self.status = error,
+                }
+            }
+            Message::StatusesLoaded {
+                policy,
+                generation,
+                expected_status,
+                results,
+            } => {
                 let mut errors = Vec::new();
                 let mut unmounted = Vec::new();
                 for (id, result) in results {
@@ -1481,10 +1597,25 @@ impl App {
                         Err(error) => errors.push(error),
                     }
                 }
-                self.status = errors
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| locale.text(TextKey::Ready).into());
+                let can_publish = match (generation, expected_status.as_deref()) {
+                    (Some(generation), Some(expected_status)) => status_publication_is_current(
+                        generation,
+                        self.status_generation,
+                        expected_status,
+                        &self.status,
+                    ),
+                    (None, None) => true,
+                    _ => false,
+                };
+                if let Some(status) = status_completion_message(
+                    policy,
+                    &errors,
+                    &mut self.startup_notice,
+                    locale,
+                    can_publish,
+                ) {
+                    self.status = status;
+                }
                 let mut tasks: Vec<_> = unmounted
                     .iter()
                     .map(|id| self.close_popups_for_server(id))
@@ -1707,6 +1838,27 @@ impl App {
             }
             Message::ConnectionSearchChanged(value) => self.connection_search = value,
             Message::ConnectionSortChanged(value) => self.connection_sort = value,
+            Message::SettingsConnectionFolderChanged(id, value) => {
+                if let Some(preference) = self.settings_draft.as_mut().and_then(|draft| {
+                    draft
+                        .connection_preferences
+                        .iter_mut()
+                        .find(|preference| preference.id == id)
+                }) {
+                    preference.folder = value;
+                }
+            }
+            Message::SettingsConnectionStartupChanged(id, value) => {
+                if let Some(preference) = self.settings_draft.as_mut().and_then(|draft| {
+                    draft
+                        .connection_preferences
+                        .iter_mut()
+                        .find(|preference| preference.id == id)
+                }) && preference.startup_available
+                {
+                    preference.auto_mount_at_login = value;
+                }
+            }
             Message::OpenTransfers => {
                 self.screen = Screen::TransferCenter;
                 self.status = locale.text(TextKey::TransferCenter).into();
@@ -1749,7 +1901,15 @@ impl App {
                 }
             }
             Message::OpenSettings => {
-                self.settings_draft = Some(SettingsDraft::from_settings(&self.settings));
+                let mut draft = SettingsDraft::from_settings(&self.settings);
+                draft.connection_preferences = self
+                    .servers
+                    .iter()
+                    .map(|server| {
+                        ConnectionPreferenceDraft::from_server(server, self.settings.startup_all)
+                    })
+                    .collect();
+                self.settings_draft = Some(draft);
                 self.screen = Screen::Settings;
                 self.status = locale.text(TextKey::Settings).into();
                 self.dependency_checking = true;
@@ -1969,6 +2129,9 @@ impl App {
                     if method != ConnectionMethod::Native {
                         draft.auth = AuthMethod::Key;
                     }
+                    if method == ConnectionMethod::Interactive {
+                        draft.auto_mount_at_login = false;
+                    }
                 }
             }
             Message::PasswordChanged(value) => {
@@ -1997,6 +2160,13 @@ impl App {
             Message::CopyKeyChanged(value) => {
                 if let Some(draft) = &mut self.connection_draft {
                     draft.copy_key_to_ssh_dir = value;
+                }
+            }
+            Message::ConnectionStartupChanged(value) => {
+                if let Some(draft) = &mut self.connection_draft
+                    && draft.connection_method != ConnectionMethod::Interactive
+                {
+                    draft.auto_mount_at_login = value;
                 }
             }
             Message::LoadSshConfig => return self.load_ssh_config(),
@@ -2134,7 +2304,29 @@ impl App {
                         self.status = outcome
                             .warning
                             .unwrap_or_else(|| locale.text(TextKey::ConnectionSaved).into());
-                        return Task::batch([terminal_task, self.status_task()]);
+                        return Task::batch([
+                            terminal_task,
+                            self.status_task(StatusPublishPolicy::Silent),
+                            self.reconcile_startup_task(),
+                        ]);
+                    }
+                    Err(error) => self.status = error,
+                }
+            }
+            Message::SaveConnectionPreferences => return self.save_connection_preferences(),
+            Message::ConnectionPreferencesSaved(result) => {
+                self.editor_saving = false;
+                match result {
+                    Ok(outcome) => {
+                        self.settings = outcome.settings;
+                        self.servers = outcome.servers;
+                        self.connection_draft = None;
+                        self.screen = Screen::Connections;
+                        self.status = outcome.warning.unwrap_or_else(|| match locale {
+                            Locale::English => "Connection organization saved".into(),
+                            Locale::Chinese => "连接整理设置已保存".into(),
+                        });
+                        return self.status_task(StatusPublishPolicy::Silent);
                     }
                     Err(error) => self.status = error,
                 }
@@ -2215,8 +2407,14 @@ impl App {
                     let (digits, unit) = split_custom_setting(option.kind, current);
                     self.custom_setting = Some(CustomSettingDraft {
                         kind: option.kind,
-                        digits,
+                        digits: if custom_setting_is_supported(option.kind, current) {
+                            digits
+                        } else {
+                            current.to_owned()
+                        },
                         unit,
+                        raw_value: (!custom_setting_is_supported(option.kind, current))
+                            .then(|| current.to_owned()),
                     });
                 } else if let Some(draft) = &mut self.settings_draft {
                     set_setting_value(draft, option.kind, option.value);
@@ -2224,10 +2422,15 @@ impl App {
             }
             Message::CustomSettingDigitsChanged(value) => {
                 if let Some(custom) = &mut self.custom_setting {
-                    custom.digits = value
-                        .chars()
-                        .filter(|character| character.is_ascii_digit())
-                        .collect();
+                    if custom.raw_value.is_some() {
+                        custom.digits = value.clone();
+                        custom.raw_value = Some(value);
+                    } else {
+                        custom.digits = value
+                            .chars()
+                            .filter(|character| character.is_ascii_digit())
+                            .collect();
+                    }
                 }
             }
             Message::CustomSettingUnitChanged(unit) => {
@@ -2241,35 +2444,20 @@ impl App {
             }
             Message::SaveCustomSetting => {
                 if let Some(custom) = self.custom_setting.take() {
-                    if custom.digits.is_empty() {
-                        self.status = match locale {
-                            Locale::English => "Custom value must contain digits".into(),
-                            Locale::Chinese => "自定义数值必须填写数字".into(),
-                        };
-                        self.custom_setting = Some(custom);
-                    } else if let Some(draft) = &mut self.settings_draft {
-                        let value = if custom.kind == SettingKind::Transfers {
-                            match validate_upload_transfers(&custom.digits, locale) {
-                                Ok(value) => value.to_string(),
-                                Err(error) => {
-                                    self.status = error;
-                                    self.custom_setting = Some(custom);
-                                    return Task::none();
-                                }
+                    match custom_setting_value(&custom, locale) {
+                        Ok(value) => {
+                            if let Some(draft) = &mut self.settings_draft {
+                                set_setting_value(draft, custom.kind, value);
                             }
-                        } else {
-                            format!("{}{}", custom.digits, custom.unit)
-                        };
-                        set_setting_value(draft, custom.kind, value);
+                        }
+                        Err(error) => {
+                            self.status = error;
+                            self.custom_setting = Some(custom);
+                        }
                     }
                 }
             }
             Message::CancelCustomSetting => self.custom_setting = None,
-            Message::StartupAllChanged(value) => {
-                if let Some(draft) = &mut self.settings_draft {
-                    draft.startup_all = value;
-                }
-            }
             Message::AutoTransfersChanged(value) => {
                 if value {
                     if let Some(draft) = &mut self.settings_draft {
@@ -2462,6 +2650,14 @@ impl App {
             Message::StartupReconciled(result) => {
                 if let Err(error) = result {
                     diagnostic_trace(&format!("login startup reconciliation failed: {error}"));
+                    self.status = match locale {
+                        Locale::English => format!(
+                            "Login startup integration failed and will be retried next launch: {error}"
+                        ),
+                        Locale::Chinese => {
+                            format!("登录自启集成失败，将在下次启动时重试：{error}")
+                        }
+                    };
                 }
             }
             Message::Mount(id) => return self.start_mount_operation(id, None),
@@ -2499,6 +2695,7 @@ impl App {
                 operation,
                 result,
             } => {
+                self.invalidate_status_publications();
                 self.busy.remove(&id);
                 let mut tasks = Vec::new();
                 match result {
@@ -2530,7 +2727,7 @@ impl App {
                             },
                         );
                         self.status = error;
-                        tasks.push(self.status_task());
+                        tasks.push(self.status_task(StatusPublishPolicy::Silent));
                     }
                 }
                 if let Some(command) = self.take_pending_command(&id) {
@@ -2558,6 +2755,9 @@ impl App {
                 let can_modify = self.can_modify(&id);
                 if let Some(server) = self.servers.iter().find(|server| server.id == id) {
                     self.connection_draft = Some(ConnectionDraft::from_server(server));
+                    if let Some(draft) = &mut self.connection_draft {
+                        draft.auto_mount_at_login |= self.settings.startup_all;
+                    }
                     self.connection_custom_mountpoint = custom_mountpoint_value(&server.mountpoint);
                     if let Some(draft) = &mut self.connection_draft
                         && draft.ssh_config_path.trim().is_empty()
@@ -2664,7 +2864,7 @@ impl App {
                         self.status = outcome
                             .warning
                             .unwrap_or_else(|| locale.text(TextKey::ConnectionRemoved).into());
-                        return terminal_task;
+                        return Task::batch([terminal_task, self.reconcile_startup_task()]);
                     }
                     Err(error) => self.status = error,
                 }
@@ -2756,6 +2956,8 @@ impl App {
             AppCommand::Open { id } => self.open_mountpoint(id),
             AppCommand::RefreshPath { path } => {
                 self.status = self.locale().text(TextKey::Refreshing).into();
+                let generation = self.claim_status_generation();
+                let expected_status = self.status.clone();
                 let service = self.service.clone();
                 let servers = self.servers.clone();
                 Task::perform(
@@ -2768,7 +2970,11 @@ impl App {
                         .await
                         .unwrap_or_else(|error| Err(error.to_string()))
                     },
-                    Message::RefreshFinished,
+                    move |result| Message::RefreshFinished {
+                        generation,
+                        expected_status,
+                        result,
+                    },
                 )
             }
             AppCommand::Refresh { id, relative_dir } => {
@@ -2777,6 +2983,8 @@ impl App {
                     return Task::none();
                 }
                 self.status = self.locale().text(TextKey::Refreshing).into();
+                let generation = self.claim_status_generation();
+                let expected_status = self.status.clone();
                 let service = self.service.clone();
                 Task::perform(
                     async move {
@@ -2788,7 +2996,11 @@ impl App {
                         .await
                         .unwrap_or_else(|error| Err(error.to_string()))
                     },
-                    Message::RefreshFinished,
+                    move |result| Message::RefreshFinished {
+                        generation,
+                        expected_status,
+                        result,
+                    },
                 )
             }
             AppCommand::MountAll => {
@@ -2796,6 +3008,16 @@ impl App {
                     .servers
                     .iter()
                     .map(|server| server.id.clone())
+                    .collect::<Vec<_>>();
+                Task::batch(
+                    ids.into_iter()
+                        .map(|id| self.handle_mount_command(id, MountOperation::Mount)),
+                )
+            }
+            AppCommand::MountStartup => {
+                let ids = startup_servers(&self.settings, &self.servers)
+                    .into_iter()
+                    .map(|server| server.id)
                     .collect::<Vec<_>>();
                 Task::batch(
                     ids.into_iter()
@@ -3289,19 +3511,106 @@ impl App {
         )
     }
 
-    fn save_settings(&mut self) -> Task<Message> {
+    fn save_connection_preferences(&mut self) -> Task<Message> {
         if self.editor_saving {
             return Task::none();
         }
-        if let Some(error) = &self.settings_load_error {
-            self.status = error.clone();
+        let Some(draft) = &self.connection_draft else {
+            return Task::none();
+        };
+        let Some(id) = draft.editing_id.clone() else {
+            return Task::none();
+        };
+        let folder = match normalized_organization_folder(&draft.folder, self.locale()) {
+            Ok(folder) => folder,
+            Err(error) => {
+                self.status = error;
+                return Task::none();
+            }
+        };
+        let auto_mount_at_login =
+            draft.auto_mount_at_login && draft.connection_method != ConnectionMethod::Interactive;
+        self.editor_saving = true;
+        self.status = self.locale().text(TextKey::SavingSettings).into();
+        let paths = self.paths.clone();
+        let previous_servers = self.servers.clone();
+        let previous_settings = self.settings.clone();
+        let mut result_settings = previous_settings.clone();
+        let startup_lock = self.startup_integration_lock.clone();
+        let locale = self.locale();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let updates = if previous_settings.startup_all {
+                        previous_servers
+                            .iter()
+                            .map(|server| {
+                                let selected = server.connection_method
+                                    != ConnectionMethod::Interactive;
+                                if server.id == id {
+                                    (id.clone(), folder.clone(), auto_mount_at_login)
+                                } else {
+                                    (server.id.clone(), server.folder.clone(), selected)
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        vec![(id, folder, auto_mount_at_login)]
+                    };
+                    let servers = storage::update_server_preferences(&paths, &updates)
+                        .map_err(|error| error.to_string())?;
+                    if previous_settings.startup_all {
+                        result_settings.startup_all = false;
+                        if let Err(error) = storage::save_settings(&paths, &result_settings) {
+                            let mut message = error.to_string();
+                            if let Err(rollback) = storage::save_servers(&paths, &previous_servers) {
+                                message.push_str(&format!(
+                                    "; server rollback failed: {rollback}"
+                                ));
+                            }
+                            return Err(message);
+                        }
+                    }
+                    let warning = reconcile_login_startup(&paths, &startup_lock)
+                        .err()
+                        .map(|error| match locale {
+                            Locale::English => format!(
+                                "Preferences were saved, but login startup integration will be retried next launch: {error}"
+                            ),
+                            Locale::Chinese => format!(
+                                "整理设置已保存，但登录自启集成失败，将在下次启动时重试：{error}"
+                            ),
+                        });
+                    Ok(SettingsMutation {
+                        settings: result_settings,
+                        servers,
+                        warning,
+                    })
+                })
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()))
+            },
+            Message::ConnectionPreferencesSaved,
+        )
+    }
+
+    fn save_settings(&mut self) -> Task<Message> {
+        if self.editor_saving {
             return Task::none();
         }
         let Some(draft) = &self.settings_draft else {
             return Task::none();
         };
-        let settings = match draft.build(&self.settings, self.locale()) {
+        let mut settings = match draft.build(&self.settings, self.locale()) {
             Ok(settings) => settings,
+            Err(error) => {
+                self.status = error;
+                return Task::none();
+            }
+        };
+        settings.startup_all = false;
+        let preference_updates = match connection_preference_updates(draft, self.locale()) {
+            Ok(updates) => updates,
             Err(error) => {
                 self.status = error;
                 return Task::none();
@@ -3315,14 +3624,7 @@ impl App {
         let previous_servers = self.servers.clone();
         let service = self.service.clone();
         let locale = self.locale();
-        let executable = match std::env::current_exe() {
-            Ok(executable) => executable,
-            Err(error) => {
-                self.editor_saving = false;
-                self.status = error.to_string();
-                return Task::none();
-            }
-        };
+        let startup_lock = self.startup_integration_lock.clone();
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
@@ -3344,9 +3646,20 @@ impl App {
                     } else {
                         None
                     };
-                    let migrated_servers = credential_migration
-                        .as_ref()
-                        .map_or_else(|| previous_servers.clone(), |migration| migration.servers.clone());
+                    let migrated_servers = match storage::update_server_preferences(
+                        &paths,
+                        &preference_updates,
+                    ) {
+                        Ok(servers) => servers,
+                        Err(error) => {
+                            return Err(rollback_credential_storage_change(
+                                &paths,
+                                &previous_servers,
+                                credential_migration.as_ref(),
+                                error.to_string(),
+                            ));
+                        }
+                    };
                     if storage_changed {
                         diagnostic_trace(&credential_presence_summary("after", &migrated_servers));
                     }
@@ -3365,51 +3678,46 @@ impl App {
                         }
                     }
                     if let Err(error) = storage::save_settings(&paths, &settings) {
-                        return Err(rollback_credential_storage_change(
-                            &paths,
-                            &previous_servers,
-                            credential_migration.as_ref(),
-                            error.to_string(),
-                        ));
-                    }
-                    if let Err(error) =
-                        Platform.set_login_startup(&executable, settings.startup_all)
-                    {
-                        let settings_rollback = storage::save_settings(&paths, &previous_settings)
-                            .map_err(|rollback| rollback.to_string());
-                        let startup_rollback = Platform
-                            .set_login_startup(&executable, previous_settings.startup_all)
-                            .map_err(|rollback| rollback.to_string());
                         let mut message = rollback_credential_storage_change(
                             &paths,
                             &previous_servers,
                             credential_migration.as_ref(),
                             error.to_string(),
                         );
-                        if let Err(rollback) = settings_rollback {
-                            message.push_str(&format!("; settings rollback failed: {rollback}"));
-                        }
-                        if let Err(rollback) = startup_rollback {
-                            message.push_str(&format!("; startup rollback failed: {rollback}"));
+                        if credential_migration.is_none()
+                            && let Err(rollback) = storage::save_servers(&paths, &previous_servers)
+                        {
+                            message.push_str(&format!("; server rollback failed: {rollback}"));
                         }
                         return Err(message);
                     }
-                    let warning = if storage_changed
+                    let mut warnings = Vec::new();
+                    if let Err(error) = reconcile_login_startup(&paths, &startup_lock) {
+                        warnings.push(match locale {
+                            Locale::English => format!(
+                                "settings were saved, but login startup integration will be retried next launch: {error}"
+                            ),
+                            Locale::Chinese => format!(
+                                "设置已保存，但登录自启集成失败，将在下次启动时重试：{error}"
+                            ),
+                        });
+                    }
+                    if storage_changed
                         && settings.credential_storage == CredentialStorage::Obscure
+                        && let Some(error) = credential_migration
+                            .as_ref()
+                            .and_then(|migration| migration.retire_system_references().err())
                     {
-                        credential_migration.as_ref().and_then(|migration| {
-                            migration.retire_system_references().err().map(|error| match locale {
-                                Locale::English => format!(
-                                    "Settings saved, but some retired vault entries could not be removed: {error}"
-                                ),
-                                Locale::Chinese => format!(
-                                    "设置已保存，但部分旧系统凭据无法删除：{error}"
-                                ),
-                            })
-                        })
-                    } else {
-                        None
-                    };
+                        warnings.push(match locale {
+                            Locale::English => format!(
+                                "some retired vault entries could not be removed: {error}"
+                            ),
+                            Locale::Chinese => {
+                                format!("部分旧系统凭据无法删除：{error}")
+                            }
+                        });
+                    }
+                    let warning = (!warnings.is_empty()).then(|| warnings.join("; "));
                     Ok(SettingsMutation {
                         settings: result_settings,
                         servers: migrated_servers,
@@ -3471,16 +3779,13 @@ impl App {
     }
 
     fn reconcile_startup_task(&self) -> Task<Message> {
+        let paths = self.paths.clone();
+        let startup_lock = self.startup_integration_lock.clone();
         Task::perform(
             async move {
-                tokio::task::spawn_blocking(move || {
-                    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-                    Platform
-                        .set_login_startup(&executable, true)
-                        .map_err(|error| error.to_string())
-                })
-                .await
-                .unwrap_or_else(|error| Err(error.to_string()))
+                tokio::task::spawn_blocking(move || reconcile_login_startup(&paths, &startup_lock))
+                    .await
+                    .unwrap_or_else(|error| Err(error.to_string()))
             },
             Message::StartupReconciled,
         )
@@ -3631,7 +3936,14 @@ impl App {
         }
     }
 
-    fn status_task(&self) -> Task<Message> {
+    fn status_task(&mut self, policy: StatusPublishPolicy) -> Task<Message> {
+        let (generation, expected_status) = match policy {
+            StatusPublishPolicy::Silent => (None, None),
+            StatusPublishPolicy::Initial | StatusPublishPolicy::UserRefresh => {
+                let generation = self.claim_status_generation();
+                (Some(generation), Some(self.status.clone()))
+            }
+        };
         let service = self.service.clone();
         let ids: Vec<_> = self
             .servers
@@ -3651,8 +3963,22 @@ impl App {
                 .await
                 .unwrap_or_else(|error| vec![(String::new(), Err(error.to_string()))])
             },
-            Message::StatusesLoaded,
+            move |results| Message::StatusesLoaded {
+                policy,
+                generation,
+                expected_status,
+                results,
+            },
         )
+    }
+
+    fn claim_status_generation(&mut self) -> u64 {
+        self.status_generation = self.status_generation.wrapping_add(1);
+        self.status_generation
+    }
+
+    fn invalidate_status_publications(&mut self) {
+        self.claim_status_generation();
     }
 
     fn capacity_task(&mut self) -> Task<Message> {
@@ -4529,6 +4855,9 @@ impl App {
                             has_interactive_terminal: self
                                 .interactive_terminals
                                 .contains_key(&server.id),
+                            auto_mount_at_login: (self.settings.startup_all
+                                || server.auto_mount_at_login)
+                                && server.connection_method != ConnectionMethod::Interactive,
                         },
                         locale,
                     ));
@@ -4904,12 +5233,6 @@ impl App {
                 requirements.name,
             ),
             connection_input(
-                locale.text(TextKey::Folder),
-                &draft.folder,
-                ConnectionField::Folder,
-                false,
-            ),
-            connection_input(
                 locale.text(TextKey::SshHostAlias),
                 &draft.host_alias,
                 ConnectionField::HostAlias,
@@ -5162,6 +5485,40 @@ impl App {
             }
         }
         let paths = row![remote_path, mountpoint].spacing(12);
+        let startup_control: Element<'_, Message> =
+            if draft.connection_method == ConnectionMethod::Interactive {
+                container(text(match locale {
+                    Locale::English => "Unavailable for interactive SSH",
+                    Locale::Chinese => "交互式 SSH 不支持开机自动挂载",
+                }))
+                .padding(10)
+                .width(Fill)
+                .into()
+            } else {
+                toggler(draft.auto_mount_at_login)
+                    .label(match locale {
+                        Locale::English => "Mount at login",
+                        Locale::Chinese => "登录时自动挂载",
+                    })
+                    .on_toggle(Message::ConnectionStartupChanged)
+                    .into()
+            };
+        let organization = row![
+            connection_input(
+                locale.text(TextKey::Folder),
+                &draft.folder,
+                ConnectionField::Folder,
+                false,
+            ),
+            labeled_control(
+                match locale {
+                    Locale::English => "Login startup",
+                    Locale::Chinese => "登录自启",
+                },
+                startup_control,
+            ),
+        ]
+        .spacing(12);
         let content = column![
             source,
             ssh_config_controls,
@@ -5170,6 +5527,7 @@ impl App {
             transport,
             auth_fields,
             managed_fields,
+            organization,
             paths
         ]
         .spacing(16)
@@ -5187,14 +5545,59 @@ impl App {
             text(title).size(28),
             Space::new().width(Fill),
             button(locale.text(TextKey::Cancel)).on_press(Message::CancelEditor),
+            button(if self.editor_saving {
+                locale.text(TextKey::Saving)
+            } else {
+                locale.text(TextKey::Save)
+            })
+            .on_press_maybe((!self.editor_saving).then_some(Message::SaveConnectionPreferences)),
         ]
         .spacing(10)
         .align_y(Center);
         let mut content = column![
-            container(text(connection_settings_locked_help(locale)).size(14))
+            container(text(match locale {
+                Locale::English => "The connection is mounted or busy. Connection, authentication, and mount fields remain read-only; folder organization and login startup can still be changed.",
+                Locale::Chinese => "此连接已挂载或正在执行操作。连接、认证和挂载字段保持只读；仍可修改文件夹归类与登录自启。",
+            }).size(14))
                 .padding(12)
                 .width(Fill)
                 .style(container::rounded_box),
+            row![
+                connection_input(
+                    locale.text(TextKey::Folder),
+                    &draft.folder,
+                    ConnectionField::Folder,
+                    false,
+                ),
+                if draft.connection_method == ConnectionMethod::Interactive {
+                    labeled_control(
+                        match locale {
+                            Locale::English => "Login startup",
+                            Locale::Chinese => "登录自启",
+                        },
+                        container(text(match locale {
+                            Locale::English => "Unavailable for interactive SSH",
+                            Locale::Chinese => "交互式 SSH 不支持",
+                        }))
+                        .padding(10)
+                        .width(Fill),
+                    )
+                } else {
+                    labeled_control(
+                        match locale {
+                            Locale::English => "Login startup",
+                            Locale::Chinese => "登录自启",
+                        },
+                        toggler(draft.auto_mount_at_login)
+                            .label(match locale {
+                                Locale::English => "Mount at login",
+                                Locale::Chinese => "登录时自动挂载",
+                            })
+                            .on_toggle(Message::ConnectionStartupChanged),
+                    )
+                },
+            ]
+            .spacing(12),
             row![
                 connection_read_only_field(
                     locale.text(TextKey::Source),
@@ -5492,10 +5895,64 @@ impl App {
             ),
         ]
         .spacing(12);
+        let mut connection_preferences = column![
+            text(match locale {
+                Locale::English => "Connection organization",
+                Locale::Chinese => "连接整理",
+            })
+            .size(20),
+            text(match locale {
+                Locale::English => {
+                    "Choose each connection's folder and whether it mounts automatically after login. Interactive SSH requires a live login session and cannot start automatically."
+                }
+                Locale::Chinese => {
+                    "设置每个连接的文件夹归类与登录后自动挂载。交互式 SSH 需要实时登录会话，不能自动启动。"
+                }
+            })
+            .size(14),
+        ]
+        .spacing(8);
+        for preference in &draft.connection_preferences {
+            let folder_id = preference.id.clone();
+            let startup_id = preference.id.clone();
+            let startup: Element<'_, Message> = if preference.startup_available {
+                toggler(preference.auto_mount_at_login)
+                    .label(match locale {
+                        Locale::English => "Mount at login",
+                        Locale::Chinese => "登录时挂载",
+                    })
+                    .on_toggle(move |value| {
+                        Message::SettingsConnectionStartupChanged(startup_id.clone(), value)
+                    })
+                    .into()
+            } else {
+                text(match locale {
+                    Locale::English => "Interactive SSH: unavailable",
+                    Locale::Chinese => "交互式 SSH：不可用",
+                })
+                .size(13)
+                .into()
+            };
+            connection_preferences = connection_preferences.push(
+                container(
+                    row![
+                        text(&preference.name).size(14).width(Length::Fixed(180.0)),
+                        text_input(locale.text(TextKey::Folder), &preference.folder)
+                            .on_input(move |value| {
+                                Message::SettingsConnectionFolderChanged(folder_id.clone(), value)
+                            })
+                            .width(Fill),
+                        container(startup).width(Length::Fixed(210.0)),
+                    ]
+                    .spacing(12)
+                    .align_y(Center),
+                )
+                .padding(10)
+                .width(Fill)
+                .style(container::rounded_box),
+            );
+        }
         let behavior = column![
-            toggler(draft.startup_all)
-                .label(locale.text(TextKey::MountAllAtLogin))
-                .on_toggle(Message::StartupAllChanged),
             row![
                 toggler(draft.auto_show_transfers)
                     .label(locale.text(TextKey::ShowTransferPopup))
@@ -5699,6 +6156,7 @@ impl App {
             cache_profile,
             cache_limits,
             cache_timing,
+            connection_preferences,
             behavior,
             logs,
             dependency_section,
@@ -5719,12 +6177,19 @@ impl App {
                 Locale::Chinese => "自定义设置",
             };
             let mut custom_value = row![
-                text_input("0", &custom.digits)
-                    .on_input(Message::CustomSettingDigitsChanged)
-                    .width(Length::Fixed(180.0))
+                text_input(
+                    if custom.raw_value.is_some() {
+                        "value"
+                    } else {
+                        "0"
+                    },
+                    &custom.digits,
+                )
+                .on_input(Message::CustomSettingDigitsChanged)
+                .width(Length::Fixed(180.0))
             ]
             .spacing(10);
-            if !units.is_empty() {
+            if !units.is_empty() && custom.raw_value.is_none() {
                 custom_value = custom_value.push(
                     pick_list(
                         units,
@@ -6051,6 +6516,7 @@ struct ConnectionCardState<'a> {
     waiting_unmount: bool,
     operation_error: Option<&'a ConnectionOperationError>,
     has_interactive_terminal: bool,
+    auto_mount_at_login: bool,
 }
 
 fn capacity_progress_view(
@@ -6131,6 +6597,7 @@ fn connection_card<'a>(
         waiting_unmount,
         operation_error,
         has_interactive_terminal,
+        auto_mount_at_login,
     } = state;
     let id = server.id.clone();
     let host = format!("{}@{}:{}", server.user, server.host, server.port);
@@ -6159,8 +6626,20 @@ fn connection_card<'a>(
     if status == MountStatus::Mounted && !busy {
         open = open.on_press(Message::Open(id.clone()));
     }
+    let mut title = row![text(server.display_name()).size(22)]
+        .spacing(8)
+        .align_y(Center);
+    if auto_mount_at_login {
+        title = title.push(
+            text(match locale {
+                Locale::English => "At login",
+                Locale::Chinese => "登录自启",
+            })
+            .size(12),
+        );
+    }
     let mut details = column![
-        text(server.display_name()).size(22),
+        title,
         text(host).size(15),
         text(format!(
             "{}  ->  {}",
@@ -6446,7 +6925,7 @@ fn setting_picker<'a>(
         .iter()
         .find(|option| !option.custom && option.value == value)
         .cloned()
-        .or_else(|| options.iter().find(|option| option.custom).cloned());
+        .or_else(|| Some(selected_custom_setting_option(kind, value, locale)));
     column![
         row![
             text(label).size(13),
@@ -6454,12 +6933,6 @@ fn setting_picker<'a>(
         ]
         .spacing(5),
         pick_list(options, selected, Message::SettingOptionChanged).width(Fill),
-        text(if setting_presets(kind).contains(&value) {
-            ""
-        } else {
-            value
-        })
-        .size(12),
     ]
     .spacing(5)
     .width(Fill)
@@ -6513,6 +6986,22 @@ fn preset_label(kind: SettingKind, value: &str, locale: Locale) -> String {
     value.to_owned()
 }
 
+fn custom_setting_label(locale: Locale, value: &str) -> String {
+    match locale {
+        Locale::English => format!("Custom: {value}"),
+        Locale::Chinese => format!("自定义：{value}"),
+    }
+}
+
+fn selected_custom_setting_option(kind: SettingKind, value: &str, locale: Locale) -> SettingOption {
+    SettingOption {
+        kind,
+        value: value.to_owned(),
+        label: custom_setting_label(locale, value),
+        custom: true,
+    }
+}
+
 fn setting_value(draft: &SettingsDraft, kind: SettingKind) -> &str {
     match kind {
         SettingKind::MaxSize => &draft.max_size,
@@ -6558,13 +7047,146 @@ fn split_custom_setting(kind: SettingKind, value: &str) -> (String, String) {
     if units.is_empty() {
         return (digits, String::new());
     }
-    let unit = units
+    if value.is_empty() {
+        return (String::new(), units[0].to_owned());
+    }
+    if let Some(unit) = units.iter().find(|unit| **unit == suffix) {
+        (digits, (*unit).to_owned())
+    } else {
+        (value.to_owned(), String::new())
+    }
+}
+
+fn custom_setting_is_supported(kind: SettingKind, value: &str) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+    if kind == SettingKind::Transfers {
+        return value.chars().all(|character| character.is_ascii_digit());
+    }
+    let (digits, unit) = split_custom_setting(kind, value);
+    !digits.is_empty()
+        && digits.len() + unit.len() == value.len()
+        && custom_units(kind).iter().any(|allowed| *allowed == unit)
+}
+
+fn custom_setting_value(custom: &CustomSettingDraft, locale: Locale) -> Result<String, String> {
+    if custom.digits.is_empty() {
+        return Err(match locale {
+            Locale::English => "Custom value must contain digits".into(),
+            Locale::Chinese => "自定义数值必须填写数字".into(),
+        });
+    }
+    if let Some(raw_value) = &custom.raw_value {
+        return Ok(raw_value.clone());
+    }
+    if custom.kind == SettingKind::Transfers {
+        return validate_upload_transfers(&custom.digits, locale).map(|value| value.to_string());
+    }
+    Ok(format!("{}{}", custom.digits, custom.unit))
+}
+
+fn startup_servers(settings: &Settings, servers: &[ServerConfig]) -> Vec<ServerConfig> {
+    servers
         .iter()
-        .find(|unit| **unit == suffix)
-        .copied()
-        .unwrap_or(units[0])
-        .to_owned();
-    (digits, unit)
+        .filter(|server| {
+            (settings.startup_all || server.auto_mount_at_login)
+                && server.connection_method != ConnectionMethod::Interactive
+        })
+        .cloned()
+        .collect()
+}
+
+fn servers_require_system_credentials(servers: &[ServerConfig]) -> bool {
+    servers.iter().any(|server| {
+        (!server.password_credential.is_empty() && server.password_obscured.is_empty())
+            || (!server.key_pass_credential.is_empty() && server.key_pass_obscured.is_empty())
+    })
+}
+
+fn settings_need_system_credential_inference(
+    settings: &Settings,
+    servers: &[ServerConfig],
+) -> bool {
+    settings.credential_storage == CredentialStorage::Obscure
+        && servers_require_system_credentials(servers)
+}
+
+fn connection_preference_updates(
+    draft: &SettingsDraft,
+    locale: Locale,
+) -> Result<Vec<(String, String, bool)>, String> {
+    draft
+        .connection_preferences
+        .iter()
+        .map(|preference| {
+            let folder = normalized_organization_folder(&preference.folder, locale)?;
+            Ok((
+                preference.id.clone(),
+                folder,
+                preference.auto_mount_at_login && preference.startup_available,
+            ))
+        })
+        .collect()
+}
+
+fn normalized_organization_folder(value: &str, locale: Locale) -> Result<String, String> {
+    if value.chars().any(char::is_control) {
+        return Err(match locale {
+            Locale::English => "Connection folders must not contain control characters".into(),
+            Locale::Chinese => "连接文件夹不能包含控制字符".into(),
+        });
+    }
+    Ok(value.trim().to_owned())
+}
+
+fn startup_integration_enabled(settings: &Settings, servers: &[ServerConfig]) -> bool {
+    !startup_servers(settings, servers).is_empty()
+}
+
+fn reconcile_login_startup(paths: &AppPaths, startup_lock: &Mutex<()>) -> Result<(), String> {
+    let _guard = startup_lock
+        .lock()
+        .map_err(|_| "login startup integration lock is poisoned".to_owned())?;
+    let settings = storage::load_settings(paths).map_err(|error| error.to_string())?;
+    let servers = storage::load_servers(paths).map_err(|error| error.to_string())?;
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    Platform
+        .set_login_startup(
+            &executable,
+            startup_integration_enabled(&settings, &servers),
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn migrate_legacy_startup_preferences(
+    paths: &AppPaths,
+    settings: &Settings,
+    servers: &[ServerConfig],
+) -> Result<(Settings, Vec<ServerConfig>), String> {
+    if !settings.startup_all {
+        return Ok((settings.clone(), servers.to_vec()));
+    }
+    let mut migrated_servers = servers.to_vec();
+    for server in &mut migrated_servers {
+        server.auto_mount_at_login = server.connection_method != ConnectionMethod::Interactive;
+    }
+    storage::save_servers(paths, &migrated_servers).map_err(|error| error.to_string())?;
+    let mut migrated_settings = settings.clone();
+    migrated_settings.startup_all = false;
+    if let Err(error) = storage::save_settings(paths, &migrated_settings) {
+        let rollback = storage::save_servers(paths, servers).map_err(|error| error.to_string());
+        let mut message = error.to_string();
+        if let Err(rollback) = rollback {
+            message.push_str(&format!("; server rollback failed: {rollback}"));
+        }
+        return Err(message);
+    }
+    Ok((migrated_settings, migrated_servers))
+}
+
+fn legacy_startup_migration_needed(settings: &Settings, servers_loaded: bool) -> bool {
+    settings.startup_all && servers_loaded
 }
 
 fn setting_help(kind: SettingKind, locale: Locale) -> &'static str {
@@ -6845,6 +7467,61 @@ fn connection_settings_locked_help(locale: Locale) -> &'static str {
             "此连接已挂载或正在执行操作。当前设置为只读；请先卸载再修改，变更会在下次挂载时生效。"
         }
     }
+}
+
+fn settings_recovery_message(
+    recovered: &storage::RecoveredSettings,
+    locale: Locale,
+) -> Option<String> {
+    let error = recovered.load_error.as_deref()?;
+    let backup = recovered.backup_path.as_ref().map(|path| path.display());
+    let reset_persisted = recovered.backup_error.is_none() && recovered.persistence_error.is_none();
+    Some(match locale {
+        Locale::English => {
+            let mut message = match (backup, reset_persisted) {
+                (Some(path), _) => format!(
+                    "The previous settings could not be read and were reset. A backup was saved at {path}. New settings can be saved normally. Original error: {error}"
+                ),
+                (None, true) => format!(
+                    "The previous settings could not be read and were reset. New settings can be saved normally. Original error: {error}"
+                ),
+                (None, false) => format!(
+                    "The previous settings could not be read. Defaults are loaded in memory, but the settings file could not be replaced; Save will retry. Original error: {error}"
+                ),
+            };
+            if let Some(backup_error) = &recovered.backup_error {
+                message.push_str(&format!("; backup failed: {backup_error}"));
+            }
+            if let Some(persistence_error) = &recovered.persistence_error {
+                message.push_str(&format!(
+                    "; the reset could not be written automatically, but Save will retry: {persistence_error}"
+                ));
+            }
+            message
+        }
+        Locale::Chinese => {
+            let mut message = match (backup, reset_persisted) {
+                (Some(path), _) => format!(
+                    "旧设置无法读取，已重置；原文件已备份到 {path}。现在可以正常保存新设置。原始错误：{error}"
+                ),
+                (None, true) => {
+                    format!("旧设置无法读取，已重置；现在可以正常保存新设置。原始错误：{error}")
+                }
+                (None, false) => format!(
+                    "旧设置无法读取，当前仅在内存中加载默认值；设置文件尚未替换，点击保存时会重试。原始错误：{error}"
+                ),
+            };
+            if let Some(backup_error) = &recovered.backup_error {
+                message.push_str(&format!("；备份失败：{backup_error}"));
+            }
+            if let Some(persistence_error) = &recovered.persistence_error {
+                message.push_str(&format!(
+                    "；自动写入重置设置失败，但点击保存时会重试：{persistence_error}"
+                ));
+            }
+            message
+        }
+    })
 }
 
 fn system_prefers_dark() -> bool {
@@ -7286,7 +7963,6 @@ fn rollback_prepared_secrets<'a>(
 }
 
 struct CredentialStorageMigration {
-    servers: Vec<ServerConfig>,
     migrations: Vec<CredentialMigration>,
     retired_references: Vec<String>,
 }
@@ -7433,9 +8109,8 @@ fn migrate_servers_for_storage(
             }
         }
     }
-    let servers = persist_and_reload_servers(paths, &finalized, servers, &migrations)?;
+    persist_and_reload_servers(paths, &finalized, servers, &migrations)?;
     Ok(CredentialStorageMigration {
-        servers,
         migrations,
         retired_references,
     })
@@ -7511,6 +8186,45 @@ fn status_label(locale: Locale, status: MountStatus) -> &'static str {
         (Locale::Chinese, MountStatus::Starting) => "正在处理",
         (Locale::Chinese, MountStatus::Stale) => "状态已失效",
     }
+}
+
+fn status_completion_message(
+    policy: StatusPublishPolicy,
+    errors: &[String],
+    startup_notice: &mut Option<String>,
+    locale: Locale,
+    can_publish: bool,
+) -> Option<String> {
+    if !can_publish {
+        return None;
+    }
+    match policy {
+        StatusPublishPolicy::Silent => None,
+        StatusPublishPolicy::UserRefresh => Some(
+            errors
+                .first()
+                .cloned()
+                .unwrap_or_else(|| locale.text(TextKey::Ready).into()),
+        ),
+        StatusPublishPolicy::Initial => {
+            let notice = startup_notice.take();
+            match (notice, errors.first()) {
+                (Some(notice), Some(error)) => Some(format!("{notice}; {error}")),
+                (Some(notice), None) => Some(notice),
+                (None, Some(error)) => Some(error.clone()),
+                (None, None) => Some(locale.text(TextKey::Ready).into()),
+            }
+        }
+    }
+}
+
+fn status_publication_is_current(
+    generation: u64,
+    current_generation: u64,
+    expected_status: &str,
+    current_status: &str,
+) -> bool {
+    generation == current_generation && expected_status == current_status
 }
 
 fn transfer_label(locale: Locale, snapshot: &TransferSnapshot) -> String {
@@ -8142,6 +8856,80 @@ mod localization_tests {
     }
 
     #[test]
+    fn silent_status_completion_cannot_overwrite_a_mount_failure() {
+        let mut startup_notice = Some("Recovered settings".into());
+
+        let message = status_completion_message(
+            StatusPublishPolicy::Silent,
+            &[],
+            &mut startup_notice,
+            Locale::English,
+            true,
+        );
+
+        assert_eq!(message, None);
+        assert_eq!(startup_notice.as_deref(), Some("Recovered settings"));
+    }
+
+    #[test]
+    fn initial_and_user_status_completions_publish_intentionally() {
+        let mut startup_notice = Some("Recovered settings".into());
+        assert_eq!(
+            status_completion_message(
+                StatusPublishPolicy::Initial,
+                &[],
+                &mut startup_notice,
+                Locale::English,
+                true,
+            ),
+            Some("Recovered settings".into())
+        );
+        assert!(startup_notice.is_none());
+        assert_eq!(
+            status_completion_message(
+                StatusPublishPolicy::UserRefresh,
+                &[],
+                &mut startup_notice,
+                Locale::English,
+                true,
+            ),
+            Some("Ready".into())
+        );
+    }
+
+    #[test]
+    fn stale_status_completion_cannot_overwrite_a_newer_failure() {
+        let mut startup_notice = Some("Recovered settings".into());
+
+        let message = status_completion_message(
+            StatusPublishPolicy::Initial,
+            &[],
+            &mut startup_notice,
+            Locale::English,
+            false,
+        );
+
+        assert_eq!(message, None);
+        assert_eq!(startup_notice.as_deref(), Some("Recovered settings"));
+    }
+
+    #[test]
+    fn repeated_status_text_does_not_make_an_older_generation_current() {
+        assert!(!status_publication_is_current(
+            1,
+            2,
+            "Refreshing",
+            "Refreshing",
+        ));
+        assert!(status_publication_is_current(
+            2,
+            2,
+            "Refreshing",
+            "Refreshing",
+        ));
+    }
+
+    #[test]
     fn unsigned_updates_have_explicit_bilingual_block_reasons() {
         let error = UpdateTrustError::MissingSignature;
         let english = automatic_install_blocked_message(Locale::English, &error);
@@ -8580,12 +9368,197 @@ mod localization_tests {
         );
         assert_eq!(
             split_custom_setting(SettingKind::MaxAge, "1h30m"),
-            ("1".into(), "s".into())
+            ("1h30m".into(), String::new())
         );
         assert_eq!(
             split_custom_setting(SettingKind::Transfers, "24"),
             ("24".into(), String::new())
         );
+        assert!(!custom_setting_is_supported(SettingKind::MaxAge, "1h30m"));
+        assert!(!custom_setting_is_supported(SettingKind::MaxSize, "20G"));
+        assert!(custom_setting_is_supported(SettingKind::MaxAge, "90m"));
+        assert!(custom_setting_is_supported(SettingKind::MaxSize, "20Gi"));
+    }
+
+    #[test]
+    fn custom_picker_labels_preserve_exact_values_in_both_locales() {
+        let values = [
+            (SettingKind::MaxSize, "20G"),
+            (SettingKind::MaxAge, "1h30m"),
+            (SettingKind::MinFreeSpace, "20G"),
+            (SettingKind::WriteBack, "250ms"),
+            (SettingKind::DirCacheTime, "2h30m"),
+            (SettingKind::BufferSize, "20G"),
+            (SettingKind::Transfers, "24"),
+        ];
+        for (kind, value) in values {
+            for (locale, expected) in [
+                (Locale::English, format!("Custom: {value}")),
+                (Locale::Chinese, format!("自定义：{value}")),
+            ] {
+                let selected = selected_custom_setting_option(kind, value, locale);
+                assert!(selected.custom);
+                assert_eq!(selected.kind, kind);
+                assert_eq!(selected.value, value);
+                assert_eq!(selected.label, expected);
+                assert_eq!(
+                    setting_options(kind, locale)
+                        .into_iter()
+                        .find(|option| option.custom)
+                        .unwrap()
+                        .label,
+                    match locale {
+                        Locale::English => "Custom...",
+                        Locale::Chinese => "自定义...",
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_custom_values_round_trip_without_coercion() {
+        for (kind, value) in [
+            (SettingKind::MaxAge, "1h30m"),
+            (SettingKind::MaxSize, "20G"),
+        ] {
+            let draft = CustomSettingDraft {
+                kind,
+                digits: value.into(),
+                unit: String::new(),
+                raw_value: Some(value.into()),
+            };
+            assert_eq!(
+                custom_setting_value(&draft, Locale::English),
+                Ok(value.into())
+            );
+            assert_eq!(
+                custom_setting_value(&draft, Locale::Chinese),
+                Ok(value.into())
+            );
+        }
+    }
+
+    #[test]
+    fn startup_selection_mounts_only_enabled_non_interactive_connections() {
+        let servers = vec![
+            ServerConfig {
+                id: "enabled".into(),
+                auto_mount_at_login: true,
+                ..ServerConfig::default()
+            },
+            ServerConfig {
+                id: "disabled".into(),
+                ..ServerConfig::default()
+            },
+            ServerConfig {
+                id: "interactive".into(),
+                auto_mount_at_login: true,
+                connection_method: ConnectionMethod::Interactive,
+                ..ServerConfig::default()
+            },
+        ];
+
+        let selected = startup_servers(&Settings::default(), &servers);
+
+        assert_eq!(
+            selected
+                .into_iter()
+                .map(|server| server.id)
+                .collect::<Vec<_>>(),
+            vec!["enabled".to_owned()]
+        );
+    }
+
+    #[test]
+    fn recovered_settings_detect_existing_system_credential_references() {
+        let system_only = ServerConfig {
+            password_credential: "ssh-mountmate:alpha:password".into(),
+            ..ServerConfig::default()
+        };
+        assert!(servers_require_system_credentials(std::slice::from_ref(
+            &system_only
+        )));
+        assert!(settings_need_system_credential_inference(
+            &Settings::default(),
+            std::slice::from_ref(&system_only),
+        ));
+        assert!(!settings_need_system_credential_inference(
+            &Settings {
+                credential_storage: CredentialStorage::System,
+                ..Settings::default()
+            },
+            &[system_only],
+        ));
+        assert!(!servers_require_system_credentials(&[ServerConfig {
+            password_obscured: "obscured".into(),
+            password_credential: "retained-reference".into(),
+            ..ServerConfig::default()
+        }]));
+    }
+
+    #[test]
+    fn legacy_startup_all_selects_every_non_interactive_connection() {
+        let settings = Settings {
+            startup_all: true,
+            ..Settings::default()
+        };
+        let servers = vec![
+            ServerConfig {
+                id: "native".into(),
+                ..ServerConfig::default()
+            },
+            ServerConfig {
+                id: "interactive".into(),
+                connection_method: ConnectionMethod::Interactive,
+                ..ServerConfig::default()
+            },
+        ];
+
+        assert_eq!(startup_servers(&settings, &servers)[0].id, "native");
+        assert!(startup_integration_enabled(&settings, &servers));
+    }
+
+    #[test]
+    fn legacy_startup_all_migrates_to_per_connection_preferences() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: temp.path().join("config"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            data_dir: temp.path().join("data"),
+        };
+        let settings = Settings {
+            startup_all: true,
+            cache_root: paths.cache_dir.clone(),
+            ..Settings::default()
+        };
+        let servers = vec![ServerConfig {
+            id: "alpha".into(),
+            name: "alpha".into(),
+            ..ServerConfig::default()
+        }];
+        storage::save_settings(&paths, &settings).unwrap();
+        storage::save_servers(&paths, &servers).unwrap();
+
+        let (migrated_settings, migrated_servers) =
+            migrate_legacy_startup_preferences(&paths, &settings, &servers).unwrap();
+
+        assert!(!migrated_settings.startup_all);
+        assert!(migrated_servers[0].auto_mount_at_login);
+        assert_eq!(storage::load_settings(&paths).unwrap(), migrated_settings);
+        assert_eq!(storage::load_servers(&paths).unwrap(), migrated_servers);
+    }
+
+    #[test]
+    fn legacy_startup_migration_never_runs_on_a_server_load_fallback() {
+        let settings = Settings {
+            startup_all: true,
+            ..Settings::default()
+        };
+
+        assert!(!legacy_startup_migration_needed(&settings, false));
+        assert!(legacy_startup_migration_needed(&settings, true));
     }
 
     #[test]
@@ -8627,6 +9600,22 @@ mod localization_tests {
         assert_eq!(rebuilt.appearance_mode, AppearanceMode::Light);
         assert_eq!(rebuilt.accent_color, AccentColor::Green);
         assert_eq!(rebuilt.font_scale, FontScale::Standard);
+    }
+
+    #[test]
+    fn fresh_profile_settings_can_be_saved_without_picking_a_cache_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: temp.path().join("config"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            data_dir: temp.path().join("data"),
+        };
+        let settings = storage::load_settings(&paths).unwrap();
+        let draft = SettingsDraft::from_settings(&settings);
+
+        assert_eq!(settings.cache_root, paths.cache_dir);
+        assert_eq!(draft.build(&settings, Locale::English), Ok(settings));
     }
 
     #[test]
