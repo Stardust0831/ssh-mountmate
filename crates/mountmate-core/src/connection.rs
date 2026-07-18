@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::model::{normalize_port, sanitize_id};
+use crate::model::{normalize_port, normalize_tags, sanitize_id};
 use crate::mountpoint::HOME_MOUNTPOINT_VALUE;
 use crate::{AuthMethod, ConnectionMethod, ServerConfig};
 
@@ -60,6 +60,7 @@ pub struct ConnectionDraft {
     pub source: ConnectionSource,
     pub name: String,
     pub folder: String,
+    pub tags: Vec<String>,
     pub host_alias: String,
     pub host: String,
     pub user: String,
@@ -125,6 +126,7 @@ impl Default for ConnectionDraft {
             source: ConnectionSource::Manual,
             name: String::new(),
             folder: String::new(),
+            tags: Vec::new(),
             host_alias: String::new(),
             host: String::new(),
             user: String::new(),
@@ -193,6 +195,7 @@ impl ConnectionDraft {
             source: ConnectionSource::from_server(server),
             name: server.name.clone(),
             folder: server.folder.clone(),
+            tags: server.tags.clone(),
             host_alias: server.host_alias.clone(),
             host: server.host.clone(),
             user: server.user.clone(),
@@ -301,7 +304,8 @@ impl ConnectionDraft {
     pub fn validate(&self, servers: &[ServerConfig]) -> Result<ValidatedConnection, DraftError> {
         let requirements = self.requirements();
         let name = required_display_name(&self.name)?;
-        let folder = validate_folder(&self.folder)?;
+        let tags = validate_tags(&self.tags, &self.folder)?;
+        let folder = tags.first().cloned().unwrap_or_default();
         let host = required_scalar(&self.host, "IP/Host")?;
         let user = required_scalar(&self.user, "User")?;
         let port = normalize_port(&self.port).ok_or(DraftError::InvalidPort)?;
@@ -348,6 +352,7 @@ impl ConnectionDraft {
             id,
             name,
             folder,
+            tags,
             mode: if matches!(
                 self.source,
                 ConnectionSource::SshConfig | ConnectionSource::SshConfigBatch
@@ -564,12 +569,15 @@ fn required_display_name(value: &str) -> Result<String, DraftError> {
     Ok(value.into())
 }
 
-fn validate_folder(value: &str) -> Result<String, DraftError> {
-    let value = value.trim();
-    if value.chars().any(char::is_control) {
+fn validate_tags(tags: &[String], legacy_folder: &str) -> Result<Vec<String>, DraftError> {
+    if tags.iter().any(|tag| tag.chars().any(char::is_control))
+        || legacy_folder.chars().any(char::is_control)
+    {
         return Err(DraftError::InvalidFolder);
     }
-    Ok(value.into())
+    let mut normalized = tags.to_vec();
+    normalize_tags(&mut normalized, legacy_folder);
+    Ok(normalized)
 }
 
 fn validate_private_key(value: &str) -> Result<(), DraftError> {
@@ -921,6 +929,7 @@ fn merge_imported_connection(existing: &ServerConfig, imported: &ServerConfig) -
         merged.key_pass_obscured.clear();
         merged.key_pass_credential.clear();
     }
+    merged.folder = merged.tags.first().cloned().unwrap_or_default();
     merged
 }
 
@@ -1166,6 +1175,43 @@ mod tests {
     }
 
     #[test]
+    fn tags_round_trip_trims_stably_deduplicates_and_preserves_spaces() {
+        let draft = ConnectionDraft {
+            name: "Alpha".into(),
+            tags: vec![
+                "  Projects  ".into(),
+                "研究 / Team".into(),
+                "Projects".into(),
+                "".into(),
+            ],
+            host: "host.example".into(),
+            user: "alice".into(),
+            auth: AuthMethod::Password,
+            password: "secret".into(),
+            ..ConnectionDraft::default()
+        };
+        let server = draft.validate(&[]).unwrap().server;
+        assert_eq!(server.tags, vec!["Projects", "研究 / Team"]);
+        assert_eq!(server.folder, "Projects");
+        let reconstructed = ConnectionDraft::from_server(&server);
+        assert_eq!(reconstructed.tags, server.tags);
+    }
+
+    #[test]
+    fn tags_reject_control_characters() {
+        let draft = ConnectionDraft {
+            name: "Alpha".into(),
+            tags: vec!["Projects\nTeam".into()],
+            host: "host.example".into(),
+            user: "alice".into(),
+            auth: AuthMethod::Password,
+            password: "secret".into(),
+            ..ConnectionDraft::default()
+        };
+        assert_eq!(draft.validate(&[]), Err(DraftError::InvalidFolder));
+    }
+
+    #[test]
     fn refreshing_an_ssh_import_preserves_user_folder() {
         let mut draft = ConnectionDraft {
             folder: "Research".into(),
@@ -1309,6 +1355,7 @@ mod tests {
         let existing = ServerConfig {
             id: "alpha".into(),
             name: "Old".into(),
+            tags: vec!["Work".into(), "研究".into()],
             host_alias: "alpha".into(),
             host: "old.example".into(),
             user: "alice".into(),
@@ -1344,6 +1391,8 @@ mod tests {
         assert_eq!(merged.mountpoint, "Z:");
         assert_eq!(merged.cache_mode, "writes");
         assert_eq!(merged.ssh_config_path, "/tmp/custom-config");
+        assert_eq!(merged.tags, vec!["Work", "研究"]);
+        assert_eq!(merged.folder, "Work");
     }
 
     #[test]

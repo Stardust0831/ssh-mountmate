@@ -200,6 +200,8 @@ pub struct ServerConfig {
     pub name: String,
     #[serde(default)]
     pub folder: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
     #[serde(default = "default_mode")]
     pub mode: String,
     #[serde(default = "default_source")]
@@ -260,6 +262,7 @@ impl Default for ServerConfig {
             id: String::new(),
             name: String::new(),
             folder: String::new(),
+            tags: Vec::new(),
             mode: default_mode(),
             source: default_source(),
             host_alias: String::new(),
@@ -302,6 +305,9 @@ impl ServerConfig {
             self.name = display_name;
         }
         self.port = normalize_port(&self.port).unwrap_or_else(|| "22".into());
+        let legacy_folder = self.folder.clone();
+        normalize_tags(&mut self.tags, &legacy_folder);
+        self.folder = self.tags.first().cloned().unwrap_or_default();
     }
 
     pub fn display_name(&self) -> &str {
@@ -338,6 +344,26 @@ impl ServerConfig {
             &self.cache_mode
         }
     }
+}
+
+/// Trims tags, drops blank values, and removes exact duplicates while retaining
+/// the first occurrence of each value. Legacy folder data is used only when
+/// no tags were persisted.
+pub fn normalize_tags(tags: &mut Vec<String>, legacy_folder: &str) {
+    let mut normalized = Vec::with_capacity(tags.len());
+    for tag in tags.drain(..) {
+        let tag = tag.trim();
+        if !tag.is_empty() && !normalized.iter().any(|existing| existing == tag) {
+            normalized.push(tag.to_owned());
+        }
+    }
+    if normalized.is_empty() {
+        let legacy = legacy_folder.trim();
+        if !legacy.is_empty() {
+            normalized.push(legacy.to_owned());
+        }
+    }
+    *tags = normalized;
 }
 
 pub fn normalize_port(value: &str) -> Option<String> {
@@ -745,6 +771,63 @@ mod tests {
     fn legacy_server_defaults_to_no_folder() {
         let server: ServerConfig = serde_json::from_str(r#"{"id":"legacy"}"#).unwrap();
         assert!(server.folder.is_empty());
+    }
+
+    #[test]
+    fn legacy_folder_migrates_to_tags_on_normalization() {
+        let mut server: ServerConfig =
+            serde_json::from_str(r#"{"id":"legacy","folder":"  Work  "}"#).unwrap();
+        server.normalize();
+        assert_eq!(server.tags, vec!["Work"]);
+        assert_eq!(server.folder, "Work");
+    }
+
+    #[test]
+    fn tags_normalize_idempotently_and_clear_legacy_folder_when_empty() {
+        let mut server = ServerConfig {
+            id: "tagged".into(),
+            folder: "Legacy".into(),
+            tags: vec![" A ".into(), "A".into(), "".into(), "研究 / Team".into()],
+            ..ServerConfig::default()
+        };
+        server.normalize();
+        assert_eq!(server.tags, vec!["A", "研究 / Team"]);
+        assert_eq!(server.folder, "A");
+        server.tags.clear();
+        server.folder.clear();
+        server.normalize();
+        assert!(server.tags.is_empty());
+        assert!(server.folder.is_empty());
+    }
+
+    #[test]
+    fn blank_tag_entries_fall_back_to_the_legacy_folder() {
+        let mut server = ServerConfig {
+            id: "legacy-with-blank-tags".into(),
+            folder: "Work".into(),
+            tags: vec![" ".into(), "".into()],
+            ..ServerConfig::default()
+        };
+
+        server.normalize();
+
+        assert_eq!(server.tags, vec!["Work"]);
+        assert_eq!(server.folder, "Work");
+    }
+
+    #[test]
+    fn tags_round_trip_through_json() {
+        let server = ServerConfig {
+            id: "tagged".into(),
+            tags: vec!["Work".into(), "研究".into()],
+            ..ServerConfig::default()
+        };
+        let json = serde_json::to_value(&server).unwrap();
+        assert_eq!(json["tags"], serde_json::json!(["Work", "研究"]));
+        assert_eq!(
+            serde_json::from_value::<ServerConfig>(json).unwrap(),
+            server
+        );
     }
 
     #[test]
