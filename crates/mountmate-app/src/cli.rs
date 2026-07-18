@@ -85,6 +85,7 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Launc
             "--mount-all" | "--mount-startup-all" => {
                 Some(LaunchAction::Headless(AppCommand::MountAll))
             }
+            "--mount-startup" => Some(LaunchAction::Headless(AppCommand::MountStartup)),
             "--unmount-all" => Some(LaunchAction::Headless(AppCommand::UnmountAll)),
             "--mount-id" => Some(LaunchAction::Headless(AppCommand::Mount {
                 id: next_value(&arguments, &mut index, argument)?,
@@ -222,6 +223,7 @@ Usage: SSHMountMate [COMMAND]
   --unmount-id ID                Unmount one saved connection
   --open-id ID                   Open one mounted connection
   --mount-all                    Mount all saved connections concurrently
+  --mount-startup                Mount saved connections selected for login startup
   --mount-startup-all            Compatibility alias for --mount-all
   --unmount-all                  Unmount all mounted connections concurrently
   --refresh-id ID                Refresh one mounted connection
@@ -293,6 +295,14 @@ mod tests {
         assert_eq!(
             parse(args(&["--mount-startup-all"])).unwrap(),
             LaunchAction::Headless(AppCommand::MountAll)
+        );
+        assert_eq!(
+            parse(args(&["--mount-all"])).unwrap(),
+            LaunchAction::Headless(AppCommand::MountAll)
+        );
+        assert_eq!(
+            parse(args(&["--mount-startup"])).unwrap(),
+            LaunchAction::Headless(AppCommand::MountStartup)
         );
         assert_eq!(
             parse(args(&["--show-transfers"])).unwrap(),
@@ -374,6 +384,7 @@ mod tests {
     fn help_keeps_command_columns_readable() {
         assert!(help().contains("\n  --show-main"));
         assert!(help().contains("\n  --check-update"));
+        assert!(help().contains("\n  --mount-startup"));
         assert!(help().contains("\n  --rclone-path"));
         assert!(help().contains("\n  --plink-path"));
         assert!(help().contains("\n  -V, --version"));

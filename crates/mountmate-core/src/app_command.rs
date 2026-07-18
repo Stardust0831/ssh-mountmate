@@ -39,6 +39,7 @@ pub enum AppCommand {
     RefreshPath { path: String },
     Refresh { id: String, relative_dir: String },
     MountAll,
+    MountStartup,
     UnmountAll,
     ExitForReplacement,
 }

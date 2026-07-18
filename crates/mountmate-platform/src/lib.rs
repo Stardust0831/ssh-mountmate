@@ -963,7 +963,7 @@ fn set_login_startup(executable: &Path, enabled: bool) -> Result<(), PlatformErr
 
 #[cfg(any(windows, test))]
 fn windows_startup_command(executable: &Path) -> String {
-    format!(r#""{}" --mount-startup-all"#, executable.to_string_lossy())
+    format!(r#""{}" --mount-startup"#, executable.to_string_lossy())
 }
 
 #[cfg(target_os = "macos")]
@@ -994,7 +994,7 @@ fn set_login_startup(executable: &Path, enabled: bool) -> Result<(), PlatformErr
         "ProgramArguments".into(),
         Value::Array(vec![
             Value::String(executable.into()),
-            Value::String("--mount-startup-all".into()),
+            Value::String("--mount-startup".into()),
         ]),
     );
     dictionary.insert("RunAtLoad".into(), Value::Boolean(true));
@@ -1025,7 +1025,7 @@ fn set_login_startup(executable: &Path, enabled: bool) -> Result<(), PlatformErr
         .ok_or_else(|| PlatformError::Failed("startup executable path is not UTF-8".into()))?;
     let command = desktop_exec_argument(executable);
     let content = format!(
-        "[Desktop Entry]\nType=Application\nName=SSH MountMate\nExec={command} --mount-startup-all\nTerminal=false\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n"
+        "[Desktop Entry]\nType=Application\nName=SSH MountMate\nExec={command} --mount-startup\nTerminal=false\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n"
     );
     mountmate_core::storage::atomic_write(&path, content.as_bytes())
         .map_err(|error| PlatformError::Failed(error.to_string()))
@@ -1185,7 +1185,7 @@ mod tests {
         let executable = Path::new(r"C:\Program Files\SSH MountMate\SSHMountMate.exe");
         assert_eq!(
             windows_startup_command(executable),
-            r#""C:\Program Files\SSH MountMate\SSHMountMate.exe" --mount-startup-all"#
+            r#""C:\Program Files\SSH MountMate\SSHMountMate.exe" --mount-startup"#
         );
         assert_eq!(
             desktop_exec_argument("/home/user/SSH MountMate/bin/$current"),

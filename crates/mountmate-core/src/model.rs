@@ -231,6 +231,8 @@ pub struct ServerConfig {
     #[serde(default)]
     pub mountpoint: String,
     #[serde(default)]
+    pub auto_mount_at_login: bool,
+    #[serde(default)]
     pub cache_mode: String,
     #[serde(default)]
     pub network_mode: bool,
@@ -273,6 +275,7 @@ impl Default for ServerConfig {
             connection_method: default_connection_method(),
             remote_path: String::new(),
             mountpoint: String::new(),
+            auto_mount_at_login: false,
             cache_mode: String::new(),
             network_mode: false,
             ssh_config_managed: false,
@@ -742,6 +745,26 @@ mod tests {
     fn legacy_server_defaults_to_no_folder() {
         let server: ServerConfig = serde_json::from_str(r#"{"id":"legacy"}"#).unwrap();
         assert!(server.folder.is_empty());
+    }
+
+    #[test]
+    fn legacy_server_defaults_auto_mount_at_login_to_false() {
+        let server: ServerConfig = serde_json::from_str(r#"{"id":"legacy"}"#).unwrap();
+        assert!(!server.auto_mount_at_login);
+    }
+
+    #[test]
+    fn server_auto_mount_at_login_round_trips() {
+        let server = ServerConfig {
+            id: "auto-mount".into(),
+            auto_mount_at_login: true,
+            ..ServerConfig::default()
+        };
+        let json = serde_json::to_value(&server).unwrap();
+        assert_eq!(json["auto_mount_at_login"], true);
+        assert!(serde_json::from_value::<ServerConfig>(json)
+            .unwrap()
+            .auto_mount_at_login);
     }
 
     #[test]
