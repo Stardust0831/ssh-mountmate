@@ -489,6 +489,11 @@ struct App {
     servers: Vec<ServerConfig>,
     connection_search: String,
     connection_sort: ConnectionSort,
+    connection_tag_filter: Option<String>,
+    connection_list_mode: ConnectionListMode,
+    selected_connections: HashSet<String>,
+    batch_tag_input: String,
+    connection_list_saving: bool,
     service: MountService,
     mount_statuses: HashMap<String, MountStatus>,
     busy: HashSet<String>,
@@ -518,6 +523,7 @@ struct App {
     popup_close_notice_shown: bool,
     screen: Screen,
     connection_draft: Option<ConnectionDraft>,
+    connection_tags_input: String,
     connection_custom_mountpoint: String,
     mountpoint_preflight: MountpointPreflight,
     mountpoint_preflight_generation: u64,
@@ -535,6 +541,7 @@ struct App {
     ssh_import_plan: Option<SshImportPlan>,
     ssh_import_actions: Vec<ImportAction>,
     pending_delete: Option<String>,
+    settings_recovery_dialog: Option<String>,
     status: String,
     status_generation: u64,
     update_health: Option<UpdateHealthAuthorization>,
@@ -787,13 +794,20 @@ impl std::fmt::Display for LogChoice {
 #[derive(Debug, Clone, Copy)]
 enum ConnectionField {
     Name,
-    Folder,
     HostAlias,
     Host,
     User,
     Port,
     KeyFile,
     SshConfigPath,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ConnectionListMode {
+    #[default]
+    Browse,
+    Batch,
+    Reorder,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -907,6 +921,7 @@ struct SettingsDraft {
     credential_storage: CredentialStorage,
     startup_all: bool,
     connection_preferences: Vec<ConnectionPreferenceDraft>,
+    connection_preferences_expanded: bool,
     auto_show_transfers: bool,
     auto_check_updates: bool,
     language: Language,
@@ -919,7 +934,7 @@ struct SettingsDraft {
 struct ConnectionPreferenceDraft {
     id: String,
     name: String,
-    folder: String,
+    tags: Vec<String>,
     auto_mount_at_login: bool,
     startup_available: bool,
 }
@@ -929,7 +944,7 @@ impl ConnectionPreferenceDraft {
         Self {
             id: server.id.clone(),
             name: server.display_name().to_owned(),
-            folder: server.folder.clone(),
+            tags: server.tags.clone(),
             auto_mount_at_login: legacy_startup_all || server.auto_mount_at_login,
             startup_available: server.connection_method != ConnectionMethod::Interactive,
         }
@@ -952,6 +967,7 @@ impl SettingsDraft {
             credential_storage: settings.credential_storage,
             startup_all: settings.startup_all,
             connection_preferences: Vec::new(),
+            connection_preferences_expanded: false,
             auto_show_transfers: settings.auto_show_transfers,
             auto_check_updates: settings.auto_check_updates,
             language: Language::from_value(&settings.language),
@@ -1034,6 +1050,7 @@ enum Message {
     EndInteractiveSession,
     RetryTerminal,
     MainWindowOpened(window::Id),
+    SettingsRecoveryDialogClosed,
     Refresh,
     RefreshFinished {
         generation: u64,
@@ -1058,8 +1075,36 @@ enum Message {
     AddConnection,
     ConnectionSearchChanged(String),
     ConnectionSortChanged(ConnectionSort),
-    SettingsConnectionFolderChanged(String, String),
+    ConnectionTagFilterChanged(Option<String>),
+    ConnectionListModeChanged(ConnectionListMode),
+    BatchSelectionChanged(String, bool),
+    BatchSelectAllChanged(bool),
+    BatchTagSelectionChanged(String, bool),
+    BatchTagInputChanged(String),
+    BatchAddTag,
+    RemoveConnectionTag(String, String),
+    RemoveTagEverywhere(String),
+    RemoveTagEverywhereDecision {
+        tag: String,
+        result: rfd::MessageDialogResult,
+    },
+    BatchTagsSaved(Result<Vec<ServerConfig>, String>),
+    BatchMountSelected,
+    BatchUnmountSelected,
+    BatchDeleteSelected,
+    BatchDeleteDecision {
+        ids: Vec<String>,
+        result: rfd::MessageDialogResult,
+    },
+    BatchRemoved {
+        ids: Vec<String>,
+        result: Result<ServerMutation, String>,
+    },
+    MoveConnection(String, i8),
+    ConnectionsReordered(Result<Vec<ServerConfig>, String>),
     SettingsConnectionStartupChanged(String, bool),
+    ToggleSettingsConnectionPreferences,
+    OpenBatchManagement,
     OpenTransfers,
     CloseTransfers,
     CloseTransfersDecision(rfd::MessageDialogResult),
@@ -1078,6 +1123,7 @@ enum Message {
     CancelEditor,
     ConnectionSourceChanged(ConnectionSource),
     ConnectionFieldChanged(ConnectionField, String),
+    ConnectionTagsChanged(String),
     RemoteBaseChanged(String),
     RemoteSuffixChanged(String),
     MountpointChoiceChanged(String),
@@ -1273,6 +1319,12 @@ impl App {
         let recovered_settings = storage::load_settings_recovering(&paths);
         let mut settings_recovery_notice =
             settings_recovery_message(&recovered_settings, system_locale);
+        let settings_recovery_dialog = settings_recovery_dialog_message(
+            &recovered_settings,
+            &paths.settings_file(),
+            system_locale,
+        );
+        let settings_recovery_incomplete = recovered_settings.failure_stage.is_some();
         let mut settings = recovered_settings.settings;
         let locale =
             Locale::from_preference(Language::from_value(&settings.language), system_locale);
@@ -1293,7 +1345,21 @@ impl App {
         };
         if settings_need_system_credential_inference(&settings, &servers) {
             settings.credential_storage = CredentialStorage::System;
-            if let Err(error) = storage::save_settings(&paths, &settings) {
+            if settings_recovery_incomplete {
+                let detail = match locale {
+                    Locale::English => {
+                        "System credential references were detected. Their storage mode is active in memory, but it was not written automatically because settings recovery is incomplete; use Save after reviewing the recovery dialog."
+                    }
+                    Locale::Chinese => {
+                        "检测到系统凭据引用；当前已在内存中启用对应存储模式，但因设置恢复尚未完成而未自动写入。请查看恢复弹窗后再主动点击“保存”。"
+                    }
+                };
+                settings_recovery_notice = Some(
+                    settings_recovery_notice
+                        .map(|notice| format!("{notice}; {detail}"))
+                        .unwrap_or_else(|| detail.into()),
+                );
+            } else if let Err(error) = storage::save_settings(&paths, &settings) {
                 let detail = match locale {
                     Locale::English => format!(
                         "System credential references were detected, but their recovered storage setting could not be persisted: {error}"
@@ -1360,6 +1426,11 @@ impl App {
             servers,
             connection_search: String::new(),
             connection_sort: ConnectionSort::default(),
+            connection_tag_filter: None,
+            connection_list_mode: ConnectionListMode::Browse,
+            selected_connections: HashSet::new(),
+            batch_tag_input: String::new(),
+            connection_list_saving: false,
             service,
             mount_statuses: HashMap::new(),
             busy: HashSet::new(),
@@ -1389,6 +1460,7 @@ impl App {
             popup_close_notice_shown: false,
             screen,
             connection_draft: None,
+            connection_tags_input: String::new(),
             connection_custom_mountpoint: String::new(),
             mountpoint_preflight: MountpointPreflight::NotRequired,
             mountpoint_preflight_generation: 0,
@@ -1406,6 +1478,7 @@ impl App {
             ssh_import_plan: None,
             ssh_import_actions: Vec::new(),
             pending_delete: None,
+            settings_recovery_dialog,
             status,
             status_generation: 0,
             update_health,
@@ -1542,6 +1615,20 @@ impl App {
                             native_integration_smoke_notification(),
                         ));
                     }
+                    if let Some(description) = self.settings_recovery_dialog.take() {
+                        tasks.push(Task::perform(
+                            async move {
+                                rfd::AsyncMessageDialog::new()
+                                    .set_title(APP_NAME)
+                                    .set_level(rfd::MessageLevel::Error)
+                                    .set_description(description)
+                                    .set_buttons(rfd::MessageButtons::Ok)
+                                    .show()
+                                    .await;
+                            },
+                            |_| Message::SettingsRecoveryDialogClosed,
+                        ));
+                    }
                     if self.pending_main_activation {
                         self.pending_main_activation = false;
                         tasks.push(self.activate_main_window());
@@ -1552,9 +1639,12 @@ impl App {
                     return Task::batch(tasks);
                 }
             }
+            Message::SettingsRecoveryDialogClosed => {}
             Message::Refresh => match storage::load_servers(&self.paths) {
                 Ok(servers) => {
                     self.servers = servers;
+                    self.selected_connections
+                        .retain(|id| self.servers.iter().any(|server| server.id == *id));
                     self.status = locale.text(TextKey::RefreshingMountStatus).into();
                     return self.status_task(StatusPublishPolicy::UserRefresh);
                 }
@@ -1826,9 +1916,13 @@ impl App {
                 }
             }
             Message::AddConnection => {
+                if self.connection_list_saving || self.editor_saving {
+                    return Task::none();
+                }
                 let mut draft = ConnectionDraft::default();
                 draft.ssh_config_path = default_ssh_config_path().display().to_string();
                 self.connection_draft = Some(draft);
+                self.connection_tags_input.clear();
                 self.connection_custom_mountpoint.clear();
                 self.mountpoint_preflight = MountpointPreflight::NotRequired;
                 self.ssh_import_plan = None;
@@ -1838,16 +1932,399 @@ impl App {
             }
             Message::ConnectionSearchChanged(value) => self.connection_search = value,
             Message::ConnectionSortChanged(value) => self.connection_sort = value,
-            Message::SettingsConnectionFolderChanged(id, value) => {
-                if let Some(preference) = self.settings_draft.as_mut().and_then(|draft| {
-                    draft
-                        .connection_preferences
-                        .iter_mut()
-                        .find(|preference| preference.id == id)
-                }) {
-                    preference.folder = value;
+            Message::ConnectionTagFilterChanged(tag) => self.connection_tag_filter = tag,
+            Message::ConnectionListModeChanged(mode) => {
+                if self.connection_list_saving || self.editor_saving {
+                    return Task::none();
+                }
+                self.connection_list_mode = mode;
+                self.selected_connections.clear();
+                self.batch_tag_input.clear();
+                if mode == ConnectionListMode::Reorder {
+                    self.connection_sort = ConnectionSort::SavedOrder;
+                    self.connection_search.clear();
+                    self.connection_tag_filter = None;
                 }
             }
+            Message::BatchSelectionChanged(id, selected) => {
+                if selected {
+                    self.selected_connections.insert(id);
+                } else {
+                    self.selected_connections.remove(&id);
+                }
+            }
+            Message::BatchSelectAllChanged(selected) => {
+                let visible_ids = visible_connections(
+                    &self.servers,
+                    &self.connection_search,
+                    self.connection_tag_filter.as_deref(),
+                    self.connection_sort,
+                )
+                .into_iter()
+                .map(|server| server.id.clone())
+                .collect::<Vec<_>>();
+                if selected {
+                    self.selected_connections.extend(visible_ids);
+                } else {
+                    for id in visible_ids {
+                        self.selected_connections.remove(&id);
+                    }
+                }
+            }
+            Message::BatchTagSelectionChanged(tag, selected) => {
+                for server in &self.servers {
+                    if server.tags.iter().any(|candidate| candidate == &tag) {
+                        if selected {
+                            self.selected_connections.insert(server.id.clone());
+                        } else {
+                            self.selected_connections.remove(&server.id);
+                        }
+                    }
+                }
+            }
+            Message::BatchTagInputChanged(value) => self.batch_tag_input = value,
+            Message::BatchAddTag => {
+                let tag = match normalized_tag_name(&self.batch_tag_input, locale) {
+                    Ok(tag) => tag,
+                    Err(error) => {
+                        self.status = error;
+                        return Task::none();
+                    }
+                };
+                let updates = self
+                    .servers
+                    .iter()
+                    .filter(|server| self.selected_connections.contains(&server.id))
+                    .map(|server| {
+                        let mut tags = server.tags.clone();
+                        if !tags.iter().any(|candidate| candidate == &tag) {
+                            tags.push(tag.clone());
+                        }
+                        storage::ServerPreferenceUpdate {
+                            id: server.id.clone(),
+                            tags: Some(tags),
+                            auto_mount_at_login: None,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                return self.save_batch_tag_updates(updates);
+            }
+            Message::RemoveConnectionTag(id, tag) => {
+                let Some(server) = self.servers.iter().find(|server| server.id == id) else {
+                    return Task::none();
+                };
+                let tags = server
+                    .tags
+                    .iter()
+                    .filter(|candidate| *candidate != &tag)
+                    .cloned()
+                    .collect();
+                return self.save_batch_tag_updates(vec![storage::ServerPreferenceUpdate {
+                    id,
+                    tags: Some(tags),
+                    auto_mount_at_login: None,
+                }]);
+            }
+            Message::RemoveTagEverywhere(tag) => {
+                if self.editor_saving || self.connection_list_saving {
+                    return Task::none();
+                }
+                let description = match locale {
+                    Locale::English => {
+                        format!(
+                            "Remove tag '{tag}' from every connection? Connections will not be deleted."
+                        )
+                    }
+                    Locale::Chinese => {
+                        format!("从所有连接中移除标签“{tag}”？连接本身不会被删除。")
+                    }
+                };
+                let decision_tag = tag.clone();
+                self.connection_list_saving = true;
+                return Task::perform(
+                    async move {
+                        rfd::AsyncMessageDialog::new()
+                            .set_title(APP_NAME)
+                            .set_description(description)
+                            .set_buttons(rfd::MessageButtons::YesNo)
+                            .show()
+                            .await
+                    },
+                    move |result| Message::RemoveTagEverywhereDecision {
+                        tag: decision_tag.clone(),
+                        result,
+                    },
+                );
+            }
+            Message::RemoveTagEverywhereDecision { tag, result } => {
+                if result != rfd::MessageDialogResult::Yes {
+                    self.connection_list_saving = false;
+                    return Task::none();
+                }
+                if self.editor_saving || !self.connection_list_saving {
+                    self.connection_list_saving = false;
+                    return Task::none();
+                }
+                let updates = self
+                    .servers
+                    .iter()
+                    .filter(|server| server.tags.iter().any(|candidate| candidate == &tag))
+                    .map(|server| storage::ServerPreferenceUpdate {
+                        id: server.id.clone(),
+                        tags: Some(
+                            server
+                                .tags
+                                .iter()
+                                .filter(|candidate| *candidate != &tag)
+                                .cloned()
+                                .collect(),
+                        ),
+                        auto_mount_at_login: None,
+                    })
+                    .collect();
+                self.connection_list_saving = false;
+                return self.save_batch_tag_updates(updates);
+            }
+            Message::BatchTagsSaved(result) => match result {
+                Ok(servers) => {
+                    self.connection_list_saving = false;
+                    self.servers = servers;
+                    if self.connection_tag_filter.as_ref().is_some_and(|filter| {
+                        !self
+                            .servers
+                            .iter()
+                            .any(|server| server.tags.contains(filter))
+                    }) {
+                        self.connection_tag_filter = None;
+                    }
+                    self.batch_tag_input.clear();
+                    self.status = match locale {
+                        Locale::English => "Connection tags saved".into(),
+                        Locale::Chinese => "连接标签已保存".into(),
+                    };
+                }
+                Err(error) => {
+                    self.connection_list_saving = false;
+                    self.status = error;
+                }
+            },
+            Message::BatchMountSelected => {
+                let ids = selected_server_ids(&self.servers, &self.selected_connections);
+                let mut tasks = Vec::new();
+                for id in ids {
+                    tasks.push(self.handle_mount_command(id, MountOperation::Mount));
+                }
+                return Task::batch(tasks);
+            }
+            Message::BatchUnmountSelected => {
+                let ids = selected_server_ids(&self.servers, &self.selected_connections)
+                    .into_iter()
+                    .filter(|id| self.paths.state_file(id).exists())
+                    .collect::<Vec<_>>();
+                let (unsafe_ids, safe_ids): (Vec<_>, Vec<_>) = ids.into_iter().partition(|id| {
+                    unmount_needs_confirmation(
+                        self.transfers.get(id),
+                        self.transfer_errors.contains_key(id),
+                        self.synced_polls.get(id).copied().unwrap_or(0),
+                    )
+                });
+                let mut tasks = Vec::new();
+                for id in safe_ids {
+                    tasks.push(self.handle_mount_command(id, MountOperation::Unmount));
+                }
+                if !unsafe_ids.is_empty() {
+                    tasks.push(self.confirm_waiting_unmount(unsafe_ids));
+                }
+                return Task::batch(tasks);
+            }
+            Message::BatchDeleteSelected => {
+                if self.editor_saving || self.connection_list_saving {
+                    return Task::none();
+                }
+                let ids = selected_server_ids(&self.servers, &self.selected_connections);
+                if ids.is_empty() {
+                    return Task::none();
+                }
+                if ids.iter().any(|id| !self.can_modify(id)) {
+                    self.status = locale.text(TextKey::UnmountBeforeRemove).into();
+                    return Task::none();
+                }
+                let mut selected_names = ids
+                    .iter()
+                    .filter_map(|id| self.servers.iter().find(|server| server.id == *id))
+                    .map(|server| server.display_name().to_owned())
+                    .take(8)
+                    .collect::<Vec<_>>();
+                if ids.len() > selected_names.len() {
+                    selected_names.push(match locale {
+                        Locale::English => format!(
+                            "... and {} more",
+                            ids.len().saturating_sub(selected_names.len())
+                        ),
+                        Locale::Chinese => format!(
+                            "……以及另外 {} 个",
+                            ids.len().saturating_sub(selected_names.len())
+                        ),
+                    });
+                }
+                let selected_names = selected_names.join("\n");
+                let description = match locale {
+                    Locale::English => format!(
+                        "Permanently remove {} selected connection(s)? Saved credentials and managed SSH entries will also be cleaned up.\n\nSelected:\n{selected_names}",
+                        ids.len()
+                    ),
+                    Locale::Chinese => format!(
+                        "永久删除选中的 {} 个连接？关联凭据和托管 SSH 配置也会被清理。\n\n已选择：\n{selected_names}",
+                        ids.len()
+                    ),
+                };
+                let decision_ids = ids.clone();
+                self.connection_list_saving = true;
+                return Task::perform(
+                    async move {
+                        rfd::AsyncMessageDialog::new()
+                            .set_title(APP_NAME)
+                            .set_level(rfd::MessageLevel::Warning)
+                            .set_description(description)
+                            .set_buttons(rfd::MessageButtons::YesNo)
+                            .show()
+                            .await
+                    },
+                    move |result| Message::BatchDeleteDecision {
+                        ids: decision_ids.clone(),
+                        result,
+                    },
+                );
+            }
+            Message::BatchDeleteDecision { ids, result } => {
+                if result != rfd::MessageDialogResult::Yes {
+                    self.connection_list_saving = false;
+                    return Task::none();
+                }
+                if self.editor_saving
+                    || !self.connection_list_saving
+                    || ids.iter().any(|id| !self.can_modify(id))
+                {
+                    self.connection_list_saving = false;
+                    return Task::none();
+                }
+                let removed_servers = ids
+                    .iter()
+                    .filter_map(|id| self.servers.iter().find(|server| server.id == *id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                self.busy.extend(ids.iter().cloned());
+                self.status = match locale {
+                    Locale::English => format!("Removing {} connection(s)...", ids.len()),
+                    Locale::Chinese => format!("正在删除 {} 个连接…", ids.len()),
+                };
+                let paths = self.paths.clone();
+                let result_ids = ids.clone();
+                return Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let servers = storage::remove_servers(&paths, &ids)
+                                .map_err(|error| error.to_string())?;
+                            let mut cleanup_errors = Vec::new();
+                            for server in &removed_servers {
+                                if server.ssh_config_managed
+                                    && let Err(error) = remove_managed_ssh_server(server)
+                                {
+                                    cleanup_errors.push(format!(
+                                        "{}: managed SSH cleanup failed: {error}",
+                                        server.display_name()
+                                    ));
+                                }
+                                if let Err(error) =
+                                    delete_server_credentials(server, &SystemCredentialStore)
+                                {
+                                    cleanup_errors.push(format!(
+                                        "{}: credential cleanup failed: {error}",
+                                        server.display_name()
+                                    ));
+                                }
+                            }
+                            let warning = (!cleanup_errors.is_empty()).then(|| match locale {
+                                Locale::English => {
+                                    format!("Connections removed; {}", cleanup_errors.join("; "))
+                                }
+                                Locale::Chinese => {
+                                    format!("连接已删除，但{}", cleanup_errors.join("；"))
+                                }
+                            });
+                            if let Some(warning) = &warning {
+                                diagnostic_trace(warning);
+                            }
+                            Ok(ServerMutation { servers, warning })
+                        })
+                        .await
+                        .unwrap_or_else(|error| Err(error.to_string()))
+                    },
+                    move |result| Message::BatchRemoved {
+                        ids: result_ids.clone(),
+                        result,
+                    },
+                );
+            }
+            Message::BatchRemoved { ids, result } => {
+                self.connection_list_saving = false;
+                for id in &ids {
+                    self.busy.remove(id);
+                }
+                match result {
+                    Ok(outcome) => {
+                        let terminal_task = self.reconcile_interactive_sessions(&outcome.servers);
+                        self.servers = outcome.servers;
+                        self.selected_connections
+                            .retain(|id| self.servers.iter().any(|server| server.id == *id));
+                        self.status = outcome.warning.unwrap_or_else(|| match locale {
+                            Locale::English => "Selected connections removed".into(),
+                            Locale::Chinese => "所选连接已删除".into(),
+                        });
+                        return Task::batch([terminal_task, self.reconcile_startup_task()]);
+                    }
+                    Err(error) => self.status = error,
+                }
+            }
+            Message::MoveConnection(id, direction) => {
+                if self.connection_list_saving || self.editor_saving {
+                    return Task::none();
+                }
+                let Some(order) = moved_connection_order(&self.servers, &id, direction) else {
+                    return Task::none();
+                };
+                let paths = self.paths.clone();
+                self.connection_list_saving = true;
+                return Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            storage::reorder_servers(&paths, &order)
+                        })
+                        .await
+                        .unwrap_or_else(|error| {
+                            Err(storage::StorageError::InvalidPreferenceUpdate(
+                                error.to_string(),
+                            ))
+                        })
+                        .map_err(|error| error.to_string())
+                    },
+                    Message::ConnectionsReordered,
+                );
+            }
+            Message::ConnectionsReordered(result) => match result {
+                Ok(servers) => {
+                    self.connection_list_saving = false;
+                    self.servers = servers;
+                    self.status = match locale {
+                        Locale::English => "Custom order saved".into(),
+                        Locale::Chinese => "自定义排序已保存".into(),
+                    };
+                }
+                Err(error) => {
+                    self.connection_list_saving = false;
+                    self.status = error;
+                }
+            },
             Message::SettingsConnectionStartupChanged(id, value) => {
                 if let Some(preference) = self.settings_draft.as_mut().and_then(|draft| {
                     draft
@@ -1858,6 +2335,24 @@ impl App {
                 {
                     preference.auto_mount_at_login = value;
                 }
+            }
+            Message::ToggleSettingsConnectionPreferences => {
+                if let Some(draft) = &mut self.settings_draft {
+                    draft.connection_preferences_expanded = !draft.connection_preferences_expanded;
+                }
+            }
+            Message::OpenBatchManagement => {
+                if self.editor_saving {
+                    return Task::none();
+                }
+                self.settings_draft = None;
+                self.screen = Screen::Connections;
+                self.connection_list_mode = ConnectionListMode::Batch;
+                self.selected_connections.clear();
+                self.status = match locale {
+                    Locale::English => "Batch connection management".into(),
+                    Locale::Chinese => "批量管理连接".into(),
+                };
             }
             Message::OpenTransfers => {
                 self.screen = Screen::TransferCenter;
@@ -1901,6 +2396,9 @@ impl App {
                 }
             }
             Message::OpenSettings => {
+                if self.connection_list_saving || self.editor_saving {
+                    return Task::none();
+                }
                 let mut draft = SettingsDraft::from_settings(&self.settings);
                 draft.connection_preferences = self
                     .servers
@@ -2013,7 +2511,6 @@ impl App {
                 if let Some(draft) = &mut self.connection_draft {
                     match field {
                         ConnectionField::Name => draft.name = value,
-                        ConnectionField::Folder => draft.folder = value,
                         ConnectionField::HostAlias => draft.host_alias = value,
                         ConnectionField::Host => draft.host = value,
                         ConnectionField::User => {
@@ -2028,6 +2525,13 @@ impl App {
                             self.ssh_import_actions.clear();
                         }
                     }
+                }
+            }
+            Message::ConnectionTagsChanged(value) => {
+                self.connection_tags_input = value.clone();
+                if let Some(draft) = &mut self.connection_draft {
+                    draft.tags = parse_tag_input(&value);
+                    draft.folder.clear();
                 }
             }
             Message::RemoteBaseChanged(base) => {
@@ -2752,9 +3256,13 @@ impl App {
                 Err(error) => self.status = error,
             },
             Message::Edit(id) => {
+                if self.connection_list_saving || self.editor_saving {
+                    return Task::none();
+                }
                 let can_modify = self.can_modify(&id);
                 if let Some(server) = self.servers.iter().find(|server| server.id == id) {
                     self.connection_draft = Some(ConnectionDraft::from_server(server));
+                    self.connection_tags_input = server.tags.join(", ");
                     if let Some(draft) = &mut self.connection_draft {
                         draft.auto_mount_at_login |= self.settings.startup_all;
                     }
@@ -2861,6 +3369,9 @@ impl App {
                     Ok(outcome) => {
                         let terminal_task = self.reconcile_interactive_sessions(&outcome.servers);
                         self.servers = outcome.servers;
+                        self.selected_connections.retain(|selected| {
+                            self.servers.iter().any(|server| server.id == *selected)
+                        });
                         self.status = outcome
                             .warning
                             .unwrap_or_else(|| locale.text(TextKey::ConnectionRemoved).into());
@@ -3183,7 +3694,7 @@ impl App {
     }
 
     fn save_connection(&mut self) -> Task<Message> {
-        if self.editor_saving {
+        if self.editor_saving || self.connection_list_saving {
             return Task::none();
         }
         if self.connection_draft.as_ref().is_some_and(|draft| {
@@ -3521,8 +4032,8 @@ impl App {
         let Some(id) = draft.editing_id.clone() else {
             return Task::none();
         };
-        let folder = match normalized_organization_folder(&draft.folder, self.locale()) {
-            Ok(folder) => folder,
+        let tags = match validated_connection_tags(&draft.tags, self.locale()) {
+            Ok(tags) => tags,
             Err(error) => {
                 self.status = error;
                 return Task::none();
@@ -3548,16 +4059,28 @@ impl App {
                                 let selected = server.connection_method
                                     != ConnectionMethod::Interactive;
                                 if server.id == id {
-                                    (id.clone(), folder.clone(), auto_mount_at_login)
+                                    storage::ServerPreferenceUpdate {
+                                        id: id.clone(),
+                                        tags: Some(tags.clone()),
+                                        auto_mount_at_login: Some(auto_mount_at_login),
+                                    }
                                 } else {
-                                    (server.id.clone(), server.folder.clone(), selected)
+                                    storage::ServerPreferenceUpdate {
+                                        id: server.id.clone(),
+                                        tags: None,
+                                        auto_mount_at_login: Some(selected),
+                                    }
                                 }
                             })
                             .collect::<Vec<_>>()
                     } else {
-                        vec![(id, folder, auto_mount_at_login)]
+                        vec![storage::ServerPreferenceUpdate {
+                            id,
+                            tags: Some(tags),
+                            auto_mount_at_login: Some(auto_mount_at_login),
+                        }]
                     };
-                    let servers = storage::update_server_preferences(&paths, &updates)
+                    let servers = storage::update_server_preferences_batch(&paths, &updates)
                         .map_err(|error| error.to_string())?;
                     if previous_settings.startup_all {
                         result_settings.startup_all = false;
@@ -3646,7 +4169,7 @@ impl App {
                     } else {
                         None
                     };
-                    let migrated_servers = match storage::update_server_preferences(
+                    let migrated_servers = match storage::update_server_preferences_batch(
                         &paths,
                         &preference_updates,
                     ) {
@@ -3684,10 +4207,23 @@ impl App {
                             credential_migration.as_ref(),
                             error.to_string(),
                         );
-                        if credential_migration.is_none()
-                            && let Err(rollback) = storage::save_servers(&paths, &previous_servers)
-                        {
-                            message.push_str(&format!("; server rollback failed: {rollback}"));
+                        if credential_migration.is_none() {
+                            let rollback_updates = previous_servers
+                                .iter()
+                                .map(|server| storage::ServerPreferenceUpdate {
+                                    id: server.id.clone(),
+                                    tags: None,
+                                    auto_mount_at_login: Some(server.auto_mount_at_login),
+                                })
+                                .collect::<Vec<_>>();
+                            if let Err(rollback) = storage::update_server_preferences_batch(
+                                &paths,
+                                &rollback_updates,
+                            ) {
+                                message.push_str(&format!(
+                                    "; login-startup rollback failed: {rollback}"
+                                ));
+                            }
                         }
                         return Err(message);
                     }
@@ -3969,6 +4505,32 @@ impl App {
                 expected_status,
                 results,
             },
+        )
+    }
+
+    fn save_batch_tag_updates(
+        &mut self,
+        updates: Vec<storage::ServerPreferenceUpdate>,
+    ) -> Task<Message> {
+        if updates.is_empty() || self.connection_list_saving || self.editor_saving {
+            return Task::none();
+        }
+        self.connection_list_saving = true;
+        self.status = match self.locale() {
+            Locale::English => "Saving connection tags...".into(),
+            Locale::Chinese => "正在保存连接标签…".into(),
+        };
+        let paths = self.paths.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    storage::update_server_preferences_batch(&paths, &updates)
+                        .map_err(|error| error.to_string())
+                })
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()))
+            },
+            Message::BatchTagsSaved,
         )
     }
 
@@ -4722,26 +5284,16 @@ impl App {
         } else {
             format!("{} ({active_transfers})", locale.text(TextKey::Transfers))
         };
-        let can_mount_all = self.servers.iter().any(|server| {
-            !self.busy.contains(&server.id)
-                && !matches!(
-                    self.mount_statuses.get(&server.id),
-                    Some(MountStatus::Mounted | MountStatus::Starting)
-                )
-        });
-        let can_unmount_all = self.servers.iter().any(|server| {
-            !self.busy.contains(&server.id)
-                && (matches!(
-                    self.mount_statuses.get(&server.id),
-                    Some(MountStatus::Mounted | MountStatus::Starting)
-                ) || self.paths.state_file(&server.id).exists())
-        });
         let toolbar = responsive(move |size| {
             let actions = row![
                 button(locale.text(TextKey::Refresh)).on_press(Message::Refresh),
                 button(text(transfers_label.clone())).on_press(Message::OpenTransfers),
-                button(locale.text(TextKey::AddConnection)).on_press(Message::AddConnection),
-                button(locale.text(TextKey::Settings)).on_press(Message::OpenSettings),
+                button(locale.text(TextKey::AddConnection)).on_press_maybe(
+                    (!self.connection_list_saving).then_some(Message::AddConnection),
+                ),
+                button(locale.text(TextKey::Settings)).on_press_maybe(
+                    (!self.connection_list_saving).then_some(Message::OpenSettings),
+                ),
             ]
             .spacing(10);
             if size.width < 760.0 {
@@ -4753,14 +5305,134 @@ impl App {
             }
         })
         .height(Length::Shrink);
-        let batch_actions = row![
-            button(locale.text(TextKey::MountAll))
-                .on_press_maybe(can_mount_all.then_some(Message::AppCommand(AppCommand::MountAll))),
-            button(locale.text(TextKey::UnmountAll)).on_press_maybe(
-                can_unmount_all.then_some(Message::AppCommand(AppCommand::UnmountAll))
-            ),
-        ]
-        .spacing(10);
+
+        let selected_count = self.selected_connections.len();
+        let selected_any = selected_count > 0;
+        let visible_ids = visible_connections(
+            &self.servers,
+            &self.connection_search,
+            self.connection_tag_filter.as_deref(),
+            self.connection_sort,
+        )
+        .into_iter()
+        .map(|server| server.id.as_str())
+        .collect::<Vec<_>>();
+        let all_selected = !visible_ids.is_empty()
+            && visible_ids
+                .iter()
+                .all(|id| self.selected_connections.contains(*id));
+        let selected_can_delete = selected_any
+            && self
+                .selected_connections
+                .iter()
+                .all(|id| self.can_modify(id));
+        let mode_actions: Element<'_, Message> = match self.connection_list_mode {
+            ConnectionListMode::Browse => row![
+                button(match locale {
+                    Locale::English => "Batch actions",
+                    Locale::Chinese => "批量操作",
+                })
+                .on_press(Message::ConnectionListModeChanged(
+                    ConnectionListMode::Batch
+                )),
+                button(match locale {
+                    Locale::English => "Custom order",
+                    Locale::Chinese => "自定义排序",
+                })
+                .on_press(Message::ConnectionListModeChanged(
+                    ConnectionListMode::Reorder
+                )),
+            ]
+            .spacing(10)
+            .into(),
+            ConnectionListMode::Batch => responsive(move |size| {
+                let selection = row![
+                    checkbox(all_selected)
+                        .label(match locale {
+                            Locale::English => "Select all",
+                            Locale::Chinese => "全选",
+                        })
+                        .on_toggle(Message::BatchSelectAllChanged),
+                    text(match locale {
+                        Locale::English => format!("{selected_count} selected"),
+                        Locale::Chinese => format!("已选择 {selected_count} 个"),
+                    }),
+                    button(locale.text(TextKey::Mount)).on_press_maybe(
+                        (selected_any && !self.connection_list_saving)
+                            .then_some(Message::BatchMountSelected)
+                    ),
+                    button(locale.text(TextKey::Unmount)).on_press_maybe(
+                        (selected_any && !self.connection_list_saving)
+                            .then_some(Message::BatchUnmountSelected)
+                    ),
+                ]
+                .spacing(10)
+                .align_y(Center);
+                let tagging = row![
+                    text_input(
+                        match locale {
+                            Locale::English => "Tag name",
+                            Locale::Chinese => "标签名称",
+                        },
+                        &self.batch_tag_input,
+                    )
+                    .on_input(Message::BatchTagInputChanged)
+                    .width(Length::Fixed(170.0)),
+                    button(match locale {
+                        Locale::English => "Add tag",
+                        Locale::Chinese => "添加标签",
+                    })
+                    .on_press_maybe(
+                        (selected_any
+                            && !self.connection_list_saving
+                            && !self.batch_tag_input.trim().is_empty())
+                        .then_some(Message::BatchAddTag),
+                    ),
+                    button(locale.text(TextKey::Remove)).on_press_maybe(
+                        (selected_can_delete && !self.connection_list_saving)
+                            .then_some(Message::BatchDeleteSelected),
+                    ),
+                    button(match locale {
+                        Locale::English => "Done",
+                        Locale::Chinese => "完成",
+                    })
+                    .on_press_maybe((!self.connection_list_saving).then_some(
+                        Message::ConnectionListModeChanged(ConnectionListMode::Browse),
+                    )),
+                ]
+                .spacing(10)
+                .align_y(Center);
+                if size.width < 860.0 {
+                    column![selection, tagging].spacing(10).into()
+                } else {
+                    row![selection, Space::new().width(Fill), tagging]
+                        .spacing(10)
+                        .align_y(Center)
+                        .into()
+                }
+            })
+            .height(Length::Shrink)
+            .into(),
+            ConnectionListMode::Reorder => row![
+                text(match locale {
+                    Locale::English => {
+                        "Move tagged connections first, then untagged connections"
+                    }
+                    Locale::Chinese => "先调整有标签连接，再调整无标签连接",
+                }),
+                Space::new().width(Fill),
+                button(match locale {
+                    Locale::English => "Done",
+                    Locale::Chinese => "完成",
+                })
+                .on_press_maybe((!self.connection_list_saving).then_some(
+                    Message::ConnectionListModeChanged(ConnectionListMode::Browse),
+                )),
+            ]
+            .spacing(10)
+            .align_y(Center)
+            .into(),
+        };
 
         let sort_options = localized_choices(ConnectionSort::ALL, locale, Locale::connection_sort);
         let organization = responsive(move |size| {
@@ -4770,25 +5442,75 @@ impl App {
             )
             .on_input(Message::ConnectionSearchChanged)
             .width(Fill);
-            let sort = pick_list(
-                sort_options.clone(),
-                Some(locale.choice(
-                    self.connection_sort,
-                    locale.connection_sort(self.connection_sort),
-                )),
-                |choice| Message::ConnectionSortChanged(choice.value),
-            )
-            .placeholder(locale.text(TextKey::SortConnections));
+            let sort: Element<'_, Message> =
+                if self.connection_list_mode == ConnectionListMode::Reorder {
+                    text(locale.connection_sort(ConnectionSort::SavedOrder)).into()
+                } else {
+                    pick_list(
+                        sort_options.clone(),
+                        Some(locale.choice(
+                            self.connection_sort,
+                            locale.connection_sort(self.connection_sort),
+                        )),
+                        |choice| Message::ConnectionSortChanged(choice.value),
+                    )
+                    .placeholder(locale.text(TextKey::SortConnections))
+                    .into()
+                };
             if size.width < 620.0 {
-                column![search, sort.width(Fill)].spacing(10).into()
+                column![search, container(sort).width(Fill)]
+                    .spacing(10)
+                    .into()
             } else {
-                row![search, sort.width(Length::Fixed(180.0))]
+                row![search, container(sort).width(Length::Fixed(180.0))]
                     .spacing(10)
                     .align_y(Center)
                     .into()
             }
         })
         .height(Length::Shrink);
+
+        let mut tag_controls = row![
+            button(match locale {
+                Locale::English => "All",
+                Locale::Chinese => "全部",
+            })
+            .on_press(Message::ConnectionTagFilterChanged(None)),
+        ]
+        .spacing(8)
+        .align_y(Center);
+        for tag in connection_tags(&self.servers) {
+            if self.connection_list_mode == ConnectionListMode::Batch {
+                let tag_selected = self
+                    .servers
+                    .iter()
+                    .filter(|server| server.tags.iter().any(|candidate| candidate == &tag))
+                    .all(|server| self.selected_connections.contains(&server.id));
+                let select_tag = tag.clone();
+                tag_controls =
+                    tag_controls.push(checkbox(tag_selected).on_toggle(move |selected| {
+                        Message::BatchTagSelectionChanged(select_tag.clone(), selected)
+                    }));
+            }
+            let filter_tag = tag.clone();
+            tag_controls = tag_controls.push(
+                button(text(tag.clone()))
+                    .on_press(Message::ConnectionTagFilterChanged(Some(filter_tag))),
+            );
+            if self.connection_list_mode == ConnectionListMode::Batch {
+                tag_controls = tag_controls.push(
+                    button("x").on_press_maybe(
+                        (!self.connection_list_saving)
+                            .then_some(Message::RemoveTagEverywhere(tag.clone())),
+                    ),
+                );
+            }
+        }
+        let tags = scrollable(tag_controls)
+            .direction(iced::widget::scrollable::Direction::Horizontal(
+                iced::widget::scrollable::Scrollbar::new(),
+            ))
+            .height(Length::Shrink);
 
         let mut connections = column![].spacing(8);
         if self.servers.is_empty() {
@@ -4802,8 +5524,9 @@ impl App {
                             Locale::Chinese => "新建连接以挂载第一个远程目录。",
                         })
                         .size(14),
-                        button(locale.text(TextKey::AddConnection))
-                            .on_press(Message::AddConnection),
+                        button(locale.text(TextKey::AddConnection)).on_press_maybe(
+                            (!self.connection_list_saving).then_some(Message::AddConnection),
+                        ),
                     ]
                     .spacing(12)
                     .align_x(Center),
@@ -4813,9 +5536,13 @@ impl App {
                 .center_x(Fill),
             );
         } else {
-            let groups =
-                organized_connections(&self.servers, &self.connection_search, self.connection_sort);
-            if groups.is_empty() {
+            let visible = visible_connections(
+                &self.servers,
+                &self.connection_search,
+                self.connection_tag_filter.as_deref(),
+                self.connection_sort,
+            );
+            if visible.is_empty() {
                 connections = connections.push(
                     container(text(locale.text(TextKey::NoMatchingConnections)).size(16))
                         .padding(24)
@@ -4823,53 +5550,49 @@ impl App {
                         .center_x(Fill),
                 );
             }
-            for (folder, servers) in groups {
-                connections = connections.push(
-                    text(if folder.is_empty() {
-                        locale.text(TextKey::Uncategorized).to_owned()
-                    } else {
-                        folder
-                    })
-                    .size(16),
-                );
-                for server in servers {
-                    connections = connections.push(connection_card(
-                        server,
-                        ConnectionCardState {
-                            status: self
-                                .mount_statuses
-                                .get(&server.id)
-                                .copied()
-                                .unwrap_or(MountStatus::Unmounted),
-                            busy: self.busy.contains(&server.id),
-                            transfer: self.transfers.get(&server.id),
-                            transfer_unavailable: self.transfer_errors.contains_key(&server.id),
-                            capacity: self.capacities.get(&server.id),
-                            capacity_checking: self.capacity_refreshing
-                                && !self.capacities.contains_key(&server.id)
-                                && !self.capacity_errors.contains(&server.id),
-                            can_modify: self.can_modify(&server.id),
-                            confirming_remove: self.pending_delete.as_deref() == Some(&server.id),
-                            waiting_unmount: self.pending_unmount_after_sync.contains(&server.id),
-                            operation_error: self.operation_errors.get(&server.id),
-                            has_interactive_terminal: self
-                                .interactive_terminals
-                                .contains_key(&server.id),
-                            auto_mount_at_login: (self.settings.startup_all
-                                || server.auto_mount_at_login)
-                                && server.connection_method != ConnectionMethod::Interactive,
-                        },
-                        locale,
-                    ));
-                }
+            for server in visible {
+                connections = connections.push(connection_card(
+                    server,
+                    ConnectionCardState {
+                        status: self
+                            .mount_statuses
+                            .get(&server.id)
+                            .copied()
+                            .unwrap_or(MountStatus::Unmounted),
+                        busy: self.busy.contains(&server.id),
+                        transfer: self.transfers.get(&server.id),
+                        transfer_unavailable: self.transfer_errors.contains_key(&server.id),
+                        capacity: self.capacities.get(&server.id),
+                        capacity_checking: self.capacity_refreshing
+                            && !self.capacities.contains_key(&server.id)
+                            && !self.capacity_errors.contains(&server.id),
+                        can_modify: self.can_modify(&server.id),
+                        confirming_remove: self.pending_delete.as_deref() == Some(&server.id),
+                        waiting_unmount: self.pending_unmount_after_sync.contains(&server.id),
+                        operation_error: self.operation_errors.get(&server.id),
+                        has_interactive_terminal: self
+                            .interactive_terminals
+                            .contains_key(&server.id),
+                        auto_mount_at_login: (self.settings.startup_all
+                            || server.auto_mount_at_login)
+                            && server.connection_method != ConnectionMethod::Interactive,
+                        list_mode: self.connection_list_mode,
+                        selected: self.selected_connections.contains(&server.id),
+                        can_move_up: can_move_connection(&self.servers, &server.id, -1),
+                        can_move_down: can_move_connection(&self.servers, &server.id, 1),
+                        connection_list_saving: self.connection_list_saving,
+                    },
+                    locale,
+                ));
             }
         }
 
         container(
             column![
                 toolbar,
-                batch_actions,
+                mode_actions,
                 organization,
+                tags,
                 scrollable(connections).height(Fill),
                 row![text(&self.status), Space::new().width(Fill), text(VERSION)],
             ]
@@ -5504,11 +6227,20 @@ impl App {
                     .into()
             };
         let organization = row![
-            connection_input(
-                locale.text(TextKey::Folder),
-                &draft.folder,
-                ConnectionField::Folder,
-                false,
+            labeled_control(
+                match locale {
+                    Locale::English => "Tags",
+                    Locale::Chinese => "标签",
+                },
+                text_input(
+                    match locale {
+                        Locale::English => "Comma-separated tags",
+                        Locale::Chinese => "用逗号分隔多个标签",
+                    },
+                    &self.connection_tags_input,
+                )
+                .on_input(Message::ConnectionTagsChanged)
+                .width(Fill),
             ),
             labeled_control(
                 match locale {
@@ -5556,18 +6288,27 @@ impl App {
         .align_y(Center);
         let mut content = column![
             container(text(match locale {
-                Locale::English => "The connection is mounted or busy. Connection, authentication, and mount fields remain read-only; folder organization and login startup can still be changed.",
-                Locale::Chinese => "此连接已挂载或正在执行操作。连接、认证和挂载字段保持只读；仍可修改文件夹归类与登录自启。",
+                Locale::English => "The connection is mounted or busy. Connection, authentication, and mount fields remain read-only; tags and login startup can still be changed.",
+                Locale::Chinese => "此连接已挂载或正在执行操作。连接、认证和挂载字段保持只读；仍可修改标签与登录自启。",
             }).size(14))
                 .padding(12)
                 .width(Fill)
                 .style(container::rounded_box),
             row![
-                connection_input(
-                    locale.text(TextKey::Folder),
-                    &draft.folder,
-                    ConnectionField::Folder,
-                    false,
+                labeled_control(
+                    match locale {
+                        Locale::English => "Tags",
+                        Locale::Chinese => "标签",
+                    },
+                    text_input(
+                        match locale {
+                            Locale::English => "Comma-separated tags",
+                            Locale::Chinese => "用逗号分隔多个标签",
+                        },
+                        &self.connection_tags_input,
+                    )
+                    .on_input(Message::ConnectionTagsChanged)
+                    .width(Fill),
                 ),
                 if draft.connection_method == ConnectionMethod::Interactive {
                     labeled_control(
@@ -5897,60 +6638,81 @@ impl App {
         .spacing(12);
         let mut connection_preferences = column![
             text(match locale {
-                Locale::English => "Connection organization",
-                Locale::Chinese => "连接整理",
+                Locale::English => "Connection management",
+                Locale::Chinese => "连接管理",
             })
             .size(20),
             text(match locale {
                 Locale::English => {
-                    "Choose each connection's folder and whether it mounts automatically after login. Interactive SSH requires a live login session and cannot start automatically."
+                    "Tags and batch actions are managed from the connection list. Login startup preferences stay available here when expanded."
                 }
                 Locale::Chinese => {
-                    "设置每个连接的文件夹归类与登录后自动挂载。交互式 SSH 需要实时登录会话，不能自动启动。"
+                    "标签与批量操作在连接列表中管理；登录自启偏好可按需展开。"
                 }
             })
             .size(14),
+            row![
+                button(match (locale, draft.connection_preferences_expanded) {
+                    (Locale::English, false) => "Show login preferences",
+                    (Locale::English, true) => "Hide login preferences",
+                    (Locale::Chinese, false) => "展开登录自启设置",
+                    (Locale::Chinese, true) => "收起登录自启设置",
+                })
+                .on_press(Message::ToggleSettingsConnectionPreferences),
+                button(match locale {
+                    Locale::English => "Open batch management",
+                    Locale::Chinese => "打开批量管理",
+                })
+                .on_press_maybe((!self.editor_saving).then_some(Message::OpenBatchManagement)),
+            ]
+            .spacing(10),
         ]
         .spacing(8);
-        for preference in &draft.connection_preferences {
-            let folder_id = preference.id.clone();
-            let startup_id = preference.id.clone();
-            let startup: Element<'_, Message> = if preference.startup_available {
-                toggler(preference.auto_mount_at_login)
-                    .label(match locale {
-                        Locale::English => "Mount at login",
-                        Locale::Chinese => "登录时挂载",
+        if draft.connection_preferences_expanded {
+            for preference in &draft.connection_preferences {
+                let startup_id = preference.id.clone();
+                let startup: Element<'_, Message> = if preference.startup_available {
+                    toggler(preference.auto_mount_at_login)
+                        .label(match locale {
+                            Locale::English => "Mount at login",
+                            Locale::Chinese => "登录时挂载",
+                        })
+                        .on_toggle(move |value| {
+                            Message::SettingsConnectionStartupChanged(startup_id.clone(), value)
+                        })
+                        .into()
+                } else {
+                    text(match locale {
+                        Locale::English => "Interactive SSH: unavailable",
+                        Locale::Chinese => "交互式 SSH：不可用",
                     })
-                    .on_toggle(move |value| {
-                        Message::SettingsConnectionStartupChanged(startup_id.clone(), value)
-                    })
+                    .size(13)
                     .into()
-            } else {
-                text(match locale {
-                    Locale::English => "Interactive SSH: unavailable",
-                    Locale::Chinese => "交互式 SSH：不可用",
-                })
-                .size(13)
-                .into()
-            };
-            connection_preferences = connection_preferences.push(
-                container(
-                    row![
-                        text(&preference.name).size(14).width(Length::Fixed(180.0)),
-                        text_input(locale.text(TextKey::Folder), &preference.folder)
-                            .on_input(move |value| {
-                                Message::SettingsConnectionFolderChanged(folder_id.clone(), value)
-                            })
-                            .width(Fill),
-                        container(startup).width(Length::Fixed(210.0)),
-                    ]
-                    .spacing(12)
-                    .align_y(Center),
-                )
-                .padding(10)
-                .width(Fill)
-                .style(container::rounded_box),
-            );
+                };
+                let tags = if preference.tags.is_empty() {
+                    match locale {
+                        Locale::English => "No tags".to_owned(),
+                        Locale::Chinese => "无标签".to_owned(),
+                    }
+                } else {
+                    preference.tags.join(", ")
+                };
+                connection_preferences = connection_preferences.push(
+                    container(
+                        row![
+                            column![text(&preference.name).size(14), text(tags).size(12)]
+                                .spacing(3)
+                                .width(Fill),
+                            container(startup).width(Length::Fixed(210.0)),
+                        ]
+                        .spacing(12)
+                        .align_y(Center),
+                    )
+                    .padding(10)
+                    .width(Fill)
+                    .style(container::rounded_box),
+                );
+            }
         }
         let behavior = column![
             row![
@@ -6517,6 +7279,11 @@ struct ConnectionCardState<'a> {
     operation_error: Option<&'a ConnectionOperationError>,
     has_interactive_terminal: bool,
     auto_mount_at_login: bool,
+    list_mode: ConnectionListMode,
+    selected: bool,
+    can_move_up: bool,
+    can_move_down: bool,
+    connection_list_saving: bool,
 }
 
 fn capacity_progress_view(
@@ -6598,6 +7365,11 @@ fn connection_card<'a>(
         operation_error,
         has_interactive_terminal,
         auto_mount_at_login,
+        list_mode,
+        selected,
+        can_move_up,
+        can_move_down,
+        connection_list_saving,
     } = state;
     let id = server.id.clone();
     let host = format!("{}@{}:{}", server.user, server.host, server.port);
@@ -6638,8 +7410,26 @@ fn connection_card<'a>(
             .size(12),
         );
     }
+    let mut tag_row = row![].spacing(6).align_y(Center);
+    for tag in &server.tags {
+        tag_row = tag_row.push(container(text(tag).size(12)).padding([3, 7]));
+        if list_mode == ConnectionListMode::Batch {
+            tag_row = tag_row.push(
+                button("x").on_press_maybe(
+                    (!connection_list_saving)
+                        .then_some(Message::RemoveConnectionTag(id.clone(), tag.clone())),
+                ),
+            );
+        }
+    }
+    let tag_row = scrollable(tag_row)
+        .direction(iced::widget::scrollable::Direction::Horizontal(
+            iced::widget::scrollable::Scrollbar::new(),
+        ))
+        .height(Length::Shrink);
     let mut details = column![
         title,
+        tag_row,
         text(host).size(15),
         text(format!(
             "{}  ->  {}",
@@ -6705,7 +7495,46 @@ fn connection_card<'a>(
             .style(container::rounded_box),
         );
     }
-    let edit = button(locale.text(TextKey::Edit)).on_press(Message::Edit(id.clone()));
+    if list_mode == ConnectionListMode::Batch {
+        let selection_id = id.clone();
+        return container(
+            row![
+                checkbox(selected).on_toggle(move |selected| {
+                    Message::BatchSelectionChanged(selection_id.clone(), selected)
+                }),
+                details,
+            ]
+            .spacing(12)
+            .align_y(Center),
+        )
+        .padding(16)
+        .width(Fill)
+        .style(container::rounded_box)
+        .into();
+    }
+    if list_mode == ConnectionListMode::Reorder {
+        return container(
+            row![
+                details,
+                button("^").on_press_maybe(
+                    (can_move_up && !connection_list_saving)
+                        .then_some(Message::MoveConnection(id.clone(), -1)),
+                ),
+                button("v").on_press_maybe(
+                    (can_move_down && !connection_list_saving)
+                        .then_some(Message::MoveConnection(id.clone(), 1)),
+                ),
+            ]
+            .spacing(8)
+            .align_y(Center),
+        )
+        .padding(16)
+        .width(Fill)
+        .style(container::rounded_box)
+        .into();
+    }
+    let edit = button(locale.text(TextKey::Edit))
+        .on_press_maybe((!connection_list_saving).then_some(Message::Edit(id.clone())));
     let actions: Element<'_, Message> = if confirming_remove {
         row![
             button(locale.text(TextKey::Cancel)).on_press(Message::CancelRemove),
@@ -6739,20 +7568,26 @@ fn connection_card<'a>(
     .into()
 }
 
-fn organized_connections<'a>(
+fn visible_connections<'a>(
     servers: &'a [ServerConfig],
     search: &str,
+    tag_filter: Option<&str>,
     sort: ConnectionSort,
-) -> Vec<(String, Vec<&'a ServerConfig>)> {
+) -> Vec<&'a ServerConfig> {
     let query = search.trim().to_lowercase();
-    let matches = servers
+    let mut matches = servers
         .iter()
         .enumerate()
         .filter(|(_, server)| {
-            query.is_empty()
+            let matches_tag =
+                tag_filter.is_none_or(|tag| server.tags.iter().any(|candidate| candidate == tag));
+            let matches_query = query.is_empty()
+                || server
+                    .tags
+                    .iter()
+                    .any(|tag| tag.to_lowercase().contains(&query))
                 || [
                     server.display_name(),
-                    server.folder.as_str(),
                     server.host_alias.as_str(),
                     server.host.as_str(),
                     server.user.as_str(),
@@ -6760,54 +7595,132 @@ fn organized_connections<'a>(
                     server.mountpoint.as_str(),
                 ]
                 .into_iter()
-                .any(|value| value.to_lowercase().contains(&query))
+                .any(|value| value.to_lowercase().contains(&query));
+            matches_tag && matches_query
         })
         .collect::<Vec<_>>();
+    matches.sort_by(|(left_index, left), (right_index, right)| {
+        left.tags
+            .is_empty()
+            .cmp(&right.tags.is_empty())
+            .then_with(|| {
+                let ordering = match sort {
+                    ConnectionSort::SavedOrder => std::cmp::Ordering::Equal,
+                    ConnectionSort::Name => left
+                        .display_name()
+                        .to_lowercase()
+                        .cmp(&right.display_name().to_lowercase()),
+                    ConnectionSort::Host => left
+                        .host
+                        .to_lowercase()
+                        .cmp(&right.host.to_lowercase())
+                        .then_with(|| left.user.to_lowercase().cmp(&right.user.to_lowercase())),
+                };
+                ordering.then_with(|| left_index.cmp(right_index))
+            })
+    });
+    matches.into_iter().map(|(_, server)| server).collect()
+}
 
-    let mut groups: Vec<(String, Vec<(usize, &ServerConfig)>)> = Vec::new();
-    for (index, server) in matches {
-        let folder = server.folder.trim().to_owned();
-        if let Some((_, group)) = groups.iter_mut().find(|(name, _)| *name == folder) {
-            group.push((index, server));
-        } else {
-            groups.push((folder, vec![(index, server)]));
+fn connection_tags(servers: &[ServerConfig]) -> Vec<String> {
+    let mut tags = Vec::new();
+    for server in servers {
+        for tag in &server.tags {
+            if !tags.iter().any(|existing| existing == tag) {
+                tags.push(tag.clone());
+            }
         }
     }
-    for (_, group) in &mut groups {
-        group.sort_by(|(left_index, left), (right_index, right)| {
-            let ordering = match sort {
-                ConnectionSort::SavedOrder => std::cmp::Ordering::Equal,
-                ConnectionSort::Name => left
-                    .display_name()
-                    .to_lowercase()
-                    .cmp(&right.display_name().to_lowercase()),
-                ConnectionSort::Host => left
-                    .host
-                    .to_lowercase()
-                    .cmp(&right.host.to_lowercase())
-                    .then_with(|| left.user.to_lowercase().cmp(&right.user.to_lowercase())),
-            };
-            ordering.then_with(|| left_index.cmp(right_index))
+    tags.sort_by_key(|tag| tag.to_lowercase());
+    tags
+}
+
+fn parse_tag_input(value: &str) -> Vec<String> {
+    let mut tags = Vec::new();
+    for tag in value.split([',', '，']) {
+        let tag = tag.trim();
+        if !tag.is_empty() && !tags.iter().any(|existing| existing == tag) {
+            tags.push(tag.to_owned());
+        }
+    }
+    tags
+}
+
+fn normalized_tag_name(value: &str, locale: Locale) -> Result<String, String> {
+    let tag = value.trim();
+    if tag.is_empty()
+        || tag.chars().any(char::is_control)
+        || tag.contains(',')
+        || tag.contains('，')
+    {
+        return Err(match locale {
+            Locale::English => {
+                "A tag must be non-empty and cannot contain commas or control characters".into()
+            }
+            Locale::Chinese => "标签不能为空，也不能包含逗号或控制字符".into(),
         });
     }
-    groups.sort_by(|(left, _), (right, _)| {
-        left.is_empty().cmp(&right.is_empty()).then_with(|| {
-            if sort == ConnectionSort::SavedOrder {
-                std::cmp::Ordering::Equal
-            } else {
-                left.to_lowercase().cmp(&right.to_lowercase())
-            }
-        })
-    });
-    groups
-        .into_iter()
-        .map(|(folder, group)| {
-            (
-                folder,
-                group.into_iter().map(|(_, server)| server).collect(),
-            )
-        })
+    Ok(tag.to_owned())
+}
+
+fn selected_server_ids(servers: &[ServerConfig], selected: &HashSet<String>) -> Vec<String> {
+    servers
+        .iter()
+        .filter(|server| selected.contains(&server.id))
+        .map(|server| server.id.clone())
         .collect()
+}
+
+fn tagged_partition(servers: &[ServerConfig], tagged: bool) -> Vec<String> {
+    servers
+        .iter()
+        .filter(|server| !server.tags.is_empty() == tagged)
+        .map(|server| server.id.clone())
+        .collect()
+}
+
+fn can_move_connection(servers: &[ServerConfig], id: &str, direction: i8) -> bool {
+    let Some(server) = servers.iter().find(|server| server.id == id) else {
+        return false;
+    };
+    let partition = tagged_partition(servers, !server.tags.is_empty());
+    let Some(index) = partition.iter().position(|candidate| candidate == id) else {
+        return false;
+    };
+    match direction {
+        -1 => index > 0,
+        1 => index + 1 < partition.len(),
+        _ => false,
+    }
+}
+
+fn moved_connection_order(
+    servers: &[ServerConfig],
+    id: &str,
+    direction: i8,
+) -> Option<Vec<String>> {
+    let tagged = !servers
+        .iter()
+        .find(|server| server.id == id)?
+        .tags
+        .is_empty();
+    let mut partition = tagged_partition(servers, tagged);
+    let index = partition.iter().position(|candidate| candidate == id)?;
+    let target = match direction {
+        -1 => index.checked_sub(1)?,
+        1 if index + 1 < partition.len() => index + 1,
+        _ => return None,
+    };
+    partition.swap(index, target);
+    let other = tagged_partition(servers, !tagged);
+    if tagged {
+        partition.extend(other);
+        Some(partition)
+    } else {
+        let mut order = other;
+        order.extend(partition);
+        Some(order)
+    }
 }
 
 fn connection_input<'a>(
@@ -7114,30 +8027,30 @@ fn settings_need_system_credential_inference(
 
 fn connection_preference_updates(
     draft: &SettingsDraft,
-    locale: Locale,
-) -> Result<Vec<(String, String, bool)>, String> {
-    draft
+    _locale: Locale,
+) -> Result<Vec<storage::ServerPreferenceUpdate>, String> {
+    Ok(draft
         .connection_preferences
         .iter()
-        .map(|preference| {
-            let folder = normalized_organization_folder(&preference.folder, locale)?;
-            Ok((
-                preference.id.clone(),
-                folder,
+        .map(|preference| storage::ServerPreferenceUpdate {
+            id: preference.id.clone(),
+            tags: None,
+            auto_mount_at_login: Some(
                 preference.auto_mount_at_login && preference.startup_available,
-            ))
+            ),
         })
-        .collect()
+        .collect())
 }
 
-fn normalized_organization_folder(value: &str, locale: Locale) -> Result<String, String> {
-    if value.chars().any(char::is_control) {
-        return Err(match locale {
-            Locale::English => "Connection folders must not contain control characters".into(),
-            Locale::Chinese => "连接文件夹不能包含控制字符".into(),
-        });
+fn validated_connection_tags(tags: &[String], locale: Locale) -> Result<Vec<String>, String> {
+    let mut normalized = Vec::new();
+    for tag in tags {
+        let tag = normalized_tag_name(tag, locale)?;
+        if !normalized.iter().any(|candidate| candidate == &tag) {
+            normalized.push(tag);
+        }
     }
-    Ok(value.trim().to_owned())
+    Ok(normalized)
 }
 
 fn startup_integration_enabled(settings: &Settings, servers: &[ServerConfig]) -> bool {
@@ -7474,54 +8387,213 @@ fn settings_recovery_message(
     locale: Locale,
 ) -> Option<String> {
     let error = recovered.load_error.as_deref()?;
-    let backup = recovered.backup_path.as_ref().map(|path| path.display());
-    let reset_persisted = recovered.backup_error.is_none() && recovered.persistence_error.is_none();
+    Some(match locale {
+        Locale::English if recovered.failure_stage.is_none() => recovered
+            .backup_path
+            .as_ref()
+            .map(|path| {
+                format!(
+                    "The previous settings could not be read and were reset. The original was backed up at {}. Original error: {error}",
+                    path.display()
+                )
+            })
+            .unwrap_or_else(|| {
+                format!("The previous settings could not be read and were reset. Original error: {error}")
+            }),
+        Locale::English => format!(
+            "The previous settings could not be read. Built-in defaults are active in memory; the recovery dialog shows the exact settings and backup paths. Original error: {error}"
+        ),
+        Locale::Chinese if recovered.failure_stage.is_none() => recovered
+            .backup_path
+            .as_ref()
+            .map(|path| {
+                format!(
+                    "旧设置无法读取，已重置；原文件备份在 {}。原始错误：{error}",
+                    path.display()
+                )
+            })
+            .unwrap_or_else(|| format!("旧设置无法读取，已重置。原始错误：{error}")),
+        Locale::Chinese => format!(
+            "旧设置无法读取，当前仅在内存中使用程序内置默认值；恢复弹窗列出了准确的设置路径和备份路径。原始错误：{error}"
+        ),
+    })
+}
+
+fn settings_recovery_dialog_message(
+    recovered: &storage::RecoveredSettings,
+    settings_path: &Path,
+    locale: Locale,
+) -> Option<String> {
+    let load_error = recovered.load_error.as_deref()?;
+    let backup_line = match (
+        &recovered.backup_path,
+        &recovered.attempted_backup_path,
+        locale,
+    ) {
+        (Some(path), _, Locale::English) => format!("Backup saved at: {}", path.display()),
+        (Some(path), _, Locale::Chinese) => format!("实际备份路径：{}", path.display()),
+        (None, Some(path), Locale::English) => {
+            format!("Attempted backup path: {}", path.display())
+        }
+        (None, Some(path), Locale::Chinese) => {
+            format!("尝试备份路径：{}", path.display())
+        }
+        (None, None, Locale::English) => "Attempted backup path: unavailable".into(),
+        (None, None, Locale::Chinese) => "尝试备份路径：不可用".into(),
+    };
+    let kind = match recovered.failure_stage {
+        Some(
+            storage::SettingsRecoveryStage::Backup
+            | storage::SettingsRecoveryStage::RestoreOriginal,
+        ) => recovered.backup_error_kind,
+        Some(
+            storage::SettingsRecoveryStage::AcquireLock
+            | storage::SettingsRecoveryStage::PersistDefaults,
+        ) => recovered.persistence_error_kind,
+        None => None,
+    };
+    let hint = recovery_error_hint(recovered.failure_stage, kind, locale);
+    let cache_root = recovered.settings.cache_root.display();
+
     Some(match locale {
         Locale::English => {
-            let mut message = match (backup, reset_persisted) {
-                (Some(path), _) => format!(
-                    "The previous settings could not be read and were reset. A backup was saved at {path}. New settings can be saved normally. Original error: {error}"
-                ),
-                (None, true) => format!(
-                    "The previous settings could not be read and were reset. New settings can be saved normally. Original error: {error}"
-                ),
-                (None, false) => format!(
-                    "The previous settings could not be read. Defaults are loaded in memory, but the settings file could not be replaced; Save will retry. Original error: {error}"
-                ),
+            let operation = match recovered.failure_stage {
+                Some(storage::SettingsRecoveryStage::AcquireLock) => {
+                    "Acquire the settings recovery lock"
+                }
+                Some(storage::SettingsRecoveryStage::Backup) => {
+                    "Back up the unreadable settings file"
+                }
+                Some(storage::SettingsRecoveryStage::PersistDefaults) => {
+                    "Write replacement default settings"
+                }
+                Some(storage::SettingsRecoveryStage::RestoreOriginal) => {
+                    "Write defaults, then restore the original after that write failed"
+                }
+                None => "Back up the unreadable file and write replacement defaults",
             };
-            if let Some(backup_error) = &recovered.backup_error {
-                message.push_str(&format!("; backup failed: {backup_error}"));
+            let result = match recovered.failure_stage {
+                Some(storage::SettingsRecoveryStage::AcquireLock) => format!(
+                    "Recovery could not start. The original settings path was left unchanged at {}. Built-in defaults are active in memory only.",
+                    settings_path.display()
+                ),
+                Some(storage::SettingsRecoveryStage::Backup) => format!(
+                    "The original file remains at {}. Built-in defaults are active in memory only.",
+                    settings_path.display()
+                ),
+                Some(storage::SettingsRecoveryStage::PersistDefaults) if recovered.original_restored => format!(
+                    "Writing defaults failed, so the original was restored to {}. Built-in defaults are active in memory only.",
+                    settings_path.display()
+                ),
+                Some(storage::SettingsRecoveryStage::PersistDefaults) => "Writing defaults failed. No original file was present when backup was attempted. Built-in defaults are active in memory only.".into(),
+                Some(storage::SettingsRecoveryStage::RestoreOriginal) => recovered.backup_path.as_ref().map(|path| format!(
+                    "Writing defaults failed and the original could not be restored to {}. The original remains at {}. Built-in defaults are active in memory only.",
+                    settings_path.display(), path.display()
+                )).unwrap_or_else(|| "Writing defaults and restoring the original both failed. Built-in defaults are active in memory only.".into()),
+                None if recovered.source_was_present => "The unreadable original was backed up and built-in defaults were written successfully.".into(),
+                None => "The source disappeared before backup; built-in defaults were written successfully.".into(),
+            };
+            let mut errors = format!("Original read error: {load_error}");
+            if let Some(error) = &recovered.persistence_error {
+                errors.push_str(&format!("\nDefault-settings write/lock error: {error}"));
             }
-            if let Some(persistence_error) = &recovered.persistence_error {
-                message.push_str(&format!(
-                    "; the reset could not be written automatically, but Save will retry: {persistence_error}"
-                ));
+            if let Some(error) = &recovered.cleanup_error {
+                errors.push_str(&format!("\nFailed-replacement cleanup error: {error}"));
             }
-            message
+            if let Some(error) = &recovered.backup_error {
+                errors.push_str(&format!("\nBackup/restore error: {error}"));
+            }
+            format!(
+                "The previous settings could not be read.\n\nSettings file: {}\n{backup_line}\nOperation: {operation}\n{errors}\nReason: {hint}\n\nResult: {result}\nOpen Settings and choose Save to retry writing the displayed values when recovery did not finish. In-memory defaults are SSH MountMate's complete built-in settings, not values read from the old file. Current cache directory: {cache_root}. The values shown in Settings are the values Save will write.",
+                settings_path.display(),
+            )
         }
         Locale::Chinese => {
-            let mut message = match (backup, reset_persisted) {
-                (Some(path), _) => format!(
-                    "旧设置无法读取，已重置；原文件已备份到 {path}。现在可以正常保存新设置。原始错误：{error}"
-                ),
-                (None, true) => {
-                    format!("旧设置无法读取，已重置；现在可以正常保存新设置。原始错误：{error}")
+            let operation = match recovered.failure_stage {
+                Some(storage::SettingsRecoveryStage::AcquireLock) => "取得设置恢复锁",
+                Some(storage::SettingsRecoveryStage::Backup) => "备份无法读取的设置文件",
+                Some(storage::SettingsRecoveryStage::PersistDefaults) => "写入替代用的默认设置",
+                Some(storage::SettingsRecoveryStage::RestoreOriginal) => {
+                    "默认设置写入失败后恢复原设置文件"
                 }
-                (None, false) => format!(
-                    "旧设置无法读取，当前仅在内存中加载默认值；设置文件尚未替换，点击保存时会重试。原始错误：{error}"
-                ),
+                None => "备份无法读取的文件并写入默认设置",
             };
-            if let Some(backup_error) = &recovered.backup_error {
-                message.push_str(&format!("；备份失败：{backup_error}"));
+            let result = match recovered.failure_stage {
+                Some(storage::SettingsRecoveryStage::AcquireLock) => format!("恢复尚未开始；原设置路径 {} 保持不变。当前仅在内存中使用程序内置默认设置。", settings_path.display()),
+                Some(storage::SettingsRecoveryStage::Backup) => format!("原文件仍位于 {}。当前仅在内存中使用程序内置默认设置。", settings_path.display()),
+                Some(storage::SettingsRecoveryStage::PersistDefaults) if recovered.original_restored => format!("默认设置写入失败，原文件已恢复到 {}。当前仅在内存中使用程序内置默认设置。", settings_path.display()),
+                Some(storage::SettingsRecoveryStage::PersistDefaults) => "默认设置写入失败；尝试备份时原文件已经不存在。当前仅在内存中使用程序内置默认设置。".into(),
+                Some(storage::SettingsRecoveryStage::RestoreOriginal) => recovered.backup_path.as_ref().map(|path| format!("默认设置写入失败，原文件也无法恢复到 {}；原文件仍位于 {}。当前仅在内存中使用程序内置默认设置。", settings_path.display(), path.display())).unwrap_or_else(|| "默认设置写入与原文件恢复均失败。当前仅在内存中使用程序内置默认设置。".into()),
+                None if recovered.source_was_present => "无法读取的原文件已备份，程序内置默认设置已成功写入。".into(),
+                None => "原文件在备份前已经消失，程序内置默认设置已成功写入。".into(),
+            };
+            let mut errors = format!("原始读取错误：{load_error}");
+            if let Some(error) = &recovered.persistence_error {
+                errors.push_str(&format!("\n默认设置写入/锁定错误：{error}"));
             }
-            if let Some(persistence_error) = &recovered.persistence_error {
-                message.push_str(&format!(
-                    "；自动写入重置设置失败，但点击保存时会重试：{persistence_error}"
-                ));
+            if let Some(error) = &recovered.cleanup_error {
+                errors.push_str(&format!("\n失败替代文件清理错误：{error}"));
             }
-            message
+            if let Some(error) = &recovered.backup_error {
+                errors.push_str(&format!("\n备份/恢复原文件错误：{error}"));
+            }
+            format!(
+                "旧设置无法读取。\n\n原设置路径：{}\n{backup_line}\n失败/执行操作：{operation}\n{errors}\n原因提示：{hint}\n\n结果：{result}\n恢复未完成时，请打开“设置”并点击“保存”重试写入页面显示的值。“内存默认值”指 SSH MountMate 程序内置的完整默认设置，并非从旧文件读取。当前缓存目录：{cache_root}。设置页当前显示的值就是点击“保存”时将写入的内容。",
+                settings_path.display(),
+            )
         }
     })
+}
+
+fn recovery_error_hint(
+    stage: Option<storage::SettingsRecoveryStage>,
+    kind: Option<std::io::ErrorKind>,
+    locale: Locale,
+) -> &'static str {
+    match (stage, kind, locale) {
+        (Some(storage::SettingsRecoveryStage::AcquireLock), _, Locale::English) => {
+            "The settings lock could not be opened or is still held by another process"
+        }
+        (Some(storage::SettingsRecoveryStage::AcquireLock), _, Locale::Chinese) => {
+            "设置锁无法打开，或仍被其他进程占用"
+        }
+        (_, Some(std::io::ErrorKind::PermissionDenied), Locale::English) => {
+            "The settings directory or file is not writable, or another process is denying access"
+        }
+        (_, Some(std::io::ErrorKind::PermissionDenied), Locale::Chinese) => {
+            "设置目录或文件没有写权限，或者其他进程正在拒绝访问"
+        }
+        (
+            _,
+            Some(
+                std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::NotADirectory
+                | std::io::ErrorKind::IsADirectory
+                | std::io::ErrorKind::AlreadyExists
+                | std::io::ErrorKind::InvalidInput,
+            ),
+            Locale::English,
+        ) => "A settings path component disappeared or is unavailable",
+        (
+            _,
+            Some(
+                std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::NotADirectory
+                | std::io::ErrorKind::IsADirectory
+                | std::io::ErrorKind::AlreadyExists
+                | std::io::ErrorKind::InvalidInput,
+            ),
+            Locale::Chinese,
+        ) => "设置路径中的目录或文件已消失，或者当前不可用",
+        (_, Some(std::io::ErrorKind::StorageFull), Locale::English) => {
+            "The destination volume has no free space"
+        }
+        (_, Some(std::io::ErrorKind::StorageFull), Locale::Chinese) => "目标磁盘空间不足",
+        (_, Some(_), Locale::English) => "The operating system rejected the file operation",
+        (_, Some(_), Locale::Chinese) => "操作系统拒绝了文件操作",
+        (_, None, Locale::English) => "No recovery write error was reported",
+        (_, None, Locale::Chinese) => "未报告恢复写入错误",
+    }
 }
 
 fn system_prefers_dark() -> bool {
@@ -9498,6 +10570,82 @@ mod localization_tests {
     }
 
     #[test]
+    fn recovery_dialog_names_exact_paths_permission_and_memory_defaults() {
+        let recovered = storage::RecoveredSettings {
+            settings: Settings {
+                cache_root: PathBuf::from("/home/alice/.cache/rclone-gui"),
+                ..Settings::default()
+            },
+            load_error: Some("invalid JSON at line 1".into()),
+            backup_path: None,
+            attempted_backup_path: Some(PathBuf::from(
+                "/home/alice/.config/rclone-gui/settings.json.invalid.bak",
+            )),
+            backup_error: Some("Permission denied (os error 13)".into()),
+            backup_error_kind: Some(std::io::ErrorKind::PermissionDenied),
+            persistence_error: None,
+            persistence_error_kind: None,
+            cleanup_error: None,
+            failure_stage: Some(storage::SettingsRecoveryStage::Backup),
+            source_was_present: true,
+            original_restored: false,
+        };
+
+        let message = settings_recovery_dialog_message(
+            &recovered,
+            Path::new("/home/alice/.config/rclone-gui/settings.json"),
+            Locale::Chinese,
+        )
+        .unwrap();
+
+        assert!(message.contains("/home/alice/.config/rclone-gui/settings.json"));
+        assert!(message.contains("settings.json.invalid.bak"));
+        assert!(message.contains("原设置路径"));
+        assert!(message.contains("尝试备份路径"));
+        assert!(message.contains("Permission denied (os error 13)"));
+        assert!(message.contains("没有写权限"));
+        assert!(message.contains("内存"));
+        assert!(message.contains("/home/alice/.cache/rclone-gui"));
+    }
+
+    #[test]
+    fn recovery_dialog_reports_write_restore_and_cleanup_errors_with_both_paths() {
+        let recovered = storage::RecoveredSettings {
+            settings: Settings {
+                cache_root: PathBuf::from("C:/Users/alice/AppData/Local/SSH MountMate/cache"),
+                ..Settings::default()
+            },
+            load_error: Some("expected value at line 1 column 1".into()),
+            backup_path: Some(PathBuf::from(
+                "C:/Users/alice/AppData/Roaming/SSH MountMate/settings.json.invalid.1.bak",
+            )),
+            attempted_backup_path: Some(PathBuf::from(
+                "C:/Users/alice/AppData/Roaming/SSH MountMate/settings.json.invalid.1.bak",
+            )),
+            backup_error: Some("Access is denied while restoring (os error 5)".into()),
+            backup_error_kind: Some(std::io::ErrorKind::PermissionDenied),
+            persistence_error: Some("The process cannot access the file (os error 32)".into()),
+            persistence_error_kind: Some(std::io::ErrorKind::PermissionDenied),
+            cleanup_error: Some("replacement is still in use (os error 32)".into()),
+            failure_stage: Some(storage::SettingsRecoveryStage::RestoreOriginal),
+            source_was_present: true,
+            original_restored: false,
+        };
+
+        let settings_path = Path::new("C:/Users/alice/AppData/Roaming/SSH MountMate/settings.json");
+        let message =
+            settings_recovery_dialog_message(&recovered, settings_path, Locale::English).unwrap();
+
+        assert!(message.contains(&settings_path.display().to_string()));
+        assert!(message.contains("Backup saved at:"));
+        assert!(message.contains("settings.json.invalid.1.bak"));
+        assert!(message.contains("expected value at line 1 column 1"));
+        assert!(message.contains("The process cannot access the file (os error 32)"));
+        assert!(message.contains("replacement is still in use (os error 32)"));
+        assert!(message.contains("Access is denied while restoring (os error 5)"));
+    }
+
+    #[test]
     fn legacy_startup_all_selects_every_non_interactive_connection() {
         let settings = Settings {
             startup_all: true,
@@ -9811,19 +10959,19 @@ mod localization_tests {
     }
 
     #[test]
-    fn connection_organization_filters_groups_and_sorts_stably() {
+    fn connection_tags_filter_and_sort_tagged_before_untagged() {
         let servers = vec![
             ServerConfig {
                 id: "zeta".into(),
                 name: "Zeta".into(),
-                folder: "Work".into(),
+                tags: vec!["Work".into(), "Shared".into()],
                 host: "b.example".into(),
                 ..ServerConfig::default()
             },
             ServerConfig {
                 id: "alpha".into(),
                 name: "Alpha".into(),
-                folder: "Work".into(),
+                tags: vec!["Work".into()],
                 host: "a.example".into(),
                 ..ServerConfig::default()
             },
@@ -9834,28 +10982,77 @@ mod localization_tests {
                 ..ServerConfig::default()
             },
         ];
-        let grouped = organized_connections(&servers, "work", ConnectionSort::Name);
-        assert_eq!(grouped.len(), 1);
-        assert_eq!(grouped[0].0, "Work");
+        let filtered = visible_connections(&servers, "work", None, ConnectionSort::Name);
         assert_eq!(
-            grouped[0]
-                .1
+            filtered
                 .iter()
                 .map(|server| server.id.as_str())
                 .collect::<Vec<_>>(),
             ["alpha", "zeta"]
         );
 
-        let saved = organized_connections(&servers, "", ConnectionSort::SavedOrder);
-        assert_eq!(saved[0].0, "Work");
-        assert_eq!(saved[0].1[0].id, "zeta");
-        assert_eq!(saved.last().unwrap().0, "");
-        assert_eq!(saved[1].0, "");
+        let shared = visible_connections(&servers, "", Some("Shared"), ConnectionSort::SavedOrder);
+        assert_eq!(
+            shared.iter().map(|server| &server.id).collect::<Vec<_>>(),
+            [&"zeta"]
+        );
 
-        let by_host = organized_connections(&servers, "", ConnectionSort::Host);
-        assert_eq!(by_host[0].0, "Work");
-        assert_eq!(by_host[0].1[0].id, "alpha");
-        assert_eq!(by_host[1].0, "");
+        let saved = visible_connections(&servers, "", None, ConnectionSort::SavedOrder);
+        assert_eq!(
+            saved
+                .iter()
+                .map(|server| server.id.as_str())
+                .collect::<Vec<_>>(),
+            ["zeta", "alpha", "home"]
+        );
+        let by_host = visible_connections(&servers, "", None, ConnectionSort::Host);
+        assert_eq!(
+            by_host
+                .iter()
+                .map(|server| server.id.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "zeta", "home"]
+        );
+    }
+
+    #[test]
+    fn custom_order_moves_within_tagged_and_untagged_partitions() {
+        let servers = vec![
+            ServerConfig {
+                id: "tagged-a".into(),
+                tags: vec!["Work".into()],
+                ..ServerConfig::default()
+            },
+            ServerConfig {
+                id: "plain-a".into(),
+                ..ServerConfig::default()
+            },
+            ServerConfig {
+                id: "tagged-b".into(),
+                tags: vec!["Home".into()],
+                ..ServerConfig::default()
+            },
+            ServerConfig {
+                id: "plain-b".into(),
+                ..ServerConfig::default()
+            },
+        ];
+
+        assert_eq!(
+            moved_connection_order(&servers, "tagged-b", -1).unwrap(),
+            ["tagged-b", "tagged-a", "plain-a", "plain-b"]
+        );
+        assert!(!can_move_connection(&servers, "tagged-a", -1));
+        assert!(can_move_connection(&servers, "plain-a", 1));
+    }
+
+    #[test]
+    fn tag_input_trims_and_deduplicates_without_losing_unicode() {
+        assert_eq!(
+            parse_tag_input(" Work,研究，Work, Shared "),
+            ["Work", "研究", "Shared"]
+        );
+        assert!(normalized_tag_name("bad\ntag", Locale::English).is_err());
     }
 
     #[test]
