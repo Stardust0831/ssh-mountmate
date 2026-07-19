@@ -38,7 +38,9 @@ use mountmate_core::dependency::{DependencyStatus, check_dependencies};
 use mountmate_core::interactive_ssh::{
     InteractiveSshError, InteractiveSshLoginCommand, InteractiveSshSession,
 };
-use mountmate_core::model::{MAX_VFS_UPLOAD_TRANSFERS, MIN_VFS_UPLOAD_TRANSFERS};
+use mountmate_core::model::{
+    MAX_CONNECTION_TAGS, MAX_TAG_CHARS, MAX_VFS_UPLOAD_TRANSFERS, MIN_VFS_UPLOAD_TRANSFERS,
+};
 use mountmate_core::mountpoint::{HOME_MOUNTPOINT_VALUE, preflight_custom_mountpoint};
 use mountmate_core::paths::AppPaths;
 use mountmate_core::plink_binary::resolve_plink;
@@ -493,6 +495,7 @@ struct App {
     connection_list_mode: ConnectionListMode,
     selected_connections: HashSet<String>,
     batch_tag_input: String,
+    reorder_original: Option<Vec<String>>,
     connection_list_saving: bool,
     service: MountService,
     mount_statuses: HashMap<String, MountStatus>,
@@ -807,6 +810,7 @@ enum ConnectionListMode {
     #[default]
     Browse,
     Batch,
+    Tags,
     Reorder,
 }
 
@@ -1091,6 +1095,11 @@ enum Message {
     BatchTagsSaved(Result<Vec<ServerConfig>, String>),
     BatchMountSelected,
     BatchUnmountSelected,
+    BatchStartupSelected(bool),
+    BatchStartupSaved {
+        skipped: usize,
+        result: Result<ServerMutation, String>,
+    },
     BatchDeleteSelected,
     BatchDeleteDecision {
         ids: Vec<String>,
@@ -1101,6 +1110,8 @@ enum Message {
         result: Result<ServerMutation, String>,
     },
     MoveConnection(String, i8),
+    SaveConnectionOrder,
+    CancelConnectionOrder,
     ConnectionsReordered(Result<Vec<ServerConfig>, String>),
     SettingsConnectionStartupChanged(String, bool),
     ToggleSettingsConnectionPreferences,
@@ -1430,6 +1441,7 @@ impl App {
             connection_list_mode: ConnectionListMode::Browse,
             selected_connections: HashSet::new(),
             batch_tag_input: String::new(),
+            reorder_original: None,
             connection_list_saving: false,
             service,
             mount_statuses: HashMap::new(),
@@ -1640,6 +1652,12 @@ impl App {
                 }
             }
             Message::SettingsRecoveryDialogClosed => {}
+            Message::Refresh if self.connection_list_mode == ConnectionListMode::Reorder => {
+                self.status = match locale {
+                    Locale::English => "Save or cancel the current order before refreshing".into(),
+                    Locale::Chinese => "请先保存或取消当前排序，再刷新".into(),
+                };
+            }
             Message::Refresh => match storage::load_servers(&self.paths) {
                 Ok(servers) => {
                     self.servers = servers;
@@ -1937,14 +1955,22 @@ impl App {
                 if self.connection_list_saving || self.editor_saving {
                     return Task::none();
                 }
-                self.connection_list_mode = mode;
-                self.selected_connections.clear();
-                self.batch_tag_input.clear();
                 if mode == ConnectionListMode::Reorder {
+                    self.reorder_original = Some(
+                        self.servers
+                            .iter()
+                            .map(|server| server.id.clone())
+                            .collect(),
+                    );
                     self.connection_sort = ConnectionSort::SavedOrder;
                     self.connection_search.clear();
                     self.connection_tag_filter = None;
+                } else if self.connection_list_mode == ConnectionListMode::Reorder {
+                    self.reorder_original = None;
                 }
+                self.connection_list_mode = mode;
+                self.selected_connections.clear();
+                self.batch_tag_input.clear();
             }
             Message::BatchSelectionChanged(id, selected) => {
                 if selected {
@@ -1995,18 +2021,26 @@ impl App {
                     .servers
                     .iter()
                     .filter(|server| self.selected_connections.contains(&server.id))
-                    .map(|server| {
+                    .map(|server| -> Result<_, String> {
                         let mut tags = server.tags.clone();
                         if !tags.iter().any(|candidate| candidate == &tag) {
                             tags.push(tag.clone());
                         }
-                        storage::ServerPreferenceUpdate {
+                        let tags = validated_connection_tags(&tags, locale)?;
+                        Ok(storage::ServerPreferenceUpdate {
                             id: server.id.clone(),
                             tags: Some(tags),
                             auto_mount_at_login: None,
-                        }
+                        })
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<Result<Vec<_>, _>>();
+                let updates = match updates {
+                    Ok(updates) => updates,
+                    Err(error) => {
+                        self.status = error;
+                        return Task::none();
+                    }
+                };
                 return self.save_batch_tag_updates(updates);
             }
             Message::RemoveConnectionTag(id, tag) => {
@@ -2099,8 +2133,8 @@ impl App {
                     }
                     self.batch_tag_input.clear();
                     self.status = match locale {
-                        Locale::English => "Connection tags saved".into(),
-                        Locale::Chinese => "连接标签已保存".into(),
+                        Locale::English => "Connection changes saved".into(),
+                        Locale::Chinese => "连接修改已保存".into(),
                     };
                 }
                 Err(error) => {
@@ -2136,6 +2170,84 @@ impl App {
                     tasks.push(self.confirm_waiting_unmount(unsafe_ids));
                 }
                 return Task::batch(tasks);
+            }
+            Message::BatchStartupSelected(enabled) => {
+                if self.editor_saving || self.connection_list_saving {
+                    return Task::none();
+                }
+                let updates = self
+                    .servers
+                    .iter()
+                    .filter(|server| {
+                        self.selected_connections.contains(&server.id)
+                            && server.connection_method != ConnectionMethod::Interactive
+                    })
+                    .map(|server| storage::ServerPreferenceUpdate {
+                        id: server.id.clone(),
+                        tags: None,
+                        auto_mount_at_login: Some(enabled),
+                    })
+                    .collect::<Vec<_>>();
+                let skipped = self
+                    .servers
+                    .iter()
+                    .filter(|server| {
+                        self.selected_connections.contains(&server.id)
+                            && server.connection_method == ConnectionMethod::Interactive
+                    })
+                    .count();
+                let startup = self.startup_integration_lock.clone();
+                let paths = self.paths.clone();
+                self.connection_list_saving = true;
+                return Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let servers =
+                                storage::update_server_preferences_batch(&paths, &updates)
+                                    .map_err(|error| error.to_string())?;
+                            let warning = reconcile_login_startup(&paths, &startup)
+                                .err()
+                                .map(|error| match locale {
+                                    Locale::English => format!(
+                                        "Login startup preferences were saved, but system startup integration will be retried: {error}"
+                                    ),
+                                    Locale::Chinese => format!(
+                                        "登录自启设置已保存，但系统自启集成失败，将稍后重试：{error}"
+                                    ),
+                                });
+                            Ok::<_, String>(ServerMutation { servers, warning })
+                        })
+                        .await
+                        .unwrap_or_else(|error| Err(error.to_string()))
+                    },
+                    move |result| Message::BatchStartupSaved { skipped, result },
+                );
+            }
+            Message::BatchStartupSaved { skipped, result } => {
+                self.connection_list_saving = false;
+                match result {
+                    Ok(outcome) => {
+                        self.servers = outcome.servers;
+                        let skipped_notice = (skipped > 0).then(|| match locale {
+                            Locale::English => format!(
+                                "{skipped} interactive connection(s) were skipped because they require a live login session"
+                            ),
+                            Locale::Chinese => format!(
+                                "已跳过 {skipped} 个交互式连接，因为它们需要实时登录会话"
+                            ),
+                        });
+                        self.status = match (outcome.warning, skipped_notice) {
+                            (Some(warning), Some(skipped)) => format!("{warning}; {skipped}"),
+                            (Some(warning), None) => warning,
+                            (None, Some(skipped)) => skipped,
+                            (None, None) => match locale {
+                                Locale::English => "Login startup preferences saved".into(),
+                                Locale::Chinese => "登录自启设置已保存".into(),
+                            },
+                        };
+                    }
+                    Err(error) => self.status = error,
+                }
             }
             Message::BatchDeleteSelected => {
                 if self.editor_saving || self.connection_list_saving {
@@ -2293,7 +2405,29 @@ impl App {
                 let Some(order) = moved_connection_order(&self.servers, &id, direction) else {
                     return Task::none();
                 };
+                let by_id = self
+                    .servers
+                    .iter()
+                    .cloned()
+                    .map(|server| (server.id.clone(), server))
+                    .collect::<HashMap<_, _>>();
+                self.servers = order
+                    .into_iter()
+                    .filter_map(|id| by_id.get(&id).cloned())
+                    .collect();
+            }
+            Message::SaveConnectionOrder => {
+                if self.connection_list_mode != ConnectionListMode::Reorder
+                    || self.connection_list_saving
+                {
+                    return Task::none();
+                }
                 let paths = self.paths.clone();
+                let order = self
+                    .servers
+                    .iter()
+                    .map(|server| server.id.clone())
+                    .collect::<Vec<_>>();
                 self.connection_list_saving = true;
                 return Task::perform(
                     async move {
@@ -2311,10 +2445,30 @@ impl App {
                     Message::ConnectionsReordered,
                 );
             }
+            Message::CancelConnectionOrder => {
+                if self.connection_list_saving {
+                    return Task::none();
+                }
+                if let Some(original) = self.reorder_original.take() {
+                    let by_id = self
+                        .servers
+                        .iter()
+                        .cloned()
+                        .map(|server| (server.id.clone(), server))
+                        .collect::<HashMap<_, _>>();
+                    self.servers = original
+                        .into_iter()
+                        .filter_map(|id| by_id.get(&id).cloned())
+                        .collect();
+                }
+                self.connection_list_mode = ConnectionListMode::Browse;
+            }
             Message::ConnectionsReordered(result) => match result {
                 Ok(servers) => {
                     self.connection_list_saving = false;
                     self.servers = servers;
+                    self.reorder_original = None;
+                    self.connection_list_mode = ConnectionListMode::Browse;
                     self.status = match locale {
                         Locale::English => "Custom order saved".into(),
                         Locale::Chinese => "自定义排序已保存".into(),
@@ -5268,6 +5422,7 @@ impl App {
 
     fn main_view(&self) -> Element<'_, Message> {
         let locale = self.locale();
+        let reordering = self.connection_list_mode == ConnectionListMode::Reorder;
         let active_transfers = self
             .servers
             .iter()
@@ -5286,13 +5441,15 @@ impl App {
         };
         let toolbar = responsive(move |size| {
             let actions = row![
-                button(locale.text(TextKey::Refresh)).on_press(Message::Refresh),
-                button(text(transfers_label.clone())).on_press(Message::OpenTransfers),
+                button(locale.text(TextKey::Refresh))
+                    .on_press_maybe((!reordering).then_some(Message::Refresh)),
+                button(text(transfers_label.clone()))
+                    .on_press_maybe((!reordering).then_some(Message::OpenTransfers)),
                 button(locale.text(TextKey::AddConnection)).on_press_maybe(
-                    (!self.connection_list_saving).then_some(Message::AddConnection),
+                    (!reordering && !self.connection_list_saving).then_some(Message::AddConnection),
                 ),
                 button(locale.text(TextKey::Settings)).on_press_maybe(
-                    (!self.connection_list_saving).then_some(Message::OpenSettings),
+                    (!reordering && !self.connection_list_saving).then_some(Message::OpenSettings),
                 ),
             ]
             .spacing(10);
@@ -5326,6 +5483,10 @@ impl App {
                 .selected_connections
                 .iter()
                 .all(|id| self.can_modify(id));
+        let selected_startup_available = self.servers.iter().any(|server| {
+            self.selected_connections.contains(&server.id)
+                && server.connection_method != ConnectionMethod::Interactive
+        });
         let mode_actions: Element<'_, Message> = match self.connection_list_mode {
             ConnectionListMode::Browse => row![
                 button(match locale {
@@ -5336,12 +5497,10 @@ impl App {
                     ConnectionListMode::Batch
                 )),
                 button(match locale {
-                    Locale::English => "Custom order",
-                    Locale::Chinese => "自定义排序",
+                    Locale::English => "Manage tags",
+                    Locale::Chinese => "标签管理",
                 })
-                .on_press(Message::ConnectionListModeChanged(
-                    ConnectionListMode::Reorder
-                )),
+                .on_press(Message::ConnectionListModeChanged(ConnectionListMode::Tags)),
             ]
             .spacing(10)
             .into(),
@@ -5368,6 +5527,77 @@ impl App {
                 ]
                 .spacing(10)
                 .align_y(Center);
+                let startup_actions = row![
+                    button(match locale {
+                        Locale::English => "Enable login startup",
+                        Locale::Chinese => "启用登录自启",
+                    })
+                    .on_press_maybe(
+                        (selected_startup_available && !self.connection_list_saving)
+                            .then_some(Message::BatchStartupSelected(true)),
+                    ),
+                    button(match locale {
+                        Locale::English => "Disable login startup",
+                        Locale::Chinese => "禁用登录自启",
+                    })
+                    .on_press_maybe(
+                        (selected_startup_available && !self.connection_list_saving)
+                            .then_some(Message::BatchStartupSelected(false)),
+                    ),
+                ]
+                .spacing(10)
+                .align_y(Center);
+                let completion = row![
+                    button(match locale {
+                        Locale::English => "Delete connections",
+                        Locale::Chinese => "删除连接",
+                    })
+                    .on_press_maybe(
+                        (selected_can_delete && !self.connection_list_saving)
+                            .then_some(Message::BatchDeleteSelected),
+                    ),
+                    button(match locale {
+                        Locale::English => "Done",
+                        Locale::Chinese => "完成",
+                    })
+                    .on_press_maybe((!self.connection_list_saving).then_some(
+                        Message::ConnectionListModeChanged(ConnectionListMode::Browse),
+                    )),
+                ]
+                .spacing(10)
+                .align_y(Center);
+                if size.width < 860.0 {
+                    column![selection, startup_actions, completion]
+                        .spacing(10)
+                        .into()
+                } else {
+                    row![
+                        column![selection, startup_actions].spacing(8),
+                        Space::new().width(Fill),
+                        completion
+                    ]
+                    .spacing(10)
+                    .align_y(Center)
+                    .into()
+                }
+            })
+            .height(Length::Shrink)
+            .into(),
+            ConnectionListMode::Tags => responsive(move |size| {
+                let selection = row![
+                    checkbox(all_selected)
+                        .label(match locale {
+                            Locale::English => "Select all",
+                            Locale::Chinese => "全选",
+                        })
+                        .on_toggle(Message::BatchSelectAllChanged),
+                    text(match locale {
+                        Locale::English => format!("{selected_count} selected"),
+                        Locale::Chinese => format!("已选择 {selected_count} 个"),
+                    }),
+                ]
+                .spacing(10)
+                .align_y(Center);
                 let tagging = row![
                     text_input(
                         match locale {
@@ -5388,10 +5618,6 @@ impl App {
                             && !self.batch_tag_input.trim().is_empty())
                         .then_some(Message::BatchAddTag),
                     ),
-                    button(locale.text(TextKey::Remove)).on_press_maybe(
-                        (selected_can_delete && !self.connection_list_saving)
-                            .then_some(Message::BatchDeleteSelected),
-                    ),
                     button(match locale {
                         Locale::English => "Done",
                         Locale::Chinese => "完成",
@@ -5402,7 +5628,7 @@ impl App {
                 ]
                 .spacing(10)
                 .align_y(Center);
-                if size.width < 860.0 {
+                if size.width < 760.0 {
                     column![selection, tagging].spacing(10).into()
                 } else {
                     row![selection, Space::new().width(Fill), tagging]
@@ -5415,19 +5641,24 @@ impl App {
             .into(),
             ConnectionListMode::Reorder => row![
                 text(match locale {
-                    Locale::English => {
-                        "Move tagged connections first, then untagged connections"
-                    }
-                    Locale::Chinese => "先调整有标签连接，再调整无标签连接",
+                    Locale::English => "Adjust saved order",
+                    Locale::Chinese => "调整保存顺序",
                 }),
                 Space::new().width(Fill),
                 button(match locale {
-                    Locale::English => "Done",
-                    Locale::Chinese => "完成",
+                    Locale::English => "Cancel",
+                    Locale::Chinese => "取消",
                 })
-                .on_press_maybe((!self.connection_list_saving).then_some(
-                    Message::ConnectionListModeChanged(ConnectionListMode::Browse),
-                )),
+                .on_press_maybe(
+                    (!self.connection_list_saving).then_some(Message::CancelConnectionOrder)
+                ),
+                button(match locale {
+                    Locale::English => "Save order",
+                    Locale::Chinese => "保存排序",
+                })
+                .on_press_maybe(
+                    (!self.connection_list_saving).then_some(Message::SaveConnectionOrder)
+                ),
             ]
             .spacing(10)
             .align_y(Center)
@@ -5436,13 +5667,23 @@ impl App {
 
         let sort_options = localized_choices(ConnectionSort::ALL, locale, Locale::connection_sort);
         let organization = responsive(move |size| {
-            let search = text_input(
-                locale.text(TextKey::SearchConnections),
-                &self.connection_search,
-            )
-            .on_input(Message::ConnectionSearchChanged)
-            .width(Fill);
-            let sort: Element<'_, Message> =
+            let search: Element<'_, Message> =
+                if self.connection_list_mode == ConnectionListMode::Reorder {
+                    text(match locale {
+                        Locale::English => "All connections",
+                        Locale::Chinese => "全部连接",
+                    })
+                    .into()
+                } else {
+                    text_input(
+                        locale.text(TextKey::SearchConnections),
+                        &self.connection_search,
+                    )
+                    .on_input(Message::ConnectionSearchChanged)
+                    .width(Fill)
+                    .into()
+                };
+            let mut sort: Element<'_, Message> =
                 if self.connection_list_mode == ConnectionListMode::Reorder {
                     text(locale.connection_sort(ConnectionSort::SavedOrder)).into()
                 } else {
@@ -5457,12 +5698,31 @@ impl App {
                     .placeholder(locale.text(TextKey::SortConnections))
                     .into()
                 };
+            if self.connection_list_mode == ConnectionListMode::Browse {
+                sort = row![
+                    container(sort).width(Length::Fixed(180.0)),
+                    tooltip(
+                        button("↕").on_press(Message::ConnectionListModeChanged(
+                            ConnectionListMode::Reorder,
+                        )),
+                        container(text(match locale {
+                            Locale::English => "Adjust saved order",
+                            Locale::Chinese => "调整保存顺序",
+                        }))
+                        .padding(6),
+                        tooltip::Position::FollowCursor,
+                    ),
+                ]
+                .spacing(6)
+                .align_y(Center)
+                .into();
+            }
             if size.width < 620.0 {
                 column![search, container(sort).width(Fill)]
                     .spacing(10)
                     .into()
             } else {
-                row![search, container(sort).width(Length::Fixed(180.0))]
+                row![search, container(sort).width(Length::Fixed(230.0))]
                     .spacing(10)
                     .align_y(Center)
                     .into()
@@ -5474,6 +5734,11 @@ impl App {
             button(match locale {
                 Locale::English => "All",
                 Locale::Chinese => "全部",
+            })
+            .style(if self.connection_tag_filter.is_none() {
+                button::secondary
+            } else {
+                button::text
             })
             .on_press(Message::ConnectionTagFilterChanged(None)),
         ]
@@ -5493,24 +5758,38 @@ impl App {
                     }));
             }
             let filter_tag = tag.clone();
+            let filter_selected = self.connection_tag_filter.as_deref() == Some(tag.as_str());
             tag_controls = tag_controls.push(
-                button(text(tag.clone()))
+                button(text(tag.clone()).size(12))
+                    .style(if filter_selected {
+                        button::secondary
+                    } else {
+                        button::text
+                    })
                     .on_press(Message::ConnectionTagFilterChanged(Some(filter_tag))),
             );
-            if self.connection_list_mode == ConnectionListMode::Batch {
+            if self.connection_list_mode == ConnectionListMode::Tags {
                 tag_controls = tag_controls.push(
-                    button("x").on_press_maybe(
-                        (!self.connection_list_saving)
-                            .then_some(Message::RemoveTagEverywhere(tag.clone())),
-                    ),
+                    button(text("×").size(12))
+                        .padding([2, 6])
+                        .style(button::secondary)
+                        .on_press_maybe(
+                            (!self.connection_list_saving)
+                                .then_some(Message::RemoveTagEverywhere(tag.clone())),
+                        ),
                 );
             }
         }
-        let tags = scrollable(tag_controls)
-            .direction(iced::widget::scrollable::Direction::Horizontal(
-                iced::widget::scrollable::Scrollbar::new(),
-            ))
-            .height(Length::Shrink);
+        let tags: Element<'_, Message> = if reordering {
+            Space::new().height(Length::Shrink).into()
+        } else {
+            scrollable(tag_controls)
+                .direction(iced::widget::scrollable::Direction::Horizontal(
+                    iced::widget::scrollable::Scrollbar::new(),
+                ))
+                .height(Length::Shrink)
+                .into()
+        };
 
         let mut connections = column![].spacing(8);
         if self.servers.is_empty() {
@@ -5525,7 +5804,8 @@ impl App {
                         })
                         .size(14),
                         button(locale.text(TextKey::AddConnection)).on_press_maybe(
-                            (!self.connection_list_saving).then_some(Message::AddConnection),
+                            (!reordering && !self.connection_list_saving)
+                                .then_some(Message::AddConnection),
                         ),
                     ]
                     .spacing(12)
@@ -7412,14 +7692,27 @@ fn connection_card<'a>(
     }
     let mut tag_row = row![].spacing(6).align_y(Center);
     for tag in &server.tags {
-        tag_row = tag_row.push(container(text(tag).size(12)).padding([3, 7]));
-        if list_mode == ConnectionListMode::Batch {
-            tag_row = tag_row.push(
-                button("x").on_press_maybe(
-                    (!connection_list_saving)
-                        .then_some(Message::RemoveConnectionTag(id.clone(), tag.clone())),
-                ),
-            );
+        if list_mode == ConnectionListMode::Tags {
+            tag_row =
+                tag_row.push(
+                    container(
+                        row![
+                            text(tag).size(11),
+                            button(text("×").size(10))
+                                .padding([1, 5])
+                                .style(button::secondary)
+                                .on_press_maybe((!connection_list_saving).then_some(
+                                    Message::RemoveConnectionTag(id.clone(), tag.clone())
+                                )),
+                        ]
+                        .spacing(3)
+                        .align_y(Center),
+                    )
+                    .padding([1, 4])
+                    .style(container::rounded_box),
+                );
+        } else {
+            tag_row = tag_row.push(container(text(tag).size(11)).padding([2, 5]));
         }
     }
     let tag_row = scrollable(tag_row)
@@ -7495,7 +7788,10 @@ fn connection_card<'a>(
             .style(container::rounded_box),
         );
     }
-    if list_mode == ConnectionListMode::Batch {
+    if matches!(
+        list_mode,
+        ConnectionListMode::Batch | ConnectionListMode::Tags
+    ) {
         let selection_id = id.clone();
         return container(
             row![
@@ -7600,24 +7896,19 @@ fn visible_connections<'a>(
         })
         .collect::<Vec<_>>();
     matches.sort_by(|(left_index, left), (right_index, right)| {
-        left.tags
-            .is_empty()
-            .cmp(&right.tags.is_empty())
-            .then_with(|| {
-                let ordering = match sort {
-                    ConnectionSort::SavedOrder => std::cmp::Ordering::Equal,
-                    ConnectionSort::Name => left
-                        .display_name()
-                        .to_lowercase()
-                        .cmp(&right.display_name().to_lowercase()),
-                    ConnectionSort::Host => left
-                        .host
-                        .to_lowercase()
-                        .cmp(&right.host.to_lowercase())
-                        .then_with(|| left.user.to_lowercase().cmp(&right.user.to_lowercase())),
-                };
-                ordering.then_with(|| left_index.cmp(right_index))
-            })
+        let ordering = match sort {
+            ConnectionSort::SavedOrder => std::cmp::Ordering::Equal,
+            ConnectionSort::Name => left
+                .display_name()
+                .to_lowercase()
+                .cmp(&right.display_name().to_lowercase()),
+            ConnectionSort::Host => left
+                .host
+                .to_lowercase()
+                .cmp(&right.host.to_lowercase())
+                .then_with(|| left.user.to_lowercase().cmp(&right.user.to_lowercase())),
+        };
+        ordering.then_with(|| left_index.cmp(right_index))
     });
     matches.into_iter().map(|(_, server)| server).collect()
 }
@@ -7660,6 +7951,12 @@ fn normalized_tag_name(value: &str, locale: Locale) -> Result<String, String> {
             Locale::Chinese => "标签不能为空，也不能包含逗号或控制字符".into(),
         });
     }
+    if tag.chars().count() > MAX_TAG_CHARS {
+        return Err(match locale {
+            Locale::English => format!("A tag must be at most {MAX_TAG_CHARS} characters"),
+            Locale::Chinese => format!("标签最多只能有 {MAX_TAG_CHARS} 个字符"),
+        });
+    }
     Ok(tag.to_owned())
 }
 
@@ -7671,25 +7968,13 @@ fn selected_server_ids(servers: &[ServerConfig], selected: &HashSet<String>) -> 
         .collect()
 }
 
-fn tagged_partition(servers: &[ServerConfig], tagged: bool) -> Vec<String> {
-    servers
-        .iter()
-        .filter(|server| !server.tags.is_empty() == tagged)
-        .map(|server| server.id.clone())
-        .collect()
-}
-
 fn can_move_connection(servers: &[ServerConfig], id: &str, direction: i8) -> bool {
-    let Some(server) = servers.iter().find(|server| server.id == id) else {
-        return false;
-    };
-    let partition = tagged_partition(servers, !server.tags.is_empty());
-    let Some(index) = partition.iter().position(|candidate| candidate == id) else {
+    let Some(index) = servers.iter().position(|server| server.id == id) else {
         return false;
     };
     match direction {
         -1 => index > 0,
-        1 => index + 1 < partition.len(),
+        1 => index + 1 < servers.len(),
         _ => false,
     }
 }
@@ -7699,28 +7984,18 @@ fn moved_connection_order(
     id: &str,
     direction: i8,
 ) -> Option<Vec<String>> {
-    let tagged = !servers
+    let mut order = servers
         .iter()
-        .find(|server| server.id == id)?
-        .tags
-        .is_empty();
-    let mut partition = tagged_partition(servers, tagged);
-    let index = partition.iter().position(|candidate| candidate == id)?;
+        .map(|server| server.id.clone())
+        .collect::<Vec<_>>();
+    let index = order.iter().position(|candidate| candidate == id)?;
     let target = match direction {
         -1 => index.checked_sub(1)?,
-        1 if index + 1 < partition.len() => index + 1,
+        1 if index + 1 < order.len() => index + 1,
         _ => return None,
     };
-    partition.swap(index, target);
-    let other = tagged_partition(servers, !tagged);
-    if tagged {
-        partition.extend(other);
-        Some(partition)
-    } else {
-        let mut order = other;
-        order.extend(partition);
-        Some(order)
-    }
+    order.swap(index, target);
+    Some(order)
 }
 
 fn connection_input<'a>(
@@ -8049,6 +8324,12 @@ fn validated_connection_tags(tags: &[String], locale: Locale) -> Result<Vec<Stri
         if !normalized.iter().any(|candidate| candidate == &tag) {
             normalized.push(tag);
         }
+    }
+    if normalized.len() > MAX_CONNECTION_TAGS {
+        return Err(match locale {
+            Locale::English => format!("A connection may have at most {MAX_CONNECTION_TAGS} tags"),
+            Locale::Chinese => format!("一个连接最多只能有 {MAX_CONNECTION_TAGS} 个标签"),
+        });
     }
     Ok(normalized)
 }
@@ -8779,6 +9060,8 @@ fn localize_draft_error(locale: Locale, error: &DraftError) -> String {
         }
         DraftError::InvalidName => "名称不能包含控制字符".into(),
         DraftError::InvalidFolder => "文件夹不能包含控制字符".into(),
+        DraftError::TooManyTags(limit) => format!("一个连接最多只能有 {limit} 个标签"),
+        DraftError::TagTooLong(limit) => format!("标签最多只能有 {limit} 个字符"),
         DraftError::InvalidPort => "端口必须是 1 到 65535 之间的数字".into(),
         DraftError::KeyRequired => "请选择私钥文件".into(),
         DraftError::KeyMissing(path) => format!("找不到私钥文件：{path}"),
@@ -10959,7 +11242,7 @@ mod localization_tests {
     }
 
     #[test]
-    fn connection_tags_filter_and_sort_tagged_before_untagged() {
+    fn connection_tags_filter_without_overriding_saved_or_selected_sort() {
         let servers = vec![
             ServerConfig {
                 id: "zeta".into(),
@@ -11016,7 +11299,7 @@ mod localization_tests {
     }
 
     #[test]
-    fn custom_order_moves_within_tagged_and_untagged_partitions() {
+    fn custom_order_moves_freely_across_tag_boundaries() {
         let servers = vec![
             ServerConfig {
                 id: "tagged-a".into(),
@@ -11040,7 +11323,7 @@ mod localization_tests {
 
         assert_eq!(
             moved_connection_order(&servers, "tagged-b", -1).unwrap(),
-            ["tagged-b", "tagged-a", "plain-a", "plain-b"]
+            ["tagged-a", "tagged-b", "plain-a", "plain-b"]
         );
         assert!(!can_move_connection(&servers, "tagged-a", -1));
         assert!(can_move_connection(&servers, "plain-a", 1));
@@ -11053,6 +11336,16 @@ mod localization_tests {
             ["Work", "研究", "Shared"]
         );
         assert!(normalized_tag_name("bad\ntag", Locale::English).is_err());
+        assert!(normalized_tag_name(&"界".repeat(MAX_TAG_CHARS + 1), Locale::English).is_err());
+        assert!(
+            validated_connection_tags(
+                &(0..=MAX_CONNECTION_TAGS)
+                    .map(|index| format!("tag-{index}"))
+                    .collect::<Vec<_>>(),
+                Locale::English,
+            )
+            .is_err()
+        );
     }
 
     #[test]

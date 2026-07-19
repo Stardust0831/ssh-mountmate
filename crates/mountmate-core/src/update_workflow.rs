@@ -15,7 +15,7 @@ use crate::update_helper::{
 use crate::update_install::{
     InstallKind, InstallLayoutError, PayloadError, PreparePayloadError, PreparedPayload,
     TransactionPaths, TransactionPlanError, detect_install_layout, locate_update_payload,
-    plan_transaction_paths, prepare_directory_payload,
+    plan_transaction_paths, prepare_directory_payload, recover_previous_update,
 };
 
 #[derive(Debug, Error)]
@@ -84,6 +84,7 @@ pub fn prepare_update_install(
     if !automatic_update_layout_supported(layout.kind, std::env::consts::OS) {
         return Err(UpdateWorkflowError::UnsupportedOnedir);
     }
+    let _recovered_backup = recover_previous_update(&layout)?;
     let parent = capture_current_process_identity(current_executable)?;
     let helper_executable =
         materialize_update_helper(&paths.update_helper_dir(), current_executable)?;
