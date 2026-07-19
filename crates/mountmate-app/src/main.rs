@@ -5572,9 +5572,7 @@ impl App {
                 .spacing(10)
                 .align_y(Center);
                 if size.width < 860.0 {
-                    column![selection, tagging, completion]
-                        .spacing(10)
-                        .into()
+                    column![selection, tagging, completion].spacing(10).into()
                 } else {
                     row![
                         column![selection, tagging].spacing(8),
@@ -7764,32 +7762,31 @@ fn connection_card<'a>(
     if list_mode == ConnectionListMode::Batch {
         let selection_id = id.clone();
         let startup_id = id.clone();
-        let startup_control: Element<'_, Message> =
-            if login_startup_available && !connection_list_saving {
-                checkbox(auto_mount_at_login)
-                    .label(match locale {
-                        Locale::English => "At login",
-                        Locale::Chinese => "登录自启",
-                    })
-                    .on_toggle(move |enabled| {
-                        Message::BatchStartupChanged(startup_id.clone(), enabled)
-                    })
-                    .into()
-            } else if login_startup_available {
-                checkbox(auto_mount_at_login)
-                    .label(match locale {
-                        Locale::English => "At login",
-                        Locale::Chinese => "登录自启",
-                    })
-                    .into()
-            } else {
-                text(match locale {
-                    Locale::English => "Interactive login",
-                    Locale::Chinese => "交互式登录",
+        let startup_control: Element<'_, Message> = if login_startup_available
+            && !connection_list_saving
+        {
+            checkbox(auto_mount_at_login)
+                .label(match locale {
+                    Locale::English => "At login",
+                    Locale::Chinese => "登录自启",
                 })
-                .size(12)
+                .on_toggle(move |enabled| Message::BatchStartupChanged(startup_id.clone(), enabled))
                 .into()
-            };
+        } else if login_startup_available {
+            checkbox(auto_mount_at_login)
+                .label(match locale {
+                    Locale::English => "At login",
+                    Locale::Chinese => "登录自启",
+                })
+                .into()
+        } else {
+            text(match locale {
+                Locale::English => "Interactive login",
+                Locale::Chinese => "交互式登录",
+            })
+            .size(12)
+            .into()
+        };
         return container(
             row![
                 checkbox(selected).on_toggle(move |selected| {
