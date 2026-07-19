@@ -495,6 +495,7 @@ struct App {
     connection_list_mode: ConnectionListMode,
     selected_connections: HashSet<String>,
     batch_tag_input: String,
+    batch_existing_tag: Option<String>,
     reorder_original: Option<Vec<String>>,
     connection_list_saving: bool,
     service: MountService,
@@ -1085,6 +1086,7 @@ enum Message {
     BatchSelectAllChanged(bool),
     BatchTagSelectionChanged(String, bool),
     BatchTagInputChanged(String),
+    BatchExistingTagChanged(String),
     BatchAddTag,
     RemoveConnectionTag(String, String),
     RemoveTagEverywhere(String),
@@ -1441,6 +1443,7 @@ impl App {
             connection_list_mode: ConnectionListMode::Browse,
             selected_connections: HashSet::new(),
             batch_tag_input: String::new(),
+            batch_existing_tag: None,
             reorder_original: None,
             connection_list_saving: false,
             service,
@@ -1971,6 +1974,7 @@ impl App {
                 self.connection_list_mode = mode;
                 self.selected_connections.clear();
                 self.batch_tag_input.clear();
+                self.batch_existing_tag = None;
             }
             Message::BatchSelectionChanged(id, selected) => {
                 if selected {
@@ -2009,8 +2013,13 @@ impl App {
                 }
             }
             Message::BatchTagInputChanged(value) => self.batch_tag_input = value,
+            Message::BatchExistingTagChanged(tag) => self.batch_existing_tag = Some(tag),
             Message::BatchAddTag => {
-                let tag = match normalized_tag_name(&self.batch_tag_input, locale) {
+                let tag = match batch_tag_to_add(
+                    &self.batch_tag_input,
+                    self.batch_existing_tag.as_deref(),
+                    locale,
+                ) {
                     Ok(tag) => tag,
                     Err(error) => {
                         self.status = error;
@@ -2132,6 +2141,7 @@ impl App {
                         self.connection_tag_filter = None;
                     }
                     self.batch_tag_input.clear();
+                    self.batch_existing_tag = None;
                     self.status = match locale {
                         Locale::English => "Connection changes saved".into(),
                         Locale::Chinese => "连接修改已保存".into(),
@@ -5487,6 +5497,11 @@ impl App {
             self.selected_connections.contains(&server.id)
                 && server.connection_method != ConnectionMethod::Interactive
         });
+        let selected_startup_enabled = selected_login_startup_enabled(
+            &self.settings,
+            &self.servers,
+            &self.selected_connections,
+        );
         let mode_actions: Element<'_, Message> = match self.connection_list_mode {
             ConnectionListMode::Browse => row![
                 button(match locale {
@@ -5527,25 +5542,55 @@ impl App {
                 ]
                 .spacing(10)
                 .align_y(Center);
-                let startup_actions = row![
+                let startup_label = match locale {
+                    Locale::English => "Mount selected connections at login",
+                    Locale::Chinese => "选中连接登录时自动挂载",
+                };
+                let startup_toggle: Element<'_, Message> =
+                    if selected_startup_available && !self.connection_list_saving {
+                        checkbox(selected_startup_enabled)
+                            .label(startup_label)
+                            .on_toggle(Message::BatchStartupSelected)
+                            .into()
+                    } else {
+                        checkbox(selected_startup_enabled)
+                            .label(startup_label)
+                            .into()
+                    };
+                let existing_tags = connection_tags(&self.servers);
+                let tagging = row![
+                    pick_list(
+                        existing_tags,
+                        self.batch_existing_tag.clone(),
+                        Message::BatchExistingTagChanged,
+                    )
+                    .placeholder(match locale {
+                        Locale::English => "Existing tag",
+                        Locale::Chinese => "选择已有标签",
+                    })
+                    .width(Length::Fixed(160.0)),
+                    text_input(
+                        match locale {
+                            Locale::English => "Or create a tag",
+                            Locale::Chinese => "或新建标签",
+                        },
+                        &self.batch_tag_input,
+                    )
+                    .on_input(Message::BatchTagInputChanged)
+                    .width(Length::Fixed(190.0)),
                     button(match locale {
-                        Locale::English => "Enable login startup",
-                        Locale::Chinese => "启用登录自启",
+                        Locale::English => "Add tag",
+                        Locale::Chinese => "添加标签",
                     })
                     .on_press_maybe(
-                        (selected_startup_available && !self.connection_list_saving)
-                            .then_some(Message::BatchStartupSelected(true)),
-                    ),
-                    button(match locale {
-                        Locale::English => "Disable login startup",
-                        Locale::Chinese => "禁用登录自启",
-                    })
-                    .on_press_maybe(
-                        (selected_startup_available && !self.connection_list_saving)
-                            .then_some(Message::BatchStartupSelected(false)),
+                        (selected_any
+                            && !self.connection_list_saving
+                            && (self.batch_existing_tag.is_some()
+                                || !self.batch_tag_input.trim().is_empty()))
+                        .then_some(Message::BatchAddTag),
                     ),
                 ]
-                .spacing(10)
+                .spacing(8)
                 .align_y(Center);
                 let completion = row![
                     button(match locale {
@@ -5567,12 +5612,12 @@ impl App {
                 .spacing(10)
                 .align_y(Center);
                 if size.width < 860.0 {
-                    column![selection, startup_actions, completion]
+                    column![selection, startup_toggle, tagging, completion]
                         .spacing(10)
                         .into()
                 } else {
                     row![
-                        column![selection, startup_actions].spacing(8),
+                        column![selection, startup_toggle, tagging].spacing(8),
                         Space::new().width(Fill),
                         completion
                     ]
@@ -5584,54 +5629,22 @@ impl App {
             .height(Length::Shrink)
             .into(),
             ConnectionListMode::Tags => responsive(move |size| {
-                let selection = row![
-                    checkbox(all_selected)
-                        .label(match locale {
-                            Locale::English => "Select all",
-                            Locale::Chinese => "全选",
-                        })
-                        .on_toggle(Message::BatchSelectAllChanged),
-                    text(match locale {
-                        Locale::English => format!("{selected_count} selected"),
-                        Locale::Chinese => format!("已选择 {selected_count} 个"),
-                    }),
-                ]
-                .spacing(10)
-                .align_y(Center);
-                let tagging = row![
-                    text_input(
-                        match locale {
-                            Locale::English => "Tag name",
-                            Locale::Chinese => "标签名称",
-                        },
-                        &self.batch_tag_input,
-                    )
-                    .on_input(Message::BatchTagInputChanged)
-                    .width(Length::Fixed(170.0)),
-                    button(match locale {
-                        Locale::English => "Add tag",
-                        Locale::Chinese => "添加标签",
-                    })
-                    .on_press_maybe(
-                        (selected_any
-                            && !self.connection_list_saving
-                            && !self.batch_tag_input.trim().is_empty())
-                        .then_some(Message::BatchAddTag),
-                    ),
-                    button(match locale {
-                        Locale::English => "Done",
-                        Locale::Chinese => "完成",
-                    })
-                    .on_press_maybe((!self.connection_list_saving).then_some(
-                        Message::ConnectionListModeChanged(ConnectionListMode::Browse),
-                    )),
-                ]
-                .spacing(10)
-                .align_y(Center);
+                let completion = button(match locale {
+                    Locale::English => "Done",
+                    Locale::Chinese => "完成",
+                })
+                .on_press_maybe((!self.connection_list_saving).then_some(
+                    Message::ConnectionListModeChanged(ConnectionListMode::Browse),
+                ));
+                let hint = text(match locale {
+                    Locale::English => "Remove a tag everywhere with its x button below.",
+                    Locale::Chinese => "点击下方标签右侧的 x 可从所有连接中移除该标签。",
+                })
+                .size(13);
                 if size.width < 760.0 {
-                    column![selection, tagging].spacing(10).into()
+                    column![hint, completion].spacing(10).into()
                 } else {
-                    row![selection, Space::new().width(Fill), tagging]
+                    row![hint, Space::new().width(Fill), completion]
                         .spacing(10)
                         .align_y(Center)
                         .into()
@@ -7788,10 +7801,7 @@ fn connection_card<'a>(
             .style(container::rounded_box),
         );
     }
-    if matches!(
-        list_mode,
-        ConnectionListMode::Batch | ConnectionListMode::Tags
-    ) {
+    if list_mode == ConnectionListMode::Batch {
         let selection_id = id.clone();
         return container(
             row![
@@ -8285,6 +8295,24 @@ fn startup_servers(settings: &Settings, servers: &[ServerConfig]) -> Vec<ServerC
         .collect()
 }
 
+fn selected_login_startup_enabled(
+    settings: &Settings,
+    servers: &[ServerConfig],
+    selected: &HashSet<String>,
+) -> bool {
+    let eligible = servers.iter().filter(|server| {
+        selected.contains(&server.id) && server.connection_method != ConnectionMethod::Interactive
+    });
+    let mut has_eligible = false;
+    for server in eligible {
+        has_eligible = true;
+        if !(settings.startup_all || server.auto_mount_at_login) {
+            return false;
+        }
+    }
+    has_eligible
+}
+
 fn servers_require_system_credentials(servers: &[ServerConfig]) -> bool {
     servers.iter().any(|server| {
         (!server.password_credential.is_empty() && server.password_obscured.is_empty())
@@ -8332,6 +8360,19 @@ fn validated_connection_tags(tags: &[String], locale: Locale) -> Result<Vec<Stri
         });
     }
     Ok(normalized)
+}
+
+fn batch_tag_to_add(
+    new_tag: &str,
+    existing_tag: Option<&str>,
+    locale: Locale,
+) -> Result<String, String> {
+    let tag = if new_tag.trim().is_empty() {
+        existing_tag.unwrap_or_default()
+    } else {
+        new_tag
+    };
+    normalized_tag_name(tag, locale)
 }
 
 fn startup_integration_enabled(settings: &Settings, servers: &[ServerConfig]) -> bool {
@@ -10951,6 +10992,45 @@ mod localization_tests {
     }
 
     #[test]
+    fn batch_login_startup_checkbox_requires_every_selected_eligible_connection() {
+        let servers = vec![
+            ServerConfig {
+                id: "enabled".into(),
+                auto_mount_at_login: true,
+                ..ServerConfig::default()
+            },
+            ServerConfig {
+                id: "disabled".into(),
+                auto_mount_at_login: false,
+                ..ServerConfig::default()
+            },
+            ServerConfig {
+                id: "interactive".into(),
+                connection_method: ConnectionMethod::Interactive,
+                auto_mount_at_login: true,
+                ..ServerConfig::default()
+            },
+        ];
+        let settings = Settings::default();
+
+        assert!(selected_login_startup_enabled(
+            &settings,
+            &servers,
+            &HashSet::from(["enabled".into(), "interactive".into()]),
+        ));
+        assert!(!selected_login_startup_enabled(
+            &settings,
+            &servers,
+            &HashSet::from(["enabled".into(), "disabled".into()]),
+        ));
+        assert!(!selected_login_startup_enabled(
+            &settings,
+            &servers,
+            &HashSet::from(["interactive".into()]),
+        ));
+    }
+
+    #[test]
     fn legacy_startup_all_migrates_to_per_connection_preferences() {
         let temp = tempfile::tempdir().unwrap();
         let paths = AppPaths {
@@ -11346,6 +11426,19 @@ mod localization_tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn batch_tag_addition_accepts_existing_or_new_tag_with_new_input_taking_priority() {
+        assert_eq!(
+            batch_tag_to_add("", Some("Work"), Locale::English).unwrap(),
+            "Work"
+        );
+        assert_eq!(
+            batch_tag_to_add("  Research ", Some("Work"), Locale::English).unwrap(),
+            "Research"
+        );
+        assert!(batch_tag_to_add("", None, Locale::English).is_err());
     }
 
     #[test]
