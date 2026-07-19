@@ -8,6 +8,8 @@ pub const SETTINGS_SCHEMA_VERSION: u32 = 14;
 pub const DEFAULT_VFS_UPLOAD_TRANSFERS: u16 = 4;
 pub const MIN_VFS_UPLOAD_TRANSFERS: u16 = 1;
 pub const MAX_VFS_UPLOAD_TRANSFERS: u16 = 32;
+pub const MAX_CONNECTION_TAGS: usize = 8;
+pub const MAX_TAG_CHARS: usize = 24;
 
 fn default_port() -> String {
     "22".into()

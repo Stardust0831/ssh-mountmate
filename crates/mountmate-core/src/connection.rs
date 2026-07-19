@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::model::{normalize_port, normalize_tags, sanitize_id};
+use crate::model::{
+    MAX_CONNECTION_TAGS, MAX_TAG_CHARS, normalize_port, normalize_tags, sanitize_id,
+};
 use crate::mountpoint::HOME_MOUNTPOINT_VALUE;
 use crate::{AuthMethod, ConnectionMethod, ServerConfig};
 
@@ -520,6 +522,10 @@ pub enum DraftError {
     InvalidName,
     #[error("Folder must not contain control characters")]
     InvalidFolder,
+    #[error("A connection may have at most {0} tags")]
+    TooManyTags(usize),
+    #[error("Tag must be at most {0} Unicode characters")]
+    TagTooLong(usize),
     #[error("Port must be a number from 1 to 65535")]
     InvalidPort,
     #[error("Select a private key file")]
@@ -577,6 +583,15 @@ fn validate_tags(tags: &[String], legacy_folder: &str) -> Result<Vec<String>, Dr
     }
     let mut normalized = tags.to_vec();
     normalize_tags(&mut normalized, legacy_folder);
+    if normalized.len() > MAX_CONNECTION_TAGS {
+        return Err(DraftError::TooManyTags(MAX_CONNECTION_TAGS));
+    }
+    if normalized
+        .iter()
+        .any(|tag| tag.chars().count() > MAX_TAG_CHARS)
+    {
+        return Err(DraftError::TagTooLong(MAX_TAG_CHARS));
+    }
     Ok(normalized)
 }
 
@@ -1209,6 +1224,22 @@ mod tests {
             ..ConnectionDraft::default()
         };
         assert_eq!(draft.validate(&[]), Err(DraftError::InvalidFolder));
+    }
+
+    #[test]
+    fn tags_enforce_count_and_unicode_length_limits() {
+        let too_many = (0..=crate::model::MAX_CONNECTION_TAGS)
+            .map(|index| format!("tag-{index}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            validate_tags(&too_many, ""),
+            Err(DraftError::TooManyTags(crate::model::MAX_CONNECTION_TAGS))
+        );
+        let too_long = vec!["界".repeat(crate::model::MAX_TAG_CHARS + 1)];
+        assert_eq!(
+            validate_tags(&too_long, ""),
+            Err(DraftError::TagTooLong(crate::model::MAX_TAG_CHARS))
+        );
     }
 
     #[test]

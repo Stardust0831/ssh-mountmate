@@ -380,6 +380,89 @@ pub fn plan_transaction_paths(
     Ok(TransactionPaths { prepared, backup })
 }
 
+/// Finish an interrupted update transaction before preparing a new one.
+///
+/// A healthy relaunch normally removes the backup, but a power loss or a
+/// failed helper cleanup can leave it behind. The current executable is the
+/// authoritative installation when it still exists. Preserve the stale entry
+/// under a unique recovery name instead of deleting an unauthenticated path.
+pub fn recover_previous_update(
+    layout: &InstallLayout,
+) -> Result<Option<PathBuf>, TransactionPlanError> {
+    let parent = layout
+        .replace_path
+        .parent()
+        .ok_or_else(|| TransactionPlanError::MissingParent(layout.replace_path.clone()))?;
+    let name = layout
+        .replace_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| TransactionPlanError::MissingName(layout.replace_path.clone()))?;
+    let backup = parent.join(transaction_file_name(name, layout.kind, "backup", None));
+    let backup_metadata = match fs::symlink_metadata(&backup) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(TransactionPlanError::Inspect {
+                path: backup,
+                source,
+            });
+        }
+    };
+    let directory_install = matches!(
+        layout.kind,
+        InstallKind::DirectoryBundle | InstallKind::MacApplicationBundle
+    );
+    if backup_metadata.file_type().is_symlink()
+        || (!directory_install && !backup_metadata.is_file())
+        || (directory_install && !backup_metadata.is_dir())
+    {
+        return Err(TransactionPlanError::Inspect {
+            path: backup,
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                "previous update backup has an unexpected file type",
+            ),
+        });
+    }
+
+    match fs::symlink_metadata(&layout.replace_path) {
+        Ok(target) => {
+            let target_is_valid = !target.file_type().is_symlink()
+                && ((directory_install && target.is_dir())
+                    || (!directory_install && target.is_file()));
+            if !target_is_valid {
+                return Err(TransactionPlanError::Inspect {
+                    path: layout.replace_path.clone(),
+                    source: io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "current installation has an unexpected file type",
+                    ),
+                });
+            }
+            let token = Uuid::new_v4().simple().to_string();
+            let recovered = parent.join(transaction_file_name(
+                name,
+                layout.kind,
+                "recovered",
+                Some(&token),
+            ));
+            rename_no_replace(&backup, &recovered).map_err(|source| {
+                TransactionPlanError::Inspect {
+                    path: backup,
+                    source,
+                }
+            })?;
+            Ok(Some(recovered))
+        }
+        Err(source) => Err(TransactionPlanError::Inspect {
+            path: layout.replace_path.clone(),
+            source,
+        }),
+    }
+}
+
 pub fn prepare_directory_payload(
     layout: &InstallLayout,
     payload: &DirectoryPayload,
@@ -1548,7 +1631,7 @@ mod tests {
     }
 
     #[test]
-    fn transaction_paths_are_siblings_and_existing_backups_block_updates() {
+    fn interrupted_backup_is_preserved_before_a_new_transaction() {
         let temp = tempdir().unwrap();
         let executable = temp.path().join("SSHMountMate");
         create_file(&executable);
@@ -1561,10 +1644,29 @@ mod tests {
         assert_ne!(transaction.prepared, transaction.backup);
 
         create_file(&transaction.backup);
-        assert!(matches!(
-            plan_transaction_paths(&layout),
-            Err(TransactionPlanError::BackupExists(_))
-        ));
+        let recovered = recover_previous_update(&layout).unwrap().unwrap();
+        assert!(!transaction.backup.exists());
+        assert_eq!(fs::read(recovered).unwrap(), b"binary");
+        let next = plan_transaction_paths(&layout).unwrap();
+        assert_eq!(next.backup, transaction.backup);
+    }
+
+    #[test]
+    fn mac_application_backup_is_preserved_as_a_directory() {
+        let temp = tempdir().unwrap();
+        let application = temp.path().join("SSH MountMate.app");
+        let executable = create_mac_application(&application, b"current application");
+        let layout = detect_install_layout_for(&executable, "macos", temp.path()).unwrap();
+        let transaction = plan_transaction_paths(&layout).unwrap();
+        create_mac_application(&transaction.backup, b"previous application");
+
+        let recovered = recover_previous_update(&layout).unwrap().unwrap();
+        assert!(recovered.is_dir());
+        assert_eq!(
+            fs::read(recovered.join("Contents/MacOS/SSHMountMate")).unwrap(),
+            b"previous application"
+        );
+        assert!(!transaction.backup.exists());
     }
 
     #[test]

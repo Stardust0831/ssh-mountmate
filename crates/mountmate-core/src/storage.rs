@@ -211,6 +211,27 @@ pub fn update_server_preferences_batch(
                 update.id
             )));
         }
+        if let Some(tags) = &update.tags {
+            let mut normalized_tags = tags.clone();
+            crate::model::normalize_tags(&mut normalized_tags, "");
+            if normalized_tags.len() > crate::model::MAX_CONNECTION_TAGS {
+                return Err(StorageError::InvalidPreferenceUpdate(format!(
+                    "connection {} may have at most {} tags",
+                    update.id,
+                    crate::model::MAX_CONNECTION_TAGS
+                )));
+            }
+            if normalized_tags
+                .iter()
+                .any(|tag| tag.chars().count() > crate::model::MAX_TAG_CHARS)
+            {
+                return Err(StorageError::InvalidPreferenceUpdate(format!(
+                    "tags for connection {} must be at most {} Unicode characters each",
+                    update.id,
+                    crate::model::MAX_TAG_CHARS
+                )));
+            }
+        }
         let server = servers
             .iter_mut()
             .find(|server| server.id == update.id)
@@ -1057,6 +1078,51 @@ mod tests {
         assert_eq!(startup_only[0].tags, vec!["Work", "研究"]);
         assert_eq!(startup_only[0].folder, "Work");
         assert!(!startup_only[0].auto_mount_at_login);
+    }
+
+    #[test]
+    fn batch_preferences_reject_tag_limits() {
+        let temp = tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: temp.path().join("config"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            data_dir: temp.path().join("data"),
+        };
+        save_servers(
+            &paths,
+            &[ServerConfig {
+                id: "alpha".into(),
+                ..ServerConfig::default()
+            }],
+        )
+        .unwrap();
+        let too_many = (0..=crate::model::MAX_CONNECTION_TAGS)
+            .map(|i| format!("tag-{i}"))
+            .collect();
+        assert!(
+            update_server_preferences_batch(
+                &paths,
+                &[ServerPreferenceUpdate {
+                    id: "alpha".into(),
+                    tags: Some(too_many),
+                    auto_mount_at_login: None
+                }]
+            )
+            .is_err()
+        );
+        let too_long = vec!["界".repeat(crate::model::MAX_TAG_CHARS + 1)];
+        assert!(
+            update_server_preferences_batch(
+                &paths,
+                &[ServerPreferenceUpdate {
+                    id: "alpha".into(),
+                    tags: Some(too_long),
+                    auto_mount_at_login: None
+                }]
+            )
+            .is_err()
+        );
     }
 
     #[test]
