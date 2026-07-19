@@ -5517,6 +5517,51 @@ impl App {
                 ]
                 .spacing(10)
                 .align_y(Center);
+                let completion = row![
+                    button(match locale {
+                        Locale::English => "Delete connections",
+                        Locale::Chinese => "删除连接",
+                    })
+                    .on_press_maybe(
+                        (selected_can_delete && !self.connection_list_saving)
+                            .then_some(Message::BatchDeleteSelected),
+                    ),
+                    button(match locale {
+                        Locale::English => "Done",
+                        Locale::Chinese => "完成",
+                    })
+                    .on_press_maybe((!self.connection_list_saving).then_some(
+                        Message::ConnectionListModeChanged(ConnectionListMode::Browse),
+                    )),
+                ]
+                .spacing(10)
+                .align_y(Center);
+                if size.width < 860.0 {
+                    column![selection, completion].spacing(10).into()
+                } else {
+                    row![selection, Space::new().width(Fill), completion]
+                        .spacing(10)
+                        .align_y(Center)
+                        .into()
+                }
+            })
+            .height(Length::Shrink)
+            .into(),
+            ConnectionListMode::Tags => responsive(move |size| {
+                let selection = row![
+                    checkbox(all_selected)
+                        .label(match locale {
+                            Locale::English => "Select all",
+                            Locale::Chinese => "全选",
+                        })
+                        .on_toggle(Message::BatchSelectAllChanged),
+                    text(match locale {
+                        Locale::English => format!("{selected_count} selected"),
+                        Locale::Chinese => format!("已选择 {selected_count} 个"),
+                    }),
+                ]
+                .spacing(10)
+                .align_y(Center);
                 let existing_tags = connection_tags(&self.servers);
                 let tagging = row![
                     pick_list(
@@ -5552,26 +5597,14 @@ impl App {
                 ]
                 .spacing(8)
                 .align_y(Center);
-                let completion = row![
-                    button(match locale {
-                        Locale::English => "Delete connections",
-                        Locale::Chinese => "删除连接",
-                    })
-                    .on_press_maybe(
-                        (selected_can_delete && !self.connection_list_saving)
-                            .then_some(Message::BatchDeleteSelected),
-                    ),
-                    button(match locale {
-                        Locale::English => "Done",
-                        Locale::Chinese => "完成",
-                    })
-                    .on_press_maybe((!self.connection_list_saving).then_some(
-                        Message::ConnectionListModeChanged(ConnectionListMode::Browse),
-                    )),
-                ]
-                .spacing(10)
-                .align_y(Center);
-                if size.width < 860.0 {
+                let completion = button(match locale {
+                    Locale::English => "Done",
+                    Locale::Chinese => "完成",
+                })
+                .on_press_maybe((!self.connection_list_saving).then_some(
+                    Message::ConnectionListModeChanged(ConnectionListMode::Browse),
+                ));
+                if size.width < 760.0 {
                     column![selection, tagging, completion].spacing(10).into()
                 } else {
                     row![
@@ -5582,30 +5615,6 @@ impl App {
                     .spacing(10)
                     .align_y(Center)
                     .into()
-                }
-            })
-            .height(Length::Shrink)
-            .into(),
-            ConnectionListMode::Tags => responsive(move |size| {
-                let completion = button(match locale {
-                    Locale::English => "Done",
-                    Locale::Chinese => "完成",
-                })
-                .on_press_maybe((!self.connection_list_saving).then_some(
-                    Message::ConnectionListModeChanged(ConnectionListMode::Browse),
-                ));
-                let hint = text(match locale {
-                    Locale::English => "Remove a tag everywhere with its x button below.",
-                    Locale::Chinese => "点击下方标签右侧的 x 可从所有连接中移除该标签。",
-                })
-                .size(13);
-                if size.width < 760.0 {
-                    column![hint, completion].spacing(10).into()
-                } else {
-                    row![hint, Space::new().width(Fill), completion]
-                        .spacing(10)
-                        .align_y(Center)
-                        .into()
                 }
             })
             .height(Length::Shrink)
@@ -7759,8 +7768,27 @@ fn connection_card<'a>(
             .style(container::rounded_box),
         );
     }
-    if list_mode == ConnectionListMode::Batch {
+    if matches!(
+        list_mode,
+        ConnectionListMode::Batch | ConnectionListMode::Tags
+    ) {
         let selection_id = id.clone();
+        if list_mode == ConnectionListMode::Tags {
+            return container(
+                row![
+                    checkbox(selected).on_toggle(move |selected| {
+                        Message::BatchSelectionChanged(selection_id.clone(), selected)
+                    }),
+                    details,
+                ]
+                .spacing(12)
+                .align_y(Center),
+            )
+            .padding(16)
+            .width(Fill)
+            .style(container::rounded_box)
+            .into();
+        }
         let startup_id = id.clone();
         let startup_control: Element<'_, Message> = if login_startup_available
             && !connection_list_saving
