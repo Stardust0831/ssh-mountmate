@@ -495,6 +495,7 @@ struct App {
     connection_list_mode: ConnectionListMode,
     selected_connections: HashSet<String>,
     batch_tag_input: String,
+    batch_existing_tag: Option<String>,
     reorder_original: Option<Vec<String>>,
     connection_list_saving: bool,
     service: MountService,
@@ -1085,6 +1086,7 @@ enum Message {
     BatchSelectAllChanged(bool),
     BatchTagSelectionChanged(String, bool),
     BatchTagInputChanged(String),
+    BatchExistingTagChanged(String),
     BatchAddTag,
     RemoveConnectionTag(String, String),
     RemoveTagEverywhere(String),
@@ -1441,6 +1443,7 @@ impl App {
             connection_list_mode: ConnectionListMode::Browse,
             selected_connections: HashSet::new(),
             batch_tag_input: String::new(),
+            batch_existing_tag: None,
             reorder_original: None,
             connection_list_saving: false,
             service,
@@ -1971,6 +1974,7 @@ impl App {
                 self.connection_list_mode = mode;
                 self.selected_connections.clear();
                 self.batch_tag_input.clear();
+                self.batch_existing_tag = None;
             }
             Message::BatchSelectionChanged(id, selected) => {
                 if selected {
@@ -2009,8 +2013,13 @@ impl App {
                 }
             }
             Message::BatchTagInputChanged(value) => self.batch_tag_input = value,
+            Message::BatchExistingTagChanged(tag) => self.batch_existing_tag = Some(tag),
             Message::BatchAddTag => {
-                let tag = match normalized_tag_name(&self.batch_tag_input, locale) {
+                let tag = match batch_tag_to_add(
+                    &self.batch_tag_input,
+                    self.batch_existing_tag.as_deref(),
+                    locale,
+                ) {
                     Ok(tag) => tag,
                     Err(error) => {
                         self.status = error;
@@ -2132,6 +2141,7 @@ impl App {
                         self.connection_tag_filter = None;
                     }
                     self.batch_tag_input.clear();
+                    self.batch_existing_tag = None;
                     self.status = match locale {
                         Locale::English => "Connection changes saved".into(),
                         Locale::Chinese => "连接修改已保存".into(),
@@ -5546,11 +5556,22 @@ impl App {
                 } else {
                     checkbox(selected_startup_enabled).label(startup_label).into()
                 };
+                let existing_tags = connection_tags(&self.servers);
                 let tagging = row![
+                    pick_list(
+                        existing_tags,
+                        self.batch_existing_tag.clone(),
+                        Message::BatchExistingTagChanged,
+                    )
+                    .placeholder(match locale {
+                        Locale::English => "Existing tag",
+                        Locale::Chinese => "选择已有标签",
+                    })
+                    .width(Length::Fixed(160.0)),
                     text_input(
                         match locale {
-                            Locale::English => "Add tag to selected",
-                            Locale::Chinese => "为选中连接添加标签",
+                            Locale::English => "Or create a tag",
+                            Locale::Chinese => "或新建标签",
                         },
                         &self.batch_tag_input,
                     )
@@ -5563,7 +5584,8 @@ impl App {
                     .on_press_maybe(
                         (selected_any
                             && !self.connection_list_saving
-                            && !self.batch_tag_input.trim().is_empty())
+                            && (self.batch_existing_tag.is_some()
+                                || !self.batch_tag_input.trim().is_empty()))
                         .then_some(Message::BatchAddTag),
                     ),
                 ]
@@ -8337,6 +8359,19 @@ fn validated_connection_tags(tags: &[String], locale: Locale) -> Result<Vec<Stri
         });
     }
     Ok(normalized)
+}
+
+fn batch_tag_to_add(
+    new_tag: &str,
+    existing_tag: Option<&str>,
+    locale: Locale,
+) -> Result<String, String> {
+    let tag = if new_tag.trim().is_empty() {
+        existing_tag.unwrap_or_default()
+    } else {
+        new_tag
+    };
+    normalized_tag_name(tag, locale)
 }
 
 fn startup_integration_enabled(settings: &Settings, servers: &[ServerConfig]) -> bool {
@@ -11390,6 +11425,19 @@ mod localization_tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn batch_tag_addition_accepts_existing_or_new_tag_with_new_input_taking_priority() {
+        assert_eq!(
+            batch_tag_to_add("", Some("Work"), Locale::English).unwrap(),
+            "Work"
+        );
+        assert_eq!(
+            batch_tag_to_add("  Research ", Some("Work"), Locale::English).unwrap(),
+            "Research"
+        );
+        assert!(batch_tag_to_add("", None, Locale::English).is_err());
     }
 
     #[test]
