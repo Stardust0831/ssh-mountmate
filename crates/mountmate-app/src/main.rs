@@ -5546,16 +5546,17 @@ impl App {
                     Locale::English => "Mount selected connections at login",
                     Locale::Chinese => "选中连接登录时自动挂载",
                 };
-                let startup_toggle: Element<'_, Message> = if selected_startup_available
-                    && !self.connection_list_saving
-                {
-                    checkbox(selected_startup_enabled)
-                        .label(startup_label)
-                        .on_toggle(Message::BatchStartupSelected)
-                        .into()
-                } else {
-                    checkbox(selected_startup_enabled).label(startup_label).into()
-                };
+                let startup_toggle: Element<'_, Message> =
+                    if selected_startup_available && !self.connection_list_saving {
+                        checkbox(selected_startup_enabled)
+                            .label(startup_label)
+                            .on_toggle(Message::BatchStartupSelected)
+                            .into()
+                    } else {
+                        checkbox(selected_startup_enabled)
+                            .label(startup_label)
+                            .into()
+                    };
                 let existing_tags = connection_tags(&self.servers);
                 let tagging = row![
                     pick_list(
@@ -5629,12 +5630,12 @@ impl App {
             .into(),
             ConnectionListMode::Tags => responsive(move |size| {
                 let completion = button(match locale {
-                        Locale::English => "Done",
-                        Locale::Chinese => "完成",
-                    })
-                    .on_press_maybe((!self.connection_list_saving).then_some(
-                        Message::ConnectionListModeChanged(ConnectionListMode::Browse),
-                    ));
+                    Locale::English => "Done",
+                    Locale::Chinese => "完成",
+                })
+                .on_press_maybe((!self.connection_list_saving).then_some(
+                    Message::ConnectionListModeChanged(ConnectionListMode::Browse),
+                ));
                 let hint = text(match locale {
                     Locale::English => "Remove a tag everywhere with its x button below.",
                     Locale::Chinese => "点击下方标签右侧的 x 可从所有连接中移除该标签。",
