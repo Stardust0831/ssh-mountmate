@@ -824,6 +824,12 @@ enum ConnectionSort {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionSortMenuAction {
+    Sort(ConnectionSort),
+    AdjustSavedOrder,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StatusPublishPolicy {
     Initial,
     UserRefresh,
@@ -1079,7 +1085,7 @@ enum Message {
     WindowClosed(window::Id),
     AddConnection,
     ConnectionSearchChanged(String),
-    ConnectionSortChanged(ConnectionSort),
+    ConnectionSortMenuChanged(ConnectionSortMenuAction),
     ConnectionTagFilterChanged(Option<String>),
     ConnectionListModeChanged(ConnectionListMode),
     BatchSelectionChanged(String, bool),
@@ -1097,11 +1103,8 @@ enum Message {
     BatchTagsSaved(Result<Vec<ServerConfig>, String>),
     BatchMountSelected,
     BatchUnmountSelected,
-    BatchStartupSelected(bool),
-    BatchStartupSaved {
-        skipped: usize,
-        result: Result<ServerMutation, String>,
-    },
+    BatchStartupChanged(String, bool),
+    BatchStartupSaved(Result<ServerMutation, String>),
     BatchDeleteSelected,
     BatchDeleteDecision {
         ids: Vec<String>,
@@ -1952,7 +1955,14 @@ impl App {
                 self.status = locale.text(TextKey::NewConnection).into();
             }
             Message::ConnectionSearchChanged(value) => self.connection_search = value,
-            Message::ConnectionSortChanged(value) => self.connection_sort = value,
+            Message::ConnectionSortMenuChanged(action) => match action {
+                ConnectionSortMenuAction::Sort(value) => self.connection_sort = value,
+                ConnectionSortMenuAction::AdjustSavedOrder => {
+                    return self.update(Message::ConnectionListModeChanged(
+                        ConnectionListMode::Reorder,
+                    ));
+                }
+            },
             Message::ConnectionTagFilterChanged(tag) => self.connection_tag_filter = tag,
             Message::ConnectionListModeChanged(mode) => {
                 if self.connection_list_saving || self.editor_saving {
@@ -2181,31 +2191,15 @@ impl App {
                 }
                 return Task::batch(tasks);
             }
-            Message::BatchStartupSelected(enabled) => {
+            Message::BatchStartupChanged(id, enabled) => {
                 if self.editor_saving || self.connection_list_saving {
                     return Task::none();
                 }
-                let updates = self
-                    .servers
-                    .iter()
-                    .filter(|server| {
-                        self.selected_connections.contains(&server.id)
-                            && server.connection_method != ConnectionMethod::Interactive
-                    })
-                    .map(|server| storage::ServerPreferenceUpdate {
-                        id: server.id.clone(),
-                        tags: None,
-                        auto_mount_at_login: Some(enabled),
-                    })
-                    .collect::<Vec<_>>();
-                let skipped = self
-                    .servers
-                    .iter()
-                    .filter(|server| {
-                        self.selected_connections.contains(&server.id)
-                            && server.connection_method == ConnectionMethod::Interactive
-                    })
-                    .count();
+                let updates = vec![storage::ServerPreferenceUpdate {
+                    id,
+                    tags: None,
+                    auto_mount_at_login: Some(enabled),
+                }];
                 let startup = self.startup_integration_lock.clone();
                 let paths = self.paths.clone();
                 self.connection_list_saving = true;
@@ -2230,27 +2224,17 @@ impl App {
                         .await
                         .unwrap_or_else(|error| Err(error.to_string()))
                     },
-                    move |result| Message::BatchStartupSaved { skipped, result },
+                    Message::BatchStartupSaved,
                 );
             }
-            Message::BatchStartupSaved { skipped, result } => {
+            Message::BatchStartupSaved(result) => {
                 self.connection_list_saving = false;
                 match result {
                     Ok(outcome) => {
                         self.servers = outcome.servers;
-                        let skipped_notice = (skipped > 0).then(|| match locale {
-                            Locale::English => format!(
-                                "{skipped} interactive connection(s) were skipped because they require a live login session"
-                            ),
-                            Locale::Chinese => format!(
-                                "已跳过 {skipped} 个交互式连接，因为它们需要实时登录会话"
-                            ),
-                        });
-                        self.status = match (outcome.warning, skipped_notice) {
-                            (Some(warning), Some(skipped)) => format!("{warning}; {skipped}"),
-                            (Some(warning), None) => warning,
-                            (None, Some(skipped)) => skipped,
-                            (None, None) => match locale {
+                        self.status = match outcome.warning {
+                            Some(warning) => warning,
+                            None => match locale {
                                 Locale::English => "Login startup preferences saved".into(),
                                 Locale::Chinese => "登录自启设置已保存".into(),
                             },
@@ -5493,15 +5477,6 @@ impl App {
                 .selected_connections
                 .iter()
                 .all(|id| self.can_modify(id));
-        let selected_startup_available = self.servers.iter().any(|server| {
-            self.selected_connections.contains(&server.id)
-                && server.connection_method != ConnectionMethod::Interactive
-        });
-        let selected_startup_enabled = selected_login_startup_enabled(
-            &self.settings,
-            &self.servers,
-            &self.selected_connections,
-        );
         let mode_actions: Element<'_, Message> = match self.connection_list_mode {
             ConnectionListMode::Browse => row![
                 button(match locale {
@@ -5542,21 +5517,6 @@ impl App {
                 ]
                 .spacing(10)
                 .align_y(Center);
-                let startup_label = match locale {
-                    Locale::English => "Mount selected connections at login",
-                    Locale::Chinese => "选中连接登录时自动挂载",
-                };
-                let startup_toggle: Element<'_, Message> =
-                    if selected_startup_available && !self.connection_list_saving {
-                        checkbox(selected_startup_enabled)
-                            .label(startup_label)
-                            .on_toggle(Message::BatchStartupSelected)
-                            .into()
-                    } else {
-                        checkbox(selected_startup_enabled)
-                            .label(startup_label)
-                            .into()
-                    };
                 let existing_tags = connection_tags(&self.servers);
                 let tagging = row![
                     pick_list(
@@ -5612,12 +5572,12 @@ impl App {
                 .spacing(10)
                 .align_y(Center);
                 if size.width < 860.0 {
-                    column![selection, startup_toggle, tagging, completion]
+                    column![selection, tagging, completion]
                         .spacing(10)
                         .into()
                 } else {
                     row![
-                        column![selection, startup_toggle, tagging].spacing(8),
+                        column![selection, tagging].spacing(8),
                         Space::new().width(Fill),
                         completion
                     ]
@@ -5678,7 +5638,22 @@ impl App {
             .into(),
         };
 
-        let sort_options = localized_choices(ConnectionSort::ALL, locale, Locale::connection_sort);
+        let mut sort_options = ConnectionSort::ALL
+            .into_iter()
+            .map(|value| {
+                locale.choice(
+                    ConnectionSortMenuAction::Sort(value),
+                    locale.connection_sort(value),
+                )
+            })
+            .collect::<Vec<_>>();
+        sort_options.push(locale.choice(
+            ConnectionSortMenuAction::AdjustSavedOrder,
+            match locale {
+                Locale::English => "⚙ Adjust saved order",
+                Locale::Chinese => "⚙ 调整保存顺序",
+            },
+        ));
         let organization = responsive(move |size| {
             let search: Element<'_, Message> =
                 if self.connection_list_mode == ConnectionListMode::Reorder {
@@ -5696,40 +5671,21 @@ impl App {
                     .width(Fill)
                     .into()
                 };
-            let mut sort: Element<'_, Message> =
+            let sort: Element<'_, Message> =
                 if self.connection_list_mode == ConnectionListMode::Reorder {
                     text(locale.connection_sort(ConnectionSort::SavedOrder)).into()
                 } else {
                     pick_list(
                         sort_options.clone(),
                         Some(locale.choice(
-                            self.connection_sort,
+                            ConnectionSortMenuAction::Sort(self.connection_sort),
                             locale.connection_sort(self.connection_sort),
                         )),
-                        |choice| Message::ConnectionSortChanged(choice.value),
+                        |choice| Message::ConnectionSortMenuChanged(choice.value),
                     )
                     .placeholder(locale.text(TextKey::SortConnections))
                     .into()
                 };
-            if self.connection_list_mode == ConnectionListMode::Browse {
-                sort = row![
-                    container(sort).width(Length::Fixed(180.0)),
-                    tooltip(
-                        button("↕").on_press(Message::ConnectionListModeChanged(
-                            ConnectionListMode::Reorder,
-                        )),
-                        container(text(match locale {
-                            Locale::English => "Adjust saved order",
-                            Locale::Chinese => "调整保存顺序",
-                        }))
-                        .padding(6),
-                        tooltip::Position::FollowCursor,
-                    ),
-                ]
-                .spacing(6)
-                .align_y(Center)
-                .into();
-            }
             if size.width < 620.0 {
                 column![search, container(sort).width(Fill)]
                     .spacing(10)
@@ -5869,6 +5825,8 @@ impl App {
                         auto_mount_at_login: (self.settings.startup_all
                             || server.auto_mount_at_login)
                             && server.connection_method != ConnectionMethod::Interactive,
+                        login_startup_available: server.connection_method
+                            != ConnectionMethod::Interactive,
                         list_mode: self.connection_list_mode,
                         selected: self.selected_connections.contains(&server.id),
                         can_move_up: can_move_connection(&self.servers, &server.id, -1),
@@ -7572,6 +7530,7 @@ struct ConnectionCardState<'a> {
     operation_error: Option<&'a ConnectionOperationError>,
     has_interactive_terminal: bool,
     auto_mount_at_login: bool,
+    login_startup_available: bool,
     list_mode: ConnectionListMode,
     selected: bool,
     can_move_up: bool,
@@ -7658,6 +7617,7 @@ fn connection_card<'a>(
         operation_error,
         has_interactive_terminal,
         auto_mount_at_login,
+        login_startup_available,
         list_mode,
         selected,
         can_move_up,
@@ -7694,7 +7654,7 @@ fn connection_card<'a>(
     let mut title = row![text(server.display_name()).size(22)]
         .spacing(8)
         .align_y(Center);
-    if auto_mount_at_login {
+    if auto_mount_at_login && list_mode != ConnectionListMode::Batch {
         title = title.push(
             text(match locale {
                 Locale::English => "At login",
@@ -7803,12 +7763,40 @@ fn connection_card<'a>(
     }
     if list_mode == ConnectionListMode::Batch {
         let selection_id = id.clone();
+        let startup_id = id.clone();
+        let startup_control: Element<'_, Message> =
+            if login_startup_available && !connection_list_saving {
+                checkbox(auto_mount_at_login)
+                    .label(match locale {
+                        Locale::English => "At login",
+                        Locale::Chinese => "登录自启",
+                    })
+                    .on_toggle(move |enabled| {
+                        Message::BatchStartupChanged(startup_id.clone(), enabled)
+                    })
+                    .into()
+            } else if login_startup_available {
+                checkbox(auto_mount_at_login)
+                    .label(match locale {
+                        Locale::English => "At login",
+                        Locale::Chinese => "登录自启",
+                    })
+                    .into()
+            } else {
+                text(match locale {
+                    Locale::English => "Interactive login",
+                    Locale::Chinese => "交互式登录",
+                })
+                .size(12)
+                .into()
+            };
         return container(
             row![
                 checkbox(selected).on_toggle(move |selected| {
                     Message::BatchSelectionChanged(selection_id.clone(), selected)
                 }),
                 details,
+                startup_control,
             ]
             .spacing(12)
             .align_y(Center),
@@ -8293,24 +8281,6 @@ fn startup_servers(settings: &Settings, servers: &[ServerConfig]) -> Vec<ServerC
         })
         .cloned()
         .collect()
-}
-
-fn selected_login_startup_enabled(
-    settings: &Settings,
-    servers: &[ServerConfig],
-    selected: &HashSet<String>,
-) -> bool {
-    let eligible = servers.iter().filter(|server| {
-        selected.contains(&server.id) && server.connection_method != ConnectionMethod::Interactive
-    });
-    let mut has_eligible = false;
-    for server in eligible {
-        has_eligible = true;
-        if !(settings.startup_all || server.auto_mount_at_login) {
-            return false;
-        }
-    }
-    has_eligible
 }
 
 fn servers_require_system_credentials(servers: &[ServerConfig]) -> bool {
@@ -10989,45 +10959,6 @@ mod localization_tests {
 
         assert_eq!(startup_servers(&settings, &servers)[0].id, "native");
         assert!(startup_integration_enabled(&settings, &servers));
-    }
-
-    #[test]
-    fn batch_login_startup_checkbox_requires_every_selected_eligible_connection() {
-        let servers = vec![
-            ServerConfig {
-                id: "enabled".into(),
-                auto_mount_at_login: true,
-                ..ServerConfig::default()
-            },
-            ServerConfig {
-                id: "disabled".into(),
-                auto_mount_at_login: false,
-                ..ServerConfig::default()
-            },
-            ServerConfig {
-                id: "interactive".into(),
-                connection_method: ConnectionMethod::Interactive,
-                auto_mount_at_login: true,
-                ..ServerConfig::default()
-            },
-        ];
-        let settings = Settings::default();
-
-        assert!(selected_login_startup_enabled(
-            &settings,
-            &servers,
-            &HashSet::from(["enabled".into(), "interactive".into()]),
-        ));
-        assert!(!selected_login_startup_enabled(
-            &settings,
-            &servers,
-            &HashSet::from(["enabled".into(), "disabled".into()]),
-        ));
-        assert!(!selected_login_startup_enabled(
-            &settings,
-            &servers,
-            &HashSet::from(["interactive".into()]),
-        ));
     }
 
     #[test]
