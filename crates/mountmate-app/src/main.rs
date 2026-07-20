@@ -4185,17 +4185,15 @@ impl App {
             .iter()
             .find(|server| server.id == id)
             .map(|server| server.tags.as_slice());
-        let tags = match validated_connection_tags_for_existing(
-            &draft.tags,
-            existing_tags,
-            self.locale(),
-        ) {
-            Ok(tags) => tags,
-            Err(error) => {
-                self.status = error;
-                return Task::none();
-            }
-        };
+        let tags =
+            match validated_connection_tags_for_existing(&draft.tags, existing_tags, self.locale())
+            {
+                Ok(tags) => tags,
+                Err(error) => {
+                    self.status = error;
+                    return Task::none();
+                }
+            };
         let auto_mount_at_login =
             draft.auto_mount_at_login && draft.connection_method != ConnectionMethod::Interactive;
         self.editor_saving = true;

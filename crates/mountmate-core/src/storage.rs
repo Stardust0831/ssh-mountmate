@@ -220,13 +220,9 @@ pub fn update_server_preferences_batch(
             crate::model::normalize_tags(&mut normalized_tags, "");
             let mut existing_tags = server.tags.clone();
             crate::model::normalize_tags(&mut existing_tags, &server.folder);
-            let preserves_existing = crate::model::tag_update_only_preserves_existing(
-                &normalized_tags,
-                &existing_tags,
-            );
-            if normalized_tags.len() > crate::model::MAX_CONNECTION_TAGS
-                && !preserves_existing
-            {
+            let preserves_existing =
+                crate::model::tag_update_only_preserves_existing(&normalized_tags, &existing_tags);
+            if normalized_tags.len() > crate::model::MAX_CONNECTION_TAGS && !preserves_existing {
                 return Err(StorageError::InvalidPreferenceUpdate(format!(
                     "connection {} may have at most {} tags",
                     update.id,

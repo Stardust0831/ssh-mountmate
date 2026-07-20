@@ -1271,19 +1271,11 @@ mod tests {
         existing.folder = existing.tags[0].clone();
 
         let unchanged = ConnectionDraft::from_server(&existing);
-        assert!(
-            unchanged
-                .validate(std::slice::from_ref(&existing))
-                .is_ok()
-        );
+        assert!(unchanged.validate(std::slice::from_ref(&existing)).is_ok());
 
         let mut cleanup = ConnectionDraft::from_server(&existing);
         cleanup.tags.pop();
-        assert!(
-            cleanup
-                .validate(std::slice::from_ref(&existing))
-                .is_ok()
-        );
+        assert!(cleanup.validate(std::slice::from_ref(&existing)).is_ok());
 
         let mut addition = ConnectionDraft::from_server(&existing);
         addition.tags.push("new-tag".into());
