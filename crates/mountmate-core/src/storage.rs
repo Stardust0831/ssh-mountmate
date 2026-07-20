@@ -201,6 +201,10 @@ pub fn update_server_preferences_batch(
         }
     }
     for update in updates {
+        let server = servers
+            .iter_mut()
+            .find(|server| server.id == update.id)
+            .expect("validated connection ID");
         if update
             .tags
             .as_ref()
@@ -214,7 +218,15 @@ pub fn update_server_preferences_batch(
         if let Some(tags) = &update.tags {
             let mut normalized_tags = tags.clone();
             crate::model::normalize_tags(&mut normalized_tags, "");
-            if normalized_tags.len() > crate::model::MAX_CONNECTION_TAGS {
+            let mut existing_tags = server.tags.clone();
+            crate::model::normalize_tags(&mut existing_tags, &server.folder);
+            let preserves_existing = crate::model::tag_update_only_preserves_existing(
+                &normalized_tags,
+                &existing_tags,
+            );
+            if normalized_tags.len() > crate::model::MAX_CONNECTION_TAGS
+                && !preserves_existing
+            {
                 return Err(StorageError::InvalidPreferenceUpdate(format!(
                     "connection {} may have at most {} tags",
                     update.id,
@@ -224,6 +236,7 @@ pub fn update_server_preferences_batch(
             if normalized_tags
                 .iter()
                 .any(|tag| tag.chars().count() > crate::model::MAX_TAG_CHARS)
+                && !preserves_existing
             {
                 return Err(StorageError::InvalidPreferenceUpdate(format!(
                     "tags for connection {} must be at most {} Unicode characters each",
@@ -232,10 +245,6 @@ pub fn update_server_preferences_batch(
                 )));
             }
         }
-        let server = servers
-            .iter_mut()
-            .find(|server| server.id == update.id)
-            .expect("validated connection ID");
         if let Some(mut tags) = update.tags.clone() {
             crate::model::normalize_tags(&mut tags, "");
             server.tags = tags;
@@ -1119,6 +1128,56 @@ mod tests {
                     id: "alpha".into(),
                     tags: Some(too_long),
                     auto_mount_at_login: None
+                }]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn batch_preferences_allow_progressive_cleanup_of_legacy_tag_limits() {
+        let temp = tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: temp.path().join("config"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            data_dir: temp.path().join("data"),
+        };
+        let legacy_tags = (0..=crate::model::MAX_CONNECTION_TAGS)
+            .map(|index| format!("tag-{index}"))
+            .collect::<Vec<_>>();
+        save_servers(
+            &paths,
+            &[ServerConfig {
+                id: "alpha".into(),
+                folder: legacy_tags[0].clone(),
+                tags: legacy_tags.clone(),
+                ..ServerConfig::default()
+            }],
+        )
+        .unwrap();
+
+        let reduced = legacy_tags[..legacy_tags.len() - 1].to_vec();
+        let updated = update_server_preferences_batch(
+            &paths,
+            &[ServerPreferenceUpdate {
+                id: "alpha".into(),
+                tags: Some(reduced.clone()),
+                auto_mount_at_login: None,
+            }],
+        )
+        .unwrap();
+        assert_eq!(updated[0].tags, reduced);
+
+        let mut invalid_addition = updated[0].tags.clone();
+        invalid_addition.push("new-tag".into());
+        assert!(
+            update_server_preferences_batch(
+                &paths,
+                &[ServerPreferenceUpdate {
+                    id: "alpha".into(),
+                    tags: Some(invalid_addition),
+                    auto_mount_at_login: None,
                 }]
             )
             .is_err()
