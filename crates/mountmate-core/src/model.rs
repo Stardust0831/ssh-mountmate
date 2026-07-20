@@ -11,6 +11,10 @@ pub const MAX_VFS_UPLOAD_TRANSFERS: u16 = 32;
 pub const MAX_CONNECTION_TAGS: usize = 8;
 pub const MAX_TAG_CHARS: usize = 24;
 
+pub fn tag_update_only_preserves_existing(candidate: &[String], existing: &[String]) -> bool {
+    candidate.iter().all(|tag| existing.contains(tag))
+}
+
 fn default_port() -> String {
     "22".into()
 }

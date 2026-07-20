@@ -4180,13 +4180,20 @@ impl App {
         let Some(id) = draft.editing_id.clone() else {
             return Task::none();
         };
-        let tags = match validated_connection_tags(&draft.tags, self.locale()) {
-            Ok(tags) => tags,
-            Err(error) => {
-                self.status = error;
-                return Task::none();
-            }
-        };
+        let existing_tags = self
+            .servers
+            .iter()
+            .find(|server| server.id == id)
+            .map(|server| server.tags.as_slice());
+        let tags =
+            match validated_connection_tags_for_existing(&draft.tags, existing_tags, self.locale())
+            {
+                Ok(tags) => tags,
+                Err(error) => {
+                    self.status = error;
+                    return Task::none();
+                }
+            };
         let auto_mount_at_login =
             draft.auto_mount_at_login && draft.connection_method != ConnectionMethod::Interactive;
         self.editor_saving = true;
@@ -8344,17 +8351,52 @@ fn connection_preference_updates(
 }
 
 fn validated_connection_tags(tags: &[String], locale: Locale) -> Result<Vec<String>, String> {
+    validated_connection_tags_for_existing(tags, None, locale)
+}
+
+fn validated_connection_tags_for_existing(
+    tags: &[String],
+    existing: Option<&[String]>,
+    locale: Locale,
+) -> Result<Vec<String>, String> {
     let mut normalized = Vec::new();
     for tag in tags {
-        let tag = normalized_tag_name(tag, locale)?;
+        let tag = match normalized_tag_name(tag, locale) {
+            Ok(tag) => tag,
+            Err(error) => {
+                let tag = tag.trim();
+                let is_existing_overlong = tag.chars().count() > MAX_TAG_CHARS
+                    && !tag.chars().any(char::is_control)
+                    && !tag.contains(',')
+                    && !tag.contains('，')
+                    && existing.is_some_and(|existing| existing.iter().any(|item| item == tag));
+                if !is_existing_overlong {
+                    return Err(error);
+                }
+                tag.to_owned()
+            }
+        };
         if !normalized.iter().any(|candidate| candidate == &tag) {
             normalized.push(tag);
         }
     }
-    if normalized.len() > MAX_CONNECTION_TAGS {
+    let preserves_existing = existing.is_some_and(|existing| {
+        mountmate_core::model::tag_update_only_preserves_existing(&normalized, existing)
+    });
+    if normalized.len() > MAX_CONNECTION_TAGS && !preserves_existing {
         return Err(match locale {
             Locale::English => format!("A connection may have at most {MAX_CONNECTION_TAGS} tags"),
             Locale::Chinese => format!("一个连接最多只能有 {MAX_CONNECTION_TAGS} 个标签"),
+        });
+    }
+    if normalized
+        .iter()
+        .any(|tag| tag.chars().count() > MAX_TAG_CHARS)
+        && !preserves_existing
+    {
+        return Err(match locale {
+            Locale::English => format!("A tag must be at most {MAX_TAG_CHARS} characters"),
+            Locale::Chinese => format!("标签最多只能有 {MAX_TAG_CHARS} 个字符"),
         });
     }
     Ok(normalized)
@@ -11381,6 +11423,25 @@ mod localization_tests {
                 &(0..=MAX_CONNECTION_TAGS)
                     .map(|index| format!("tag-{index}"))
                     .collect::<Vec<_>>(),
+                Locale::English,
+            )
+            .is_err()
+        );
+
+        let legacy_long = "界".repeat(MAX_TAG_CHARS + 1);
+        assert_eq!(
+            validated_connection_tags_for_existing(
+                std::slice::from_ref(&legacy_long),
+                Some(std::slice::from_ref(&legacy_long)),
+                Locale::English,
+            )
+            .unwrap(),
+            vec![legacy_long.clone()]
+        );
+        assert!(
+            validated_connection_tags_for_existing(
+                &[legacy_long, "new-tag".into()],
+                Some(std::slice::from_ref(&"界".repeat(MAX_TAG_CHARS + 1))),
                 Locale::English,
             )
             .is_err()
