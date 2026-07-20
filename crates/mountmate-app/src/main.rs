@@ -5680,7 +5680,9 @@ impl App {
                 };
             let sort: Element<'_, Message> =
                 if self.connection_list_mode == ConnectionListMode::Reorder {
-                    text(locale.connection_sort(ConnectionSort::SavedOrder)).into()
+                    container(text(locale.connection_sort(ConnectionSort::SavedOrder)))
+                        .width(Fill)
+                        .into()
                 } else {
                     pick_list(
                         sort_options.clone(),
@@ -5691,6 +5693,7 @@ impl App {
                         |choice| Message::ConnectionSortMenuChanged(choice.value),
                     )
                     .placeholder(locale.text(TextKey::SortConnections))
+                    .width(Fill)
                     .into()
                 };
             if size.width < 620.0 {
