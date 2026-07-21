@@ -17,6 +17,17 @@ grep -F 'Repair or uninstall' "${iss}"
 grep -F 'points outside the fixed install directory' "${iss}"
 grep -F 'cannot be verified. Restore the installed executable' "${iss}"
 grep -F 'InitializeSetup' "${iss}"
+grep -F "Result := Value <> '';" "${iss}"
+grep -F "Pos(Value[Index], '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.+-') = 0" "${iss}"
+if grep -F "Value[Index] in ['0'..'9'" "${iss}"; then
+  echo 'Inno Pascal Script does not accept range expressions in set literals' >&2
+  exit 1
+fi
+grep -F '// The app owns the active-mount check.' "${iss}"
+if sed -n '/^\[Code\]$/,$p' "${iss}" | grep -E '^[[:space:]]*;'; then
+  echo 'Pascal Script comments in [Code] must not use semicolon syntax' >&2
+  exit 1
+fi
 grep -F 'Downgrade' "${root}/crates/mountmate-core/src/installed.rs"
 workflow="${root}/.github/workflows/release.yml"
 grep -F 'SHA256SUMS.txt' "${workflow}"

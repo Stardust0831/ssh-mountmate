@@ -95,7 +95,7 @@ var
 begin
   Result := Value <> '';
   for Index := 1 to Length(Value) do begin
-    if not (Value[Index] in ['0'..'9', 'a'..'z', 'A'..'Z', '.', '+', '-']) then begin
+    if Pos(Value[Index], '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.+-') = 0 then begin
       Result := False;
       exit;
     end;
@@ -159,7 +159,7 @@ begin
     Result := False;
     exit;
   end;
-  ; The app owns the active-mount check. A non-zero result blocks uninstall.
+  // The app owns the active-mount check. A non-zero result blocks uninstall.
   if not Exec(ExpandConstant('{app}\{#AppExeName}'), '--installer-uninstall-preflight', '', SW_HIDE, ewWaitUntilTerminated, ExitCode) then begin
     MsgBox('Could not run the SSH MountMate uninstall preflight; uninstall was blocked.', mbError, MB_OK);
     Result := False;
