@@ -254,24 +254,30 @@ impl MountService {
         Err(ServiceError::PathOutsideMount(local_path.into()))
     }
 
-    /// Refresh only rclone's local VFS cache for an Explorer navigation.  The
-    /// operation intentionally does not list the remote or inspect the upload
-    /// queue; callers use it from a bounded background worker.
+    /// Revalidate one cached VFS directory for Explorer navigation while its
+    /// previous snapshot remains readable. Callers use a bounded background
+    /// worker and never fall back to an invalidating or blocking refresh.
     pub fn refresh_job_cache_only(&self, job: &RefreshJob) -> Result<(), ServiceError> {
         let state: MountState = read_json(&self.paths.state_file(&job.identity.server_id))?;
         if MountIdentity::from_state(&state) != job.identity {
             return Err(ServiceError::StaleMount(job.identity.server_id.clone()));
         }
-        let client = HttpRcClient::with_credentials(
+        let identity_client = HttpRcClient::with_credentials(
             &state.rc_addr,
             &state.rc_user,
             &state.rc_pass,
             Duration::from_secs(3),
         )?;
-        if client.process_id()? != job.identity.pid {
+        if identity_client.process_id()? != job.identity.pid {
             return Err(ServiceError::StaleMount(job.identity.server_id.clone()));
         }
-        client.refresh_remote_cache(&job.relative_dir)?;
+        HttpRcClient::with_credentials(
+            &state.rc_addr,
+            &state.rc_user,
+            &state.rc_pass,
+            Duration::from_secs(60),
+        )?
+        .refresh_remote_cache(&job.relative_dir)?;
         Ok(())
     }
 

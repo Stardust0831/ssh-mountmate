@@ -16,6 +16,20 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
+      - name: Check out pinned rclone source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: rclone/rclone
+          ref: 5bc93a2a7ab0ebd0a11352bc4968eabeffb18027
+          path: .rclone-source
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: 1.25.0
+          cache-dependency-path: .rclone-source/go.sum
+      - name: Test patched rclone VFS behavior
+        shell: bash
+        run: sh scripts/build-patched-rclone.sh .rclone-source target/rclone-quality/rclone --test
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: 1.97.0
@@ -85,43 +99,36 @@ jobs:
         include:
           - os: windows-latest
             artifact: SSHMountMate-rust-windows-x64
-            rclone_platform: windows
-            rclone_arch: amd64
-            rclone_sha256: ef097ef9de37a57feb7d9f9c7afb34148ad3c65be8025f1d8f7f521554a701ea
             plink_arch: w64
             plink_sha256: e5621ffe4879f0ec39ed40f688db9399c2d43054d41ef14472fa335c4693b915
           - os: windows-11-arm
             artifact: SSHMountMate-rust-windows-arm64
-            rclone_platform: windows
-            rclone_arch: arm64
-            rclone_sha256: 72194ad0aaf210d7a55808801191fecc7e175444dab7be7491b7a63074521f3a
             plink_arch: wa64
             plink_sha256: 998011ef455dabbb66c176913ea897a58e176402d53dc01607a5b36610a7f5fa
           - os: macos-15-intel
             artifact: SSHMountMate-rust-macos-x64
-            rclone_platform: osx
-            rclone_arch: amd64
-            rclone_sha256: 4188aa84043d7a6240912923f47639a9d2da21f3b40a521c065c8d92e66563f6
           - os: macos-14
             artifact: SSHMountMate-rust-macos-arm64
-            rclone_platform: osx
-            rclone_arch: arm64
-            rclone_sha256: c2100e2d4a4b3be04c55cd45380cafe7647e1ad772bb055f52f00876ed701167
           - os: ubuntu-latest
             artifact: SSHMountMate-rust-linux-x64
-            rclone_platform: linux
-            rclone_arch: amd64
-            rclone_sha256: fe435e0c36228e7c2f116a8701f01127bb1f694005fc11d1f27186c8bca4115d
           - os: ubuntu-24.04-arm
             artifact: SSHMountMate-rust-linux-arm64
-            rclone_platform: linux
-            rclone_arch: arm64
-            rclone_sha256: 97685285c9ad6a0cf17d5844115d2a67245af6444db672187074bd9c358de419
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
+      - name: Check out pinned rclone source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: rclone/rclone
+          ref: 5bc93a2a7ab0ebd0a11352bc4968eabeffb18027
+          path: .rclone-source
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: 1.25.0
+          cache-dependency-path: .rclone-source/go.sum
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: 1.97.0
@@ -297,53 +304,28 @@ jobs:
         timeout-minutes: 3
         shell: pwsh
         run: ./tests/rust_windows_gui_smoke.ps1 -Binary target/release/SSHMountMate.exe
-      - name: Bundle verified rclone
-        if: runner.os != 'Windows'
+      - name: Build pinned patched rclone
         shell: bash
-        env:
-          RCLONE_VERSION: v1.74.4
-          RCLONE_PLATFORM: ${{ matrix.rclone_platform }}
-          RCLONE_ARCH: ${{ matrix.rclone_arch }}
-          RCLONE_SHA256: ${{ matrix.rclone_sha256 }}
         run: |
           set -euo pipefail
-          archive="rclone-${RCLONE_VERSION}-${RCLONE_PLATFORM}-${RCLONE_ARCH}.zip"
-          curl --fail --location --silent --show-error \
-            "https://downloads.rclone.org/${RCLONE_VERSION}/${archive}" \
-            --output "${RUNNER_TEMP}/${archive}"
-          echo "${RCLONE_SHA256}  ${RUNNER_TEMP}/${archive}" | shasum -a 256 --check
-          mkdir -p "${RUNNER_TEMP}/rclone" target/release/bin
-          unzip -q "${RUNNER_TEMP}/${archive}" -d "${RUNNER_TEMP}/rclone"
-          find "${RUNNER_TEMP}/rclone" -type f -name rclone -exec cp {} target/release/bin/rclone \;
-          test -x target/release/bin/rclone || chmod 755 target/release/bin/rclone
-          shasum -a 256 target/release/bin/rclone | awk '{print $1}' > target/release/bin/rclone.sha256
+          binary=rclone
+          if [ "$RUNNER_OS" = Windows ]; then binary=rclone.exe; fi
+          sh scripts/build-patched-rclone.sh .rclone-source "target/release/bin/${binary}"
+          if [ "$RUNNER_OS" = macOS ]; then
+            shasum -a 256 "target/release/bin/${binary}" | awk '{print $1}' > "target/release/bin/${binary}.sha256"
+          else
+            sha256sum "target/release/bin/${binary}" | awk '{print $1}' > "target/release/bin/${binary}.sha256"
+          fi
           cp THIRD_PARTY_NOTICES.md licenses/*.txt target/release/
           cp distribution/SSHMountMate.install-layout target/release/
-      - name: Bundle verified rclone and Plink
+      - name: Bundle verified Plink
         if: runner.os == 'Windows'
         shell: pwsh
         env:
-          RCLONE_VERSION: v1.74.4
-          RCLONE_PLATFORM: ${{ matrix.rclone_platform }}
-          RCLONE_ARCH: ${{ matrix.rclone_arch }}
-          RCLONE_SHA256: ${{ matrix.rclone_sha256 }}
           PLINK_VERSION: '0.84'
           PLINK_ARCH: ${{ matrix.plink_arch }}
           PLINK_SHA256: ${{ matrix.plink_sha256 }}
         run: |
-          $archive = "rclone-$env:RCLONE_VERSION-$env:RCLONE_PLATFORM-$env:RCLONE_ARCH.zip"
-          $archivePath = Join-Path $env:RUNNER_TEMP $archive
-          Invoke-WebRequest "https://downloads.rclone.org/$env:RCLONE_VERSION/$archive" -OutFile $archivePath
-          $actual = (Get-FileHash -Algorithm SHA256 $archivePath).Hash.ToLowerInvariant()
-          if ($actual -ne $env:RCLONE_SHA256) { throw "rclone archive SHA-256 mismatch: $actual" }
-          $extract = Join-Path $env:RUNNER_TEMP "rclone"
-          Expand-Archive -Path $archivePath -DestinationPath $extract -Force
-          New-Item -ItemType Directory -Force target/release/bin | Out-Null
-          $binary = Get-ChildItem -Path $extract -Recurse -File -Filter rclone.exe | Select-Object -First 1
-          if (-not $binary) { throw "rclone archive did not contain rclone.exe" }
-          Copy-Item $binary.FullName target/release/bin/rclone.exe
-          (Get-FileHash -Algorithm SHA256 target/release/bin/rclone.exe).Hash.ToLowerInvariant() |
-            Set-Content -NoNewline target/release/bin/rclone.exe.sha256
           $plinkUrl = "https://the.earth.li/~sgtatham/putty/$env:PLINK_VERSION/$env:PLINK_ARCH/plink.exe"
           Invoke-WebRequest $plinkUrl -OutFile target/release/bin/plink.exe
           $plinkActual = (Get-FileHash -Algorithm SHA256 target/release/bin/plink.exe).Hash.ToLowerInvariant()

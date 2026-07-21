@@ -804,6 +804,18 @@ Cross-platform considerations:
 - Compiled the complete x64 and ARM64 installer scripts locally with the pinned official Inno Setup
   6.4.3 compiler before starting another release workflow.
 
+### 2026-07-22 - v0.6.0-alpha.6 cache-preserving navigation refresh
+
+- Audited rclone v1.74.4 and confirmed ordinary nonrecursive `vfs/refresh` holds the directory mutex
+  during remote listing, so merely removing `vfs/forget` still blocks Explorer reads.
+- Added the isolated `vfs/refresh-swr` capability: it lists outside the directory lock, serves the
+  previous snapshot throughout, briefly merges successful results with existing virtual entries,
+  and preserves the old cache and freshness timestamp on failure.
+- Passive navigation uses only the new capability and does not fall back on older external rclone
+  binaries. Manual refresh retains its explicit forget, refresh, verified listing, and queue checks.
+- Release CI builds the immutable upstream rclone commit with a checksum-pinned repository patch and
+  pinned Go toolchain for all six native targets.
+
 ### 2026-07-15
 
 - Preserved `issue-1-reply.md` and the five user-owned screenshots as untracked files.
