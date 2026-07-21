@@ -318,7 +318,9 @@ SSH MountMate 会尽量启用 rclone 的 host key 校验。
 
 ## 容量显示
 
-对已挂载连接，SSH MountMate 会在连接卡片上显示已用容量和总容量。对于 Lustre 路径，程序会优先用 `lfs project -d` 读取远端目录的 project ID，再用 `lfs quota -p` 读取 project quota。如果路径不在 Lustre 上、远端没有 `lfs`，或该 project 没有非零 hard block limit，则回退使用 `rclone about`；当 SSH 配置支持非交互登录时，还会继续尝试远端 `df -Pk`。
+对已挂载连接，SSH MountMate 会在连接卡片上显示已用容量和总容量。对于 Lustre 路径，卡片上的“配额”按钮会展示 project、当前用户和主组的空间及 inode 配额，包括软限制、硬限制和宽限期状态。程序通过一次已认证的 SSH 调用查询全部范围；其中一个范围不可用时，其他成功结果仍会保留。远端缺少 `lfs`、路径不在 Lustre 上、project ID 缺失或权限不足时会明确显示原因，但不会影响挂载。交互式共享 SSH 会复用已验证的连接，不会另开认证提示。
+
+Windows 预发布版还提供未签名的 x64 和 ARM64 每用户安装包。安装版位于 `%LOCALAPPDATA%\Programs\SSH MountMate`，不需要管理员权限，并可感知资源管理器进入已挂载目录的行为。缓存刷新在后台按有限并发和去重规则异步执行，不会阻塞目录打开。便携 ZIP 继续保留，并且不会启用这种被动感知。安装包尚未签名，运行前请核对 `SHA256SUMS.txt`。
 
 ## 设置
 

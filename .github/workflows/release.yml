@@ -120,7 +120,6 @@ jobs:
             rclone_arch: arm64
             rclone_sha256: 97685285c9ad6a0cf17d5844115d2a67245af6444db672187074bd9c358de419
     runs-on: ${{ matrix.os }}
-
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -453,6 +452,47 @@ jobs:
           Remove-Item $shipping -Recurse -Force -ErrorAction SilentlyContinue
           Expand-Archive "release/${{ matrix.asset }}.zip" $shipping
 
+      - name: Install pinned Inno Setup compiler
+        if: runner.os == 'Windows' && contains(inputs.tag || github.ref_name, '-')
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = '6.4.3'
+          $iscc = Get-Command iscc.exe -ErrorAction SilentlyContinue
+          if (-not $iscc) {
+            if (-not (Get-Command choco.exe -ErrorAction SilentlyContinue)) {
+              throw 'Neither ISCC.exe nor Chocolatey is available for the pinned Inno Setup toolchain'
+            }
+            choco install innosetup --version $expected --yes --no-progress
+            $iscc = Get-Command iscc.exe -ErrorAction SilentlyContinue
+            if (-not $iscc) {
+              $iscc = Get-ChildItem "$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe" -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+            }
+          }
+          if (-not $iscc) { throw 'ISCC.exe was not found after installing pinned Inno Setup' }
+          $version = (Get-Item $iscc.Source).VersionInfo.FileVersion
+          if (-not $version.StartsWith($expected)) {
+            throw "Unexpected Inno Setup compiler version '$version'; expected $expected"
+          }
+          "ISCC_PATH=$($iscc.Source)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build unsigned per-user installer for prerelease
+        if: runner.os == 'Windows' && contains(inputs.tag || github.ref_name, '-')
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ inputs.tag || github.ref_name }}
+        run: |
+          $version = $env:RELEASE_VERSION.TrimStart('v')
+          $arch = if ('${{ matrix.asset }}' -like '*-arm64') { 'arm64' } else { 'x64' }
+          & ./distribution/windows-installer/build-installer.ps1 `
+            -InputExe "target/onefile/SSHMountMate.exe" `
+            -OutputDir "release" `
+            -AppVersion $version `
+            -Arch $arch `
+            -IsccPath ($env:ISCC_PATH ?? 'iscc.exe')
+          if ($LASTEXITCODE -ne 0) { throw 'per-user installer build failed' }
+
       - name: Exercise packaged update and rollback
         if: runner.os == 'Linux'
         shell: bash
@@ -515,10 +555,17 @@ jobs:
           path: release/${{ matrix.asset }}.zip
           if-no-files-found: error
 
+      - name: Upload unsigned prerelease installer
+        if: runner.os == 'Windows' && contains(inputs.tag || github.ref_name, '-')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.asset }}-setup
+          path: release/${{ matrix.asset }}-setup.exe
+          if-no-files-found: error
+
   release-set:
     needs: build
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -530,6 +577,8 @@ jobs:
           merge-multiple: true
       - name: Validate release set
         shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
           expected=(
@@ -544,7 +593,17 @@ jobs:
             test -s "release-assets/${asset}"
           done
           test "$(find release-assets -maxdepth 1 -name 'SSHMountMate-*.zip' | wc -l)" -eq 6
-          (cd release-assets && sha256sum SSHMountMate-*.zip > SHA256SUMS.txt)
+          version="${RELEASE_TAG#v}"
+          setup_count="$(find release-assets -maxdepth 1 -type f -name 'SSHMountMate-windows-*-setup.exe' | wc -l)"
+          case "${version}" in
+            *-*)
+              test "${setup_count}" -eq 2
+              test -s release-assets/SSHMountMate-windows-x64-setup.exe
+              test -s release-assets/SSHMountMate-windows-arm64-setup.exe
+              ;;
+            *) test "${setup_count}" -eq 0 ;;
+          esac
+          (cd release-assets && sha256sum SSHMountMate-* > SHA256SUMS.txt)
           (cd release-assets && sha256sum --check SHA256SUMS.txt)
 
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88

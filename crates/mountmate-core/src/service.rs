@@ -9,7 +9,10 @@ use std::os::windows::process::CommandExt;
 
 use thiserror::Error;
 
-use crate::capacity::{CapacityError, CapacityInfo, mounted_capacity};
+use crate::capacity::{
+    CapacityError, CapacityInfo, CapacitySnapshot, capacity_snapshot_with_connector,
+    mounted_capacity,
+};
 use crate::connection::{SshImportPlan, plan_ssh_imports};
 use crate::credential::{CredentialError, SystemCredentialStore, hydrate_server_from_system};
 use crate::interactive_ssh::{InteractiveSshError, InteractiveSshSession};
@@ -164,6 +167,33 @@ impl MountService {
         result
     }
 
+    /// Return the existing display capacity together with Lustre project,
+    /// current-user, and primary-group quota details.  Interactive/shared SSH
+    /// sessions are intentionally not bypassed by spawning a second SSH
+    /// process; local mount statistics remain available in that case.
+    pub fn capacity_snapshot(
+        &self,
+        server: &ServerConfig,
+    ) -> Result<Option<CapacitySnapshot>, ServiceError> {
+        if self.status(&server.id)? != MountStatus::Mounted {
+            return Ok(None);
+        }
+        let state: MountState = read_json(&self.paths.state_file(&server.id))?;
+        let external_ssh = self.interactive_ssh_arguments(server)?;
+        let prepared_server = self.prepare_server_credentials(server)?;
+        self.ensure_remote(&prepared_server, external_ssh.as_deref())?;
+        let result = capacity_snapshot_with_connector(
+            &prepared_server,
+            &state,
+            &self.paths.rclone_config(),
+            external_ssh.as_deref(),
+        )
+        .map(Some)
+        .map_err(ServiceError::from);
+        self.finish_secret_use(server, &result)?;
+        result
+    }
+
     pub fn refresh(
         &self,
         server_id: &str,
@@ -214,6 +244,42 @@ impl MountService {
             .refresh_remote(&state.remote, &relative_dir, false)?);
         }
         Err(ServiceError::PathOutsideMount(local_path.into()))
+    }
+
+    /// Refresh only rclone's local VFS cache for an Explorer navigation.  The
+    /// operation intentionally does not list the remote or inspect the upload
+    /// queue; callers use it from a bounded background worker.
+    pub fn refresh_path_cache_only(
+        &self,
+        servers: &[ServerConfig],
+        local_path: &Path,
+    ) -> Result<(), ServiceError> {
+        for server in servers {
+            let state_file = self.paths.state_file(&server.id);
+            if !state_file.exists() {
+                continue;
+            }
+            let state: MountState = match read_json(&state_file) {
+                Ok(state) => state,
+                Err(_) => continue,
+            };
+            let Some(relative_dir) = crate::navigation_refresh::validated_relative_dir(
+                local_path,
+                &state.mountpoint,
+                cfg!(windows),
+            ) else {
+                continue;
+            };
+            let client = HttpRcClient::with_credentials(
+                &state.rc_addr,
+                &state.rc_user,
+                &state.rc_pass,
+                Duration::from_secs(3),
+            )?;
+            client.refresh_remote_cache(&relative_dir)?;
+            return Ok(());
+        }
+        Err(ServiceError::PathOutsideMount(local_path.display().to_string()))
     }
 
     pub fn obscure_secret(&self, secret: &str) -> Result<String, ServiceError> {

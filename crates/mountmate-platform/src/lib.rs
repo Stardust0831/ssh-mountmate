@@ -1,7 +1,15 @@
 use std::path::Path;
 
+use mountmate_core::installed::{InstalledEditionIdentity, enforce_uninstall_preflight};
+#[cfg(windows)]
+use mountmate_core::installed::{
+    InstalledInstallRecord, InstallPolicyError, enforce_no_downgrade, validate_installed_identity,
+};
 use mountmate_core::ssh::SshPermissionControl;
 use thiserror::Error;
+
+pub mod navigation;
+pub use navigation::{NavigationObserver, notify_shell_updated_dir, start_navigation_observer};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlobalProgressState {
@@ -48,6 +56,27 @@ pub trait PlatformIntegration: Send + Sync {
     fn register_file_manager_menu(&self, executable: &Path) -> Result<(), PlatformError>;
     fn unregister_file_manager_menu(&self) -> Result<(), PlatformError>;
     fn set_login_startup(&self, executable: &Path, enabled: bool) -> Result<(), PlatformError>;
+    /// Return the installed identity only when HKCU's marker and the canonical
+    /// fixed executable path both validate. Portable copies return `None`.
+    fn installed_edition_identity(
+        &self,
+        current_executable: &Path,
+    ) -> Result<Option<InstalledEditionIdentity>, PlatformError> {
+        let _ = current_executable;
+        Err(PlatformError::Unsupported("installed-edition identity"))
+    }
+    /// Enforce the no-implicit-downgrade installer policy against the HKCU
+    /// marker. Missing markers are accepted for first-time installation.
+    fn enforce_installed_version(&self, requested_version: &str) -> Result<(), PlatformError> {
+        let _ = requested_version;
+        Err(PlatformError::Unsupported("installed-edition version policy"))
+    }
+    /// Hook for the app's future uninstall preflight command. Inno Setup uses
+    /// a non-zero result to block removal while mounts are active.
+    fn uninstall_preflight(&self, active_mounts: bool) -> Result<(), PlatformError> {
+        enforce_uninstall_preflight(active_mounts)
+            .map_err(|error| PlatformError::Failed(error.to_string()))
+    }
 }
 
 pub struct Platform;
@@ -214,6 +243,212 @@ impl PlatformIntegration for Platform {
     fn set_login_startup(&self, executable: &Path, enabled: bool) -> Result<(), PlatformError> {
         set_login_startup(executable, enabled)
     }
+
+    fn installed_edition_identity(
+        &self,
+        current_executable: &Path,
+    ) -> Result<Option<InstalledEditionIdentity>, PlatformError> {
+        installed_edition_identity(current_executable)
+    }
+
+    fn enforce_installed_version(&self, requested_version: &str) -> Result<(), PlatformError> {
+        enforce_installed_version(requested_version)
+    }
+
+    fn uninstall_preflight(&self, active_mounts: bool) -> Result<(), PlatformError> {
+        enforce_uninstall_preflight(active_mounts)
+            .map_err(|error| PlatformError::Failed(error.to_string()))
+    }
+}
+
+fn installed_edition_identity(
+    current_executable: &Path,
+) -> Result<Option<InstalledEditionIdentity>, PlatformError> {
+    #[cfg(windows)]
+    {
+        let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
+            return Ok(None);
+        };
+        let Some(record) = read_windows_install_record()? else {
+            return Ok(None);
+        };
+        return validate_installed_identity(
+            &record,
+            current_executable,
+            Path::new(&local_app_data),
+        )
+        .map(Some)
+        .map_err(|error| PlatformError::Failed(error.to_string()));
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = current_executable;
+        Ok(None)
+    }
+}
+
+fn enforce_installed_version(requested_version: &str) -> Result<(), PlatformError> {
+    #[cfg(windows)]
+    {
+        let existing = read_windows_install_record()?
+            .map(|record| record.version)
+            .filter(|version| !version.is_empty());
+        return enforce_no_downgrade(existing.as_deref(), requested_version).map_err(|error| {
+            match error {
+                InstallPolicyError::DowngradeBlocked { .. }
+                | InstallPolicyError::InvalidExistingVersion(_)
+                | InstallPolicyError::InvalidRequestedVersion(_) => {
+                    PlatformError::Failed(error.to_string())
+                }
+            }
+        });
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = requested_version;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn read_windows_install_record() -> Result<Option<InstalledInstallRecord>, PlatformError> {
+    use std::mem::size_of;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::{null, null_mut};
+
+    use windows_sys::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, KEY_READ, REG_DWORD, REG_EXPAND_SZ, REG_SZ, RegCloseKey,
+        RegOpenKeyExW, RegQueryValueExW,
+    };
+
+    struct OwnedKey(HKEY);
+    impl Drop for OwnedKey {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { RegCloseKey(self.0) };
+            }
+        }
+    }
+    fn wide(value: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(value)
+            .encode_wide()
+            .chain(Some(0))
+            .collect()
+    }
+    fn query_string(key: HKEY, name: &str) -> Result<Option<String>, PlatformError> {
+        let name = wide(name);
+        let mut kind = 0;
+        let mut bytes = 0;
+        let result = unsafe {
+            RegQueryValueExW(
+                key,
+                name.as_ptr(),
+                null_mut(),
+                &mut kind,
+                null_mut(),
+                &mut bytes,
+            )
+        };
+        if result == 2 {
+            return Ok(None);
+        }
+        if result != 0 {
+            return Err(PlatformError::Failed(
+                std::io::Error::from_raw_os_error(result as i32).to_string(),
+            ));
+        }
+        if kind != REG_SZ && kind != REG_EXPAND_SZ {
+            return Err(PlatformError::Failed(format!(
+                "install marker value {name:?} is not a string"
+            )));
+        }
+        let mut buffer = vec![0u16; (bytes as usize).div_ceil(size_of::<u16>())];
+        let mut capacity = bytes;
+        let result = unsafe {
+            RegQueryValueExW(
+                key,
+                name.as_ptr(),
+                null_mut(),
+                &mut kind,
+                buffer.as_mut_ptr().cast(),
+                &mut capacity,
+            )
+        };
+        if result != 0 {
+            return Err(PlatformError::Failed(
+                std::io::Error::from_raw_os_error(result as i32).to_string(),
+            ));
+        }
+        if buffer.last() == Some(&0) {
+            buffer.pop();
+        }
+        Ok(Some(String::from_utf16_lossy(&buffer)))
+    }
+    fn query_dword(key: HKEY, name: &str) -> Result<Option<u32>, PlatformError> {
+        let name = wide(name);
+        let mut kind = 0;
+        let mut bytes = size_of::<u32>() as u32;
+        let mut value = 0u32;
+        let result = unsafe {
+            RegQueryValueExW(
+                key,
+                name.as_ptr(),
+                null_mut(),
+                &mut kind,
+                (&mut value as *mut u32).cast(),
+                &mut bytes,
+            )
+        };
+        if result == 2 {
+            return Ok(None);
+        }
+        if result != 0 {
+            return Err(PlatformError::Failed(
+                std::io::Error::from_raw_os_error(result as i32).to_string(),
+            ));
+        }
+        if kind != REG_DWORD || bytes != size_of::<u32>() as u32 {
+            return Err(PlatformError::Failed(format!(
+                "install marker value {name:?} is not a DWORD"
+            )));
+        }
+        Ok(Some(value))
+    }
+
+    let path = wide(mountmate_core::installed::WINDOWS_INSTALL_RECORD_KEY);
+    let mut key = null_mut();
+    let result = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, KEY_READ, &mut key) };
+    if result == 2 {
+        return Ok(None);
+    }
+    if result != 0 {
+        return Err(PlatformError::Failed(
+            std::io::Error::from_raw_os_error(result as i32).to_string(),
+        ));
+    }
+    let key = OwnedKey(key);
+    let Some(schema_version) = query_dword(key.0, "SchemaVersion")? else {
+        return Ok(None);
+    };
+    let Some(version) = query_string(key.0, "Version")? else {
+        return Ok(None);
+    };
+    let Some(install_root) = query_string(key.0, "InstallRoot")? else {
+        return Ok(None);
+    };
+    let Some(executable_path) = query_string(key.0, "ExecutablePath")? else {
+        return Ok(None);
+    };
+    let aumid = query_string(key.0, "Aumid")?.unwrap_or_default();
+    let architecture = query_string(key.0, "Architecture")?.unwrap_or_default();
+    Ok(Some(InstalledInstallRecord {
+        schema_version,
+        version,
+        install_root: install_root.into(),
+        executable_path: executable_path.into(),
+        aumid,
+        architecture,
+    }))
 }
 
 #[cfg(windows)]

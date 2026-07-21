@@ -23,6 +23,8 @@ pub(crate) enum LaunchAction {
     UnregisterFileManagerMenu,
     RegisterLoginStartup,
     UnregisterLoginStartup,
+    InstallerCheckVersion(String),
+    InstallerUninstallPreflight,
     Help,
     Version,
     Licenses,
@@ -74,6 +76,12 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Launc
             }
             "--register-login-startup" => Some(LaunchAction::RegisterLoginStartup),
             "--unregister-login-startup" => Some(LaunchAction::UnregisterLoginStartup),
+            "--installer-check-version" => Some(LaunchAction::InstallerCheckVersion(
+                next_value(&arguments, &mut index, argument)?,
+            )),
+            "--installer-uninstall-preflight" => {
+                Some(LaunchAction::InstallerUninstallPreflight)
+            }
             "--show-main" => Some(LaunchAction::Gui {
                 command: AppCommand::ShowMain,
                 update_health: None,
@@ -331,6 +339,14 @@ mod tests {
             parse(args(&["--register-login-startup"])).unwrap(),
             LaunchAction::RegisterLoginStartup
         );
+        assert_eq!(
+            parse(args(&["--installer-check-version", "0.6.0-alpha.1"])).unwrap(),
+            LaunchAction::InstallerCheckVersion("0.6.0-alpha.1".into())
+        );
+        assert_eq!(
+            parse(args(&["--installer-uninstall-preflight"])).unwrap(),
+            LaunchAction::InstallerUninstallPreflight
+        );
     }
 
     #[test]
@@ -390,6 +406,7 @@ mod tests {
         assert!(help().contains("\n  -V, --version"));
         assert!(!help().contains("update-helper"));
         assert!(!help().contains("update-health"));
+        assert!(!help().contains("installer-check-version"));
     }
 
     #[test]

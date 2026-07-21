@@ -41,6 +41,9 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
+      - name: Validate Windows installer contract
+        shell: bash
+        run: bash tests/windows_installer_static.sh
       - name: Verify live stable and prerelease update channels
         env:
           GITHUB_TOKEN: ${{ github.token }}

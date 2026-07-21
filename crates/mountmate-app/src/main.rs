@@ -23,7 +23,10 @@ use mountmate_core::app_command::{
     AppCommand, AppCommandError, AppCommandServer, InstanceLock, running_instance,
     same_instance_build, send_command_retry,
 };
-use mountmate_core::capacity::CapacityInfo;
+use mountmate_core::capacity::{
+    CapacityInfo, CapacitySnapshot, LustreQuotaMetric, LustreQuotaScopeStatus, LustreQuotaSeverity,
+    LustreQuotaStatus,
+};
 use mountmate_core::connection::{
     ConnectionDraft, ConnectionSource, DraftError, ImportAction, ImportStatus,
     PreservedSecretState, SecretAction, SshImportPlan,
@@ -38,10 +41,14 @@ use mountmate_core::dependency::{DependencyStatus, check_dependencies};
 use mountmate_core::interactive_ssh::{
     InteractiveSshError, InteractiveSshLoginCommand, InteractiveSshSession,
 };
+use mountmate_core::installed::enforce_no_downgrade;
 use mountmate_core::model::{
     MAX_CONNECTION_TAGS, MAX_TAG_CHARS, MAX_VFS_UPLOAD_TRANSFERS, MIN_VFS_UPLOAD_TRANSFERS,
 };
 use mountmate_core::mountpoint::{HOME_MOUNTPOINT_VALUE, preflight_custom_mountpoint};
+use mountmate_core::navigation_refresh::{
+    MountIdentity, NavigationEvent, RefreshJob, RefreshScheduler, validated_relative_dir,
+};
 use mountmate_core::paths::AppPaths;
 use mountmate_core::plink_binary::resolve_plink;
 use mountmate_core::process::MountStatus;
@@ -65,7 +72,10 @@ use mountmate_core::{
 };
 #[cfg(windows)]
 use mountmate_platform::NativeWindowHandle;
-use mountmate_platform::{GlobalProgressState, Platform, PlatformIntegration};
+use mountmate_platform::{
+    GlobalProgressState, NavigationObserver, Platform, PlatformIntegration,
+    notify_shell_updated_dir, start_navigation_observer,
+};
 use mountmate_platform::{
     Notification as NativeNotification, NotificationLevel as NativeNotificationLevel,
 };
@@ -123,6 +133,14 @@ fn run() -> Result<(), String> {
             } else {
                 println!("SSH MountMate {VERSION} is up to date");
             }
+            return Ok(());
+        }
+        LaunchAction::InstallerCheckVersion(requested) => {
+            enforce_no_downgrade(Some(VERSION), &requested).map_err(|error| error.to_string())?;
+            return Ok(());
+        }
+        LaunchAction::InstallerUninstallPreflight => {
+            run_installer_uninstall_preflight()?;
             return Ok(());
         }
         LaunchAction::RclonePath => {
@@ -311,6 +329,44 @@ fn run() -> Result<(), String> {
     }
 }
 
+fn run_installer_uninstall_preflight() -> Result<(), String> {
+    let paths = AppPaths::discover();
+    storage::load_servers(&paths).map_err(|error| error.to_string())?;
+    let service = MountService::new(paths.clone(), application_root());
+    let mut active = false;
+    let entries = match fs::read_dir(&paths.state_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Platform
+                .uninstall_preflight(false)
+                .map_err(|error| error.to_string());
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(state) = read_json::<MountState>(&path) else {
+            continue;
+        };
+        match service.status(&state.server_id) {
+            Ok(MountStatus::Mounted | MountStatus::Starting) => active = true,
+            Ok(_) | Err(_) => {}
+        }
+        if !active
+            && let Ok(snapshot) = service.transfer_snapshot(&state.server_id)
+            && (snapshot.queued > 0 || snapshot.uploading > 0)
+        {
+            active = true;
+        }
+    }
+    Platform
+        .uninstall_preflight(active)
+        .map_err(|error| error.to_string())
+}
+
 #[derive(Clone)]
 struct Bootstrap {
     paths: AppPaths,
@@ -345,6 +401,18 @@ impl Hash for TraySubscription {
 
 fn tray_stream(subscription: &TraySubscription) -> async_channel::Receiver<TrayAction> {
     subscription.0.clone()
+}
+
+fn navigation_stream(
+    observer: &NavigationObserver,
+) -> impl iced::futures::Stream<Item = NavigationEvent> {
+    iced::futures::stream::unfold(observer.clone(), |observer| async move {
+        observer
+            .recv()
+            .await
+            .ok()
+            .map(|event| (event, observer))
+    })
 }
 
 fn run_headless(paths: &AppPaths, command: AppCommand) -> Result<(), String> {
@@ -558,9 +626,17 @@ struct App {
     dependency_status: Option<DependencyStatus>,
     dependency_checking: bool,
     capacities: HashMap<String, CapacityInfo>,
+    lustre_quotas: HashMap<String, LustreQuotaStatus>,
+    quota_observed_at: HashMap<String, Instant>,
+    quota_next_probe: HashMap<String, Instant>,
+    quota_dialog: Option<String>,
     capacity_errors: HashSet<String>,
     capacity_refreshing: bool,
     capacity_refresh_pending: bool,
+    navigation_observer: Option<NavigationObserver>,
+    navigation_installed: bool,
+    navigation_status: Option<String>,
+    navigation_scheduler: RefreshScheduler,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -935,6 +1011,7 @@ struct SettingsDraft {
     connection_preferences_expanded: bool,
     auto_show_transfers: bool,
     auto_check_updates: bool,
+    navigation_refresh_enabled: bool,
     language: Language,
     appearance_mode: AppearanceMode,
     accent_color: AccentColor,
@@ -981,6 +1058,7 @@ impl SettingsDraft {
             connection_preferences_expanded: false,
             auto_show_transfers: settings.auto_show_transfers,
             auto_check_updates: settings.auto_check_updates,
+            navigation_refresh_enabled: settings.navigation_refresh_enabled,
             language: Language::from_value(&settings.language),
             appearance_mode: settings.appearance_mode,
             accent_color: settings.accent_color,
@@ -1035,6 +1113,7 @@ impl SettingsDraft {
         settings.startup_all = self.startup_all;
         settings.auto_show_transfers = self.auto_show_transfers;
         settings.auto_check_updates = self.auto_check_updates;
+        settings.navigation_refresh_enabled = self.navigation_refresh_enabled;
         settings.language = self.language.value().into();
         settings.appearance_mode = self.appearance_mode;
         settings.accent_color = self.accent_color;
@@ -1047,6 +1126,11 @@ impl SettingsDraft {
 enum Message {
     AppCommand(AppCommand),
     TrayAction(TrayAction),
+    ExplorerNavigation(NavigationEvent),
+    NavigationRefreshFinished {
+        job: RefreshJob,
+        result: Result<(), String>,
+    },
     TrayTick,
     InteractiveTick,
     InteractiveReadinessChecked {
@@ -1192,6 +1276,7 @@ enum Message {
     AutoTransfersChanged(bool),
     AutoTransfersDecision(rfd::MessageDialogResult),
     AutoUpdatesChanged(bool),
+    NavigationRefreshChanged(bool),
     CheckForUpdates,
     UpdateChecked {
         manual: bool,
@@ -1203,7 +1288,10 @@ enum Message {
     CheckDependencies,
     DependenciesChecked(Result<DependencyStatus, String>),
     CapacityTick,
-    CapacitiesLoaded(Vec<(String, Result<Option<CapacityInfo>, String>)>),
+    CapacitiesLoaded(Vec<(String, bool, Result<Option<CapacitySnapshot>, String>)>),
+    OpenQuotaDetails(String),
+    CloseQuotaDetails,
+    RefreshQuotaDetails(String),
     LanguageChanged(Language),
     AppearanceModeChanged(AppearanceMode),
     AccentColorChanged(AccentColor),
@@ -1311,6 +1399,12 @@ impl App {
             window::close_requests().map(Message::CloseRequested),
             window::close_events().map(Message::WindowClosed),
         ];
+        if let Some(observer) = &self.navigation_observer {
+            subscriptions.push(
+                Subscription::run_with(observer.clone(), navigation_stream)
+                    .map(Message::ExplorerNavigation),
+            );
+        }
         subscriptions.extend(self.interactive_terminals.values().map(|session| {
             session
                 .terminal
@@ -1318,6 +1412,98 @@ impl App {
                 .map(|event| Message::TerminalEvent(RedactedTerminalEvent(event)))
         }));
         Subscription::batch(subscriptions)
+    }
+
+    fn current_mount_identities(&self) -> HashMap<String, MountIdentity> {
+        self.servers
+            .iter()
+            .filter(|server| self.mount_statuses.get(&server.id) == Some(&MountStatus::Mounted))
+            .filter_map(|server| {
+                read_json::<MountState>(&self.paths.state_file(&server.id))
+                    .ok()
+                    .map(|state| (server.id.clone(), MountIdentity::from_state(&state)))
+            })
+            .collect()
+    }
+
+    fn handle_explorer_navigation(&mut self, event: NavigationEvent) -> Task<Message> {
+        let now = Instant::now();
+        let current = self.current_mount_identities();
+        self.navigation_scheduler.cancel_stale(&current);
+        for server in &self.servers {
+            let Some(identity) = current.get(&server.id).cloned() else {
+                continue;
+            };
+            let Ok(state) = read_json::<MountState>(&self.paths.state_file(&server.id)) else {
+                continue;
+            };
+            let Some(relative_dir) = validated_relative_dir(
+                &event.target,
+                &state.mountpoint,
+                cfg!(windows),
+            ) else {
+                continue;
+            };
+            self.navigation_scheduler.enqueue(
+                event.clone(),
+                relative_dir,
+                identity,
+                now,
+            );
+            break;
+        }
+        self.start_ready_navigation_refreshes()
+    }
+
+    fn start_ready_navigation_refreshes(&mut self) -> Task<Message> {
+        let mut tasks = Vec::new();
+        while let Some(job) = self.navigation_scheduler.take_ready() {
+            let service = self.service.clone();
+            let servers = self.servers.clone();
+            let target = job.target.clone();
+            let message_job = job.clone();
+            tasks.push(Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        service
+                            .refresh_path_cache_only(&servers, &target)
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .unwrap_or_else(|error| Err(error.to_string()))
+                },
+                move |result| Message::NavigationRefreshFinished {
+                    job: message_job,
+                    result,
+                },
+            ));
+        }
+        Task::batch(tasks)
+    }
+
+    fn reconfigure_navigation_observer(&mut self) {
+        self.navigation_observer = None;
+        let locale = self.locale();
+        if !self.navigation_installed {
+            self.navigation_status = Some(locale.text(TextKey::NavigationRefreshUnavailable).into());
+            return;
+        }
+        if !self.settings.navigation_refresh_enabled {
+            self.navigation_status = Some(locale.text(TextKey::NavigationRefreshDisabled).into());
+            return;
+        }
+        match start_navigation_observer() {
+            Ok(observer) => {
+                self.navigation_observer = Some(observer);
+                self.navigation_status = Some(locale.text(TextKey::NavigationRefreshActive).into());
+            }
+            Err(error) => {
+                self.navigation_status = Some(format!(
+                    "{}: {error}",
+                    locale.text(TextKey::NavigationRefreshUnavailable)
+                ));
+            }
+        }
     }
 
     fn new(bootstrap: Bootstrap) -> (Self, Task<Message>) {
@@ -1344,6 +1530,26 @@ impl App {
         let mut settings = recovered_settings.settings;
         let locale =
             Locale::from_preference(Language::from_value(&settings.language), system_locale);
+        let navigation_installed = std::env::current_exe()
+            .ok()
+            .and_then(|executable| Platform.installed_edition_identity(&executable).ok().flatten())
+            .is_some();
+        let (navigation_observer, navigation_status) = if !navigation_installed {
+            (None, Some(locale.text(TextKey::NavigationRefreshUnavailable).to_owned()))
+        } else if !settings.navigation_refresh_enabled {
+            (None, Some(locale.text(TextKey::NavigationRefreshDisabled).to_owned()))
+        } else {
+            match start_navigation_observer() {
+                Ok(observer) => (Some(observer), Some(locale.text(TextKey::NavigationRefreshActive).to_owned())),
+                Err(error) => (
+                    None,
+                    Some(format!(
+                        "{}: {error}",
+                        locale.text(TextKey::NavigationRefreshUnavailable)
+                    )),
+                ),
+            }
+        };
         let (mut servers, server_status, servers_loaded) = match storage::load_servers(&paths) {
             Ok(servers) => (
                 servers,
@@ -1509,9 +1715,17 @@ impl App {
             dependency_status: None,
             dependency_checking: false,
             capacities: HashMap::new(),
+            lustre_quotas: HashMap::new(),
+            quota_observed_at: HashMap::new(),
+            quota_next_probe: HashMap::new(),
+            quota_dialog: None,
             capacity_errors: HashSet::new(),
             capacity_refreshing: false,
             capacity_refresh_pending: false,
+            navigation_observer,
+            navigation_installed,
+            navigation_status,
+            navigation_scheduler: RefreshScheduler::new(),
         };
         let mut tasks = vec![
             open_window.map(Message::MainWindowOpened),
@@ -1537,6 +1751,23 @@ impl App {
                 return self.handle_app_command(command);
             }
             Message::TrayAction(action) => return self.handle_tray_action(action),
+            Message::ExplorerNavigation(event) => return self.handle_explorer_navigation(event),
+            Message::NavigationRefreshFinished { job, result } => {
+                let current = self.current_mount_identities();
+                let current_job = self.navigation_scheduler.is_current(&job, &current);
+                self.navigation_scheduler.finish(job.token);
+                if current_job {
+                    if let Err(error) = result {
+                        diagnostic_trace(&format!(
+                            "passive Explorer refresh failed for {}: {error}",
+                            job.target.display()
+                        ));
+                    } else {
+                        notify_shell_updated_dir(&job.target);
+                    }
+                }
+                return self.start_ready_navigation_refreshes();
+            }
             Message::InteractiveTick => return self.poll_interactive_terminals(),
             Message::InteractiveReadinessChecked {
                 id,
@@ -1597,6 +1828,17 @@ impl App {
             Message::EndInteractiveSession => return self.end_interactive_session(),
             Message::RetryTerminal => return self.retry_interactive_terminal(),
             Message::TrayTick => {
+                if let Some(failure) = self
+                    .navigation_observer
+                    .as_ref()
+                    .and_then(NavigationObserver::failure)
+                {
+                    self.navigation_observer = None;
+                    self.navigation_status = Some(format!(
+                        "{}: {failure}",
+                        locale.text(TextKey::NavigationRefreshUnavailable)
+                    ));
+                }
                 if self.tray.is_some() {
                     TrayController::desktop_iteration();
                     self.sync_tray();
@@ -1736,6 +1978,12 @@ impl App {
                     .collect();
                 for id in &unmounted {
                     self.capacities.remove(id);
+                    self.lustre_quotas.remove(id);
+                    self.quota_observed_at.remove(id);
+                    self.quota_next_probe.remove(id);
+                    if self.quota_dialog.as_deref() == Some(id) {
+                        self.quota_dialog = None;
+                    }
                     self.capacity_errors.remove(id);
                 }
                 tasks.push(self.capacity_task());
@@ -1747,16 +1995,42 @@ impl App {
             }
             Message::TransferTick => return self.transfer_task(),
             Message::CapacityTick => return self.capacity_task(),
+            Message::OpenQuotaDetails(id) => {
+                if self.mount_statuses.get(&id) == Some(&MountStatus::Mounted) {
+                    self.quota_dialog = Some(id);
+                }
+            }
+            Message::CloseQuotaDetails => self.quota_dialog = None,
+            Message::RefreshQuotaDetails(id) => {
+                self.quota_next_probe.remove(&id);
+                return self.capacity_task();
+            }
             Message::CapacitiesLoaded(results) => {
                 self.capacity_refreshing = false;
-                for (id, result) in results {
+                let now = Instant::now();
+                for (id, probed_quota, result) in results {
                     match result {
-                        Ok(Some(capacity)) => {
-                            self.capacities.insert(id.clone(), capacity);
+                        Ok(Some(snapshot)) => {
+                            if let Some(capacity) = snapshot.capacity {
+                                self.capacities.insert(id.clone(), capacity);
+                            } else {
+                                self.capacities.remove(&id);
+                            }
+                            if probed_quota {
+                                let delay = match &snapshot.lustre {
+                                    LustreQuotaStatus::Available(_) => Duration::from_secs(30),
+                                    LustreQuotaStatus::NotLustre { .. } => Duration::from_secs(600),
+                                    LustreQuotaStatus::Unavailable { .. } => Duration::from_secs(120),
+                                };
+                                self.quota_observed_at.insert(id.clone(), now);
+                                self.quota_next_probe.insert(id.clone(), now + delay);
+                            }
+                            self.lustre_quotas.insert(id.clone(), snapshot.lustre);
                             self.capacity_errors.remove(&id);
                         }
                         Ok(None) => {
                             self.capacities.remove(&id);
+                            self.lustre_quotas.remove(&id);
                             self.capacity_errors.insert(id);
                         }
                         Err(_) => {
@@ -3149,6 +3423,13 @@ impl App {
                     draft.auto_check_updates = value;
                 }
             }
+            Message::NavigationRefreshChanged(value) => {
+                if self.navigation_installed {
+                    if let Some(draft) = &mut self.settings_draft {
+                        draft.navigation_refresh_enabled = value;
+                    }
+                }
+            }
             Message::CheckForUpdates => {
                 if !self.update_checking && !self.update_downloading {
                     self.update_checking = true;
@@ -3290,6 +3571,7 @@ impl App {
                     Ok(outcome) => {
                         self.settings = outcome.settings;
                         self.servers = outcome.servers;
+                        self.reconfigure_navigation_observer();
                         self.settings_draft = None;
                         self.screen = Screen::Connections;
                         self.status = outcome
@@ -4703,6 +4985,7 @@ impl App {
             self.capacity_refresh_pending = true;
             return Task::none();
         }
+        let now = Instant::now();
         let servers: Vec<_> = self
             .servers
             .iter()
@@ -4710,14 +4993,21 @@ impl App {
                 self.mount_statuses.get(&server.id) == Some(&MountStatus::Mounted)
                     && !self.busy.contains(&server.id)
             })
-            .cloned()
+            .map(|server| {
+                let probe_quota = self
+                    .quota_next_probe
+                    .get(&server.id)
+                    .is_none_or(|next| now >= *next);
+                let previous_quota = self.lustre_quotas.get(&server.id).cloned();
+                (server.clone(), probe_quota, previous_quota)
+            })
             .collect();
         if servers.is_empty() {
             self.capacity_refreshing = false;
             self.capacity_refresh_pending = false;
             return Task::none();
         }
-        for server in &servers {
+        for (server, _, _) in &servers {
             if !self.capacities.contains_key(&server.id) {
                 self.capacity_errors.remove(&server.id);
             }
@@ -4726,7 +5016,7 @@ impl App {
         let service = self.service.clone();
         let failed_ids = servers
             .iter()
-            .map(|server| server.id.clone())
+            .map(|(server, _, _)| server.id.clone())
             .collect::<Vec<_>>();
         Task::perform(
             async move {
@@ -4734,21 +5024,38 @@ impl App {
                     std::thread::scope(|scope| {
                         let tasks: Vec<_> = servers
                             .into_iter()
-                            .map(|server| {
+                            .map(|(server, probe_quota, previous_quota)| {
                                 let service = service.clone();
                                 let id = server.id.clone();
                                 let task_id = id.clone();
                                 let task = scope.spawn(move || {
-                                    service.capacity(&server).map_err(|error| error.to_string())
+                                    if probe_quota {
+                                        service
+                                            .capacity_snapshot(&server)
+                                            .map_err(|error| error.to_string())
+                                    } else {
+                                        service.capacity(&server).map(|capacity| {
+                                            capacity.map(|capacity| CapacitySnapshot {
+                                                capacity: Some(capacity),
+                                                lustre: previous_quota.unwrap_or(
+                                                    LustreQuotaStatus::Unavailable {
+                                                        reason: mountmate_core::capacity::LustreStatusReason::Other(
+                                                            "quota has not been probed".into(),
+                                                        ),
+                                                    },
+                                                ),
+                                            })
+                                        }).map_err(|error| error.to_string())
+                                    }
                                 });
-                                (task_id, task)
+                                (task_id, probe_quota, task)
                             })
                             .collect();
                         tasks
                             .into_iter()
-                            .map(|(id, task)| match task.join() {
-                                Ok(result) => (id, result),
-                                Err(_) => (id, Err("capacity worker panicked".into())),
+                            .map(|(id, probed_quota, task)| match task.join() {
+                                Ok(result) => (id, probed_quota, result),
+                                Err(_) => (id, probed_quota, Err("capacity worker panicked".into())),
                             })
                             .collect()
                     })
@@ -4757,7 +5064,7 @@ impl App {
                 .unwrap_or_else(|error| {
                     failed_ids
                         .into_iter()
-                        .map(|id| (id, Err(error.to_string())))
+                        .map(|id| (id, false, Err(error.to_string())))
                         .collect()
                 })
             },
@@ -5855,7 +6162,7 @@ impl App {
             }
         }
 
-        container(
+        let base: Element<'_, Message> = container(
             column![
                 toolbar,
                 mode_actions,
@@ -5869,6 +6176,28 @@ impl App {
         .padding(18)
         .width(Fill)
         .height(Fill)
+        .into();
+        let Some(id) = self.quota_dialog.as_deref() else {
+            return base;
+        };
+        let Some(server) = self.servers.iter().find(|server| server.id == id) else {
+            return base;
+        };
+        let dialog = quota_details_dialog(
+            server,
+            self.lustre_quotas.get(id),
+            self.quota_observed_at.get(id).map(Instant::elapsed),
+            self.capacity_refreshing,
+            locale,
+        );
+        stack![
+            base,
+            container(dialog)
+                .width(Fill)
+                .height(Fill)
+                .center_x(Fill)
+                .center_y(Fill),
+        ]
         .into()
     }
 
@@ -6994,6 +7323,16 @@ impl App {
             toggler(draft.auto_check_updates)
                 .label(locale.text(TextKey::CheckUpdatesAutomatically))
                 .on_toggle(Message::AutoUpdatesChanged),
+            toggler(draft.navigation_refresh_enabled)
+                .label(locale.text(TextKey::NavigationRefresh))
+                .on_toggle(Message::NavigationRefreshChanged),
+            text(locale.text(TextKey::NavigationRefreshHelp)).size(13),
+            text(
+                self.navigation_status
+                    .as_deref()
+                    .unwrap_or_else(|| locale.text(TextKey::NavigationRefreshUnavailable)),
+            )
+            .size(13),
             labeled_control(
                 locale.text(TextKey::Language),
                 pick_list(
@@ -7616,6 +7955,181 @@ fn capacity_progress_state(
     }
 }
 
+fn quota_details_dialog(
+    server: &ServerConfig,
+    status: Option<&LustreQuotaStatus>,
+    observed_age: Option<Duration>,
+    refreshing: bool,
+    locale: Locale,
+) -> Element<'static, Message> {
+    let id = server.id.clone();
+    let observed = observed_age.map(|age| match locale {
+        Locale::English => format!("Updated {}s ago", age.as_secs()),
+        Locale::Chinese => format!("{} 秒前更新", age.as_secs()),
+    });
+    let mut details = column![].spacing(14);
+    match status {
+        Some(LustreQuotaStatus::Available(report)) => {
+            let project = report.project_id.map_or_else(
+                || match locale {
+                    Locale::English => "Project (ID unavailable)".into(),
+                    Locale::Chinese => "项目（ID 不可用）".into(),
+                },
+                |project_id| match locale {
+                    Locale::English => format!("Project {project_id}"),
+                    Locale::Chinese => format!("项目 {project_id}"),
+                },
+            );
+            let user = match (&report.user_name, report.uid) {
+                (Some(name), Some(uid)) => format!("{} ({uid})", name),
+                (Some(name), None) => name.clone(),
+                (None, Some(uid)) => uid.to_string(),
+                (None, None) => match locale {
+                    Locale::English => "Current user".into(),
+                    Locale::Chinese => "当前用户".into(),
+                },
+            };
+            let group = match (&report.group_name, report.gid) {
+                (Some(name), Some(gid)) => format!("{} ({gid})", name),
+                (Some(name), None) => name.clone(),
+                (None, Some(gid)) => gid.to_string(),
+                (None, None) => match locale {
+                    Locale::English => "Primary group".into(),
+                    Locale::Chinese => "主组".into(),
+                },
+            };
+            details = details
+                .push(text(format!("{}: {}", match locale { Locale::English => "Path", Locale::Chinese => "路径" }, report.resolved_path)).size(12))
+                .push(quota_scope_view(project, &report.project, locale))
+                .push(quota_scope_view(user, &report.current_user, locale))
+                .push(quota_scope_view(group, &report.primary_group, locale));
+        }
+        Some(LustreQuotaStatus::NotLustre { reason }) => {
+            details = details.push(text(match locale {
+                Locale::English => format!("This path is not on Lustre: {reason}"),
+                Locale::Chinese => format!("该路径不在 Lustre 文件系统上：{reason}"),
+            }));
+        }
+        Some(LustreQuotaStatus::Unavailable { reason }) => {
+            details = details.push(text(match locale {
+                Locale::English => format!("Lustre quota is unavailable: {reason}"),
+                Locale::Chinese => format!("无法获取 Lustre 配额：{reason}"),
+            }));
+        }
+        None => {
+            details = details.push(text(match locale {
+                Locale::English => "Lustre quota has not been checked yet.",
+                Locale::Chinese => "尚未检查 Lustre 配额。",
+            }));
+        }
+    }
+    if let Some(observed) = observed {
+        details = details.push(text(observed).size(12));
+    }
+    let title = match locale {
+        Locale::English => format!("Quota - {}", server.display_name()),
+        Locale::Chinese => format!("配额 - {}", server.display_name()),
+    };
+    let refresh = button(match locale {
+        Locale::English => "Refresh",
+        Locale::Chinese => "刷新",
+    })
+    .on_press_maybe((!refreshing).then_some(Message::RefreshQuotaDetails(id)));
+    container(
+        column![
+            row![
+                text(title).size(22),
+                Space::new().width(Fill),
+                button("x").on_press(Message::CloseQuotaDetails),
+            ]
+            .align_y(Center),
+            scrollable(details).height(Length::Fixed(460.0)),
+            refresh,
+        ]
+        .spacing(14),
+    )
+    .padding(20)
+    .width(Fill)
+    .max_width(720.0)
+    .style(container::rounded_box)
+    .into()
+}
+
+fn quota_scope_view(
+    title: String,
+    status: &LustreQuotaScopeStatus,
+    locale: Locale,
+) -> Element<'static, Message> {
+    let mut content = column![text(title).size(17)].spacing(5);
+    match status {
+        LustreQuotaScopeStatus::Available(scope) => {
+            content = content
+                .push(text(quota_metric_summary(&scope.blocks, true, locale)).size(13))
+                .push(text(quota_metric_summary(&scope.inodes, false, locale)).size(13));
+        }
+        LustreQuotaScopeStatus::Unavailable { reason } => {
+            content = content.push(text(match locale {
+                Locale::English => format!("Unavailable: {reason}"),
+                Locale::Chinese => format!("不可用：{reason}"),
+            }).size(13));
+        }
+    }
+    content.into()
+}
+
+fn quota_metric_summary(metric: &LustreQuotaMetric, bytes: bool, locale: Locale) -> String {
+    let format_value = |value: u64| {
+        if bytes {
+            format_bytes(value.saturating_mul(1024))
+        } else {
+            value.to_string()
+        }
+    };
+    let format_limit = |limit: Option<u64>| {
+        limit.map_or_else(
+            || match locale {
+                Locale::English => "unlimited".into(),
+                Locale::Chinese => "无限制".into(),
+            },
+            format_value,
+        )
+    };
+    let metric_name = match (bytes, locale) {
+        (true, Locale::English) => "Storage",
+        (true, Locale::Chinese) => "空间",
+        (false, Locale::English) => "Files",
+        (false, Locale::Chinese) => "文件数",
+    };
+    let severity = match (metric.severity, locale) {
+        (LustreQuotaSeverity::Normal, Locale::English) => "normal",
+        (LustreQuotaSeverity::Normal, Locale::Chinese) => "正常",
+        (LustreQuotaSeverity::Grace, Locale::English) => "grace active",
+        (LustreQuotaSeverity::Grace, Locale::Chinese) => "宽限期中",
+        (LustreQuotaSeverity::SoftExceeded, Locale::English) => "soft limit exceeded",
+        (LustreQuotaSeverity::SoftExceeded, Locale::Chinese) => "已超过软限制",
+        (LustreQuotaSeverity::HardExceeded, Locale::English) => "hard limit reached",
+        (LustreQuotaSeverity::HardExceeded, Locale::Chinese) => "已达到硬限制",
+        (LustreQuotaSeverity::Unknown, Locale::English) => "unknown",
+        (LustreQuotaSeverity::Unknown, Locale::Chinese) => "未知",
+    };
+    match locale {
+        Locale::English => format!(
+            "{metric_name}: used {}, soft {}, hard {}, grace {}, {severity}",
+            format_value(metric.used),
+            format_limit(metric.soft),
+            format_limit(metric.hard),
+            metric.grace.raw,
+        ),
+        Locale::Chinese => format!(
+            "{metric_name}：已用 {}，软限制 {}，硬限制 {}，宽限期 {}，{severity}",
+            format_value(metric.used),
+            format_limit(metric.soft),
+            format_limit(metric.hard),
+            metric.grace.raw,
+        ),
+    }
+}
+
 fn connection_card<'a>(
     server: &'a ServerConfig,
     state: ConnectionCardState<'a>,
@@ -7667,6 +8181,14 @@ fn connection_card<'a>(
     let mut open = button(locale.text(TextKey::Open));
     if status == MountStatus::Mounted && !busy {
         open = open.on_press(Message::Open(id.clone()));
+    }
+    let quota_label = match locale {
+        Locale::English => "Quota",
+        Locale::Chinese => "配额",
+    };
+    let mut quota = button(quota_label);
+    if status == MountStatus::Mounted && !busy {
+        quota = quota.on_press(Message::OpenQuotaDetails(id.clone()));
     }
     let mut title = row![text(server.display_name()).size(22)]
         .spacing(8)
@@ -7887,7 +8409,7 @@ fn connection_card<'a>(
             .into()
     };
     container(
-        row![details, operation, open, actions]
+        row![details, operation, open, quota, actions]
             .spacing(8)
             .align_y(Center),
     )
@@ -10245,6 +10767,34 @@ fn open_path(path: &Path, locale: Locale) -> Result<(), String> {
 #[cfg(test)]
 mod localization_tests {
     use super::*;
+
+    #[test]
+    fn quota_metric_summary_formats_limits_in_both_languages() {
+        let metric = LustreQuotaMetric {
+            used: 1024,
+            soft: Some(2048),
+            hard: None,
+            grace: mountmate_core::capacity::LustreGrace {
+                raw: "1d".into(),
+                state: mountmate_core::capacity::LustreGraceState::Active,
+            },
+            severity: LustreQuotaSeverity::Grace,
+            marked: false,
+            soft_marked: false,
+            hard_marked: false,
+        };
+        let english = quota_metric_summary(&metric, true, Locale::English);
+        assert!(english.contains("used 1.0 MB"));
+        assert!(english.contains("soft 2.0 MB"));
+        assert!(english.contains("hard unlimited"));
+        assert!(english.contains("grace active"));
+
+        let chinese = quota_metric_summary(&metric, false, Locale::Chinese);
+        assert!(chinese.contains("已用 1024"));
+        assert!(chinese.contains("软限制 2048"));
+        assert!(chinese.contains("硬限制 无限制"));
+        assert!(chinese.contains("宽限期中"));
+    }
 
     #[test]
     fn mount_error_summary_is_bounded_to_two_lines_and_compact_content() {

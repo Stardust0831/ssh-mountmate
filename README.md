@@ -20,7 +20,7 @@ It uses rclone for the actual mount operation and provides a small GUI around th
 - Check for rclone and platform mount dependencies.
 - Bundle and verify the official rclone binary in release builds.
 - Configure global rclone VFS cache options in the GUI.
-- Show mount status, capacity usage, logs, and common actions per connection.
+- Show mount status, capacity usage, Lustre project/user/group quotas, logs, and common actions per connection.
 - Show the real rclone upload queue and remote-transfer progress after local file copies appear complete.
 - Verify remote directory contents on refresh and expose refresh/transfer actions from connection-card context menus.
 - Mount or unmount all saved connections from the main window.
@@ -333,6 +333,12 @@ The simultaneous-upload setting limits how many different cached files rclone ma
 Refresh clears the VFS directory cache, actively reloads the requested directory, and verifies it with a direct remote listing. If local writes are still queued, the result states that the verified remote snapshot does not yet include those uploads.
 
 Right-click a connection card for Open, Refresh, Transfers, and Log actions. Settings can register Refresh and Transfers commands in Windows Explorer, macOS Finder Quick Actions, and Nautilus, Nemo, or KDE file managers on Linux. The commands point back to the same SSH MountMate executable; no helper program is installed. A short-lived file-manager process forwards its request to the running app over authenticated loopback IPC and exits.
+
+The Windows prerelease also provides unsigned per-user x64 and ARM64 setup packages. The installed edition lives under `%LOCALAPPDATA%\Programs\SSH MountMate`, does not require elevation, and can observe Explorer navigation into mounted directories. It schedules cache-only VFS refreshes in the background, with bounded concurrency and deduplication, so opening a directory is never blocked. Portable ZIP builds remain available and do not enable passive Explorer observation. Because the setup executables are unsigned, verify `SHA256SUMS.txt` before running them.
+
+## Capacity And Lustre Quotas
+
+Mounted cards show used and total capacity. On Lustre paths, the Quota action opens project, current-user, and primary-group block and inode quota details, including soft/hard limits and grace state. The probe uses one authenticated SSH invocation and keeps successful scopes visible when another scope is unavailable. Missing `lfs`, non-Lustre filesystems, missing project IDs, and permission errors are reported without affecting the mount. Interactive/shared SSH connections reuse their verified connector instead of opening a second authentication prompt.
 
 The Rust application keeps a native system-tray icon on Windows, a menu-bar item on macOS, and an AppIndicator on supported Linux desktops. Closing the main window hides it without stopping mounts or transfer monitoring. The tray menu can restore the main window, open Transfers, mount or unmount all connections, and explicitly exit the interface. Exit asks for confirmation when uploads are active or cloud state is unknown; rclone mount processes remain independent of the GUI.
 
