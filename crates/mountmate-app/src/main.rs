@@ -351,9 +351,8 @@ fn run_installer_uninstall_preflight() -> Result<(), String> {
         let Ok(state) = read_json::<MountState>(&path) else {
             continue;
         };
-        match service.status(&state.server_id) {
-            Ok(MountStatus::Mounted | MountStatus::Starting) => active = true,
-            Ok(_) | Err(_) => {}
+        if let Ok(MountStatus::Mounted | MountStatus::Starting) = service.status(&state.server_id) {
+            active = true;
         }
         if !active
             && let Ok(snapshot) = service.transfer_snapshot(&state.server_id)
@@ -3431,10 +3430,10 @@ impl App {
                 }
             }
             Message::NavigationRefreshChanged(value) => {
-                if self.navigation_installed {
-                    if let Some(draft) = &mut self.settings_draft {
-                        draft.navigation_refresh_enabled = value;
-                    }
+                if self.navigation_installed
+                    && let Some(draft) = &mut self.settings_draft
+                {
+                    draft.navigation_refresh_enabled = value;
                 }
             }
             Message::CheckForUpdates => {
