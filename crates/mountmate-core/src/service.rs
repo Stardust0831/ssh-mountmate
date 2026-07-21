@@ -11,12 +11,13 @@ use thiserror::Error;
 
 use crate::capacity::{
     CapacityError, CapacityInfo, CapacitySnapshot, capacity_snapshot_with_connector,
-    mounted_capacity,
+    mounted_capacity_with_connector,
 };
 use crate::connection::{SshImportPlan, plan_ssh_imports};
 use crate::credential::{CredentialError, SystemCredentialStore, hydrate_server_from_system};
 use crate::interactive_ssh::{InteractiveSshError, InteractiveSshSession};
 use crate::mountpoint::{HOME_MOUNTPOINT_VALUE, MountpointAllocator, SystemMountpointProbe};
+use crate::navigation_refresh::{MountIdentity, RefreshJob};
 use crate::paths::AppPaths;
 use crate::process::MountStatus;
 use crate::rc::{HttpRcClient, RcError, RefreshResult};
@@ -64,6 +65,8 @@ pub enum ServiceError {
     Obscure(String),
     #[error("the selected path is not inside an active SSH MountMate mount: {0}")]
     PathOutsideMount(String),
+    #[error("the mount changed before its queued refresh could run: {0}")]
+    StaleMount(String),
 }
 
 #[derive(Debug, Clone)]
@@ -161,8 +164,13 @@ impl MountService {
         let external_ssh = self.interactive_ssh_arguments(server)?;
         let prepared_server = self.prepare_server_credentials(server)?;
         self.ensure_remote(&prepared_server, external_ssh.as_deref())?;
-        let result = mounted_capacity(&prepared_server, &state, &self.paths.rclone_config())
-            .map_err(ServiceError::from);
+        let result = mounted_capacity_with_connector(
+            &prepared_server,
+            &state,
+            &self.paths.rclone_config(),
+            external_ssh.as_deref(),
+        )
+        .map_err(ServiceError::from);
         self.finish_secret_use(server, &result)?;
         result
     }
@@ -249,39 +257,22 @@ impl MountService {
     /// Refresh only rclone's local VFS cache for an Explorer navigation.  The
     /// operation intentionally does not list the remote or inspect the upload
     /// queue; callers use it from a bounded background worker.
-    pub fn refresh_path_cache_only(
-        &self,
-        servers: &[ServerConfig],
-        local_path: &Path,
-    ) -> Result<(), ServiceError> {
-        for server in servers {
-            let state_file = self.paths.state_file(&server.id);
-            if !state_file.exists() {
-                continue;
-            }
-            let state: MountState = match read_json(&state_file) {
-                Ok(state) => state,
-                Err(_) => continue,
-            };
-            let Some(relative_dir) = crate::navigation_refresh::validated_relative_dir(
-                local_path,
-                &state.mountpoint,
-                cfg!(windows),
-            ) else {
-                continue;
-            };
-            let client = HttpRcClient::with_credentials(
-                &state.rc_addr,
-                &state.rc_user,
-                &state.rc_pass,
-                Duration::from_secs(3),
-            )?;
-            client.refresh_remote_cache(&relative_dir)?;
-            return Ok(());
+    pub fn refresh_job_cache_only(&self, job: &RefreshJob) -> Result<(), ServiceError> {
+        let state: MountState = read_json(&self.paths.state_file(&job.identity.server_id))?;
+        if MountIdentity::from_state(&state) != job.identity {
+            return Err(ServiceError::StaleMount(job.identity.server_id.clone()));
         }
-        Err(ServiceError::PathOutsideMount(
-            local_path.display().to_string(),
-        ))
+        let client = HttpRcClient::with_credentials(
+            &state.rc_addr,
+            &state.rc_user,
+            &state.rc_pass,
+            Duration::from_secs(3),
+        )?;
+        if client.process_id()? != job.identity.pid {
+            return Err(ServiceError::StaleMount(job.identity.server_id.clone()));
+        }
+        client.refresh_remote_cache(&job.relative_dir)?;
+        Ok(())
     }
 
     pub fn obscure_secret(&self, secret: &str) -> Result<String, ServiceError> {
@@ -762,6 +753,56 @@ mod tests {
             Some("Folder/Child".into())
         );
         assert_eq!(relative_refresh_dir("Z:\\Folder", "Y:", true), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_refresh_rejects_a_replaced_mount_before_rc_side_effects() {
+        let temp = tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: temp.path().join("config"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            data_dir: temp.path().join("data"),
+        };
+        fs::create_dir_all(&paths.state_dir).unwrap();
+        let state = MountState {
+            pid: 22,
+            server_id: "alpha".into(),
+            remote: "alpha:".into(),
+            mountpoint: temp.path().join("mount"),
+            log: temp.path().join("mount.log"),
+            rc_addr: "127.0.0.1:1".into(),
+            rc_user: "user".into(),
+            rc_pass: "pass".into(),
+            phase: crate::MountPhase::Mounted,
+            process_started_at: Some(2),
+            rclone: PathBuf::new(),
+            mount_backend: crate::MountBackend::Fuse,
+        };
+        fs::write(
+            paths.state_file("alpha"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        let service = MountService::new(paths, temp.path().join("app"));
+        let job = RefreshJob {
+            token: 1,
+            window_id: 1,
+            target: temp.path().join("mount/folder"),
+            relative_dir: "folder".into(),
+            identity: MountIdentity {
+                server_id: "alpha".into(),
+                pid: 11,
+                process_started_at: Some(1),
+            },
+            key: "mount/folder".into(),
+        };
+
+        assert!(matches!(
+            service.refresh_job_cache_only(&job),
+            Err(ServiceError::StaleMount(id)) if id == "alpha"
+        ));
     }
 
     #[cfg(unix)]

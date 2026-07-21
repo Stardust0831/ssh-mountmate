@@ -145,14 +145,30 @@ fn validate_raw_path(value: &str, windows: bool) -> Result<(), NavigationPathErr
         || lower.starts_with("//./")
         || lower.starts_with("//?/")
         || lower.starts_with("/device/")
-        || (windows && lower.starts_with("\\\\"))
+        || (windows && lower.starts_with("//"))
     {
         return Err(NavigationPathError::DeviceOrNamespace);
     }
     if normalized.split('/').any(|component| component == "..") {
         return Err(NavigationPathError::Traversal);
     }
+    if windows && normalized.split('/').any(is_reserved_windows_component) {
+        return Err(NavigationPathError::DeviceOrNamespace);
+    }
     Ok(())
+}
+
+fn is_reserved_windows_component(component: &str) -> bool {
+    let component = component.trim_end_matches([' ', '.']);
+    let stem = component.split('.').next().unwrap_or_default();
+    let upper = stem.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || upper
+        .strip_prefix("COM")
+        .or_else(|| upper.strip_prefix("LPT"))
+        .is_some_and(|number| matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"))
 }
 
 fn lexical_path(value: &str, windows: bool) -> String {
@@ -190,32 +206,36 @@ impl RefreshScheduler {
         identity: MountIdentity,
         now: Instant,
     ) -> EnqueueResult {
+        self.last_enqueued
+            .retain(|_, last| now.saturating_duration_since(*last) < REFRESH_DEDUPE_WINDOW);
         let key = canonical_key(&event.target);
         if self
             .last_enqueued
             .get(&key)
-            .is_some_and(|last| now.duration_since(*last) < REFRESH_DEDUPE_WINDOW)
+            .is_some_and(|last| now.saturating_duration_since(*last) < REFRESH_DEDUPE_WINDOW)
             || self.pending.iter().any(|job| job.key == key)
             || self.running.values().any(|job| job.key == key)
         {
             return EnqueueResult::Deduplicated;
         }
-        self.last_enqueued.insert(key.clone(), now);
         let job = RefreshJob {
             token: self.next_token,
             window_id: event.window_id,
             target: event.target,
             relative_dir,
             identity,
-            key,
+            key: key.clone(),
         };
         self.next_token = self.next_token.wrapping_add(1).max(1);
         let dropped = if self.pending.len() >= MAX_PENDING_REFRESHES {
-            self.pending.pop_front();
+            if let Some(dropped) = self.pending.pop_front() {
+                self.last_enqueued.remove(&dropped.key);
+            }
             true
         } else {
             false
         };
+        self.last_enqueued.insert(key, now);
         self.pending.push_back(job);
         if dropped {
             EnqueueResult::DroppedOldest
@@ -382,6 +402,19 @@ mod tests {
             validated_relative_dir_result(Path::new("Y:\\Mount2"), mount, true),
             Err(NavigationPathError::OutsideMount)
         ));
+        for path in [
+            r"\\server\share\folder",
+            r"\\?\Y:\Mount\folder",
+            r"Y:\Mount\NUL",
+            r"Y:\Mount\con.txt",
+            r"Y:\Mount\COM1 ",
+            r"Y:\Mount\lpt9.log",
+        ] {
+            assert!(matches!(
+                validated_relative_dir_result(Path::new(path), mount, true),
+                Err(NavigationPathError::DeviceOrNamespace)
+            ));
+        }
     }
 
     #[test]
@@ -393,5 +426,24 @@ mod tests {
         current.insert("a".into(), identity("a", 2));
         scheduler.cancel_stale(&current);
         assert_eq!(scheduler.pending_len(), 0);
+    }
+
+    #[test]
+    fn scheduler_prunes_expired_dedupe_history() {
+        let now = Instant::now();
+        let mut scheduler = RefreshScheduler::new();
+        scheduler.enqueue(event("/mnt/old"), "".into(), identity("old", 1), now);
+        let job = scheduler.take_ready().unwrap();
+        scheduler.finish(job.token);
+        assert_eq!(scheduler.last_enqueued.len(), 1);
+
+        scheduler.enqueue(
+            event("/mnt/new"),
+            "".into(),
+            identity("new", 2),
+            now + REFRESH_DEDUPE_WINDOW,
+        );
+        assert_eq!(scheduler.last_enqueued.len(), 1);
+        assert!(scheduler.last_enqueued.contains_key("/mnt/new"));
     }
 }

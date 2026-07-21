@@ -89,19 +89,57 @@ Root: HKCU; Subkey: "Software\Classes\Drive\shell\SSHMountMate.Transfers\command
 Type: filesandordirs; Name: "{app}"
 
 [Code]
+function IsSafeInstallerVersion(const Value: String): Boolean;
+var
+  Index: Integer;
+begin
+  Result := Value <> '';
+  for Index := 1 to Length(Value) do begin
+    if not (Value[Index] in ['0'..'9', 'a'..'z', 'A'..'Z', '.', '+', '-']) then begin
+      Result := False;
+      exit;
+    end;
+  end;
+end;
+
 function InitializeSetup(): Boolean;
 var
   ExistingExecutable: String;
+  ExistingVersion: String;
   ExitCode: Integer;
 begin
   Result := True;
-  if not RegQueryStringValue(HKCU, '{#InstallRecord}', 'ExecutablePath', ExistingExecutable) then
+  if not RegKeyExists(HKCU, '{#InstallRecord}') then
     exit;
-  if not FileExists(ExistingExecutable) then
+
+  if not RegQueryStringValue(HKCU, '{#InstallRecord}', 'ExecutablePath', ExistingExecutable) then begin
+    MsgBox('The existing SSH MountMate install record is incomplete. Repair or uninstall the existing installation before installing.', mbError, MB_OK);
+    Result := False;
     exit;
-  if not Exec(ExistingExecutable, '--installer-check-version {#APP_VERSION}', '', SW_HIDE,
+  end;
+  if CompareText(ExistingExecutable, ExpandConstant('{#InstallRoot}\{#AppExeName}')) <> 0 then begin
+    MsgBox('The existing SSH MountMate install record points outside the fixed install directory. Repair or uninstall the existing installation before installing.', mbError, MB_OK);
+    Result := False;
+    exit;
+  end;
+  if not RegQueryStringValue(HKCU, '{#InstallRecord}', 'Version', ExistingVersion) then begin
+    MsgBox('The existing SSH MountMate install record has no readable version. Repair or uninstall the existing installation before installing.', mbError, MB_OK);
+    Result := False;
+    exit;
+  end;
+  if not IsSafeInstallerVersion(ExistingVersion) then begin
+    MsgBox('The existing SSH MountMate install record has an invalid version. Repair or uninstall the existing installation before installing.', mbError, MB_OK);
+    Result := False;
+    exit;
+  end;
+  if not FileExists(ExistingExecutable) then begin
+    MsgBox('The existing SSH MountMate executable is missing. Repair or uninstall the existing installation before installing.', mbError, MB_OK);
+    Result := False;
+    exit;
+  end;
+  if not Exec(ExistingExecutable, '--installer-check-version "{#APP_VERSION}" --installer-recorded-version "' + ExistingVersion + '"', '', SW_HIDE,
       ewWaitUntilTerminated, ExitCode) then begin
-    MsgBox('Could not validate the installed SSH MountMate version. Installation was blocked.', mbError, MB_OK);
+    MsgBox('Could not validate the installed SSH MountMate version. Repair or uninstall the existing installation before installing.', mbError, MB_OK);
     Result := False;
     exit;
   end;
@@ -116,7 +154,11 @@ var
   ExitCode: Integer;
 begin
   Result := True;
-  if not FileExists(ExpandConstant('{app}\{#AppExeName}')) then exit;
+  if not FileExists(ExpandConstant('{app}\{#AppExeName}')) then begin
+    MsgBox('The SSH MountMate executable is missing, so active mounts and uploads cannot be verified. Restore the installed executable before uninstalling.', mbError, MB_OK);
+    Result := False;
+    exit;
+  end;
   ; The app owns the active-mount check. A non-zero result blocks uninstall.
   if not Exec(ExpandConstant('{app}\{#AppExeName}'), '--installer-uninstall-preflight', '', SW_HIDE, ewWaitUntilTerminated, ExitCode) then begin
     MsgBox('Could not run the SSH MountMate uninstall preflight; uninstall was blocked.', mbError, MB_OK);
@@ -124,7 +166,7 @@ begin
     exit;
   end;
   if ExitCode <> 0 then begin
-    MsgBox('SSH MountMate reports active mounts. Unmount them before uninstalling.', mbError, MB_OK);
+    MsgBox('SSH MountMate reports active mounts or uploads, or could not verify their state. Unmount all connections and wait for uploads before uninstalling.', mbError, MB_OK);
     Result := False;
   end;
 end;

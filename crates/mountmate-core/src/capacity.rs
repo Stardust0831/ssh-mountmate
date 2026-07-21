@@ -320,8 +320,17 @@ pub fn mounted_capacity(
     state: &MountState,
     rclone_config: &Path,
 ) -> Result<Option<CapacityInfo>, CapacityError> {
+    mounted_capacity_with_connector(server, state, rclone_config, None)
+}
+
+pub fn mounted_capacity_with_connector(
+    server: &ServerConfig,
+    state: &MountState,
+    rclone_config: &Path,
+    connector: Option<&[String]>,
+) -> Result<Option<CapacityInfo>, CapacityError> {
     if server.source == "sai_cluster"
-        && let Some(capacity) = lustre_project_capacity(server)?
+        && let Some(capacity) = lustre_project_capacity_with_connector(server, connector)?
     {
         return Ok(Some(capacity));
     }
@@ -329,7 +338,7 @@ pub fn mounted_capacity(
         return Ok(Some(capacity));
     }
     if server.source != "sai_cluster"
-        && let Some(capacity) = lustre_project_capacity(server)?
+        && let Some(capacity) = lustre_project_capacity_with_connector(server, connector)?
     {
         return Ok(Some(capacity));
     }
@@ -337,7 +346,7 @@ pub fn mounted_capacity(
     if let Ok(Some(capacity)) = &rclone_result {
         return Ok(Some(*capacity));
     }
-    let remote_result = remote_filesystem_capacity(server);
+    let remote_result = remote_filesystem_capacity_with_connector(server, connector);
     if let Ok(Some(capacity)) = &remote_result {
         return Ok(Some(*capacity));
     }
@@ -403,7 +412,7 @@ pub fn capacity_snapshot_with_connector(
             lustre,
         });
     }
-    let remote_result = remote_filesystem_capacity(server);
+    let remote_result = remote_filesystem_capacity_with_connector(server, connector);
     if let Ok(Some(capacity)) = &remote_result {
         return Ok(CapacitySnapshot {
             capacity: Some(*capacity),
@@ -521,27 +530,28 @@ fn capacity_from_about(about: RcloneAbout) -> Option<CapacityInfo> {
     )
 }
 
-fn lustre_project_capacity(server: &ServerConfig) -> Result<Option<CapacityInfo>, CapacityError> {
-    let Some(output) = ssh_capacity_output(server, LUSTRE_CAPACITY_SCRIPT)? else {
+fn lustre_project_capacity_with_connector(
+    server: &ServerConfig,
+    connector: Option<&[String]>,
+) -> Result<Option<CapacityInfo>, CapacityError> {
+    let Some(output) =
+        ssh_capacity_output_with_connector(server, LUSTRE_CAPACITY_SCRIPT, connector)?
+    else {
         return Ok(None);
     };
     Ok(parse_lustre_quota(&output))
 }
 
-fn remote_filesystem_capacity(
+fn remote_filesystem_capacity_with_connector(
     server: &ServerConfig,
+    connector: Option<&[String]>,
 ) -> Result<Option<CapacityInfo>, CapacityError> {
-    let Some(output) = ssh_capacity_output(server, FILESYSTEM_CAPACITY_SCRIPT)? else {
+    let Some(output) =
+        ssh_capacity_output_with_connector(server, FILESYSTEM_CAPACITY_SCRIPT, connector)?
+    else {
         return Ok(None);
     };
     Ok(parse_filesystem_capacity(&output))
-}
-
-fn ssh_capacity_output(
-    server: &ServerConfig,
-    script: &str,
-) -> Result<Option<String>, CapacityError> {
-    ssh_capacity_output_with_connector(server, script, None)
 }
 
 fn ssh_capacity_output_with_connector(
@@ -549,6 +559,9 @@ fn ssh_capacity_output_with_connector(
     script: &str,
     connector: Option<&[String]>,
 ) -> Result<Option<String>, CapacityError> {
+    if server.connection_method == ConnectionMethod::Interactive && connector.is_none() {
+        return Ok(None);
+    }
     if server.auth == AuthMethod::Password
         && server.source != "ssh_config"
         && !server.ssh_config_managed
@@ -988,7 +1001,7 @@ fn quota_metric(
     hard_marked: bool,
 ) -> LustreQuotaMetric {
     let grace = parse_grace(grace, soft.is_none() && hard.is_none());
-    let severity = if hard.is_some_and(|hard| used > hard) || hard_marked {
+    let severity = if hard.is_some_and(|hard| used >= hard) || hard_marked {
         LustreQuotaSeverity::HardExceeded
     } else if soft.is_some_and(|soft| used > soft) || soft_marked || (used_marked && soft.is_some())
     {
@@ -1080,6 +1093,21 @@ mod tests {
         assert_eq!(capacity.total, 1000 * 1024);
         assert_eq!(capacity.percent, 100);
         assert_eq!(capacity.source, CapacitySource::LustreProjectQuota);
+
+        let at_limit = parse_lustre_quota_scope("/lustre 1000 0 1000 - 1 0 0 -").unwrap();
+        assert_eq!(at_limit.blocks.severity, LustreQuotaSeverity::HardExceeded);
+    }
+
+    #[test]
+    fn interactive_capacity_never_starts_unverified_ssh() {
+        let server = ServerConfig {
+            connection_method: ConnectionMethod::Interactive,
+            ..ServerConfig::default()
+        };
+        assert_eq!(
+            ssh_capacity_output_with_connector(&server, "exit 99", None).unwrap(),
+            None
+        );
     }
 
     #[test]

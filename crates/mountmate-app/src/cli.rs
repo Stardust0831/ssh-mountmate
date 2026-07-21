@@ -23,7 +23,10 @@ pub(crate) enum LaunchAction {
     UnregisterFileManagerMenu,
     RegisterLoginStartup,
     UnregisterLoginStartup,
-    InstallerCheckVersion(String),
+    InstallerCheckVersion {
+        requested: String,
+        recorded: String,
+    },
     InstallerUninstallPreflight,
     Help,
     Version,
@@ -58,6 +61,7 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Launc
     let mut update_helper_token = None;
     let mut update_health_marker = None;
     let mut update_health_token = None;
+    let mut installer_recorded_version = None;
     let mut index = 0;
     while index < arguments.len() {
         let argument = &arguments[index];
@@ -76,9 +80,21 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Launc
             }
             "--register-login-startup" => Some(LaunchAction::RegisterLoginStartup),
             "--unregister-login-startup" => Some(LaunchAction::UnregisterLoginStartup),
-            "--installer-check-version" => Some(LaunchAction::InstallerCheckVersion(next_value(
-                &arguments, &mut index, argument,
-            )?)),
+            "--installer-check-version" => {
+                let requested = next_value(&arguments, &mut index, argument)?;
+                Some(LaunchAction::InstallerCheckVersion {
+                    requested,
+                    recorded: String::new(),
+                })
+            }
+            "--installer-recorded-version" => {
+                set_once(
+                    &mut installer_recorded_version,
+                    next_value(&arguments, &mut index, argument)?,
+                    argument,
+                )?;
+                None
+            }
             "--installer-uninstall-preflight" => Some(LaunchAction::InstallerUninstallPreflight),
             "--show-main" => Some(LaunchAction::Gui {
                 command: AppCommand::ShowMain,
@@ -164,6 +180,19 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Launc
         }
     }
     match &mut action {
+        LaunchAction::InstallerCheckVersion { recorded, .. } => {
+            if recorded.is_empty() {
+                *recorded = installer_recorded_version.ok_or_else(|| {
+                    "--installer-check-version requires a recorded version".to_owned()
+                })?;
+            }
+            if update_helper_token.is_some()
+                || update_health_marker.is_some()
+                || update_health_token.is_some()
+            {
+                return Err("internal update arguments require their matching command".into());
+            }
+        }
         LaunchAction::RunUpdateHelper(authorization) => {
             authorization.token = update_helper_token
                 .ok_or_else(|| "--run-update-helper requires --update-helper-token".to_owned())?;
@@ -189,7 +218,8 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Launc
             };
         }
         _ => {
-            if update_helper_token.is_some()
+            if installer_recorded_version.is_some()
+                || update_helper_token.is_some()
                 || update_health_marker.is_some()
                 || update_health_token.is_some()
             {
@@ -338,8 +368,17 @@ mod tests {
             LaunchAction::RegisterLoginStartup
         );
         assert_eq!(
-            parse(args(&["--installer-check-version", "0.6.0-alpha.1"])).unwrap(),
-            LaunchAction::InstallerCheckVersion("0.6.0-alpha.1".into())
+            parse(args(&[
+                "--installer-check-version",
+                "0.6.0-alpha.1",
+                "--installer-recorded-version",
+                "0.6.0-alpha.1",
+            ]))
+            .unwrap(),
+            LaunchAction::InstallerCheckVersion {
+                requested: "0.6.0-alpha.1".into(),
+                recorded: "0.6.0-alpha.1".into(),
+            }
         );
         assert_eq!(
             parse(args(&["--installer-uninstall-preflight"])).unwrap(),
@@ -392,6 +431,16 @@ mod tests {
         assert!(parse(args(&["--mount-all", "--show-main"])).is_err());
         assert!(parse(args(&["--relative-dir", "folder"])).is_err());
         assert!(parse(args(&["--unknown"])).is_err());
+        assert!(parse(args(&["--installer-check-version", "0.6.0-alpha.1"])).is_err());
+        assert!(
+            parse(args(&[
+                "--installer-check-version",
+                "0.6.0-alpha.1",
+                "0.6.0-alpha.1",
+            ]))
+            .is_err()
+        );
+        assert!(parse(args(&["--installer-recorded-version", "0.6.0-alpha.1"])).is_err());
     }
 
     #[test]

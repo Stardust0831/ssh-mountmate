@@ -135,8 +135,12 @@ fn run() -> Result<(), String> {
             }
             return Ok(());
         }
-        LaunchAction::InstallerCheckVersion(requested) => {
+        LaunchAction::InstallerCheckVersion {
+            requested,
+            recorded,
+        } => {
             enforce_no_downgrade(Some(VERSION), &requested).map_err(|error| error.to_string())?;
+            enforce_no_downgrade(Some(&recorded), &requested).map_err(|error| error.to_string())?;
             return Ok(());
         }
         LaunchAction::InstallerUninstallPreflight => {
@@ -343,21 +347,47 @@ fn run_installer_uninstall_preflight() -> Result<(), String> {
         }
         Err(error) => return Err(error.to_string()),
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!("Could not enumerate SSH MountMate uninstall state: {error}")
+        })?;
         let path = entry.path();
         if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
             continue;
         }
-        let Ok(state) = read_json::<MountState>(&path) else {
+
+        // app-command.json is IPC state, not a mount record. It is intentionally
+        // ignored here; every mount-state JSON file must be readable and valid.
+        if path == paths.app_command_state() {
             continue;
-        };
-        if let Ok(MountStatus::Mounted | MountStatus::Starting) = service.status(&state.server_id) {
-            active = true;
         }
-        if !active
-            && let Ok(snapshot) = service.transfer_snapshot(&state.server_id)
-            && (snapshot.queued > 0 || snapshot.uploading > 0)
-        {
+
+        let state: MountState = read_json(&path).map_err(|error| {
+            format!(
+                "Could not verify SSH MountMate uninstall state in {}: {error}",
+                path.display()
+            )
+        })?;
+        let status = service.status(&state.server_id).map_err(|error| {
+            format!(
+                "Could not verify SSH MountMate mount state for {}: {error}",
+                state.server_id
+            )
+        })?;
+        if matches!(status, MountStatus::Mounted | MountStatus::Starting) {
+            active = true;
+            continue;
+        }
+
+        let snapshot = service
+            .transfer_snapshot(&state.server_id)
+            .map_err(|error| {
+                format!(
+                    "Could not verify SSH MountMate transfer state for {}: {error}",
+                    state.server_id
+                )
+            })?;
+        if snapshot.queued > 0 || snapshot.uploading > 0 {
             active = true;
         }
     }
@@ -1444,14 +1474,13 @@ impl App {
         let mut tasks = Vec::new();
         while let Some(job) = self.navigation_scheduler.take_ready() {
             let service = self.service.clone();
-            let servers = self.servers.clone();
-            let target = job.target.clone();
+            let refresh_job = job.clone();
             let message_job = job.clone();
             tasks.push(Task::perform(
                 async move {
                     tokio::task::spawn_blocking(move || {
                         service
-                            .refresh_path_cache_only(&servers, &target)
+                            .refresh_job_cache_only(&refresh_job)
                             .map_err(|error| error.to_string())
                     })
                     .await

@@ -3,6 +3,8 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(windows)]
 use std::path::PathBuf;
+#[cfg(windows)]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use mountmate_core::navigation_refresh::NavigationEvent;
 
@@ -10,6 +12,7 @@ use mountmate_core::navigation_refresh::NavigationEvent;
 /// consumes it through an iced subscription and never blocks its UI thread.
 #[derive(Clone)]
 pub struct NavigationObserver {
+    subscription_id: u64,
     receiver: async_channel::Receiver<NavigationEvent>,
     failure: Arc<Mutex<Option<String>>>,
 }
@@ -30,13 +33,14 @@ impl NavigationObserver {
 
 impl Hash for NavigationObserver {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        "ssh-mountmate-explorer-navigation-observer".hash(state);
+        self.subscription_id.hash(state);
     }
 }
 
 pub fn start_navigation_observer() -> Result<NavigationObserver, String> {
     #[cfg(windows)]
     {
+        static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
         let (sender, receiver) = async_channel::bounded(64);
         let failure = Arc::new(Mutex::new(None));
         let thread_failure = failure.clone();
@@ -44,7 +48,11 @@ pub fn start_navigation_observer() -> Result<NavigationObserver, String> {
             .name("ssh-mountmate-explorer-observer".into())
             .spawn(move || poll_explorer_windows(sender, thread_failure))
             .map_err(|error| error.to_string())?;
-        return Ok(NavigationObserver { receiver, failure });
+        return Ok(NavigationObserver {
+            subscription_id: NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed),
+            receiver,
+            failure,
+        });
     }
     #[cfg(not(windows))]
     {
@@ -65,7 +73,6 @@ fn poll_explorer_windows(
 
     use windows::Win32::System::Com::{
         CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
-        CoUninitialize,
     };
     use windows::Win32::UI::Shell::{IShellWindows, IWebBrowserApp, ShellWindows};
     use windows::core::Interface;
@@ -78,12 +85,12 @@ fn poll_explorer_windows(
         set_failure(&failure, "COM apartment initialization failed");
         return;
     }
+    let _apartment = ComApartment;
     let shell: IShellWindows =
         match unsafe { CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER) } {
             Ok(shell) => shell,
             Err(_) => {
                 set_failure(&failure, "Explorer automation is unavailable");
-                unsafe { CoUninitialize() };
                 return;
             }
         };
@@ -126,14 +133,22 @@ fn poll_explorer_windows(
                     })
                     .is_err()
             {
-                unsafe { CoUninitialize() };
                 return;
             }
         }
         previous = observed;
         std::thread::sleep(Duration::from_millis(750));
     }
-    unsafe { CoUninitialize() };
+}
+
+#[cfg(windows)]
+struct ComApartment;
+
+#[cfg(windows)]
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        unsafe { windows::Win32::System::Com::CoUninitialize() };
+    }
 }
 
 #[cfg(windows)]
@@ -192,3 +207,34 @@ pub fn notify_shell_updated_dir(path: &std::path::Path) {
 
 #[cfg(not(windows))]
 pub fn notify_shell_updated_dir(_path: &std::path::Path) {}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::hash_map::DefaultHasher;
+
+    use super::*;
+
+    fn observer_hash(observer: &NavigationObserver) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        observer.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[test]
+    fn replacement_observers_have_distinct_subscription_identities() {
+        let (_, first_receiver) = async_channel::bounded(1);
+        let (_, second_receiver) = async_channel::bounded(1);
+        let first = NavigationObserver {
+            subscription_id: 1,
+            receiver: first_receiver,
+            failure: Arc::new(Mutex::new(None)),
+        };
+        let second = NavigationObserver {
+            subscription_id: 2,
+            receiver: second_receiver,
+            failure: Arc::new(Mutex::new(None)),
+        };
+
+        assert_ne!(observer_hash(&first), observer_hash(&second));
+    }
+}
