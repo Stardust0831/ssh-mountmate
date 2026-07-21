@@ -1,1 +1,3 @@
 distribution/SSHMountMate.install-layout text eol=lf
+distribution/rclone/*.patch text eol=lf
+scripts/*.sh text eol=lf
