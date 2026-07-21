@@ -796,6 +796,14 @@ Cross-platform considerations:
 - Corrected the compiler banner check to match the upstream `Inno Setup 6 Command-Line Compiler`
   text before packaging.
 
+### 2026-07-22 - v0.6.0-alpha.5 installer compilation correction
+
+- Replaced a Pascal Script range-set expression unsupported by Inno Setup's scripting compiler with
+  an explicit allowlist lookup while preserving the installer version policy.
+- Corrected a configuration-style semicolon comment inside the Pascal Script `[Code]` section.
+- Compiled the complete x64 and ARM64 installer scripts locally with the pinned official Inno Setup
+  6.4.3 compiler before starting another release workflow.
+
 ### 2026-07-15
 
 - Preserved `issue-1-reply.md` and the five user-owned screenshots as untracked files.

@@ -2982,7 +2982,7 @@ dependencies = [
 
 [[package]]
 name = "mountmate-core"
-version = "0.6.0-alpha.4"
+version = "0.6.0-alpha.5"
 dependencies = [
  "base64",
  "configparser",
@@ -3013,7 +3013,7 @@ dependencies = [
 
 [[package]]
 name = "mountmate-platform"
-version = "0.6.0-alpha.4"
+version = "0.6.0-alpha.5"
 dependencies = [
  "async-channel 2.5.0",
  "mountmate-core",
@@ -5007,7 +5007,7 @@ dependencies = [
 
 [[package]]
 name = "ssh-mountmate"
-version = "0.6.0-alpha.4"
+version = "0.6.0-alpha.5"
 dependencies = [
  "async-channel 2.5.0",
  "dark-light",
