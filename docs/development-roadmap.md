@@ -763,6 +763,17 @@ Cross-platform considerations:
 - macOS NFS, system credential protection, reusable interactive SSH, installers, and server changes
   are not part of `v0.4.0`.
 
+### 2026-07-21 - v0.6.0-alpha.1 implementation
+
+- Added one-shot Lustre quota probing for project, current user, and primary group block/inode limits,
+  with partial-scope results, grace/severity parsing, and interactive SSH connector reuse.
+- Added per-user Windows x64/ARM64 Inno Setup packages for prereleases while retaining all portable
+  ZIP artifacts. Stable releases intentionally exclude the unsigned setup executables.
+- Added installed-edition-only Explorer navigation observation. Cache-only VFS refreshes run
+  asynchronously with path validation, deduplication, bounded queueing, and stale-mount protection.
+- Release acceptance requires the six portable ZIPs, two prerelease setup executables,
+  `SHA256SUMS.txt`, and a signed update manifest that continues to name only canonical ZIP assets.
+
 ### 2026-07-15
 
 - Preserved `issue-1-reply.md` and the five user-owned screenshots as untracked files.

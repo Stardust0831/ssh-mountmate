@@ -5,6 +5,7 @@ use thiserror::Error;
 
 use crate::model::{
     MAX_CONNECTION_TAGS, MAX_TAG_CHARS, normalize_port, normalize_tags, sanitize_id,
+    tag_update_only_preserves_existing,
 };
 use crate::mountpoint::HOME_MOUNTPOINT_VALUE;
 use crate::{AuthMethod, ConnectionMethod, ServerConfig};
@@ -306,7 +307,13 @@ impl ConnectionDraft {
     pub fn validate(&self, servers: &[ServerConfig]) -> Result<ValidatedConnection, DraftError> {
         let requirements = self.requirements();
         let name = required_display_name(&self.name)?;
-        let tags = validate_tags(&self.tags, &self.folder)?;
+        let tags = validate_tags(
+            &self.tags,
+            &self.folder,
+            self.existing
+                .as_ref()
+                .map(|server| (server.tags.as_slice(), server.folder.as_str())),
+        )?;
         let folder = tags.first().cloned().unwrap_or_default();
         let host = required_scalar(&self.host, "IP/Host")?;
         let user = required_scalar(&self.user, "User")?;
@@ -575,7 +582,11 @@ fn required_display_name(value: &str) -> Result<String, DraftError> {
     Ok(value.into())
 }
 
-fn validate_tags(tags: &[String], legacy_folder: &str) -> Result<Vec<String>, DraftError> {
+fn validate_tags(
+    tags: &[String],
+    legacy_folder: &str,
+    existing: Option<(&[String], &str)>,
+) -> Result<Vec<String>, DraftError> {
     if tags.iter().any(|tag| tag.chars().any(char::is_control))
         || legacy_folder.chars().any(char::is_control)
     {
@@ -583,12 +594,21 @@ fn validate_tags(tags: &[String], legacy_folder: &str) -> Result<Vec<String>, Dr
     }
     let mut normalized = tags.to_vec();
     normalize_tags(&mut normalized, legacy_folder);
-    if normalized.len() > MAX_CONNECTION_TAGS {
+    let existing_normalized = existing.map(|(tags, folder)| {
+        let mut tags = tags.to_vec();
+        normalize_tags(&mut tags, folder);
+        tags
+    });
+    let preserves_existing = existing_normalized
+        .as_ref()
+        .is_some_and(|existing| tag_update_only_preserves_existing(&normalized, existing));
+    if normalized.len() > MAX_CONNECTION_TAGS && !preserves_existing {
         return Err(DraftError::TooManyTags(MAX_CONNECTION_TAGS));
     }
     if normalized
         .iter()
         .any(|tag| tag.chars().count() > MAX_TAG_CHARS)
+        && !preserves_existing
     {
         return Err(DraftError::TagTooLong(MAX_TAG_CHARS));
     }
@@ -1232,13 +1252,45 @@ mod tests {
             .map(|index| format!("tag-{index}"))
             .collect::<Vec<_>>();
         assert_eq!(
-            validate_tags(&too_many, ""),
+            validate_tags(&too_many, "", None),
             Err(DraftError::TooManyTags(crate::model::MAX_CONNECTION_TAGS))
         );
         let too_long = vec!["界".repeat(crate::model::MAX_TAG_CHARS + 1)];
         assert_eq!(
-            validate_tags(&too_long, ""),
+            validate_tags(&too_long, "", None),
             Err(DraftError::TagTooLong(crate::model::MAX_TAG_CHARS))
+        );
+    }
+
+    #[test]
+    fn legacy_tag_limits_allow_unrelated_edits_and_progressive_cleanup() {
+        let mut existing = password_server();
+        existing.tags = (0..=crate::model::MAX_CONNECTION_TAGS)
+            .map(|index| format!("tag-{index}"))
+            .collect();
+        existing.folder = existing.tags[0].clone();
+
+        let unchanged = ConnectionDraft::from_server(&existing);
+        assert!(unchanged.validate(std::slice::from_ref(&existing)).is_ok());
+
+        let mut cleanup = ConnectionDraft::from_server(&existing);
+        cleanup.tags.pop();
+        assert!(cleanup.validate(std::slice::from_ref(&existing)).is_ok());
+
+        let mut addition = ConnectionDraft::from_server(&existing);
+        addition.tags.push("new-tag".into());
+        assert_eq!(
+            addition.validate(std::slice::from_ref(&existing)),
+            Err(DraftError::TooManyTags(crate::model::MAX_CONNECTION_TAGS))
+        );
+
+        let mut overlong = password_server();
+        overlong.tags = vec!["界".repeat(crate::model::MAX_TAG_CHARS + 1)];
+        overlong.folder = overlong.tags[0].clone();
+        assert!(
+            ConnectionDraft::from_server(&overlong)
+                .validate(std::slice::from_ref(&overlong))
+                .is_ok()
         );
     }
 

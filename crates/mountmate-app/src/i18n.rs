@@ -411,6 +411,11 @@ pub(crate) enum TextKey {
     MountAll,
     MountConnectionForTransfers,
     Mountpoint,
+    NavigationRefresh,
+    NavigationRefreshActive,
+    NavigationRefreshDisabled,
+    NavigationRefreshHelp,
+    NavigationRefreshUnavailable,
     Name,
     NewConnection,
     NoMountedConnections,
@@ -544,6 +549,15 @@ fn english(key: TextKey) -> &'static str {
             "Mount a connection to inspect its cloud transfer state"
         }
         TextKey::Mountpoint => "Mountpoint (Auto by default)",
+        TextKey::NavigationRefresh => "Refresh Explorer folders automatically",
+        TextKey::NavigationRefreshActive => "Active (installed Windows edition; best effort)",
+        TextKey::NavigationRefreshDisabled => "Disabled",
+        TextKey::NavigationRefreshHelp => {
+            "Installed Windows edition only. Navigation is observed out of process; refreshes run in the background and never show a modal error."
+        }
+        TextKey::NavigationRefreshUnavailable => {
+            "Unavailable (installed Windows edition required; use Refresh now for an explicit refresh)"
+        }
         TextKey::Name => "Name",
         TextKey::NewConnection => "New connection",
         TextKey::NoMountedConnections => "No mounted connections",
@@ -676,6 +690,15 @@ fn chinese(key: TextKey) -> &'static str {
         TextKey::MountAll => "全部挂载",
         TextKey::MountConnectionForTransfers => "挂载连接后可查看其云端传输状态",
         TextKey::Mountpoint => "挂载点（默认自动选择）",
+        TextKey::NavigationRefresh => "自动刷新资源管理器文件夹",
+        TextKey::NavigationRefreshActive => "已启用（仅 Windows 安装版，尽力而为）",
+        TextKey::NavigationRefreshDisabled => "已禁用",
+        TextKey::NavigationRefreshHelp => {
+            "仅适用于 Windows 安装版。导航观察在进程外进行；刷新在后台运行，不会弹出模态错误。"
+        }
+        TextKey::NavigationRefreshUnavailable => {
+            "不可用（需要 Windows 安装版；可使用“立即刷新”执行明确刷新）"
+        }
         TextKey::Name => "名称",
         TextKey::NewConnection => "新建连接",
         TextKey::NoMountedConnections => "没有已挂载的连接",
@@ -775,6 +798,19 @@ mod tests {
             Locale::from_preference(LanguagePreference::English, Locale::Chinese),
             Locale::English
         );
+    }
+
+    #[test]
+    fn navigation_refresh_settings_have_bilingual_labels() {
+        for key in [
+            TextKey::NavigationRefresh,
+            TextKey::NavigationRefreshHelp,
+            TextKey::NavigationRefreshActive,
+            TextKey::NavigationRefreshUnavailable,
+        ] {
+            assert!(!Locale::English.text(key).is_empty());
+            assert!(!Locale::Chinese.text(key).is_empty());
+        }
     }
 
     #[test]

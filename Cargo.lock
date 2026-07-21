@@ -2982,7 +2982,7 @@ dependencies = [
 
 [[package]]
 name = "mountmate-core"
-version = "0.4.4-alpha.4"
+version = "0.6.0-alpha.1"
 dependencies = [
  "base64",
  "configparser",
@@ -3013,8 +3013,9 @@ dependencies = [
 
 [[package]]
 name = "mountmate-platform"
-version = "0.4.4-alpha.4"
+version = "0.6.0-alpha.1"
 dependencies = [
+ "async-channel 2.5.0",
  "mountmate-core",
  "notify-rust",
  "objc2 0.6.4",
@@ -3023,6 +3024,7 @@ dependencies = [
  "plist",
  "tempfile",
  "thiserror 2.0.18",
+ "url",
  "windows 0.61.3",
  "windows-registry",
  "windows-sys 0.61.2",
@@ -5005,7 +5007,7 @@ dependencies = [
 
 [[package]]
 name = "ssh-mountmate"
-version = "0.4.4-alpha.4"
+version = "0.6.0-alpha.1"
 dependencies = [
  "async-channel 2.5.0",
  "dark-light",

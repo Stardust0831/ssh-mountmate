@@ -83,6 +83,13 @@ impl HttpRcClient {
     ) -> Result<RefreshResult, RcError> {
         refresh_remote_snapshot(self, remote, relative_dir, recursive)
     }
+
+    /// Invalidate and refresh only the VFS cache entry.  This deliberately
+    /// avoids operations/list and vfs/queue so Explorer navigation can remain
+    /// fire-and-forget and cannot expose transfer state.
+    pub fn refresh_remote_cache(&self, relative_dir: &str) -> Result<(), RcError> {
+        refresh_remote_cache(self, relative_dir)
+    }
 }
 
 impl RcApi for HttpRcClient {
@@ -184,6 +191,17 @@ pub fn refresh_remote_snapshot(
         relative_dir: relative_dir.into(),
         entries: listing.list,
     })
+}
+
+pub fn refresh_remote_cache(api: &impl RcApi, relative_dir: &str) -> Result<(), RcError> {
+    let params = if relative_dir.is_empty() {
+        json!({})
+    } else {
+        json!({"dir": relative_dir})
+    };
+    api.call("vfs/forget", params.clone())?;
+    api.call("vfs/refresh", params)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -288,6 +306,22 @@ mod tests {
             calls[2].1,
             json!({"fs": "alpha:folder", "remote": "subdir"})
         );
+    }
+
+    #[test]
+    fn cache_only_refresh_calls_exactly_forget_and_refresh() {
+        let api = FakeRc::new([json!({}), json!({}), json!({})]);
+        refresh_remote_cache(&api, "subdir").unwrap();
+        let calls = api.calls.borrow();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|(method, _)| method.as_str())
+                .collect::<Vec<_>>(),
+            ["vfs/forget", "vfs/refresh"]
+        );
+        assert_eq!(calls[0].1, json!({"dir": "subdir"}));
+        assert_eq!(calls[1].1, json!({"dir": "subdir"}));
     }
 
     #[test]

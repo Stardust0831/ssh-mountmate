@@ -4,12 +4,16 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const SETTINGS_SCHEMA_VERSION: u32 = 14;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 15;
 pub const DEFAULT_VFS_UPLOAD_TRANSFERS: u16 = 4;
 pub const MIN_VFS_UPLOAD_TRANSFERS: u16 = 1;
 pub const MAX_VFS_UPLOAD_TRANSFERS: u16 = 32;
 pub const MAX_CONNECTION_TAGS: usize = 8;
 pub const MAX_TAG_CHARS: usize = 24;
+
+pub fn tag_update_only_preserves_existing(candidate: &[String], existing: &[String]) -> bool {
+    candidate.iter().all(|tag| existing.contains(tag))
+}
 
 fn default_port() -> String {
     "22".into()
@@ -425,6 +429,10 @@ pub struct Settings {
     pub auto_show_transfers: bool,
     #[serde(default = "default_true")]
     pub auto_check_updates: bool,
+    /// Best-effort Explorer navigation refresh.  The app applies this only
+    /// after validating the Windows installed-edition identity.
+    #[serde(default = "default_true")]
+    pub navigation_refresh_enabled: bool,
     #[serde(default = "default_language")]
     pub language: String,
     #[serde(default = "default_appearance_mode")]
@@ -461,6 +469,7 @@ impl Default for Settings {
             startup_all: false,
             auto_show_transfers: true,
             auto_check_updates: true,
+            navigation_refresh_enabled: true,
             language: default_language(),
             appearance_mode: default_appearance_mode(),
             accent_color: default_accent_color(),
@@ -722,6 +731,23 @@ mod tests {
         let migrated = legacy.migrate();
         assert_eq!(migrated.settings_schema_version, SETTINGS_SCHEMA_VERSION);
         assert_eq!(migrated.font_scale, FontScale::Standard);
+    }
+
+    #[test]
+    fn legacy_settings_enable_navigation_refresh_by_default() {
+        let legacy: Settings = serde_json::from_str(r#"{"settings_schema_version":14}"#).unwrap();
+        assert!(legacy.navigation_refresh_enabled);
+        assert!(legacy.migrate().navigation_refresh_enabled);
+
+        let disabled = Settings {
+            navigation_refresh_enabled: false,
+            ..Settings::default()
+        };
+        assert!(
+            !serde_json::from_value::<Settings>(serde_json::to_value(disabled).unwrap())
+                .unwrap()
+                .navigation_refresh_enabled
+        );
     }
 
     #[test]
