@@ -18,6 +18,18 @@ grep -F 'points outside the fixed install directory' "${iss}"
 grep -F 'cannot be verified. Restore the installed executable' "${iss}"
 grep -F 'InitializeSetup' "${iss}"
 grep -F 'Downgrade' "${root}/crates/mountmate-core/src/installed.rs"
-grep -F 'SHA256SUMS.txt' "${root}/.github/workflows/release.yml"
+workflow="${root}/.github/workflows/release.yml"
+grep -F 'SHA256SUMS.txt' "${workflow}"
+grep -F -- 'choco install innosetup --version $expected --yes --no-progress --allow-downgrade --force' "${workflow}"
+grep -F '${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe' "${workflow}"
+grep -F "\$version -notmatch '^6\\.4\\.3(?:\\.0)?\$'" "${workflow}"
+if grep -F '"$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe"' "${workflow}"; then
+  echo 'release workflow must brace the ProgramFiles(x86) environment variable' >&2
+  exit 1
+fi
+if grep -F 'Get-Command iscc.exe' "${workflow}"; then
+  echo 'release workflow must not trust a runner-provided ISCC.exe shim' >&2
+  exit 1
+fi
 
 echo "Windows installer static checks passed"
