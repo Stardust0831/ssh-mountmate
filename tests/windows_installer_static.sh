@@ -20,11 +20,14 @@ grep -F 'InitializeSetup' "${iss}"
 grep -F 'Downgrade' "${root}/crates/mountmate-core/src/installed.rs"
 workflow="${root}/.github/workflows/release.yml"
 grep -F 'SHA256SUMS.txt' "${workflow}"
-grep -F -- 'choco install innosetup --version $expected --yes --no-progress --allow-downgrade --force' "${workflow}"
-grep -F '${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe' "${workflow}"
+grep -F 'https://github.com/jrsoftware/issrc/releases/download/is-6_4_3/innosetup-6.4.3.exe' "${workflow}"
+grep -F 'f3c42116542c4cc57263c5ba6c4feabfc49fe771f2f98a79d2f7628b8762723b' "${workflow}"
+grep -F 'Get-FileHash -LiteralPath $installer -Algorithm SHA256' "${workflow}"
+grep -F '"/DIR=$installDir"' "${workflow}"
+grep -F "\$isccPath = Join-Path \$installDir 'ISCC.exe'" "${workflow}"
 grep -F "\$version -notmatch '^6\\.4\\.3(?:\\.0)?\$'" "${workflow}"
-if grep -F '"$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe"' "${workflow}"; then
-  echo 'release workflow must brace the ProgramFiles(x86) environment variable' >&2
+if grep -F 'choco install innosetup' "${workflow}"; then
+  echo 'release workflow must not depend on Chocolatey package versions for Inno Setup' >&2
   exit 1
 fi
 if grep -F 'Get-Command iscc.exe' "${workflow}"; then

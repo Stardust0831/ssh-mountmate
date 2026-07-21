@@ -458,14 +458,23 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $expected = '6.4.3'
-          if (-not (Get-Command choco.exe -ErrorAction SilentlyContinue)) {
-            throw 'Chocolatey is unavailable for the pinned Inno Setup toolchain'
+          $installerSha256 = 'f3c42116542c4cc57263c5ba6c4feabfc49fe771f2f98a79d2f7628b8762723b'
+          $installer = Join-Path $env:RUNNER_TEMP "innosetup-$expected.exe"
+          $installerUrl = 'https://github.com/jrsoftware/issrc/releases/download/is-6_4_3/innosetup-6.4.3.exe'
+          Invoke-WebRequest -Uri $installerUrl -OutFile $installer
+          $actualSha256 = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $installerSha256) {
+            throw "Inno Setup installer SHA-256 mismatch: $actualSha256"
           }
-          choco install innosetup --version $expected --yes --no-progress --allow-downgrade --force
-          if ($LASTEXITCODE -ne 0) {
-            throw "Could not install pinned Inno Setup $expected"
+          $installDir = Join-Path $env:RUNNER_TEMP "inno-setup-$expected"
+          Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction SilentlyContinue
+          $install = Start-Process -FilePath $installer -ArgumentList @(
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/DIR=$installDir"
+          ) -Wait -PassThru
+          if ($install.ExitCode -ne 0) {
+            throw "Inno Setup installer exited with code $($install.ExitCode)"
           }
-          $isccPath = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          $isccPath = Join-Path $installDir 'ISCC.exe'
           if (-not (Test-Path -LiteralPath $isccPath -PathType Leaf)) {
             throw "Pinned Inno Setup compiler was not found at '$isccPath'"
           }
