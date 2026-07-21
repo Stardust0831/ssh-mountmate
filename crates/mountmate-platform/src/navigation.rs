@@ -1,6 +1,8 @@
-use std::path::PathBuf;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
+
+#[cfg(windows)]
+use std::path::PathBuf;
 
 use mountmate_core::navigation_refresh::NavigationEvent;
 
@@ -15,6 +17,10 @@ pub struct NavigationObserver {
 impl NavigationObserver {
     pub async fn recv(&self) -> Result<NavigationEvent, async_channel::RecvError> {
         self.receiver.recv().await
+    }
+
+    pub fn events(&self) -> async_channel::Receiver<NavigationEvent> {
+        self.receiver.clone()
     }
 
     pub fn failure(&self) -> Option<String> {
@@ -42,7 +48,10 @@ pub fn start_navigation_observer() -> Result<NavigationObserver, String> {
     }
     #[cfg(not(windows))]
     {
-        Err("Explorer navigation observation is available in the Windows installed edition only".into())
+        Err(
+            "Explorer navigation observation is available in the Windows installed edition only"
+                .into(),
+        )
     }
 }
 
@@ -58,8 +67,8 @@ fn poll_explorer_windows(
         CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
         CoUninitialize,
     };
-    use windows::Win32::System::Variant::VARIANT;
-    use windows::Win32::UI::Shell::{IWebBrowserApp, IShellWindows, ShellWindows};
+    use windows::Win32::UI::Shell::{IShellWindows, IWebBrowserApp, ShellWindows};
+    use windows::core::Interface;
 
     // Explorer's automation objects are apartment-bound.  Keep all COM work
     // on this thread and reconcile paths at a low frequency; no DLL injection
@@ -69,14 +78,15 @@ fn poll_explorer_windows(
         set_failure(&failure, "COM apartment initialization failed");
         return;
     }
-    let shell: IShellWindows = match unsafe { CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER) } {
-        Ok(shell) => shell,
-        Err(_) => {
-            set_failure(&failure, "Explorer automation is unavailable");
-            unsafe { CoUninitialize() };
-            return;
-        }
-    };
+    let shell: IShellWindows =
+        match unsafe { CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER) } {
+            Ok(shell) => shell,
+            Err(_) => {
+                set_failure(&failure, "Explorer automation is unavailable");
+                unsafe { CoUninitialize() };
+                return;
+            }
+        };
     let mut previous = HashMap::<u64, String>::new();
     loop {
         if sender.is_closed() {
@@ -85,7 +95,7 @@ fn poll_explorer_windows(
         let count = unsafe { shell.Count() }.unwrap_or(0);
         let mut observed = HashMap::new();
         for index in 0..count {
-            let variant = VARIANT::from(index);
+            let variant = i32_variant(index);
             let Ok(dispatch) = (unsafe { shell.Item(&variant) }) else {
                 continue;
             };
@@ -106,7 +116,7 @@ fn poll_explorer_windows(
                 continue;
             }
             let path_key = path.to_string_lossy().into_owned();
-            let id = hwnd as u64;
+            let id = hwnd.0 as u64;
             observed.insert(id, path_key.clone());
             if previous.get(&id) != Some(&path_key)
                 && sender
@@ -124,6 +134,24 @@ fn poll_explorer_windows(
         std::thread::sleep(Duration::from_millis(750));
     }
     unsafe { CoUninitialize() };
+}
+
+#[cfg(windows)]
+fn i32_variant(value: i32) -> windows::Win32::System::Variant::VARIANT {
+    use std::mem::ManuallyDrop;
+    use windows::Win32::System::Variant::{VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_I4};
+
+    VARIANT {
+        Anonymous: VARIANT_0 {
+            Anonymous: ManuallyDrop::new(VARIANT_0_0 {
+                vt: VT_I4,
+                wReserved1: 0,
+                wReserved2: 0,
+                wReserved3: 0,
+                Anonymous: VARIANT_0_0_0 { lVal: value },
+            }),
+        },
+    }
 }
 
 #[cfg(windows)]
@@ -145,12 +173,16 @@ fn set_failure(failure: &Arc<Mutex<Option<String>>>, message: &str) {
 #[cfg(windows)]
 pub fn notify_shell_updated_dir(path: &std::path::Path) {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::UI::Shell::{SHChangeNotify, SHCNE_UPDATEDIR, SHCNF_PATHW};
+    use windows_sys::Win32::UI::Shell::{SHCNE_UPDATEDIR, SHCNF_PATHW, SHChangeNotify};
 
-    let wide = path.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<_>>();
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
     unsafe {
         SHChangeNotify(
-            SHCNE_UPDATEDIR,
+            SHCNE_UPDATEDIR as i32,
             SHCNF_PATHW,
             wide.as_ptr().cast(),
             std::ptr::null(),

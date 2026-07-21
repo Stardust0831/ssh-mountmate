@@ -55,8 +55,13 @@ pub enum InstalledIdentityError {
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum InstallPolicyError {
-    #[error("installed version {existing} is newer than requested version {requested}; refusing implicit downgrade")]
-    DowngradeBlocked { existing: Version, requested: Version },
+    #[error(
+        "installed version {existing} is newer than requested version {requested}; refusing implicit downgrade"
+    )]
+    DowngradeBlocked {
+        existing: Version,
+        requested: Version,
+    },
     #[error("invalid installed version: {0}")]
     InvalidExistingVersion(String),
     #[error("invalid requested version: {0}")]
@@ -91,7 +96,9 @@ pub fn validate_installed_identity(
     let version = Version::parse(&record.version)
         .map_err(|_| InstalledIdentityError::InvalidVersion(record.version.clone()))?;
     if version.to_string() != record.version {
-        return Err(InstalledIdentityError::InvalidVersion(record.version.clone()));
+        return Err(InstalledIdentityError::InvalidVersion(
+            record.version.clone(),
+        ));
     }
     if record.aumid != WINDOWS_AUMID {
         return Err(InstalledIdentityError::InvalidAumid);
@@ -141,7 +148,10 @@ pub fn enforce_no_downgrade(
         ));
     }
     if existing > requested {
-        return Err(InstallPolicyError::DowngradeBlocked { existing, requested });
+        return Err(InstallPolicyError::DowngradeBlocked {
+            existing,
+            requested,
+        });
     }
     Ok(())
 }
@@ -195,9 +205,8 @@ mod tests {
     fn installed_identity_requires_marker_and_canonical_path() {
         let local = Path::new(r"C:\Users\alice\AppData\Local");
         let marker = record(local, "0.6.0-alpha.1");
-        let current = Path::new(
-            r"c:/users/alice/appdata/local/programs/ssh mountmate/SSHMountMate.exe",
-        );
+        let current =
+            Path::new(r"c:/users/alice/appdata/local/programs/ssh mountmate/SSHMountMate.exe");
         assert!(validate_installed_identity(&marker, current, local).is_ok());
         assert_eq!(
             validate_installed_identity(&marker, Path::new(r"C:\tmp\SSHMountMate.exe"), local),

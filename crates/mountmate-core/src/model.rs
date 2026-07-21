@@ -743,9 +743,11 @@ mod tests {
             navigation_refresh_enabled: false,
             ..Settings::default()
         };
-        assert!(!serde_json::from_value::<Settings>(serde_json::to_value(disabled).unwrap())
-            .unwrap()
-            .navigation_refresh_enabled);
+        assert!(
+            !serde_json::from_value::<Settings>(serde_json::to_value(disabled).unwrap())
+                .unwrap()
+                .navigation_refresh_enabled
+        );
     }
 
     #[test]

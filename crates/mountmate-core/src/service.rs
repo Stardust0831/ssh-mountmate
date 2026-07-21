@@ -279,7 +279,9 @@ impl MountService {
             client.refresh_remote_cache(&relative_dir)?;
             return Ok(());
         }
-        Err(ServiceError::PathOutsideMount(local_path.display().to_string()))
+        Err(ServiceError::PathOutsideMount(
+            local_path.display().to_string(),
+        ))
     }
 
     pub fn obscure_secret(&self, secret: &str) -> Result<String, ServiceError> {

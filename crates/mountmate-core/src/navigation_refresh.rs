@@ -112,13 +112,11 @@ pub fn validated_relative_dir_result(
     }
     let prefix = format!("{mountpoint_normalized}/");
     let relative = if windows {
-        requested_normalized
-            .get(prefix.len()..)
-            .filter(|_| {
-                requested_normalized
-                    .get(..prefix.len())
-                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&prefix))
-            })
+        requested_normalized.get(prefix.len()..).filter(|_| {
+            requested_normalized
+                .get(..prefix.len())
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&prefix))
+        })
     } else {
         requested_normalized.strip_prefix(&prefix)
     }
@@ -129,10 +127,7 @@ pub fn validated_relative_dir_result(
     if relative.split('/').any(|component| component == "..") {
         return Err(NavigationPathError::Traversal);
     }
-    if relative
-        .split('/')
-        .any(|component| component.contains(':'))
-    {
+    if relative.split('/').any(|component| component.contains(':')) {
         return Err(NavigationPathError::DeviceOrNamespace);
     }
     Ok(normalize_refresh_relative_path(relative))
@@ -273,7 +268,9 @@ impl RefreshScheduler {
 }
 
 fn canonical_key(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/").to_ascii_lowercase()
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -341,7 +338,12 @@ mod tests {
         let mut scheduler = RefreshScheduler::new();
         for index in 0..(MAX_PENDING_REFRESHES + 4) {
             let path = format!("/mnt/{index}");
-            scheduler.enqueue(event(&path), "".into(), identity(&format!("m{index}"), index as u32), now);
+            scheduler.enqueue(
+                event(&path),
+                "".into(),
+                identity(&format!("m{index}"), index as u32),
+                now,
+            );
         }
         assert_eq!(scheduler.pending_len(), MAX_PENDING_REFRESHES);
         assert!(scheduler.take_ready().is_some());

@@ -76,12 +76,10 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Launc
             }
             "--register-login-startup" => Some(LaunchAction::RegisterLoginStartup),
             "--unregister-login-startup" => Some(LaunchAction::UnregisterLoginStartup),
-            "--installer-check-version" => Some(LaunchAction::InstallerCheckVersion(
-                next_value(&arguments, &mut index, argument)?,
-            )),
-            "--installer-uninstall-preflight" => {
-                Some(LaunchAction::InstallerUninstallPreflight)
-            }
+            "--installer-check-version" => Some(LaunchAction::InstallerCheckVersion(next_value(
+                &arguments, &mut index, argument,
+            )?)),
+            "--installer-uninstall-preflight" => Some(LaunchAction::InstallerUninstallPreflight),
             "--show-main" => Some(LaunchAction::Gui {
                 command: AppCommand::ShowMain,
                 update_health: None,

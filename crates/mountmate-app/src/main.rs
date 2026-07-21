@@ -38,10 +38,10 @@ use mountmate_core::credential::{
     replace_verified, rollback_change,
 };
 use mountmate_core::dependency::{DependencyStatus, check_dependencies};
+use mountmate_core::installed::enforce_no_downgrade;
 use mountmate_core::interactive_ssh::{
     InteractiveSshError, InteractiveSshLoginCommand, InteractiveSshSession,
 };
-use mountmate_core::installed::enforce_no_downgrade;
 use mountmate_core::model::{
     MAX_CONNECTION_TAGS, MAX_TAG_CHARS, MAX_VFS_UPLOAD_TRANSFERS, MIN_VFS_UPLOAD_TRANSFERS,
 };
@@ -403,16 +403,8 @@ fn tray_stream(subscription: &TraySubscription) -> async_channel::Receiver<TrayA
     subscription.0.clone()
 }
 
-fn navigation_stream(
-    observer: &NavigationObserver,
-) -> impl iced::futures::Stream<Item = NavigationEvent> {
-    iced::futures::stream::unfold(observer.clone(), |observer| async move {
-        observer
-            .recv()
-            .await
-            .ok()
-            .map(|event| (event, observer))
-    })
+fn navigation_stream(observer: &NavigationObserver) -> async_channel::Receiver<NavigationEvent> {
+    observer.events()
 }
 
 fn run_headless(paths: &AppPaths, command: AppCommand) -> Result<(), String> {
@@ -1437,19 +1429,13 @@ impl App {
             let Ok(state) = read_json::<MountState>(&self.paths.state_file(&server.id)) else {
                 continue;
             };
-            let Some(relative_dir) = validated_relative_dir(
-                &event.target,
-                &state.mountpoint,
-                cfg!(windows),
-            ) else {
+            let Some(relative_dir) =
+                validated_relative_dir(&event.target, &state.mountpoint, cfg!(windows))
+            else {
                 continue;
             };
-            self.navigation_scheduler.enqueue(
-                event.clone(),
-                relative_dir,
-                identity,
-                now,
-            );
+            self.navigation_scheduler
+                .enqueue(event.clone(), relative_dir, identity, now);
             break;
         }
         self.start_ready_navigation_refreshes()
@@ -1485,7 +1471,8 @@ impl App {
         self.navigation_observer = None;
         let locale = self.locale();
         if !self.navigation_installed {
-            self.navigation_status = Some(locale.text(TextKey::NavigationRefreshUnavailable).into());
+            self.navigation_status =
+                Some(locale.text(TextKey::NavigationRefreshUnavailable).into());
             return;
         }
         if !self.settings.navigation_refresh_enabled {
@@ -1532,15 +1519,33 @@ impl App {
             Locale::from_preference(Language::from_value(&settings.language), system_locale);
         let navigation_installed = std::env::current_exe()
             .ok()
-            .and_then(|executable| Platform.installed_edition_identity(&executable).ok().flatten())
+            .and_then(|executable| {
+                Platform
+                    .installed_edition_identity(&executable)
+                    .ok()
+                    .flatten()
+            })
             .is_some();
         let (navigation_observer, navigation_status) = if !navigation_installed {
-            (None, Some(locale.text(TextKey::NavigationRefreshUnavailable).to_owned()))
+            (
+                None,
+                Some(
+                    locale
+                        .text(TextKey::NavigationRefreshUnavailable)
+                        .to_owned(),
+                ),
+            )
         } else if !settings.navigation_refresh_enabled {
-            (None, Some(locale.text(TextKey::NavigationRefreshDisabled).to_owned()))
+            (
+                None,
+                Some(locale.text(TextKey::NavigationRefreshDisabled).to_owned()),
+            )
         } else {
             match start_navigation_observer() {
-                Ok(observer) => (Some(observer), Some(locale.text(TextKey::NavigationRefreshActive).to_owned())),
+                Ok(observer) => (
+                    Some(observer),
+                    Some(locale.text(TextKey::NavigationRefreshActive).to_owned()),
+                ),
                 Err(error) => (
                     None,
                     Some(format!(
@@ -2020,7 +2025,9 @@ impl App {
                                 let delay = match &snapshot.lustre {
                                     LustreQuotaStatus::Available(_) => Duration::from_secs(30),
                                     LustreQuotaStatus::NotLustre { .. } => Duration::from_secs(600),
-                                    LustreQuotaStatus::Unavailable { .. } => Duration::from_secs(120),
+                                    LustreQuotaStatus::Unavailable { .. } => {
+                                        Duration::from_secs(120)
+                                    }
                                 };
                                 self.quota_observed_at.insert(id.clone(), now);
                                 self.quota_next_probe.insert(id.clone(), now + delay);
@@ -7999,7 +8006,17 @@ fn quota_details_dialog(
                 },
             };
             details = details
-                .push(text(format!("{}: {}", match locale { Locale::English => "Path", Locale::Chinese => "路径" }, report.resolved_path)).size(12))
+                .push(
+                    text(format!(
+                        "{}: {}",
+                        match locale {
+                            Locale::English => "Path",
+                            Locale::Chinese => "路径",
+                        },
+                        report.resolved_path
+                    ))
+                    .size(12),
+                )
                 .push(quota_scope_view(project, &report.project, locale))
                 .push(quota_scope_view(user, &report.current_user, locale))
                 .push(quota_scope_view(group, &report.primary_group, locale));
@@ -8068,10 +8085,13 @@ fn quota_scope_view(
                 .push(text(quota_metric_summary(&scope.inodes, false, locale)).size(13));
         }
         LustreQuotaScopeStatus::Unavailable { reason } => {
-            content = content.push(text(match locale {
-                Locale::English => format!("Unavailable: {reason}"),
-                Locale::Chinese => format!("不可用：{reason}"),
-            }).size(13));
+            content = content.push(
+                text(match locale {
+                    Locale::English => format!("Unavailable: {reason}"),
+                    Locale::Chinese => format!("不可用：{reason}"),
+                })
+                .size(13),
+            );
         }
     }
     content.into()

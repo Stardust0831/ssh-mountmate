@@ -87,10 +87,7 @@ impl HttpRcClient {
     /// Invalidate and refresh only the VFS cache entry.  This deliberately
     /// avoids operations/list and vfs/queue so Explorer navigation can remain
     /// fire-and-forget and cannot expose transfer state.
-    pub fn refresh_remote_cache(
-        &self,
-        relative_dir: &str,
-    ) -> Result<(), RcError> {
+    pub fn refresh_remote_cache(&self, relative_dir: &str) -> Result<(), RcError> {
         refresh_remote_cache(self, relative_dir)
     }
 }
@@ -317,7 +314,10 @@ mod tests {
         refresh_remote_cache(&api, "subdir").unwrap();
         let calls = api.calls.borrow();
         assert_eq!(
-            calls.iter().map(|(method, _)| method.as_str()).collect::<Vec<_>>(),
+            calls
+                .iter()
+                .map(|(method, _)| method.as_str())
+                .collect::<Vec<_>>(),
             ["vfs/forget", "vfs/refresh"]
         );
         assert_eq!(calls[0].1, json!({"dir": "subdir"}));

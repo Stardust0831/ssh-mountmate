@@ -1,10 +1,10 @@
 use std::path::Path;
 
-use mountmate_core::installed::{InstalledEditionIdentity, enforce_uninstall_preflight};
 #[cfg(windows)]
 use mountmate_core::installed::{
-    InstalledInstallRecord, InstallPolicyError, enforce_no_downgrade, validate_installed_identity,
+    InstallPolicyError, InstalledInstallRecord, enforce_no_downgrade, validate_installed_identity,
 };
+use mountmate_core::installed::{InstalledEditionIdentity, enforce_uninstall_preflight};
 use mountmate_core::ssh::SshPermissionControl;
 use thiserror::Error;
 
@@ -69,7 +69,9 @@ pub trait PlatformIntegration: Send + Sync {
     /// marker. Missing markers are accepted for first-time installation.
     fn enforce_installed_version(&self, requested_version: &str) -> Result<(), PlatformError> {
         let _ = requested_version;
-        Err(PlatformError::Unsupported("installed-edition version policy"))
+        Err(PlatformError::Unsupported(
+            "installed-edition version policy",
+        ))
     }
     /// Hook for the app's future uninstall preflight command. Inno Setup uses
     /// a non-zero result to block removal while mounts are active.
@@ -101,7 +103,7 @@ fn restrict_private_path(path: &Path, directory: bool) -> Result<(), String> {
     use std::ffi::c_void;
     use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt;
-    use std::ptr::{null, null_mut};
+    use std::ptr::null_mut;
 
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};

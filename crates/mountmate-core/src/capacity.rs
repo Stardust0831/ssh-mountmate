@@ -182,15 +182,19 @@ impl std::fmt::Display for LustreStatusReason {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::AuthUnavailable => formatter.write_str("authentication unavailable"),
-            Self::NotLustre(filesystem) => write!(formatter, "remote filesystem is not Lustre ({filesystem})"),
+            Self::NotLustre(filesystem) => {
+                write!(formatter, "remote filesystem is not Lustre ({filesystem})")
+            }
             Self::LfsMissing => formatter.write_str("lfs is unavailable"),
             Self::PathUnresolved => formatter.write_str("remote path could not be resolved"),
             Self::FilesystemUnresolved => formatter.write_str("filesystem could not be resolved"),
             Self::ProjectIdMissing => formatter.write_str("Lustre project ID is unavailable"),
-            Self::IdentityUnavailable => formatter.write_str("remote user or group identity is unavailable"),
-            Self::QuotaUnavailable(message) | Self::InvalidOutput(message) | Self::Other(message) => {
-                formatter.write_str(message)
+            Self::IdentityUnavailable => {
+                formatter.write_str("remote user or group identity is unavailable")
             }
+            Self::QuotaUnavailable(message)
+            | Self::InvalidOutput(message)
+            | Self::Other(message) => formatter.write_str(message),
         }
     }
 }
@@ -925,10 +929,8 @@ fn parse_lustre_row_fields(fields: &[String]) -> Option<LustreQuotaScopeDetails>
         }
     }
     if fields.len() >= 8
-        && let (Some((block_used, block_marked)), Some((inode_used, inode_marked))) = (
-            parse_used_token(&fields[0]),
-            parse_used_token(&fields[4]),
-        )
+        && let (Some((block_used, block_marked)), Some((inode_used, inode_marked))) =
+            (parse_used_token(&fields[0]), parse_used_token(&fields[4]))
     {
         let (block_soft, block_soft_marked) = parse_limit_token(&fields[1])?;
         let (block_hard, block_hard_marked) = parse_limit_token(&fields[2])?;
@@ -959,7 +961,9 @@ fn parse_lustre_row_fields(fields: &[String]) -> Option<LustreQuotaScopeDetails>
 }
 
 fn parse_used_token(value: &str) -> Option<(u64, bool)> {
-    let (number, marked) = value.strip_suffix('*').map_or((value, false), |value| (value, true));
+    let (number, marked) = value
+        .strip_suffix('*')
+        .map_or((value, false), |value| (value, true));
     Some((number.parse().ok()?, marked))
 }
 
@@ -967,7 +971,9 @@ fn parse_limit_token(value: &str) -> Option<(Option<u64>, bool)> {
     if value == "-" || value == "--" {
         return Some((None, false));
     }
-    let (number, marked) = value.strip_suffix('*').map_or((value, false), |value| (value, true));
+    let (number, marked) = value
+        .strip_suffix('*')
+        .map_or((value, false), |value| (value, true));
     let parsed = number.parse::<u64>().ok()?;
     Some((if parsed == 0 { None } else { Some(parsed) }, marked))
 }
@@ -984,9 +990,7 @@ fn quota_metric(
     let grace = parse_grace(grace, soft.is_none() && hard.is_none());
     let severity = if hard.is_some_and(|hard| used > hard) || hard_marked {
         LustreQuotaSeverity::HardExceeded
-    } else if soft.is_some_and(|soft| used > soft)
-        || soft_marked
-        || (used_marked && soft.is_some())
+    } else if soft.is_some_and(|soft| used > soft) || soft_marked || (used_marked && soft.is_some())
     {
         LustreQuotaSeverity::SoftExceeded
     } else if grace.state == LustreGraceState::Active {
@@ -1193,10 +1197,7 @@ Filesystem kbytes quota limit grace files quota limit grace
         assert_eq!(details.blocks.used, 1200);
         assert!(details.blocks.marked);
         assert_eq!(details.blocks.severity, LustreQuotaSeverity::HardExceeded);
-        assert!(parse_lustre_quota_scope(
-            "/lustre 184467440737095516160 0 0 - 1 0 0 -"
-        )
-        .is_none());
+        assert!(parse_lustre_quota_scope("/lustre 184467440737095516160 0 0 - 1 0 0 -").is_none());
     }
 
     #[test]
@@ -1236,8 +1237,14 @@ permission denied
                 reason: LustreStatusReason::QuotaUnavailable(_)
             }
         ));
-        assert!(matches!(details.project, LustreQuotaScopeStatus::Available(_)));
-        assert!(matches!(details.primary_group, LustreQuotaScopeStatus::Available(_)));
+        assert!(matches!(
+            details.project,
+            LustreQuotaScopeStatus::Available(_)
+        ));
+        assert!(matches!(
+            details.primary_group,
+            LustreQuotaScopeStatus::Available(_)
+        ));
         assert!(matches!(
             parse_lustre_quota_snapshot("garbage output\n"),
             LustreQuotaStatus::Unavailable {
