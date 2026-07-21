@@ -781,6 +781,13 @@ Cross-platform considerations:
 - Kept the failed `v0.6.0-alpha.1` tag immutable and reserved the corrected artifact set for
   `v0.6.0-alpha.2`.
 
+### 2026-07-21 - v0.6.0-alpha.3 packaging correction
+
+- Replaced the unavailable Chocolatey `innosetup` 6.4.3 package dependency with the immutable
+  official Inno Setup release asset and pinned SHA-256 verification.
+- Install the compiler into an isolated runner-temporary directory so Windows x64 and ARM64 builds
+  do not depend on machine-wide package or PATH state.
+
 ### 2026-07-15
 
 - Preserved `issue-1-reply.md` and the five user-owned screenshots as untracked files.
