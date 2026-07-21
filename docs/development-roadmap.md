@@ -774,6 +774,13 @@ Cross-platform considerations:
 - Release acceptance requires the six portable ZIPs, two prerelease setup executables,
   `SHA256SUMS.txt`, and a signed update manifest that continues to name only canonical ZIP assets.
 
+### 2026-07-21 - v0.6.0-alpha.2 packaging correction
+
+- Made the prerelease workflow install or downgrade to the pinned Inno Setup 6.4.3 compiler before
+  packaging instead of trusting a runner-provided `ISCC.exe` shim with unusable version metadata.
+- Kept the failed `v0.6.0-alpha.1` tag immutable and reserved the corrected artifact set for
+  `v0.6.0-alpha.2`.
+
 ### 2026-07-15
 
 - Preserved `issue-1-reply.md` and the five user-owned screenshots as untracked files.
