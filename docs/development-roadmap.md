@@ -788,6 +788,14 @@ Cross-platform considerations:
 - Install the compiler into an isolated runner-temporary directory so Windows x64 and ARM64 builds
   do not depend on machine-wide package or PATH state.
 
+### 2026-07-21 - v0.6.0-alpha.4 packaging correction
+
+- Replaced invalid `ISCC.exe` file-version metadata checks with the exact compiler engine version
+  reported while compiling the real SSH MountMate installer. Upstream intentionally sets the PE
+  file and product metadata to `0.0.0.0`.
+- Corrected the compiler banner check to match the upstream `Inno Setup 6 Command-Line Compiler`
+  text before packaging.
+
 ### 2026-07-15
 
 - Preserved `issue-1-reply.md` and the five user-owned screenshots as untracked files.

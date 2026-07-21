@@ -4,7 +4,8 @@ param(
   [Parameter(Mandatory = $true)][string]$OutputDir,
   [Parameter(Mandatory = $true)][string]$AppVersion,
   [ValidateSet('x64', 'arm64')][string]$Arch = 'x64',
-  [string]$IsccPath = 'iscc.exe'
+  [string]$IsccPath = 'iscc.exe',
+  [string]$ExpectedCompilerVersion = '6.4.3'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -19,14 +20,19 @@ $resolvedIscc = Get-Command $IsccPath -ErrorAction SilentlyContinue
 if (-not $resolvedIscc) {
   throw "Inno Setup ISCC.exe was not found. Install the pinned Inno Setup toolchain before packaging."
 }
-$versionText = (& $resolvedIscc.Source /? 2>&1 | Out-String)
-if ($versionText -notmatch 'Inno Setup 6\.') {
-  throw "unsupported Inno Setup compiler; expected Inno Setup 6.x"
-}
 
-& $resolvedIscc.Source "/DARCH=$Arch" "/DAPP_VERSION=$AppVersion" "/DINPUT_EXE=$((Resolve-Path $InputExe).Path)" "/DOUTPUT_DIR=$((Resolve-Path $OutputDir).Path)" $iss
-if ($LASTEXITCODE -ne 0) {
-  throw "Inno Setup compilation failed with exit code $LASTEXITCODE"
+$compilerOutput = (& $resolvedIscc.Source "/DARCH=$Arch" "/DAPP_VERSION=$AppVersion" "/DINPUT_EXE=$((Resolve-Path $InputExe).Path)" "/DOUTPUT_DIR=$((Resolve-Path $OutputDir).Path)" $iss 2>&1 | Out-String)
+$compilerExitCode = $LASTEXITCODE
+Write-Output $compilerOutput
+if ($compilerExitCode -ne 0) {
+  throw "Inno Setup compilation failed with exit code $compilerExitCode"
+}
+if ($compilerOutput -notmatch '(?m)^Inno Setup 6 Command-Line Compiler\r?$') {
+  throw "unexpected Inno Setup compiler banner"
+}
+$escapedCompilerVersion = [regex]::Escape($ExpectedCompilerVersion)
+if ($compilerOutput -notmatch "(?m)^Compiler engine version: Inno Setup $escapedCompilerVersion\r?$") {
+  throw "Inno Setup compiler engine did not report expected version $ExpectedCompilerVersion"
 }
 $output = Join-Path (Resolve-Path $OutputDir).Path "SSHMountMate-windows-$Arch-setup.exe"
 if (-not (Test-Path -LiteralPath $output -PathType Leaf)) {

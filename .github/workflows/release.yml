@@ -478,10 +478,6 @@ jobs:
           if (-not (Test-Path -LiteralPath $isccPath -PathType Leaf)) {
             throw "Pinned Inno Setup compiler was not found at '$isccPath'"
           }
-          $version = (Get-Item -LiteralPath $isccPath).VersionInfo.FileVersion
-          if ($version -notmatch '^6\.4\.3(?:\.0)?$') {
-            throw "Unexpected Inno Setup compiler version '$version'; expected $expected"
-          }
           "ISCC_PATH=$isccPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build unsigned per-user installer for prerelease
@@ -497,7 +493,8 @@ jobs:
             -OutputDir "release" `
             -AppVersion $version `
             -Arch $arch `
-            -IsccPath ($env:ISCC_PATH ?? 'iscc.exe')
+            -IsccPath ($env:ISCC_PATH ?? 'iscc.exe') `
+            -ExpectedCompilerVersion '6.4.3'
           if ($LASTEXITCODE -ne 0) { throw 'per-user installer build failed' }
 
       - name: Exercise packaged update and rollback

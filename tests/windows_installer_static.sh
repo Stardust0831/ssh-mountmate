@@ -25,7 +25,13 @@ grep -F 'f3c42116542c4cc57263c5ba6c4feabfc49fe771f2f98a79d2f7628b8762723b' "${wo
 grep -F 'Get-FileHash -LiteralPath $installer -Algorithm SHA256' "${workflow}"
 grep -F '"/DIR=$installDir"' "${workflow}"
 grep -F "\$isccPath = Join-Path \$installDir 'ISCC.exe'" "${workflow}"
-grep -F "\$version -notmatch '^6\\.4\\.3(?:\\.0)?\$'" "${workflow}"
+grep -F -- "-ExpectedCompilerVersion '6.4.3'" "${workflow}"
+grep -F "(?m)^Inno Setup 6 Command-Line Compiler\\r?\$" "${builder}"
+grep -F 'Compiler engine version: Inno Setup $escapedCompilerVersion' "${builder}"
+if grep -F 'VersionInfo.FileVersion' "${workflow}"; then
+  echo 'ISCC.exe intentionally reports FileVersion 0.0.0.0; do not use it for toolchain validation' >&2
+  exit 1
+fi
 if grep -F 'choco install innosetup' "${workflow}"; then
   echo 'release workflow must not depend on Chocolatey package versions for Inno Setup' >&2
   exit 1
