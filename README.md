@@ -18,7 +18,7 @@ It uses rclone for the actual mount operation and provides a small GUI around th
   shared SSH session for OAuth/2FA-style login.
 - Store passwords and key passphrases through `rclone obscure`, not as plain text.
 - Check for rclone and platform mount dependencies.
-- Bundle and verify the official rclone binary in release builds.
+- Build and verify a pinned, minimally patched rclone in release builds.
 - Configure global rclone VFS cache options in the GUI.
 - Show mount status, capacity usage, Lustre project/user/group quotas, logs, and common actions per connection.
 - Show the real rclone upload queue and remote-transfer progress after local file copies appear complete.
@@ -28,7 +28,7 @@ It uses rclone for the actual mount operation and provides a small GUI around th
 
 ## Requirements
 
-SSH MountMate release builds bundle the official rclone binary for the target platform and verify it before use. Source builds can use an explicitly configured rclone, a previously managed copy, or a compatible rclone found on `PATH`.
+SSH MountMate release builds bundle a pinned rclone v1.74.4 source build with a small audited cache-refresh patch and verify it before use. Source builds can use an explicitly configured rclone, a previously managed copy, or a compatible rclone found on `PATH`.
 
 Windows:
 
@@ -52,7 +52,7 @@ macOS:
 - macFUSE or FUSE-T
 - OpenSSH Client
 
-Important macOS note: SSH MountMate release builds use the bundled official rclone binary, so users normally do not need Homebrew rclone. If you override rclone or run from source, do not use the Homebrew `rclone` package for mounting. Homebrew's rclone package cannot run `rclone mount` on macOS. Use the official rclone binary instead:
+Important macOS note: SSH MountMate release builds use the bundled rclone binary, so users normally do not need Homebrew rclone. If you override rclone or run from source, do not use the Homebrew `rclone` package for mounting. Homebrew's rclone package cannot run `rclone mount` on macOS. Use the official rclone installer instead:
 
 ```bash
 curl https://rclone.org/install.sh | sudo bash
@@ -124,7 +124,7 @@ In the Settings window, `Check dependencies` reports rclone, OpenSSH, and the cu
 
 ## Bundled And Managed rclone
 
-Release workflows download a pinned official rclone archive for the target platform and architecture, verify its SHA-256 digest, and place rclone beside the Rust application inside the package. At runtime SSH MountMate verifies the bundled digest again and materializes a content-addressed managed copy in the application data directory. Explicitly configured and existing legacy managed copies remain supported for migration; a compatible system rclone is the final source-build fallback.
+Release workflows check out an immutable rclone v1.74.4 commit, verify and apply the tracked stale-while-revalidate patch, build it with pinned Go 1.25.0, and place rclone beside the Rust application inside the package. At runtime SSH MountMate verifies the bundled digest again and materializes a content-addressed managed copy in the application data directory. Explicitly configured and existing legacy managed copies remain supported for migration; a compatible system rclone is the final source-build fallback, but passive navigation refresh is skipped when that binary lacks the custom capability.
 
 The remote server is assumed to be a Linux server reachable over SSH/SFTP.
 
@@ -140,7 +140,7 @@ Use the latest GitHub Release and download the package for your platform:
 - `SSHMountMate-linux-arm64.zip`
 
 Release builds are produced from the Rust workspace by six native GitHub Actions runners. Windows
-and Linux ZIPs contain one executable with the verified official rclone embedded; Windows builds
+and Linux ZIPs contain one executable with the verified patched rclone embedded; Windows builds
 also embed the independently verified official Plink used by interactive sharing. macOS ZIPs
 contain the native `SSH MountMate.app` bundle with rclone and license notices inside the application.
 

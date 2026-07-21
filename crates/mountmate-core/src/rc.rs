@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
@@ -84,9 +85,9 @@ impl HttpRcClient {
         refresh_remote_snapshot(self, remote, relative_dir, recursive)
     }
 
-    /// Invalidate and refresh only the VFS cache entry.  This deliberately
-    /// avoids operations/list and vfs/queue so Explorer navigation can remain
-    /// fire-and-forget and cannot expose transfer state.
+    /// Refresh a cached VFS directory without invalidating its old snapshot.
+    /// This custom endpoint is deliberately not emulated on older rclone
+    /// builds because their ordinary refresh blocks readers during remote I/O.
     pub fn refresh_remote_cache(&self, relative_dir: &str) -> Result<(), RcError> {
         refresh_remote_cache(self, relative_dir)
     }
@@ -199,9 +200,30 @@ pub fn refresh_remote_cache(api: &impl RcApi, relative_dir: &str) -> Result<(), 
     } else {
         json!({"dir": relative_dir})
     };
-    api.call("vfs/forget", params.clone())?;
-    api.call("vfs/refresh", params)?;
+    let response: CacheRefreshResponse =
+        decode("vfs/refresh-swr", api.call("vfs/refresh-swr", params)?)?;
+    let key = relative_dir.trim_matches('/');
+    match response.result.get(key).map(String::as_str) {
+        Some("OK") => {}
+        Some(message) => {
+            return Err(RcError::Request {
+                method: "vfs/refresh-swr".into(),
+                message: message.into(),
+            });
+        }
+        None => {
+            return Err(RcError::InvalidResponse {
+                method: "vfs/refresh-swr".into(),
+                message: format!("missing result for directory {key:?}"),
+            });
+        }
+    }
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct CacheRefreshResponse {
+    result: HashMap<String, String>,
 }
 
 #[cfg(test)]
@@ -309,8 +331,8 @@ mod tests {
     }
 
     #[test]
-    fn cache_only_refresh_calls_exactly_forget_and_refresh() {
-        let api = FakeRc::new([json!({}), json!({}), json!({})]);
+    fn cache_only_refresh_calls_stale_while_revalidate_endpoint() {
+        let api = FakeRc::new([json!({"result": {"subdir": "OK"}})]);
         refresh_remote_cache(&api, "subdir").unwrap();
         let calls = api.calls.borrow();
         assert_eq!(
@@ -318,10 +340,29 @@ mod tests {
                 .iter()
                 .map(|(method, _)| method.as_str())
                 .collect::<Vec<_>>(),
-            ["vfs/forget", "vfs/refresh"]
+            ["vfs/refresh-swr"]
         );
         assert_eq!(calls[0].1, json!({"dir": "subdir"}));
-        assert_eq!(calls[1].1, json!({"dir": "subdir"}));
+    }
+
+    #[test]
+    fn cache_only_refresh_surfaces_directory_failure() {
+        let api = FakeRc::new([json!({"result": {"subdir": "directory not found"}})]);
+        let error = refresh_remote_cache(&api, "subdir").unwrap_err();
+        assert!(matches!(
+            error,
+            RcError::Request { method, message }
+                if method == "vfs/refresh-swr" && message == "directory not found"
+        ));
+    }
+
+    #[test]
+    fn cache_only_root_refresh_uses_empty_result_key() {
+        let api = FakeRc::new([json!({"result": {"": "OK"}})]);
+        refresh_remote_cache(&api, "").unwrap();
+        let calls = api.calls.borrow();
+        assert_eq!(calls[0].0, "vfs/refresh-swr");
+        assert_eq!(calls[0].1, json!({}));
     }
 
     #[test]

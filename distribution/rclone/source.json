@@ -1,0 +1,11 @@
+{
+  "project": "rclone",
+  "repository": "https://github.com/rclone/rclone",
+  "upstream_tag": "v1.74.4",
+  "upstream_commit": "5bc93a2a7ab0ebd0a11352bc4968eabeffb18027",
+  "go_version": "1.25.0",
+  "build_version": "v1.74.4-ssh-mountmate.1",
+  "patch": "rclone-v1.74.4-swr.patch",
+  "patch_sha256": "ebdf3b6d3043526a29efd285768a829e2291275d6fbd4c4836861c665f440334",
+  "added_rc_capability": "vfs/refresh-swr"
+}

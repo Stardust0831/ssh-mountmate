@@ -1,6 +1,7 @@
 # Third-Party Notices
 
-SSH MountMate release builds bundle the official rclone binary for the target platform.
+SSH MountMate release builds bundle a source-built, minimally modified rclone binary for the
+target platform.
 
 The complete generated inventory and license text for every Rust crate linked on the six release
 targets is available in `licenses/RUST-THIRD-PARTY.txt`. CI regenerates it from `Cargo.lock` with
@@ -13,13 +14,18 @@ cargo-about and rejects stale output.
 - License: MIT
 - License text: `licenses/rclone-COPYING.txt`
 
-The bundled rclone binary is downloaded from the official rclone download host during the SSH MountMate build. Release workflows currently pin rclone v1.74.4:
+Release workflows check out rclone v1.74.4 at immutable upstream commit
+`5bc93a2a7ab0ebd0a11352bc4968eabeffb18027`, apply the audited patch below, and build it with Go
+1.25.0. The bundled binary identifies itself as `v1.74.4-ssh-mountmate.1`:
 
 ```text
-https://downloads.rclone.org/v1.74.4/rclone-v1.74.4-<platform>-<arch>.zip
+distribution/rclone/rclone-v1.74.4-swr.patch
+SHA-256: ebdf3b6d3043526a29efd285768a829e2291275d6fbd4c4836861c665f440334
 ```
 
-Platform is `windows`, `osx`, or `linux`; architecture is selected from the build machine, usually `amd64` or `arm64`.
+The patch adds only the cache-preserving `vfs/refresh-swr` remote-control operation used for passive
+file-manager navigation refresh. The source/build provenance is recorded in
+`distribution/rclone/source.json`; rclone remains licensed under the MIT license above.
 
 ## rfd
 
