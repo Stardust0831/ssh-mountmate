@@ -103,7 +103,7 @@ fn restrict_private_path(path: &Path, directory: bool) -> Result<(), String> {
     use std::ffi::c_void;
     use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt;
-    use std::ptr::null_mut;
+    use std::ptr::{null, null_mut};
 
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
@@ -316,7 +316,7 @@ fn enforce_installed_version(requested_version: &str) -> Result<(), PlatformErro
 fn read_windows_install_record() -> Result<Option<InstalledInstallRecord>, PlatformError> {
     use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt;
-    use std::ptr::{null, null_mut};
+    use std::ptr::null_mut;
 
     use windows_sys::Win32::System::Registry::{
         HKEY, HKEY_CURRENT_USER, KEY_READ, REG_DWORD, REG_EXPAND_SZ, REG_SZ, RegCloseKey,

@@ -287,7 +287,7 @@ pub struct LustreQuotaDetails {
 pub enum LustreQuotaStatus {
     NotLustre { reason: LustreStatusReason },
     Unavailable { reason: LustreStatusReason },
-    Available(LustreQuotaDetails),
+    Available(Box<LustreQuotaDetails>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -781,7 +781,7 @@ pub fn parse_lustre_quota_snapshot(output: &str) -> LustreQuotaStatus {
             };
             let current_user = scope_status(&scope_lines[1], scope_exit[1]);
             let primary_group = scope_status(&scope_lines[2], scope_exit[2]);
-            LustreQuotaStatus::Available(LustreQuotaDetails {
+            LustreQuotaStatus::Available(Box::new(LustreQuotaDetails {
                 resolved_path,
                 mountpoint,
                 project_id,
@@ -792,7 +792,7 @@ pub fn parse_lustre_quota_snapshot(output: &str) -> LustreQuotaStatus {
                 project,
                 current_user,
                 primary_group,
-            })
+            }))
         }
         _ => LustreQuotaStatus::Unavailable {
             reason: LustreStatusReason::InvalidOutput("missing Lustre status frame".into()),
@@ -846,7 +846,7 @@ fn unavailable_reason(value: &str) -> LustreStatusReason {
         "filesystem-unresolved" => LustreStatusReason::FilesystemUnresolved,
         "project-id-missing" => LustreStatusReason::ProjectIdMissing,
         "identity-unavailable" => LustreStatusReason::IdentityUnavailable,
-        other if other.is_empty() => LustreStatusReason::Other("Lustre probe unavailable".into()),
+        "" => LustreStatusReason::Other("Lustre probe unavailable".into()),
         _ => LustreStatusReason::Other(value.trim().to_owned()),
     }
 }
@@ -995,8 +995,6 @@ fn quota_metric(
         LustreQuotaSeverity::SoftExceeded
     } else if grace.state == LustreGraceState::Active {
         LustreQuotaSeverity::Grace
-    } else if hard.is_none() && soft.is_none() {
-        LustreQuotaSeverity::Normal
     } else {
         LustreQuotaSeverity::Normal
     };
