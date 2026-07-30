@@ -21,7 +21,7 @@ use crate::paths::AppPaths;
 use crate::process::{MountStatus, argv_matches_state};
 use crate::rc::HttpRcClient;
 use crate::rclone::{MountCommand, MountPlatform};
-use crate::storage::{FileLock, StorageError, read_json, write_private_json};
+use crate::storage::{FileLock, StorageError, atomic_write, read_json, write_private_json};
 use crate::{MountPhase, MountState, ServerConfig, Settings};
 
 #[cfg(windows)]
@@ -46,6 +46,8 @@ pub enum RuntimeError {
     MountpointReserved(PathBuf),
     #[error("process operation failed: {0}")]
     Process(String),
+    #[error("could not prepare private rclone RC authentication: {0}")]
+    RcAuthentication(String),
     #[error("mount did not become ready; log: {log}\n{tail}")]
     NotReady { log: PathBuf, tail: String },
     #[error("recorded PID was reused; stale state was removed without stopping the process")]
@@ -350,6 +352,8 @@ impl<'a> MountRuntime<'a> {
         let rc_addr = allocate_loopback_address()?;
         let rc_user = "mountmate".to_owned();
         let rc_pass = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let rc_htpasswd = self.paths.rc_htpasswd_file(&server.id);
+        write_rc_htpasswd(&rc_htpasswd, &rc_user, &rc_pass)?;
         let command = MountCommand {
             rclone: request.rclone,
             config: &self.paths.rclone_config(),
@@ -360,16 +364,18 @@ impl<'a> MountRuntime<'a> {
             cache_dir: request.cache_dir,
             log_path: &log,
             rc_addr: &rc_addr,
-            rc_user: &rc_user,
-            rc_pass: &rc_pass,
+            rc_htpasswd: &rc_htpasswd,
             platform: self.platform,
         }
         .build();
         let arguments = &command[1..];
-        let pid = self
-            .processes
-            .spawn(request.rclone, arguments, &log)
-            .map_err(RuntimeError::Process)?;
+        let pid = match self.processes.spawn(request.rclone, arguments, &log) {
+            Ok(pid) => pid,
+            Err(error) => {
+                let _ = remove_file_if_exists(&rc_htpasswd);
+                return Err(RuntimeError::Process(error));
+            }
+        };
         let spawned_snapshot = self.processes.snapshot(pid);
         let process_started_at = spawned_snapshot
             .as_ref()
@@ -392,6 +398,7 @@ impl<'a> MountRuntime<'a> {
         };
         if let Err(error) = self.save_state(&state) {
             let _ = self.stop_if_owned(&state);
+            let _ = remove_file_if_exists(&rc_htpasswd);
             return Err(error);
         }
         drop(allocation_lock);
@@ -636,12 +643,30 @@ impl<'a> MountRuntime<'a> {
     }
 
     fn remove_state(&self, server_id: &str) -> Result<(), RuntimeError> {
-        let path = self.paths.state_file(server_id);
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(source) => Err(StorageError::Io { path, source }.into()),
+        let state_result = remove_file_if_exists(&self.paths.state_file(server_id));
+        let auth_result = remove_file_if_exists(&self.paths.rc_htpasswd_file(server_id));
+        state_result.and(auth_result)
+    }
+}
+
+const RC_BCRYPT_COST: u32 = 10;
+
+fn write_rc_htpasswd(path: &Path, username: &str, password: &str) -> Result<(), RuntimeError> {
+    let password_hash = bcrypt::hash(password, RC_BCRYPT_COST)
+        .map_err(|error| RuntimeError::RcAuthentication(error.to_string()))?;
+    atomic_write(path, format!("{username}:{password_hash}\n").as_bytes())?;
+    Ok(())
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<(), RuntimeError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(StorageError::Io {
+            path: path.to_owned(),
+            source,
         }
+        .into()),
     }
 }
 
@@ -717,6 +742,8 @@ mod tests {
         last: RefCell<Option<ProcessSnapshot>>,
         signals: RefCell<Vec<&'static str>>,
         spawn_calls: RefCell<usize>,
+        spawned_arguments: RefCell<Vec<String>>,
+        spawn_error: RefCell<Option<String>>,
     }
 
     impl FakeProcesses {
@@ -726,18 +753,23 @@ mod tests {
                 last: RefCell::new(None),
                 signals: RefCell::new(Vec::new()),
                 spawn_calls: RefCell::new(0),
+                spawned_arguments: RefCell::new(Vec::new()),
+                spawn_error: RefCell::new(None),
             }
+        }
+
+        fn fail_spawn(&self, message: &str) {
+            *self.spawn_error.borrow_mut() = Some(message.into());
         }
     }
 
     impl ProcessControl for FakeProcesses {
-        fn spawn(
-            &self,
-            _program: &Path,
-            _arguments: &[String],
-            _log: &Path,
-        ) -> Result<u32, String> {
+        fn spawn(&self, _program: &Path, arguments: &[String], _log: &Path) -> Result<u32, String> {
             *self.spawn_calls.borrow_mut() += 1;
+            *self.spawned_arguments.borrow_mut() = arguments.to_vec();
+            if let Some(error) = self.spawn_error.borrow_mut().take() {
+                return Err(error);
+            }
             Ok(42)
         }
 
@@ -910,6 +942,57 @@ mod tests {
         let saved: MountState = read_json(&paths.state_file("alpha")).unwrap();
         assert_eq!(saved.phase, MountPhase::Mounted);
         assert!(processes.signals.borrow().is_empty());
+        let auth_path = paths.rc_htpasswd_file("alpha");
+        let auth = fs::read_to_string(&auth_path).unwrap();
+        let (username, password_hash) = auth.trim_end().split_once(':').unwrap();
+        assert_eq!(username, "mountmate");
+        assert!(bcrypt::verify(&saved.rc_pass, password_hash).unwrap());
+        let arguments = processes.spawned_arguments.borrow();
+        assert!(!arguments.iter().any(|argument| argument == &saved.rc_pass));
+        assert!(arguments.windows(2).any(|arguments| {
+            arguments == ["--rc-htpasswd", auth_path.to_string_lossy().as_ref()]
+        }));
+        assert!(!arguments.contains(&"--rc-user".into()));
+        assert!(!arguments.contains(&"--rc-pass".into()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                fs::metadata(auth_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_failure_removes_rc_authentication_file() {
+        let temp = tempdir().unwrap();
+        let paths = paths(temp.path());
+        let processes = FakeProcesses::new([]);
+        processes.fail_spawn("injected spawn failure");
+        let rc = FakeRc {
+            pid: Err("offline".into()),
+            quit_calls: RefCell::new(0),
+        };
+        let mountpoint = FakeMountpoint {
+            ready: RefCell::new(false),
+        };
+        let runtime =
+            MountRuntime::new(&paths, &processes, &rc, &mountpoint).with_options(options());
+
+        assert!(matches!(
+            runtime.mount(MountRequest {
+                server: &server(),
+                settings: &Settings::default(),
+                rclone: Path::new("rclone"),
+                mountpoint: &temp.path().join("mnt"),
+                cache_dir: &temp.path().join("cache"),
+            }),
+            Err(RuntimeError::Process(message)) if message == "injected spawn failure"
+        ));
+        assert!(!paths.rc_htpasswd_file("alpha").exists());
+        assert!(!paths.state_file("alpha").exists());
     }
 
     #[test]
@@ -1006,6 +1089,7 @@ mod tests {
         let paths = paths(temp.path());
         let (state, snapshot) = state(temp.path(), Some(matching_arguments(temp.path())));
         write_private_json(&paths.state_file("alpha"), &state).unwrap();
+        fs::write(paths.rc_htpasswd_file("alpha"), "mountmate:hash\n").unwrap();
         let processes = FakeProcesses::new([Some(snapshot), None]);
         let rc = FakeRc {
             pid: Ok(42),
@@ -1022,6 +1106,7 @@ mod tests {
         assert_eq!(*rc.quit_calls.borrow(), 1);
         assert!(processes.signals.borrow().is_empty());
         assert!(!paths.state_file("alpha").exists());
+        assert!(!paths.rc_htpasswd_file("alpha").exists());
     }
 
     #[test]
@@ -1052,6 +1137,7 @@ mod tests {
         ));
         assert_eq!(&*processes.signals.borrow(), &["term"]);
         assert!(!paths.state_file("alpha").exists());
+        assert!(!paths.rc_htpasswd_file("alpha").exists());
     }
 
     #[test]
@@ -1085,6 +1171,7 @@ mod tests {
             Err(RuntimeError::NotReady { .. })
         ));
         assert!(paths.state_file("alpha").exists());
+        assert!(paths.rc_htpasswd_file("alpha").exists());
         assert!(processes.signals.borrow().is_empty());
     }
 
@@ -1134,6 +1221,51 @@ mod tests {
         assert!(!runtime.cleanup_stale_state("alpha").unwrap());
         assert!(paths.state_file("alpha").exists());
         assert_eq!(runtime.status("alpha").unwrap(), MountStatus::Starting);
+    }
+
+    #[test]
+    fn stale_state_cleanup_removes_rc_authentication_file() {
+        let temp = tempdir().unwrap();
+        let paths = paths(temp.path());
+        let (state, _) = state(temp.path(), Some(matching_arguments(temp.path())));
+        write_private_json(&paths.state_file("alpha"), &state).unwrap();
+        fs::write(paths.rc_htpasswd_file("alpha"), "mountmate:hash\n").unwrap();
+        let processes = FakeProcesses::new([None]);
+        let rc = FakeRc {
+            pid: Err("offline".into()),
+            quit_calls: RefCell::new(0),
+        };
+        let mountpoint = FakeMountpoint {
+            ready: RefCell::new(false),
+        };
+        let runtime =
+            MountRuntime::new(&paths, &processes, &rc, &mountpoint).with_options(options());
+
+        assert!(runtime.cleanup_stale_state("alpha").unwrap());
+        assert!(!paths.state_file("alpha").exists());
+        assert!(!paths.rc_htpasswd_file("alpha").exists());
+    }
+
+    #[test]
+    fn legacy_state_without_rc_authentication_file_remains_cleanable() {
+        let temp = tempdir().unwrap();
+        let paths = paths(temp.path());
+        let (state, _) = state(temp.path(), Some(matching_arguments(temp.path())));
+        write_private_json(&paths.state_file("alpha"), &state).unwrap();
+        let processes = FakeProcesses::new([None]);
+        let rc = FakeRc {
+            pid: Err("offline".into()),
+            quit_calls: RefCell::new(0),
+        };
+        let mountpoint = FakeMountpoint {
+            ready: RefCell::new(false),
+        };
+        let runtime =
+            MountRuntime::new(&paths, &processes, &rc, &mountpoint).with_options(options());
+
+        runtime.unmount("alpha").unwrap();
+        assert!(!paths.state_file("alpha").exists());
+        assert!(!paths.rc_htpasswd_file("alpha").exists());
     }
 
     #[test]

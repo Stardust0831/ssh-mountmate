@@ -8,7 +8,10 @@ use thiserror::Error;
 
 use crate::model::{AuthMethod, ConnectionMethod};
 use crate::paths::AppPaths;
-use crate::ssh::{ResolvedSshConfig, readable_file, validate_host_alias};
+use crate::ssh::{
+    ResolvedSshConfig, known_hosts_file_has_binding, known_hosts_marker, readable_file,
+    validate_host_alias,
+};
 use crate::storage::{FileLock, StorageError, atomic_write};
 use crate::{MountBackend, ServerConfig, Settings};
 
@@ -22,6 +25,8 @@ pub enum RcloneConfigError {
     MissingResolvedSshConfig,
     #[error("interactive SSH requires a verified shared-session connector")]
     MissingInteractiveConnector,
+    #[error("native SFTP requires a readable host-key binding")]
+    MissingHostKeyBinding,
     #[error("invalid rclone config at {path}: {message}")]
     InvalidConfig { path: PathBuf, message: String },
     #[error(transparent)]
@@ -142,9 +147,11 @@ impl RcloneRemote {
                 }
             }
         }
-        if let Some(path) = known_hosts.and_then(readable_file) {
-            options.push(("known_hosts_file".into(), path.display().to_string()));
-        }
+        let known_hosts = known_hosts
+            .and_then(readable_file)
+            .filter(|path| known_hosts_file_has_binding(path, &known_hosts_marker(host, port)))
+            .ok_or(RcloneConfigError::MissingHostKeyBinding)?;
+        options.push(("known_hosts_file".into(), known_hosts.display().to_string()));
         Ok(Self { name, options })
     }
 
@@ -350,8 +357,7 @@ pub struct MountCommand<'a> {
     pub cache_dir: &'a Path,
     pub log_path: &'a Path,
     pub rc_addr: &'a str,
-    pub rc_user: &'a str,
-    pub rc_pass: &'a str,
+    pub rc_htpasswd: &'a Path,
     pub platform: MountPlatform,
 }
 
@@ -398,10 +404,8 @@ impl MountCommand<'_> {
             "--rc".into(),
             "--rc-addr".into(),
             self.rc_addr.into(),
-            "--rc-user".into(),
-            self.rc_user.into(),
-            "--rc-pass".into(),
-            self.rc_pass.into(),
+            "--rc-htpasswd".into(),
+            self.rc_htpasswd.display().to_string(),
             match backend {
                 MountBackend::Fuse => "mount".into(),
                 MountBackend::Nfs => "nfsmount".into(),
@@ -515,6 +519,9 @@ mod tests {
 
     use super::*;
 
+    const TEST_HOST_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
+
     fn app_paths(root: &Path) -> AppPaths {
         AppPaths {
             config_dir: root.join("config"),
@@ -541,8 +548,7 @@ mod tests {
             cache_dir: Path::new("cache"),
             log_path: Path::new("alpha.log"),
             rc_addr: "127.0.0.1:1234",
-            rc_user: "mountmate",
-            rc_pass: "secret",
+            rc_htpasswd: Path::new("rc.htpasswd"),
             platform: MountPlatform::Windows,
         }
         .build()
@@ -554,15 +560,11 @@ mod tests {
         assert!(command.contains(&"--links".into()));
         assert!(command.contains(&"--no-console".into()));
         assert!(!command.contains(&"--rc-no-auth".into()));
+        assert!(!command.iter().any(|argument| argument == "secret"));
         assert!(
             command
                 .windows(2)
-                .any(|item| item == ["--rc-user", "mountmate"])
-        );
-        assert!(
-            command
-                .windows(2)
-                .any(|item| item == ["--rc-pass", "secret"])
+                .any(|item| { item == ["--rc-htpasswd", "rc.htpasswd"] })
         );
         assert!(
             command
@@ -609,8 +611,7 @@ mod tests {
                 cache_dir: Path::new("cache"),
                 log_path: Path::new("alpha.log"),
                 rc_addr: "127.0.0.1:1234",
-                rc_user: "mountmate",
-                rc_pass: "secret",
+                rc_htpasswd: Path::new("rc.htpasswd"),
                 platform,
             }
             .build();
@@ -642,8 +643,7 @@ mod tests {
             cache_dir: Path::new("cache"),
             log_path: Path::new("alpha.log"),
             rc_addr: "127.0.0.1:1234",
-            rc_user: "mountmate",
-            rc_pass: "secret",
+            rc_htpasswd: Path::new("rc.htpasswd"),
             platform: MountPlatform::Linux,
         }
         .build();
@@ -683,12 +683,11 @@ mod tests {
                 cache_dir: Path::new("cache"),
                 log_path: Path::new("alpha.log"),
                 rc_addr: "127.0.0.1:1234",
-                rc_user: "mountmate",
-                rc_pass: "secret",
+                rc_htpasswd: Path::new("rc.htpasswd"),
                 platform,
             }
             .build();
-            assert_eq!(command[10], expected);
+            assert_eq!(command[8], expected);
         }
     }
 
@@ -713,8 +712,7 @@ mod tests {
             cache_dir: Path::new("cache"),
             log_path: Path::new("alpha.log"),
             rc_addr: "127.0.0.1:1234",
-            rc_user: "mountmate",
-            rc_pass: "secret",
+            rc_htpasswd: Path::new("rc.htpasswd"),
             platform: MountPlatform::Macos,
         }
         .build();
@@ -752,7 +750,11 @@ mod tests {
     fn native_remote_keeps_obscured_password_and_readable_known_hosts() {
         let temp = tempdir().unwrap();
         let known_hosts = temp.path().join("known_hosts");
-        fs::write(&known_hosts, "host ssh-ed25519 AAAA\n").unwrap();
+        fs::write(
+            &known_hosts,
+            format!("[alpha.example]:12022 {TEST_HOST_KEY}\n"),
+        )
+        .unwrap();
         let server = ServerConfig {
             id: "alpha".into(),
             host: "alpha.example".into(),
@@ -779,7 +781,7 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_known_hosts_is_never_written_to_remote() {
+    fn unreadable_known_hosts_fails_closed() {
         let temp = tempdir().unwrap();
         let not_a_file = temp.path().join("known_hosts");
         fs::create_dir(&not_a_file).unwrap();
@@ -790,21 +792,23 @@ mod tests {
             ..ServerConfig::default()
         };
 
-        let remote = RcloneRemote::for_server(&server, None, Some(&not_a_file), false).unwrap();
-
-        assert!(
-            !remote
-                .options
-                .iter()
-                .any(|(key, _)| key == "known_hosts_file")
-        );
+        assert!(matches!(
+            RcloneRemote::for_server(&server, None, Some(&not_a_file), false),
+            Err(RcloneConfigError::MissingHostKeyBinding)
+        ));
     }
 
     #[test]
     fn ssh_config_remote_uses_resolved_values_and_existing_identity() {
         let temp = tempdir().unwrap();
         let identity = temp.path().join("id key");
+        let known_hosts = temp.path().join("known_hosts");
         fs::write(&identity, "PRIVATE KEY").unwrap();
+        fs::write(
+            &known_hosts,
+            format!("[c1.example]:12022 {TEST_HOST_KEY}\n"),
+        )
+        .unwrap();
         let resolved = ResolvedSshConfig::parse(&format!(
             "hostname c1.example\nuser researcher\nport 12022\nidentityfile \"{}\"\n",
             identity.display()
@@ -816,7 +820,8 @@ mod tests {
             ..ServerConfig::default()
         };
 
-        let remote = RcloneRemote::for_server(&server, Some(&resolved), None, false).unwrap();
+        let remote =
+            RcloneRemote::for_server(&server, Some(&resolved), Some(&known_hosts), false).unwrap();
 
         assert_eq!(remote.name, "cluster");
         assert!(
@@ -836,7 +841,13 @@ mod tests {
     fn ssh_config_remote_keeps_key_passphrase_after_server_json_round_trip() {
         let temp = tempdir().unwrap();
         let identity = temp.path().join("id key");
+        let known_hosts = temp.path().join("known_hosts");
         fs::write(&identity, "PRIVATE KEY").unwrap();
+        fs::write(
+            &known_hosts,
+            format!("[c1.example]:12022 {TEST_HOST_KEY}\n"),
+        )
+        .unwrap();
         let resolved = ResolvedSshConfig::parse(&format!(
             "hostname c1.example\nuser researcher\nport 12022\nidentityfile \"{}\"\n",
             identity.display()
@@ -851,13 +862,35 @@ mod tests {
         let server: ServerConfig =
             serde_json::from_value(serde_json::to_value(server).unwrap()).unwrap();
 
-        let remote = RcloneRemote::for_server(&server, Some(&resolved), None, false).unwrap();
+        let remote =
+            RcloneRemote::for_server(&server, Some(&resolved), Some(&known_hosts), false).unwrap();
 
         assert!(
             remote
                 .options
                 .contains(&("key_file_pass".into(), "obscured-key-passphrase".into()))
         );
+    }
+
+    #[test]
+    fn unrelated_readable_known_hosts_fails_closed() {
+        let temp = tempdir().unwrap();
+        let known_hosts = temp.path().join("known_hosts");
+        fs::write(&known_hosts, format!("other.example {TEST_HOST_KEY}\n")).unwrap();
+        let server = ServerConfig {
+            id: "alpha".into(),
+            host: "alpha.example".into(),
+            user: "researcher".into(),
+            port: "12022".into(),
+            auth: AuthMethod::Password,
+            password_obscured: "obscured".into(),
+            ..ServerConfig::default()
+        };
+
+        assert!(matches!(
+            RcloneRemote::for_server(&server, None, Some(&known_hosts), false),
+            Err(RcloneConfigError::MissingHostKeyBinding)
+        ));
     }
 
     #[test]

@@ -298,13 +298,26 @@ OpenSSH 或 Plink 自己的终端中输入。
 
 ## 主机指纹校验
 
-SSH MountMate 会尽量启用 rclone 的 host key 校验。
+SSH MountMate 要求 rclone 原生 SFTP 连接必须启用 host key 校验。
 
 对于 rclone SFTP remote，程序会维护自己的 `known_hosts` 文件。首次连接某个 host 和 port 时，会记录 `ssh-keyscan` 返回的 key；后续连接会固定使用这些 key，不再用网络扫描结果覆盖。
 
-如果无法扫描 host key，程序会回退使用用户默认的 OpenSSH `known_hosts` 文件。
+如果 host key 扫描失败或没有返回可用 key，程序只会在现有可读 `known_hosts` 文件已经包含
+该 host 和 port 的精确绑定时使用它，否则停止挂载。原生 SFTP 不会静默跳过主机指纹校验。
+OpenSSH 和交互式共享 SSH 连接则继续使用各自 SSH 实现的主机指纹策略。
 
 如果 rclone 报 `knownhosts: key mismatch`，SSH MountMate 会停止挂载，不会关闭校验重试。请先向服务器管理员核实新指纹，再从程序托管的 `known_hosts` 文件中删除该主机的旧记录并重试。
+
+## 本机控制接口认证
+
+每个挂载的 rclone 远程控制接口只监听单独分配的 IPv4 回环地址。每次挂载仍使用随机客户端
+密码，但该密码不再出现在 rclone 进程参数中；rclone 改为读取仅当前用户可访问的 Apache
+兼容 htpasswd 文件，其中只包含 BCrypt 哈希。启动失败、正常卸载和 stale state 清理时，
+程序会把该文件与挂载状态一起删除。GUI 仍需用原始客户端凭据执行带认证的状态、刷新、传输
+和退出请求，因此它只保存在当前用户可访问的私有挂载状态文件中。
+
+文件管理器命令和第二实例转发使用另一套随机 token 与回环监听器。未认证请求具有固定总
+期限，并由有上限的工作线程池处理，因此单个慢速本机连接无法长期独占监听器或拖住正常退出。
 
 ## 传输进度和远端刷新
 

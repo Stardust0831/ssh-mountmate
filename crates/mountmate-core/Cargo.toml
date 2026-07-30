@@ -12,6 +12,7 @@ sha2.workspace = true
 
 [dependencies]
 base64.workspace = true
+bcrypt.workspace = true
 configparser.workspace = true
 directories.workspace = true
 ed25519-dalek.workspace = true
@@ -25,6 +26,7 @@ serde.workspace = true
 serde_json.workspace = true
 semver.workspace = true
 sha2.workspace = true
+ssh-key.workspace = true
 sysinfo.workspace = true
 thiserror.workspace = true
 url.workspace = true
@@ -47,6 +49,7 @@ keyring = { workspace = true, features = ["windows-native"] }
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Threading",
 ] }

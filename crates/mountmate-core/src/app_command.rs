@@ -1,11 +1,12 @@
 #[cfg(not(windows))]
 use std::fs::File;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -27,6 +28,15 @@ use crate::ssh::SshPermissionControl;
 use crate::storage::read_json;
 
 const MAX_MESSAGE_BYTES: u64 = 64 * 1024;
+const AUTH_WORKER_COUNT: usize = 4;
+const AUTH_QUEUE_CAPACITY: usize = 16;
+const UNAUTHENTICATED_DEADLINE: Duration = Duration::from_millis(500);
+
+struct AcceptedConnection {
+    stream: TcpStream,
+    peer: SocketAddr,
+    deadline: Instant,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -208,6 +218,39 @@ pub struct AppCommandServer {
     thread: Option<JoinHandle<()>>,
 }
 
+struct PendingCommandState {
+    path: PathBuf,
+    token: String,
+    armed: bool,
+}
+
+impl PendingCommandState {
+    fn new(path: PathBuf, token: String) -> Self {
+        Self {
+            path,
+            token,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingCommandState {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let owns_state = read_json::<CommandState>(&self.path)
+            .is_ok_and(|state| constant_time_eq(state.token.as_bytes(), self.token.as_bytes()));
+        if owns_state {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 impl AppCommandServer {
     pub fn start(
         state_path: PathBuf,
@@ -239,18 +282,60 @@ impl AppCommandServer {
             token: token.clone(),
         };
         write_private_state(&state_path, &state, permissions)?;
+        let mut pending_state = PendingCommandState::new(state_path.clone(), token.clone());
 
         let stopping = Arc::new(AtomicBool::new(false));
         let thread_stopping = Arc::clone(&stopping);
         let thread_token = token.clone();
-        let callback = Arc::new(callback);
+        let callback = Arc::new(Mutex::new(callback));
+        let (connection_sender, connection_receiver) =
+            mpsc::sync_channel::<AcceptedConnection>(AUTH_QUEUE_CAPACITY);
+        let connection_receiver = Arc::new(Mutex::new(connection_receiver));
+        for worker_index in 0..AUTH_WORKER_COUNT {
+            let worker_receiver = Arc::clone(&connection_receiver);
+            let worker_token = thread_token.clone();
+            let worker_callback = Arc::clone(&callback);
+            let worker_stopping = Arc::clone(&thread_stopping);
+            thread::Builder::new()
+                .name(format!("ssh-mountmate-command-auth-{worker_index}"))
+                .spawn(move || {
+                    loop {
+                        let connection = {
+                            let Ok(receiver) = worker_receiver.lock() else {
+                                return;
+                            };
+                            receiver.recv()
+                        };
+                        let Ok(connection) = connection else {
+                            return;
+                        };
+                        handle_connection(
+                            connection.stream,
+                            connection.peer,
+                            connection.deadline,
+                            &worker_token,
+                            worker_callback.as_ref(),
+                            worker_stopping.as_ref(),
+                        );
+                    }
+                })?;
+        }
         let thread = thread::Builder::new()
             .name("ssh-mountmate-command".into())
             .spawn(move || {
                 while !thread_stopping.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((stream, peer)) => {
-                            handle_connection(stream, peer, &thread_token, callback.as_ref());
+                            let connection = AcceptedConnection {
+                                stream,
+                                peer,
+                                deadline: Instant::now() + UNAUTHENTICATED_DEADLINE,
+                            };
+                            match connection_sender.try_send(connection) {
+                                Ok(()) => {}
+                                Err(TrySendError::Full(_connection)) => {}
+                                Err(TrySendError::Disconnected(_connection)) => break,
+                            }
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(20));
@@ -259,12 +344,14 @@ impl AppCommandServer {
                     }
                 }
             })?;
-        Ok(Self {
+        let server = Self {
             state_path,
             token,
             stopping,
             thread: Some(thread),
-        })
+        };
+        pending_state.disarm();
+        Ok(server)
     }
 }
 
@@ -409,12 +496,16 @@ fn same_executable(actual: &Path, expected: &Path) -> bool {
     normalize(actual) == normalize(expected)
 }
 
-fn handle_connection(
+fn handle_connection<F>(
     mut stream: TcpStream,
     peer: SocketAddr,
+    deadline: Instant,
     token: &str,
-    callback: &dyn Fn(AppCommand),
-) {
+    callback: &Mutex<F>,
+    stopping: &AtomicBool,
+) where
+    F: Fn(AppCommand),
+{
     let response = (|| {
         if !peer.ip().is_loopback() {
             return Err("non-loopback client".into());
@@ -423,15 +514,18 @@ fn handle_connection(
             .set_nonblocking(false)
             .map_err(|error| error.to_string())?;
         stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .map_err(|error| error.to_string())?;
-        stream
             .set_write_timeout(Some(Duration::from_secs(2)))
             .map_err(|error| error.to_string())?;
         let request: CommandRequest =
-            read_message(&mut stream).map_err(|error| error.to_string())?;
+            read_message_until(&mut stream, deadline).map_err(|error| error.to_string())?;
         if !constant_time_eq(request.token.as_bytes(), token.as_bytes()) {
             return Err("invalid command token".into());
+        }
+        let callback = callback
+            .lock()
+            .map_err(|_| "command callback is unavailable".to_owned())?;
+        if stopping.load(Ordering::Acquire) {
+            return Err("command server is stopping".into());
         }
         callback(request.command);
         Ok(())
@@ -451,14 +545,57 @@ fn handle_connection(
 fn read_message<T: for<'de> Deserialize<'de>>(
     stream: &mut TcpStream,
 ) -> Result<T, AppCommandError> {
-    let mut reader = BufReader::new(stream).take(MAX_MESSAGE_BYTES + 1);
+    read_message_with_deadline(stream, None)
+}
+
+fn read_message_until<T: for<'de> Deserialize<'de>>(
+    stream: &mut TcpStream,
+    deadline: Instant,
+) -> Result<T, AppCommandError> {
+    read_message_with_deadline(stream, Some(deadline))
+}
+
+fn read_message_with_deadline<T: for<'de> Deserialize<'de>>(
+    stream: &mut TcpStream,
+    deadline: Option<Instant>,
+) -> Result<T, AppCommandError> {
     let mut message = Vec::new();
-    reader.read_until(b'\n', &mut message)?;
-    if message.is_empty() || message.len() as u64 > MAX_MESSAGE_BYTES || !message.ends_with(b"\n") {
+    let mut buffer = [0_u8; 4096];
+    loop {
+        if let Some(deadline) = deadline {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "request deadline elapsed")
+                })?;
+            stream.set_read_timeout(Some(remaining))?;
+        }
+        let capacity = (MAX_MESSAGE_BYTES + 1).saturating_sub(message.len() as u64) as usize;
+        if capacity == 0 {
+            return Err(AppCommandError::InvalidState("invalid command size".into()));
+        }
+        let read_capacity = buffer.len().min(capacity);
+        let read = stream.read(&mut buffer[..read_capacity])?;
+        if read == 0 {
+            return Err(AppCommandError::InvalidState("incomplete command".into()));
+        }
+        if let Some(newline) = buffer[..read].iter().position(|byte| *byte == b'\n') {
+            message.extend_from_slice(&buffer[..=newline]);
+            break;
+        }
+        message.extend_from_slice(&buffer[..read]);
+    }
+    if message.len() as u64 > MAX_MESSAGE_BYTES {
         return Err(AppCommandError::InvalidState("invalid command size".into()));
     }
     message.pop();
-    Ok(serde_json::from_slice(&message)?)
+    let parsed = serde_json::from_slice(&message)?;
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "request deadline elapsed").into(),
+        );
+    }
+    Ok(parsed)
 }
 
 fn write_private_state(
@@ -557,6 +694,244 @@ mod tests {
     }
 
     #[test]
+    fn unpublished_server_state_is_removed_by_startup_guard() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("command.json");
+        let state = CommandState {
+            pid: 1,
+            started_at: 1,
+            executable: PathBuf::from("app"),
+            version: "test".into(),
+            port: 1234,
+            token: "a".repeat(64),
+        };
+        write_private_state(&path, &state, &TestPermissions).unwrap();
+
+        drop(PendingCommandState::new(path.clone(), state.token));
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn slow_unauthenticated_client_does_not_block_valid_command() {
+        let temp = tempdir().unwrap();
+        let state_path = temp.path().join("command.json");
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let callback_received = Arc::clone(&received);
+        let server =
+            AppCommandServer::start(state_path.clone(), &TestPermissions, move |command| {
+                callback_received.lock().unwrap().push(command);
+            })
+            .unwrap();
+        let state: CommandState = read_json(&state_path).unwrap();
+        let mut slow = TcpStream::connect((Ipv4Addr::LOCALHOST, state.port)).unwrap();
+        slow.write_all(b"{").unwrap();
+        thread::sleep(Duration::from_millis(100));
+
+        let started = Instant::now();
+        let result = send_command(
+            &state_path,
+            &AppCommand::ShowTransfers,
+            Duration::from_secs(1),
+        );
+        let elapsed = started.elapsed();
+        drop(slow);
+
+        assert!(
+            result.is_ok(),
+            "valid command failed after {elapsed:?}: {result:?}"
+        );
+        assert!(elapsed < Duration::from_secs(1));
+        assert_eq!(
+            received.lock().unwrap().as_slice(),
+            &[AppCommand::ShowTransfers]
+        );
+        drop(server);
+    }
+
+    #[test]
+    fn drip_fed_bytes_cannot_extend_unauthenticated_deadline() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let writer = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            for _ in 0..20 {
+                if stream.write_all(b"{").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(40));
+            }
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        let started = Instant::now();
+        let result =
+            read_message_until::<CommandRequest>(&mut stream, started + Duration::from_millis(150));
+        drop(stream);
+        writer.join().unwrap();
+
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_millis(400));
+    }
+
+    #[test]
+    fn json_parsing_cannot_cross_unauthenticated_deadline() {
+        struct SlowRequest;
+
+        impl<'de> Deserialize<'de> for SlowRequest {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let _ = serde_json::Value::deserialize(deserializer)?;
+                thread::sleep(Duration::from_millis(25));
+                Ok(Self)
+            }
+        }
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client.write_all(b"{}\n").unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+
+        let result = read_message_until::<SlowRequest>(
+            &mut stream,
+            Instant::now() + Duration::from_millis(5),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn unauthenticated_deadline_starts_when_connection_is_accepted() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let (server_stream, peer) = listener.accept().unwrap();
+        let accepted_deadline = Instant::now() + Duration::from_millis(50);
+        let token = "a".repeat(64);
+        serde_json::to_writer(
+            &mut client,
+            &CommandRequest {
+                token: token.clone(),
+                command: AppCommand::ShowTransfers,
+            },
+        )
+        .unwrap();
+        client.write_all(b"\n").unwrap();
+        thread::sleep(Duration::from_millis(75));
+        let received = Mutex::new(Vec::new());
+        handle_connection(
+            server_stream,
+            peer,
+            accepted_deadline,
+            &token,
+            &Mutex::new(|command| received.lock().unwrap().push(command)),
+            &AtomicBool::new(false),
+        );
+
+        assert!(received.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn callback_waiter_rechecks_stopping_after_serialization_lock() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let (server_stream, peer) = listener.accept().unwrap();
+        let token = "a".repeat(64);
+        serde_json::to_writer(
+            &mut client,
+            &CommandRequest {
+                token: token.clone(),
+                command: AppCommand::ShowTransfers,
+            },
+        )
+        .unwrap();
+        client.write_all(b"\n").unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let callback_received = Arc::clone(&received);
+        let callback = Arc::new(Mutex::new(move |command| {
+            callback_received.lock().unwrap().push(command);
+        }));
+        let callback_guard = callback.lock().unwrap();
+        let stopping = Arc::new(AtomicBool::new(false));
+        let worker_callback = Arc::clone(&callback);
+        let worker_stopping = Arc::clone(&stopping);
+        let worker = thread::spawn(move || {
+            handle_connection(
+                server_stream,
+                peer,
+                Instant::now() + Duration::from_secs(1),
+                &token,
+                worker_callback.as_ref(),
+                worker_stopping.as_ref(),
+            );
+        });
+        thread::sleep(Duration::from_millis(50));
+        stopping.store(true, Ordering::Release);
+        drop(callback_guard);
+        worker.join().unwrap();
+        let response: CommandResponse = read_message(&mut client).unwrap();
+
+        assert!(!response.ok);
+        assert!(received.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn invalid_token_never_invokes_callback() {
+        let temp = tempdir().unwrap();
+        let state_path = temp.path().join("command.json");
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let callback_received = Arc::clone(&received);
+        let server =
+            AppCommandServer::start(state_path.clone(), &TestPermissions, move |command| {
+                callback_received.lock().unwrap().push(command);
+            })
+            .unwrap();
+        let state: CommandState = read_json(&state_path).unwrap();
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, state.port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        serde_json::to_writer(
+            &mut stream,
+            &CommandRequest {
+                token: "0".repeat(64),
+                command: AppCommand::ShowTransfers,
+            },
+        )
+        .unwrap();
+        stream.write_all(b"\n").unwrap();
+        let response: CommandResponse = read_message(&mut stream).unwrap();
+
+        assert!(!response.ok);
+        assert!(received.lock().unwrap().is_empty());
+        drop(server);
+    }
+
+    #[test]
+    fn server_drop_is_not_delayed_by_unauthenticated_client() {
+        let temp = tempdir().unwrap();
+        let state_path = temp.path().join("command.json");
+        let server = AppCommandServer::start(state_path.clone(), &TestPermissions, |_| {}).unwrap();
+        let state: CommandState = read_json(&state_path).unwrap();
+        let mut slow = TcpStream::connect((Ipv4Addr::LOCALHOST, state.port)).unwrap();
+        slow.write_all(b"{").unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        let started = Instant::now();
+        drop(server);
+
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(!state_path.exists());
+        drop(slow);
+    }
+
+    #[test]
     fn second_instance_lock_is_rejected_until_release() {
         const CHILD_PATH: &str = "SSH_MOUNTMATE_LOCK_TEST_PATH";
         if let Some(path) = std::env::var_os(CHILD_PATH) {
@@ -649,10 +1024,47 @@ mod tests {
     }
 
     #[test]
-    fn invalid_tokens_and_oversized_messages_are_rejected() {
+    fn token_comparison_accepts_only_equal_values() {
         assert!(constant_time_eq(b"secret", b"secret"));
         assert!(!constant_time_eq(b"secret", b"public"));
         assert!(!constant_time_eq(b"short", b"longer"));
+    }
+
+    #[test]
+    fn oversized_messages_are_rejected() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let writer = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream
+                .write_all(&vec![b'a'; MAX_MESSAGE_BYTES as usize + 1])
+                .unwrap();
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+
+        let result = read_message::<serde_json::Value>(&mut stream);
+        writer.join().unwrap();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn message_at_exact_size_limit_is_accepted() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let payload_length = MAX_MESSAGE_BYTES as usize - 3;
+        let writer = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream.write_all(b"\"").unwrap();
+            stream.write_all(&vec![b'a'; payload_length]).unwrap();
+            stream.write_all(b"\"\n").unwrap();
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+
+        let value = read_message::<String>(&mut stream).unwrap();
+        writer.join().unwrap();
+
+        assert_eq!(value.len(), payload_length);
     }
 
     #[test]
