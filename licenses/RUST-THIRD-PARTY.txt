@@ -7642,6 +7642,7 @@ Used by:
 - atomic-waker 1.1.2 (https://github.com/smol-rs/atomic-waker)
 - autocfg 1.5.1 (https://github.com/cuviper/autocfg)
 - base64 0.22.1 (https://github.com/marshallpierce/rust-base64)
+- base64 0.23.0 (https://github.com/marshallpierce/rust-base64)
 - bitflags 1.3.2 (https://github.com/bitflags/bitflags)
 - bitflags 2.13.0 (https://github.com/bitflags/bitflags)
 - blocking 1.6.2 (https://github.com/smol-rs/blocking)
@@ -8382,21 +8383,33 @@ Apache License 2.0
 
 Used by:
 - aes 0.8.4 (https://github.com/RustCrypto/block-ciphers)
+- base16ct 0.2.0 (https://github.com/RustCrypto/formats/tree/master/base16ct)
+- base64ct 1.8.3 (https://github.com/RustCrypto/formats)
 - block-buffer 0.10.4 (https://github.com/RustCrypto/utils)
 - block-padding 0.3.3 (https://github.com/RustCrypto/utils)
+- blowfish 0.10.0 (https://github.com/RustCrypto/block-ciphers)
 - cbc 0.1.2 (https://github.com/RustCrypto/block-modes)
 - cipher 0.4.4 (https://github.com/RustCrypto/traits)
+- cipher 0.5.2 (https://github.com/RustCrypto/traits)
 - const-oid 0.9.6 (https://github.com/RustCrypto/formats/tree/master/const-oid)
 - cpufeatures 0.2.17 (https://github.com/RustCrypto/utils)
 - crypto-common 0.1.7 (https://github.com/RustCrypto/traits)
+- crypto-common 0.2.2 (https://github.com/RustCrypto/traits)
 - der 0.7.10 (https://github.com/RustCrypto/formats/tree/master/der)
 - digest 0.10.7 (https://github.com/RustCrypto/traits)
 - hmac 0.12.1 (https://github.com/RustCrypto/MACs)
+- hybrid-array 0.4.14 (https://github.com/RustCrypto/hybrid-array)
 - inout 0.1.4 (https://github.com/RustCrypto/utils)
+- inout 0.2.2 (https://github.com/RustCrypto/utils)
+- pem-rfc7468 0.7.0 (https://github.com/RustCrypto/formats/tree/master/pem-rfc7468)
 - pkcs8 0.10.2 (https://github.com/RustCrypto/formats/tree/master/pkcs8)
+- sec1 0.7.3 (https://github.com/RustCrypto/formats/tree/master/sec1)
 - sha2 0.10.9 (https://github.com/RustCrypto/hashes)
 - signature 2.2.0 (https://github.com/RustCrypto/traits/tree/master/signature)
 - spki 0.7.3 (https://github.com/RustCrypto/formats/tree/master/spki)
+- ssh-cipher 0.2.0 (https://github.com/RustCrypto/SSH/tree/master/ssh-cipher)
+- ssh-encoding 0.2.0 (https://github.com/RustCrypto/SSH/tree/master/ssh-encoding)
+- ssh-key 0.6.7 (https://github.com/RustCrypto/SSH/tree/master/ssh-key)
 --------------------------------------------------------------------------------
                               Apache License
                         Version 2.0, January 2004
@@ -13817,6 +13830,35 @@ Used by:
 The MIT License (MIT)
 
 Copyright (c) 2020 James Dyson <avitex@wfxlabs.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+================================================================================
+MIT License
+
+Used by:
+- bcrypt 0.19.3 (https://github.com/Keats/rust-bcrypt)
+--------------------------------------------------------------------------------
+The MIT License (MIT)
+
+Copyright (c) 2020 Vincent Prouillet
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

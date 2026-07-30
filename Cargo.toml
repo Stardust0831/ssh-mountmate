@@ -17,6 +17,7 @@ repository = "https://github.com/Stardust0831/ssh-mountmate"
 anyhow = "1.0"
 async-channel = "2.5"
 base64 = "0.22"
+bcrypt = "0.19.3"
 configparser = { version = "3.1", features = ["indexmap"] }
 directories = "6.0"
 dark-light = "2.0"
@@ -41,6 +42,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 semver = "1.0"
 sha2 = "0.10"
+ssh-key = "0.6.7"
 tempfile = "3.20"
 thiserror = "2.0"
 tray-icon = { version = "0.24.1", default-features = false }

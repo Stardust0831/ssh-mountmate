@@ -20,6 +20,55 @@ until its stated evidence exists.
    this extension branch until that separate decision is made.
 7. Keep installer work, Explorer navigation-triggered refresh, complex Windows ProxyJump
    translation, server changes, and production signing/notarization as separate later work.
+8. Complete local and six-platform review for security issues #41-#43 before any merge or release:
+   keep raw RC credentials out of argv, fail closed without a native-SFTP host-key binding, and
+   bound unauthenticated app-command resource use.
+
+## Security hardening in progress: issues #41-#43
+
+Implemented and independently reviewed on 2026-07-31. Merge and Release remain gated on the
+repository's six-platform CI:
+
+- Replaced rclone `--rc-user`/`--rc-pass` arguments with `--rc-htpasswd`. Each mount writes an
+  owner-private file containing only `mountmate:<BCrypt hash>`, while the private mount state keeps
+  the random client credential needed by authenticated RC requests. Authentication files are
+  removed on spawn failure, verified readiness failure, normal unmount, PID-reuse/stale cleanup,
+  and old-state cleanup; they are intentionally retained when process ownership is unverifiable and
+  the mount state must remain recoverable.
+- Required successful `ssh-keyscan` exit and at least one normalized key. Native rclone SFTP remote
+  construction now fails when no readable host-key binding with a supported key type and key data
+  is available; marker-only and unrelated files are rejected. OpenSSH and Interactive transports
+  are unchanged.
+- Moved unauthenticated app-command reads off the sole accept loop into four fixed authentication
+  workers behind a 16-connection queue. Each pre-authentication request has a 500 ms total deadline,
+  including JSON parsing; message size remains capped at 64 KiB, equal-length token values remain
+  constant-time compared, and authenticated callbacks remain serialized.
+- Regression tests cover secrets absent from mount argv, BCrypt verification and Unix `0600`, auth
+  file cleanup/preservation, failed and empty key scans, native-SFTP fail-closed behavior, slow and
+  drip-fed clients, accept-time deadlines, invalid tokens, callback shutdown ordering, startup-state
+  cleanup, marker-only and unrelated readable host-key files, the real 64 KiB boundary, and bounded
+  server drop.
+- Independent security review found four gaps in the first implementation: queued connections did
+  not start their deadline at accept time, a callback waiter could cross server shutdown, thread
+  creation failure could leave published command state, and Windows htpasswd privacy depended on
+  startup ordering. All four were corrected before the final local verification.
+- Final independent review found two further gaps: marker-only `known_hosts` lines could pass the
+  construction preflight, and JSON parsing could finish after the pre-authentication deadline. Both
+  now have red/green regression tests and are fixed. The suggestion to retain htpasswd after the
+  first mount-state save fails was not adopted: no recoverable state exists on that path, so the
+  runtime attempts to stop the process and removes the orphan credential. Retention remains limited
+  to an already-persisted state whose live process ownership becomes unverifiable.
+- The post-rebase review found that prefix-only host-key checks still accepted invented algorithms
+  and malformed key blobs. Host keys are now structurally parsed with RustCrypto `ssh-key`, unknown
+  algorithms are rejected, and the former placeholder fixtures use a real Ed25519 public key. The
+  same review identified overbroad queue-test wording; the audit now names only the exercised
+  accept-time expiry and slow-client concurrent-delivery behavior.
+- The final integrated PR tree passes format checking, zero-warning full-workspace Clippy, and full
+  workspace tests. Core results are 307 passed and four explicitly ignored native/live tests;
+  legacy migration (one test), update signature (12 tests), signing CLI (three tests), platform
+  (five tests), and app (84 tests) also pass. Packaged-update fixtures have one passing test and
+  three explicitly ignored tests that require a packaged GUI application. Native Windows, Linux,
+  and macOS evidence remains an authoritative PR merge gate.
 
 ## Low-priority connection organization backlog
 

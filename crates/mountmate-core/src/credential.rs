@@ -586,6 +586,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    const TEST_HOST_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
     use crate::rclone::RcloneRemote;
     use crate::ssh::ResolvedSshConfig;
 
@@ -951,13 +954,21 @@ mod tests {
                 .unwrap();
         let temp = tempdir().unwrap();
         let identity = temp.path().join("id key");
+        let known_hosts = temp.path().join("known_hosts");
         fs::write(&identity, "PRIVATE KEY").unwrap();
+        fs::write(
+            &known_hosts,
+            format!("[c1.example]:12022 {TEST_HOST_KEY}\n"),
+        )
+        .unwrap();
         let resolved = ResolvedSshConfig::parse(&format!(
             "hostname c1.example\nuser researcher\nport 12022\nidentityfile \"{}\"\n",
             identity.display()
         ));
 
-        let remote = RcloneRemote::for_server(&hydrated, Some(&resolved), None, false).unwrap();
+        let remote =
+            RcloneRemote::for_server(&hydrated, Some(&resolved), Some(&known_hosts), false)
+                .unwrap();
 
         assert!(
             remote

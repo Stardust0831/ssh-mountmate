@@ -11,6 +11,9 @@ use mountmate_core::storage::{
 use mountmate_core::{AuthMethod, MountState};
 use tempfile::tempdir;
 
+const TEST_HOST_KEY: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
+
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/legacy-v0.3")
@@ -121,7 +124,13 @@ fn complete_python_layout_migrates_without_losing_user_data() {
     assert!(state.rc_user.is_empty());
     assert!(state.rc_pass.is_empty());
 
-    let remote = RcloneRemote::for_server(password, None, None, false).unwrap();
+    let known_hosts = paths.config_dir.join("known_hosts");
+    fs::write(
+        &known_hosts,
+        format!("[password.example]:2202 {TEST_HOST_KEY}\n"),
+    )
+    .unwrap();
+    let remote = RcloneRemote::for_server(password, None, Some(&known_hosts), false).unwrap();
     write_rclone_remote(&paths, &remote).unwrap();
     let mut config = Ini::new_cs();
     config.load(paths.rclone_config()).unwrap();

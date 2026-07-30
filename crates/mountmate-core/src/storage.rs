@@ -1,12 +1,9 @@
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 
 use fs2::FileExt;
 use serde::Serialize;
@@ -608,15 +605,11 @@ pub fn atomic_write(path: &Path, content: &[u8]) -> Result<(), StorageError> {
             .truncate(true)
             .write(true)
             .open(&temporary)?;
-        #[cfg(unix)]
-        {
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        }
+        restrict_private_path(&temporary, false)?;
         file.write_all(content)?;
         file.sync_all()?;
         fs::rename(&temporary, path)?;
-        #[cfg(unix)]
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        restrict_private_path(path, false)?;
         Ok::<_, std::io::Error>(())
     })();
     if let Err(source) = result {
@@ -627,6 +620,141 @@ pub fn atomic_write(path: &Path, content: &[u8]) -> Result<(), StorageError> {
         });
     }
     Ok(())
+}
+
+#[cfg(unix)]
+pub fn restrict_private_path(path: &Path, directory: bool) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = if directory { 0o700 } else { 0o600 };
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+}
+
+#[cfg(windows)]
+pub fn restrict_private_path(path: &Path, directory: bool) -> io::Result<()> {
+    use std::ffi::c_void;
+    use std::mem::size_of;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::{null, null_mut};
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE,
+        CreateWellKnownSid, DACL_SECURITY_INFORMATION, GetLengthSid, GetTokenInformation,
+        InitializeAcl, OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
+        SECURITY_MAX_SID_SIZE, TOKEN_QUERY, TOKEN_USER, TokenUser, WinLocalSystemSid,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    struct OwnedHandle(HANDLE);
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    fn aligned_buffer(bytes: usize) -> Vec<usize> {
+        vec![0; bytes.div_ceil(size_of::<usize>())]
+    }
+
+    let mut token = null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let _token = OwnedHandle(token);
+    let mut token_bytes = 0;
+    unsafe {
+        GetTokenInformation(token, TokenUser, null_mut(), 0, &mut token_bytes);
+    }
+    if token_bytes == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut token_buffer = aligned_buffer(token_bytes as usize);
+    if unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            token_buffer.as_mut_ptr().cast(),
+            token_bytes,
+            &mut token_bytes,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let user_sid = unsafe { (*(token_buffer.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+    let user_sid_bytes = unsafe { GetLengthSid(user_sid) };
+    if user_sid_bytes == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut system_buffer = aligned_buffer(SECURITY_MAX_SID_SIZE as usize);
+    let system_sid: PSID = system_buffer.as_mut_ptr().cast::<c_void>();
+    let mut system_sid_bytes = SECURITY_MAX_SID_SIZE;
+    if unsafe {
+        CreateWellKnownSid(
+            WinLocalSystemSid,
+            null_mut(),
+            system_sid,
+            &mut system_sid_bytes,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+
+    let ace_header = size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>();
+    let acl_bytes =
+        size_of::<ACL>() + ace_header * 2 + user_sid_bytes as usize + system_sid_bytes as usize;
+    let mut acl_buffer = aligned_buffer(acl_bytes);
+    let acl = acl_buffer.as_mut_ptr().cast::<ACL>();
+    if unsafe { InitializeAcl(acl, acl_bytes as u32, ACL_REVISION) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let inheritance = if directory {
+        OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+    } else {
+        0
+    };
+    for sid in [user_sid, system_sid] {
+        if unsafe { AddAccessAllowedAceEx(acl, ACL_REVISION, inheritance, FILE_ALL_ACCESS, sid) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let result = unsafe {
+        SetNamedSecurityInfoW(
+            path.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            acl,
+            null(),
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(result as i32))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn restrict_private_path(_path: &Path, _directory: bool) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "private path permissions are not supported on this platform",
+    ))
 }
 
 pub struct FileLock {

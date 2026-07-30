@@ -89,6 +89,11 @@ impl AppPaths {
             .join(format!("{}.json", path_component(server_id)))
     }
 
+    pub fn rc_htpasswd_file(&self, server_id: &str) -> PathBuf {
+        self.state_dir
+            .join(format!("{}.rc.htpasswd", path_component(server_id)))
+    }
+
     pub fn mount_lock(&self, server_id: &str) -> PathBuf {
         self.state_dir
             .join(format!("{}.mount.lock", path_component(server_id)))
@@ -197,6 +202,10 @@ mod tests {
         assert_eq!(
             paths.mount_log("host:22"),
             PathBuf::from("state/host_22.log")
+        );
+        assert_eq!(
+            paths.rc_htpasswd_file("../../outside"),
+            PathBuf::from("state/outside.rc.htpasswd")
         );
         assert_eq!(paths.managed_bin_dir(), PathBuf::from("data/bin"));
         assert_eq!(paths.update_helper_dir(), PathBuf::from("data/update"));

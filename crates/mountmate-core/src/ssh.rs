@@ -39,6 +39,35 @@ pub fn known_hosts_line_matches(line: &str, marker: &str) -> bool {
     hosts.is_some_and(|hosts| hosts.split(',').any(|host| host == marker))
 }
 
+fn known_hosts_line_has_key_binding(line: &str, marker: &str) -> bool {
+    parsed_known_hosts_binding(line).is_some_and(|patterns| match patterns {
+        ssh_key::known_hosts::HostPatterns::Patterns(hosts) => {
+            hosts.iter().any(|host| host == marker)
+        }
+        ssh_key::known_hosts::HostPatterns::HashedName { .. } => false,
+    })
+}
+
+fn parsed_known_hosts_binding(line: &str) -> Option<ssh_key::known_hosts::HostPatterns> {
+    let mut parts = line.split_whitespace();
+    let first = parts.next()?;
+    if first.starts_with('@') {
+        return None;
+    }
+    let hosts = first;
+    let key_type = parts.next()?;
+    let key_data = parts.next()?;
+    if !valid_ssh_public_key(key_type, key_data) {
+        return None;
+    }
+    hosts.parse().ok()
+}
+
+fn valid_ssh_public_key(key_type: &str, key_data: &str) -> bool {
+    ssh_key::PublicKey::from_openssh(&format!("{key_type} {key_data}"))
+        .is_ok_and(|key| !matches!(key.algorithm(), ssh_key::Algorithm::Other(_)))
+}
+
 #[derive(Debug, Error)]
 pub enum SshError {
     #[error("I/O error at {path}: {source}")]
@@ -627,6 +656,7 @@ pub fn scan_host_keys(
         let _ = reader.join();
         return Err(SshError::Command("ssh-keyscan timed out".into()));
     }
+    let status = status.expect("timeout was handled above");
     let output = reader
         .join()
         .map_err(|_| SshError::Command("ssh-keyscan output reader panicked".into()))?
@@ -634,7 +664,18 @@ pub fn scan_host_keys(
             path: keyscan.to_owned(),
             source,
         })?;
-    Ok(normalize_host_key_output(host, &port, &output))
+    if !status.success() {
+        return Err(SshError::Command(format!(
+            "ssh-keyscan exited unsuccessfully ({status})"
+        )));
+    }
+    let keys = normalize_host_key_output(host, &port, &output);
+    if keys.is_empty() {
+        return Err(SshError::Command(
+            "ssh-keyscan returned no usable host keys".into(),
+        ));
+    }
+    Ok(keys)
 }
 
 pub fn normalize_host_key_output(host: &str, port: &str, output: &str) -> Vec<String> {
@@ -647,9 +688,8 @@ pub fn normalize_host_key_output(host: &str, port: &str, output: &str) -> Vec<St
         }
         let parts: Vec<_> = line.split_whitespace().collect();
         if parts.len() < 3
-            || !(parts[1].starts_with("ssh-")
-                || parts[1].starts_with("ecdsa-")
-                || parts[1].starts_with("sk-"))
+            || (parts[0] != host && parts[0] != marker)
+            || !valid_ssh_public_key(parts[1], parts[2])
         {
             continue;
         }
@@ -715,7 +755,9 @@ impl<'a> KnownHostsManager<'a> {
 
         let scanned = scan()?;
         if scanned.is_empty() {
-            return Ok(None);
+            return Err(SshError::Command(
+                "ssh-keyscan returned no usable host keys".into(),
+            ));
         }
 
         let _lock = FileLock::acquire(&self.paths.known_hosts_lock(), self.lock_timeout)?;
@@ -749,7 +791,7 @@ impl<'a> KnownHostsManager<'a> {
         match fs::read_to_string(&path) {
             Ok(content) => Ok(content
                 .lines()
-                .any(|line| known_hosts_line_matches(line, marker))),
+                .any(|line| known_hosts_line_has_key_binding(line, marker))),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(source) => Err(SshError::Io { path, source }),
         }
@@ -809,28 +851,27 @@ pub fn select_known_hosts_for_marker(
         })
 }
 
+pub fn known_hosts_file_has_binding(path: &Path, marker: &str) -> bool {
+    known_hosts_file_contains_marker(path, marker)
+        || known_hosts_file_contains_hashed_marker(path, marker)
+}
+
 fn known_hosts_file_contains_marker(path: &Path, marker: &str) -> bool {
     fs::read_to_string(path).is_ok_and(|content| {
         content
             .lines()
-            .any(|line| known_hosts_line_matches(line, marker))
+            .any(|line| known_hosts_line_has_key_binding(line, marker))
     })
 }
 
 fn known_hosts_file_contains_hashed_marker(path: &Path, marker: &str) -> bool {
     fs::read_to_string(path).is_ok_and(|content| {
         content.lines().any(|line| {
-            let mut parts = line.split_whitespace();
-            let first = parts.next();
-            let hosts = if first.is_some_and(|value| value.starts_with('@')) {
-                parts.next()
-            } else {
-                first
-            };
-            hosts.is_some_and(|hosts| {
-                hosts
-                    .split(',')
-                    .any(|host| hashed_host_matches(host, marker))
+            parsed_known_hosts_binding(line).is_some_and(|patterns| match patterns {
+                ssh_key::known_hosts::HostPatterns::HashedName { .. } => {
+                    hashed_host_matches(&patterns.to_string(), marker)
+                }
+                ssh_key::known_hosts::HostPatterns::Patterns(_) => false,
             })
         })
     })
@@ -869,6 +910,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    const TEST_HOST_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
 
     #[derive(Default)]
     struct FakePermissions {
@@ -952,13 +996,20 @@ mod tests {
 
     #[test]
     fn normalizes_keyscan_hosts_and_deduplicates_keys() {
-        let output = "# banner\n[c1.example]:12022 ssh-ed25519 AAAA\nc1.example ssh-rsa BBBB\nc1.example ssh-rsa BBBB\nbad line\n";
+        let output = format!(
+            "# banner\n[c1.example]:12022 {TEST_HOST_KEY}\nc1.example {TEST_HOST_KEY}\nc1.example ssh-not-real garbage\nbad line\n"
+        );
         assert_eq!(
-            normalize_host_key_output("c1.example", "12022", output),
-            [
-                "[c1.example]:12022 ssh-ed25519 AAAA",
-                "[c1.example]:12022 ssh-rsa BBBB"
-            ]
+            normalize_host_key_output("c1.example", "12022", &output),
+            [format!("[c1.example]:12022 {TEST_HOST_KEY}")]
+        );
+        assert!(
+            normalize_host_key_output(
+                "c1.example",
+                "12022",
+                &format!("other.example {TEST_HOST_KEY}\n")
+            )
+            .is_empty()
         );
     }
 
@@ -970,9 +1021,36 @@ mod tests {
             "[example.com]:12022"
         );
         assert!(known_hosts_line_matches(
-            "@cert-authority example.com ssh-ed25519 AAAA",
+            &format!("@cert-authority example.com {TEST_HOST_KEY}"),
             "example.com"
         ));
+    }
+
+    #[test]
+    fn marker_without_host_key_data_is_not_a_binding() {
+        let temp = tempdir().unwrap();
+        let known_hosts = temp.path().join("known_hosts");
+        fs::write(&known_hosts, "example.com\n").unwrap();
+
+        assert!(!known_hosts_file_has_binding(&known_hosts, "example.com"));
+    }
+
+    #[test]
+    fn malformed_or_unsupported_host_keys_are_not_bindings() {
+        let temp = tempdir().unwrap();
+        let known_hosts = temp.path().join("known_hosts");
+
+        for line in [
+            "example.com ssh-not-real garbage\n".to_owned(),
+            "example.com ssh-ed25519 not-base64\n".to_owned(),
+            format!("@not-a-marker {TEST_HOST_KEY}\n"),
+            format!("@revoked example.com {TEST_HOST_KEY}\n"),
+            format!("@cert-authority example.com {TEST_HOST_KEY}\n"),
+        ] {
+            fs::write(&known_hosts, &line).unwrap();
+            assert!(!known_hosts_file_has_binding(&known_hosts, "example.com"));
+            assert!(normalize_host_key_output("example.com", "22", &line).is_empty());
+        }
     }
 
     #[test]
@@ -982,7 +1060,7 @@ mod tests {
         fs::create_dir_all(&paths.config_dir).unwrap();
         fs::write(
             paths.known_hosts(),
-            "[c1.example]:12022 ssh-ed25519 AAAAPINNED\n",
+            format!("[c1.example]:12022 {TEST_HOST_KEY}\n"),
         )
         .unwrap();
         let called = Cell::new(false);
@@ -999,7 +1077,7 @@ mod tests {
         assert!(
             fs::read_to_string(paths.known_hosts())
                 .unwrap()
-                .contains("AAAAPINNED")
+                .contains(TEST_HOST_KEY)
         );
     }
 
@@ -1009,14 +1087,14 @@ mod tests {
         let paths = paths(temp.path());
         let selected = KnownHostsManager::new(&paths)
             .pin_first_seen_with("c1.example", "12022", || {
-                Ok(vec!["[c1.example]:12022 ssh-ed25519 AAAAFIRST".into()])
+                Ok(vec![format!("[c1.example]:12022 {TEST_HOST_KEY}")])
             })
             .unwrap();
 
         assert_eq!(selected, Some(paths.known_hosts()));
         assert_eq!(
             fs::read_to_string(paths.known_hosts()).unwrap(),
-            "[c1.example]:12022 ssh-ed25519 AAAAFIRST\n"
+            format!("[c1.example]:12022 {TEST_HOST_KEY}\n")
         );
         #[cfg(unix)]
         {
@@ -1026,6 +1104,32 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn empty_first_seen_scan_is_rejected() {
+        let temp = tempdir().unwrap();
+        let paths = paths(temp.path());
+
+        let error = KnownHostsManager::new(&paths)
+            .pin_first_seen_with("c1.example", "12022", || Ok(Vec::new()))
+            .unwrap_err();
+
+        assert!(matches!(error, SshError::Command(_)));
+        assert!(!paths.known_hosts().exists());
+    }
+
+    #[test]
+    fn unsuccessful_keyscan_process_is_rejected() {
+        let error = scan_host_keys(
+            &std::env::current_exe().unwrap(),
+            "c1.example",
+            "12022",
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, SshError::Command(_)));
     }
 
     #[test]
@@ -1097,8 +1201,8 @@ mod tests {
         let temp = tempdir().unwrap();
         let managed = temp.path().join("managed");
         let default = temp.path().join("default");
-        fs::write(&managed, "[other.example]:2200 ssh-ed25519 AAAAOTHER\n").unwrap();
-        fs::write(&default, "[target.example]:2200 ssh-ed25519 AAAATARGET\n").unwrap();
+        fs::write(&managed, format!("[other.example]:2200 {TEST_HOST_KEY}\n")).unwrap();
+        fs::write(&default, format!("[target.example]:2200 {TEST_HOST_KEY}\n")).unwrap();
 
         assert_eq!(
             select_known_hosts_for_marker(Some(&managed), None, &default, "[target.example]:2200"),
@@ -1112,7 +1216,7 @@ mod tests {
         let managed = temp.path().join("managed");
         fs::write(
             &managed,
-            "|1|c2FsdA==|mF58uSfHH9jfpQnmp1eRRf3z0VY= ssh-ed25519 AAAAHASHED\n",
+            format!("|1|c2FsdA==|mF58uSfHH9jfpQnmp1eRRf3z0VY= {TEST_HOST_KEY}\n"),
         )
         .unwrap();
 

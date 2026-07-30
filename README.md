@@ -316,13 +316,29 @@ responses, and rotating 2FA codes are entered only in the terminal owned by Open
 
 ## Host Key Validation
 
-SSH MountMate enables rclone host key validation when possible.
+SSH MountMate requires host key validation for native rclone SFTP connections.
 
 For rclone SFTP remotes, the app maintains its own `known_hosts` file. The first connection to a host and port records the keys returned by `ssh-keyscan`; later connections keep those pinned keys instead of replacing them from the network.
 
-If host key scanning is unavailable, the app falls back to the user's default OpenSSH `known_hosts` file.
+If host key scanning fails or returns no usable key, the app may use an existing readable
+`known_hosts` file only when it already contains a binding for the exact host and port. Otherwise
+the mount stops. Native SFTP never silently starts without a host-key binding. OpenSSH and
+interactive shared-SSH transports continue to apply their own SSH host-key policy.
 
 If rclone reports `knownhosts: key mismatch`, SSH MountMate stops the mount rather than disabling validation. Verify the new fingerprint with the server administrator before removing that host's old entry from the app-managed `known_hosts` file and trying again.
+
+## Local Control Authentication
+
+Each mount exposes rclone's remote-control API only on an allocated IPv4 loopback address. The
+client password remains random per mount and is not placed in rclone's process arguments. Rclone
+instead reads an owner-private Apache-compatible htpasswd file containing a BCrypt hash; SSH
+MountMate removes that file with the mount state after startup failures, normal unmounts, and stale
+state cleanup. The raw client credential remains in the owner-private mount state because the GUI
+needs it for authenticated status, refresh, transfer, and quit requests.
+
+File-manager and second-instance commands use a separate random token and loopback listener.
+Unauthenticated requests have a fixed total deadline and are handled by a bounded worker pool, so a
+slow local connection cannot monopolize the listener or delay normal shutdown indefinitely.
 
 ## Transfers And Remote Refresh
 
