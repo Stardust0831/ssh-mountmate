@@ -7950,7 +7950,10 @@ fn capacity_progress_view(
     .into()
 }
 
-fn inode_progress_state(status: Option<&LustreQuotaStatus>, locale: Locale) -> Option<(f32, String)> {
+fn inode_progress_state(
+    status: Option<&LustreQuotaStatus>,
+    locale: Locale,
+) -> Option<(f32, String)> {
     let LustreQuotaStatus::Available(details) = status? else {
         return None;
     };
@@ -7967,14 +7970,8 @@ fn inode_progress_state(status: Option<&LustreQuotaStatus>, locale: Locale) -> O
     Some((
         percentage as f32,
         match locale {
-            Locale::English => format!(
-                "Inodes: {} / {} used ({}%)",
-                inode.used, total, percentage
-            ),
-            Locale::Chinese => format!(
-                "inode：已用 {} / {}（{}%）",
-                inode.used, total, percentage
-            ),
+            Locale::English => format!("Inodes: {} / {} used ({}%)", inode.used, total, percentage),
+            Locale::Chinese => format!("inode：已用 {} / {}（{}%）", inode.used, total, percentage),
         },
     ))
 }
