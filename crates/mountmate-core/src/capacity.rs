@@ -75,6 +75,15 @@ pub struct CapacityInfo {
     pub total: u64,
     pub percent: u8,
     pub source: CapacitySource,
+    /// Optional inode usage for filesystems (notably Lustre) that expose it.
+    pub inode: Option<InodeInfo>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InodeInfo {
+    pub used: u64,
+    pub total: u64,
+    pub percent: u8,
 }
 
 #[derive(Debug, Error)]
@@ -315,11 +324,21 @@ pub fn parse_lustre_quota(output: &str) -> Option<CapacityInfo> {
         if limit_kib == 0 {
             return None;
         }
-        return capacity_from_usage(
+        let mut capacity = capacity_from_usage(
             limit_kib.saturating_mul(1024),
             used_kib.saturating_mul(1024),
             CapacitySource::LustreProjectQuota,
-        );
+        )?;
+        // lfs quota columns after the byte quota are: files used, quota, limit, grace.
+        // A zero limit means unlimited, so leave inode information unavailable.
+        if fields.len() >= 8
+            && let (Ok(inode_used), Ok(inode_limit)) =
+                (fields[5].parse::<u64>(), fields[7].parse::<u64>())
+            && inode_limit > 0
+        {
+            capacity.inode = inode_from_usage(inode_limit, inode_used);
+        }
+        return Some(capacity);
     }
     None
 }
@@ -358,6 +377,20 @@ fn capacity_from_usage(total: u64, used: u64, source: CapacitySource) -> Option<
         total,
         percent,
         source,
+        inode: None,
+    })
+}
+
+fn inode_from_usage(total: u64, used: u64) -> Option<InodeInfo> {
+    if total == 0 {
+        return None;
+    }
+    let used = used.min(total);
+    let percent = ((used as u128 * 100 + total as u128 / 2) / total as u128).min(100) as u8;
+    Some(InodeInfo {
+        used,
+        total,
+        percent,
     })
 }
 
@@ -375,12 +408,42 @@ mod tests {
         assert_eq!(capacity.total, 1000 * 1024);
         assert_eq!(capacity.percent, 100);
         assert_eq!(capacity.source, CapacitySource::LustreProjectQuota);
+        assert_eq!(capacity.inode, None);
     }
 
     #[test]
     fn empty_or_unlimited_lustre_quotas_are_not_presented_as_capacity() {
         assert!(parse_lustre_quota("/lustre 1200 0 0 -").is_none());
         assert!(parse_lustre_quota("no project quota").is_none());
+    }
+
+    #[test]
+    fn lustre_quota_parses_inode_limit_when_present() {
+        let capacity = parse_lustre_quota("/lustre 1200 0 2000 - 300 0 1000 -\n").unwrap();
+        assert_eq!(
+            capacity.inode,
+            Some(InodeInfo {
+                used: 300,
+                total: 1000,
+                percent: 30,
+            })
+        );
+    }
+
+    #[test]
+    fn lustre_inode_usage_is_clamped_and_unlimited_inode_quota_is_ignored() {
+        let over_limit = parse_lustre_quota("/lustre 10 0 20 - 12 0 10 -\n").unwrap();
+        assert_eq!(
+            over_limit.inode,
+            Some(InodeInfo {
+                used: 10,
+                total: 10,
+                percent: 100,
+            })
+        );
+
+        let unlimited = parse_lustre_quota("/lustre 10 0 20 - 12 0 0 -\n").unwrap();
+        assert_eq!(unlimited.inode, None);
     }
 
     #[test]

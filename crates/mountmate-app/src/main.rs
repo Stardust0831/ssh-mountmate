@@ -23,7 +23,7 @@ use mountmate_core::app_command::{
     AppCommand, AppCommandError, AppCommandServer, InstanceLock, running_instance,
     same_instance_build, send_command_retry,
 };
-use mountmate_core::capacity::CapacityInfo;
+use mountmate_core::capacity::{CapacityInfo, InodeInfo};
 use mountmate_core::connection::{
     ConnectionDraft, ConnectionSource, DraftError, ImportAction, ImportStatus,
     PreservedSecretState, SecretAction, SshImportPlan,
@@ -7574,6 +7574,30 @@ fn capacity_progress_view(
     .into()
 }
 
+fn inode_progress_view(inode: &InodeInfo, locale: Locale) -> Element<'static, Message> {
+    let label = match locale {
+        Locale::English => format!(
+            "Inodes: {} / {} used ({}%)",
+            inode.used, inode.total, inode.percent
+        ),
+        Locale::Chinese => format!(
+            "inode：已用 {} / {}（{}%）",
+            inode.used, inode.total, inode.percent
+        ),
+    };
+    stack![
+        progress_bar(0.0..=100.0, inode.percent as f32).girth(Length::Fixed(22.0)),
+        container(text(label).size(12))
+            .width(Fill)
+            .height(Length::Fixed(22.0))
+            .center_x(Fill)
+            .center_y(Length::Fixed(22.0)),
+    ]
+    .width(Fill)
+    .height(Length::Fixed(22.0))
+    .into()
+}
+
 fn capacity_progress_state(
     capacity: Option<&CapacityInfo>,
     checking: bool,
@@ -7726,6 +7750,9 @@ fn connection_card<'a>(
     .width(Fill);
     if status == MountStatus::Mounted {
         details = details.push(capacity_progress_view(capacity, capacity_checking, locale));
+        if let Some(inode) = capacity.and_then(|capacity| capacity.inode.as_ref()) {
+            details = details.push(inode_progress_view(inode, locale));
+        }
         if transfer_unavailable {
             details = details.push(text(locale.text(TextKey::TransferStateUnavailable)).size(13));
         } else if let Some(snapshot) = transfer.filter(|snapshot| transfer_is_active(snapshot)) {
@@ -10703,6 +10730,7 @@ mod localization_tests {
             total: 1024 * 1024,
             percent: 25,
             source: mountmate_core::capacity::CapacitySource::RemoteFilesystem,
+            inode: None,
         };
         assert_eq!(
             capacity_progress_state(Some(&capacity), false, Locale::English),
