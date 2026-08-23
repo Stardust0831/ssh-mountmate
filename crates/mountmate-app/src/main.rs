@@ -6171,6 +6171,7 @@ impl App {
                         transfer: self.transfers.get(&server.id),
                         transfer_unavailable: self.transfer_errors.contains_key(&server.id),
                         capacity: self.capacities.get(&server.id),
+                        lustre_quota: self.lustre_quotas.get(&server.id),
                         capacity_checking: self.capacity_refreshing
                             && !self.capacities.contains_key(&server.id)
                             && !self.capacity_errors.contains(&server.id),
@@ -7914,6 +7915,7 @@ struct ConnectionCardState<'a> {
     transfer: Option<&'a TransferSnapshot>,
     transfer_unavailable: bool,
     capacity: Option<&'a CapacityInfo>,
+    lustre_quota: Option<&'a LustreQuotaStatus>,
     capacity_checking: bool,
     can_modify: bool,
     confirming_remove: bool,
@@ -7946,6 +7948,52 @@ fn capacity_progress_view(
     .width(Fill)
     .height(Length::Fixed(22.0))
     .into()
+}
+
+fn inode_progress_state(
+    status: Option<&LustreQuotaStatus>,
+    locale: Locale,
+) -> Option<(f32, String)> {
+    let LustreQuotaStatus::Available(details) = status? else {
+        return None;
+    };
+    let LustreQuotaScopeStatus::Available(project) = &details.project else {
+        return None;
+    };
+    let inode = project.inode();
+    let total = inode.hard?;
+    if total == 0 {
+        return None;
+    }
+    let percentage =
+        ((inode.used as u128 * 100 + total as u128 / 2) / total as u128).min(100) as u8;
+    Some((
+        percentage as f32,
+        match locale {
+            Locale::English => format!("Inodes: {} / {} used ({}%)", inode.used, total, percentage),
+            Locale::Chinese => format!("inode：已用 {} / {}（{}%）", inode.used, total, percentage),
+        },
+    ))
+}
+
+fn inode_progress_view(
+    status: Option<&LustreQuotaStatus>,
+    locale: Locale,
+) -> Option<Element<'static, Message>> {
+    let (percentage, label) = inode_progress_state(status, locale)?;
+    Some(
+        stack![
+            progress_bar(0.0..=100.0, percentage).girth(Length::Fixed(22.0)),
+            container(text(label).size(12))
+                .width(Fill)
+                .height(Length::Fixed(22.0))
+                .center_x(Fill)
+                .center_y(Length::Fixed(22.0)),
+        ]
+        .width(Fill)
+        .height(Length::Fixed(22.0))
+        .into(),
+    )
 }
 
 fn capacity_progress_state(
@@ -8189,6 +8237,7 @@ fn connection_card<'a>(
         transfer,
         transfer_unavailable,
         capacity,
+        lustre_quota,
         capacity_checking,
         can_modify,
         confirming_remove,
@@ -8296,6 +8345,9 @@ fn connection_card<'a>(
     .width(Fill);
     if status == MountStatus::Mounted {
         details = details.push(capacity_progress_view(capacity, capacity_checking, locale));
+        if let Some(inode_progress) = inode_progress_view(lustre_quota, locale) {
+            details = details.push(inode_progress);
+        }
         if transfer_unavailable {
             details = details.push(text(locale.text(TextKey::TransferStateUnavailable)).size(13));
         } else if let Some(snapshot) = transfer.filter(|snapshot| transfer_is_active(snapshot)) {
