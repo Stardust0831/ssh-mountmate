@@ -387,7 +387,11 @@ fn inode_from_usage(total: u64, used: u64) -> Option<InodeInfo> {
     }
     let used = used.min(total);
     let percent = ((used as u128 * 100 + total as u128 / 2) / total as u128).min(100) as u8;
-    Some(InodeInfo { used, total, percent })
+    Some(InodeInfo {
+        used,
+        total,
+        percent,
+    })
 }
 
 #[cfg(test)]
