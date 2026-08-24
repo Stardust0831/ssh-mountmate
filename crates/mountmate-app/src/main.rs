@@ -37,7 +37,9 @@ use mountmate_core::credential::{
     delete_server_credentials, prepare_server_to_obscure, prepare_server_to_system,
     replace_verified, rollback_change,
 };
-use mountmate_core::dependency::{DependencyStatus, check_dependencies};
+use mountmate_core::dependency::{
+    DependencyStatus, check_dependencies, mount_dependency_available,
+};
 use mountmate_core::installed::enforce_no_downgrade;
 use mountmate_core::interactive_ssh::{
     InteractiveSshError, InteractiveSshLoginCommand, InteractiveSshSession,
@@ -1187,6 +1189,7 @@ enum Message {
     TogglePopupDetails,
     CloseRequested(window::Id),
     ExitDecision(bool),
+    WinFspInstallDecision(rfd::MessageDialogResult),
     WindowClosed(window::Id),
     AddConnection,
     ConnectionSearchChanged(String),
@@ -3623,6 +3626,14 @@ impl App {
                     };
                 }
             }
+            Message::WinFspInstallDecision(result) => {
+                if result == rfd::MessageDialogResult::Yes {
+                    if let Err(error) = open_external_url("https://winfsp.dev/rel/") {
+                        diagnostic_trace(&format!("could not open WinFsp installation guide: {error}"));
+                        self.status = error;
+                    }
+                }
+            }
             Message::Mount(id) => return self.start_mount_operation(id, None),
             Message::CancelPendingUnmount(id) => {
                 self.pending_unmount_after_sync.remove(&id);
@@ -5525,6 +5536,32 @@ impl App {
         } else {
             MountOperation::Mount
         });
+        if operation == MountOperation::Mount
+            && cfg!(windows)
+            && !mount_dependency_available(MountBackend::Fuse)
+        {
+            let locale = self.locale();
+            self.status = match locale {
+                Locale::English => "WinFsp is required for Windows mounts. Install it from https://winfsp.dev/rel/ and retry.".into(),
+                Locale::Chinese => "Windows 挂载需要 WinFsp。请从 https://winfsp.dev/rel/ 安装后重试。".into(),
+            };
+            let description = match locale {
+                Locale::English => "WinFsp is required to mount on Windows. Open the WinFsp installation page?",
+                Locale::Chinese => "Windows 挂载需要 WinFsp。是否打开 WinFsp 安装页面？",
+            };
+            return Task::perform(
+                async move {
+                    rfd::AsyncMessageDialog::new()
+                        .set_title(APP_NAME)
+                        .set_description(description)
+                        .set_level(rfd::MessageLevel::Warning)
+                        .set_buttons(rfd::MessageButtons::YesNo)
+                        .show()
+                        .await
+                },
+                Message::WinFspInstallDecision,
+            );
+        }
         if operation == MountOperation::Unmount
             && !self.confirmed_unmounts.remove(&id)
             && unmount_needs_confirmation(
@@ -10848,6 +10885,23 @@ fn open_path(path: &Path, locale: Locale) -> Result<(), String> {
     #[cfg(windows)]
     drop(child);
     Ok(())
+}
+
+fn open_external_url(url: &str) -> Result<(), String> {
+    let mut command = if cfg!(windows) {
+        let mut command = Command::new("explorer.exe");
+        command.arg(url);
+        command
+    } else if cfg!(target_os = "macos") {
+        let mut command = Command::new("open");
+        command.arg(url);
+        command
+    } else {
+        let mut command = Command::new("xdg-open");
+        command.arg(url);
+        command
+    };
+    command.spawn().map(|_| ()).map_err(|error| format!("could not open {url}: {error}"))
 }
 
 #[cfg(test)]

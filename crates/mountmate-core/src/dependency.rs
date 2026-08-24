@@ -69,6 +69,11 @@ pub fn mount_dependency_status(
     }
 }
 
+/// Returns whether the dependency required by the selected backend is ready.
+pub fn mount_dependency_available(selected_backend: MountBackend) -> bool {
+    mount_dependency_status(selected_backend, MountPlatform::current()).1
+}
+
 #[cfg(windows)]
 fn fuse_dependency_installed() -> bool {
     ["ProgramFiles", "ProgramFiles(x86)"]

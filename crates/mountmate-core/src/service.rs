@@ -508,6 +508,10 @@ impl MountService {
         let default = directories::BaseDirs::new()
             .map(|directories| directories.home_dir().join(".ssh/known_hosts"))
             .unwrap_or_else(|| PathBuf::from(".ssh/known_hosts"));
+        let marker = known_hosts_marker(host, port);
+        if let Some(path) = select_known_hosts_for_marker(None, resolved, &default, &marker) {
+            return Ok(Some(path));
+        }
         let manager = KnownHostsManager::new(&self.paths);
         match manager.pin_first_seen(Path::new("ssh-keyscan"), host, port) {
             Ok(Some(path)) => Ok(Some(path)),
