@@ -8279,14 +8279,6 @@ fn connection_card<'a>(
     if status == MountStatus::Mounted && !busy {
         open = open.on_press(Message::Open(id.clone()));
     }
-    let quota_label = match locale {
-        Locale::English => "Quota",
-        Locale::Chinese => "配额",
-    };
-    let mut quota = button(quota_label);
-    if status == MountStatus::Mounted && !busy {
-        quota = quota.on_press(Message::OpenQuotaDetails(id.clone()));
-    }
     let mut title = row![text(server.display_name()).size(22)]
         .spacing(8)
         .align_y(Center);
@@ -8509,7 +8501,7 @@ fn connection_card<'a>(
             .into()
     };
     container(
-        row![details, operation, open, quota, actions]
+        row![details, operation, open, actions]
             .spacing(8)
             .align_y(Center),
     )
@@ -11365,6 +11357,17 @@ mod localization_tests {
         assert_eq!(
             capacity_progress_state(None, false, Locale::Chinese),
             (0.0, "容量：未知".into())
+        );
+    }
+
+    #[test]
+    fn inode_progress_caps_over_limit_usage_at_one_hundred_percent() {
+        let status = mountmate_core::capacity::parse_lustre_quota_snapshot(
+            "@@MMQ|STATUS|LUSTRE\n@@MMQ|PROJECT|42\n@@MMQ|IDENTITY|1000|100|alice|users\n@@MMQ|BEGIN|project\nFilesystem kbytes quota limit grace files quota limit grace\n/data 1200 0 1000 - 8 0 5 -\n@@MMQ|END|project|0\n@@MMQ|BEGIN|user\n/data 1 0 0 - 1 0 0 -\n@@MMQ|END|user|0\n@@MMQ|BEGIN|group\n/data 1 0 0 - 1 0 0 -\n@@MMQ|END|group|0\n",
+        );
+        assert_eq!(
+            inode_progress_state(Some(&status), Locale::English),
+            Some((100.0, "Inodes: 8 / 5 used (100%)".into()))
         );
     }
 
