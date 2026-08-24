@@ -103,8 +103,15 @@ run_scope() {
   scope=$1
   shift
   printf '@@MMQ|BEGIN|%s\n' "$scope"
-  quota_output=$(lfs quota "$@" "$mountpoint" 2>&1)
+  # The filesystem mountpoint can be inaccessible to a user even when the
+  # requested directory is readable (for example /org on SAI). Prefer the
+  # resolved path so quotactl is authorized by the user's actual path.
+  quota_output=$(lfs quota "$@" "$resolved" 2>&1)
   quota_status=$?
+  if [ "$quota_status" -ne 0 ] && [ "$resolved" != "$mountpoint" ]; then
+    quota_output=$(lfs quota "$@" "$mountpoint" 2>&1)
+    quota_status=$?
+  fi
   printf '%s\n' "$quota_output"
   printf '@@MMQ|END|%s|%s\n' "$scope" "$quota_status"
 }
