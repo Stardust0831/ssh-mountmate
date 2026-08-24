@@ -1310,7 +1310,6 @@ enum Message {
     DependenciesChecked(Result<DependencyStatus, String>),
     CapacityTick,
     CapacitiesLoaded(Vec<(String, bool, Result<Option<CapacitySnapshot>, String>)>),
-    OpenQuotaDetails(String),
     CloseQuotaDetails,
     RefreshQuotaDetails(String),
     LanguageChanged(Language),
@@ -2028,11 +2027,6 @@ impl App {
             }
             Message::TransferTick => return self.transfer_task(),
             Message::CapacityTick => return self.capacity_task(),
-            Message::OpenQuotaDetails(id) => {
-                if self.mount_statuses.get(&id) == Some(&MountStatus::Mounted) {
-                    self.quota_dialog = Some(id);
-                }
-            }
             Message::CloseQuotaDetails => self.quota_dialog = None,
             Message::RefreshQuotaDetails(id) => {
                 self.quota_next_probe.remove(&id);
