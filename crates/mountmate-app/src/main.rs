@@ -11357,7 +11357,7 @@ mod localization_tests {
     #[test]
     fn inode_progress_caps_over_limit_usage_at_one_hundred_percent() {
         let status = mountmate_core::capacity::parse_lustre_quota_snapshot(
-            "@@MMQ|STATUS|LUSTRE\n@@MMQ|PROJECT|42\n@@MMQ|IDENTITY|1000|100|alice|users\n@@MMQ|BEGIN|project\nFilesystem kbytes quota limit grace files quota limit grace\n/data 1200 0 1000 - 8 0 5 -\n@@MMQ|END|project|0\n@@MMQ|BEGIN|user\n/data 1 0 0 - 1 0 0 -\n@@MMQ|END|user|0\n@@MMQ|BEGIN|group\n/data 1 0 0 - 1 0 0 -\n@@MMQ|END|group|0\n",
+            "@@MMQ|STATUS|LUSTRE\n@@MMQ|PATH|/data/project|/data\n@@MMQ|PROJECT|42\n@@MMQ|IDENTITY|1000|100|alice|users\n@@MMQ|BEGIN|project\nFilesystem kbytes quota limit grace files quota limit grace\n/data 1200 0 1000 - 8 0 5 -\n@@MMQ|END|project|0\n@@MMQ|BEGIN|user\n/data 1 0 0 - 1 0 0 -\n@@MMQ|END|user|0\n@@MMQ|BEGIN|group\n/data 1 0 0 - 1 0 0 -\n@@MMQ|END|group|0\n",
         );
         assert_eq!(
             inode_progress_state(Some(&status), Locale::English),
