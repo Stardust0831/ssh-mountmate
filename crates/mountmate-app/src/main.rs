@@ -5542,11 +5542,18 @@ impl App {
         {
             let locale = self.locale();
             self.status = match locale {
-                Locale::English => "WinFsp is required for Windows mounts. Install it from https://winfsp.dev/rel/ and retry.".into(),
-                Locale::Chinese => "Windows 挂载需要 WinFsp。请从 https://winfsp.dev/rel/ 安装后重试。".into(),
+                Locale::English => {
+                    "WinFsp is required for Windows mounts. Install it from https://winfsp.dev/rel/ and retry."
+                        .into()
+                }
+                Locale::Chinese => {
+                    "Windows 挂载需要 WinFsp。请从 https://winfsp.dev/rel/ 安装后重试。".into()
+                }
             };
             let description = match locale {
-                Locale::English => "WinFsp is required to mount on Windows. Open the WinFsp installation page?",
+                Locale::English => {
+                    "WinFsp is required to mount on Windows. Open the WinFsp installation page?"
+                }
                 Locale::Chinese => "Windows 挂载需要 WinFsp。是否打开 WinFsp 安装页面？",
             };
             return Task::perform(
@@ -10901,7 +10908,10 @@ fn open_external_url(url: &str) -> Result<(), String> {
         command.arg(url);
         command
     };
-    command.spawn().map(|_| ()).map_err(|error| format!("could not open {url}: {error}"))
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("could not open {url}: {error}"))
 }
 
 #[cfg(test)]
