@@ -3629,7 +3629,9 @@ impl App {
             Message::WinFspInstallDecision(result) => {
                 if result == rfd::MessageDialogResult::Yes {
                     if let Err(error) = open_external_url("https://winfsp.dev/rel/") {
-                        diagnostic_trace(&format!("could not open WinFsp installation guide: {error}"));
+                        diagnostic_trace(&format!(
+                            "could not open WinFsp installation guide: {error}"
+                        ));
                         self.status = error;
                     }
                 }
