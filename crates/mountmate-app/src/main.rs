@@ -34,7 +34,9 @@ use mountmate_core::credential::{
     delete_server_credentials, prepare_server_to_obscure, prepare_server_to_system,
     replace_verified, rollback_change,
 };
-use mountmate_core::dependency::{DependencyStatus, check_dependencies};
+use mountmate_core::dependency::{
+    DependencyStatus, check_dependencies, mount_dependency_available,
+};
 use mountmate_core::interactive_ssh::{
     InteractiveSshError, InteractiveSshLoginCommand, InteractiveSshSession,
 };
@@ -1082,6 +1084,7 @@ enum Message {
     TogglePopupDetails,
     CloseRequested(window::Id),
     ExitDecision(bool),
+    WinFspInstallDecision(rfd::MessageDialogResult),
     WindowClosed(window::Id),
     AddConnection,
     ConnectionSearchChanged(String),
@@ -3312,6 +3315,14 @@ impl App {
                     };
                 }
             }
+            Message::WinFspInstallDecision(result) => {
+                if result == rfd::MessageDialogResult::Yes {
+                    if let Err(error) = open_external_url("https://winfsp.dev/rel/") {
+                        diagnostic_trace(&format!("could not open WinFsp installation guide: {error}"));
+                        self.status = error;
+                    }
+                }
+            }
             Message::Mount(id) => return self.start_mount_operation(id, None),
             Message::CancelPendingUnmount(id) => {
                 self.pending_unmount_after_sync.remove(&id);
@@ -5189,6 +5200,36 @@ impl App {
         } else {
             MountOperation::Mount
         });
+        if operation == MountOperation::Mount
+            && cfg!(windows)
+            && !mount_dependency_available(MountBackend::Fuse)
+        {
+            let locale = self.locale();
+            self.status = match locale {
+                Locale::English => {
+                    "WinFsp is required for Windows mounts. Install it from https://winfsp.dev/rel/ and retry.".into()
+                }
+                Locale::Chinese => {
+                    "Windows 挂载需要 WinFsp。请从 https://winfsp.dev/rel/ 安装后重试。".into()
+                }
+            };
+            let description = match locale {
+                Locale::English => "WinFsp is required to mount on Windows. Open the WinFsp installation page?",
+                Locale::Chinese => "Windows 挂载需要 WinFsp。是否打开 WinFsp 安装页面？",
+            };
+            return Task::perform(
+                async move {
+                    rfd::AsyncMessageDialog::new()
+                        .set_title(APP_NAME)
+                        .set_description(description)
+                        .set_level(rfd::MessageLevel::Warning)
+                        .set_buttons(rfd::MessageButtons::YesNo)
+                        .show()
+                        .await
+                },
+                Message::WinFspInstallDecision,
+            );
+        }
         if operation == MountOperation::Unmount
             && !self.confirmed_unmounts.remove(&id)
             && unmount_needs_confirmation(
@@ -6295,7 +6336,11 @@ impl App {
         ]
         .spacing(5);
         let transport = row![
-            labeled_control(locale.text(TextKey::Transport), transport_choice,),
+            labeled_control_with_help(
+                locale.text(TextKey::Transport),
+                transport_choice,
+                transport_help(locale),
+            ),
             labeled_control(locale.text(TextKey::Authentication), authentication),
         ]
         .spacing(12);
@@ -8213,7 +8258,7 @@ fn setting_presets(kind: SettingKind) -> &'static [&'static str] {
         SettingKind::MaxSize => &["", "10G", "50G", "100G"],
         SettingKind::MaxAge => &["30m", "1h", "6h", "24h"],
         SettingKind::MinFreeSpace => &["", "5G", "10G", "20G"],
-        SettingKind::WriteBack => &["0s", "5s", "30s", "1m"],
+        SettingKind::WriteBack => &["0s", "1s", "5s", "30s", "1m"],
         SettingKind::DirCacheTime => &["30s", "5m", "15m", "1h"],
         SettingKind::BufferSize => &["", "0", "16Mi", "64Mi"],
         SettingKind::Transfers => &["4", "8", "12"],
@@ -8546,10 +8591,20 @@ fn validate_upload_transfers(value: &str, locale: Locale) -> Result<u16, String>
 fn settings_help<'a>(help: &'a str) -> Element<'a, Message> {
     tooltip(
         container(text("?").size(13)).padding([0, 5]),
-        container(text(help).size(12)).padding(8),
+        container(text(help).size(12))
+            .padding(8)
+            .width(Length::Fixed(320.0))
+            .style(container::rounded_box),
         tooltip::Position::FollowCursor,
     )
     .into()
+}
+
+fn transport_help(locale: Locale) -> &'static str {
+    match locale {
+        Locale::English => "Selects the SSH connection backend. Native SFTP handles authentication here; OpenSSH and interactive shared SSH use the SSH configuration or terminal for authentication.",
+        Locale::Chinese => "选择 SSH 连接后端。原生 SFTP 会在此处使用身份验证；OpenSSH 和交互式共享 SSH 则由 SSH 配置或终端负责身份验证。",
+    }
 }
 
 fn vfs_cache_mode_help(locale: Locale) -> &'static str {
@@ -9122,6 +9177,21 @@ fn labeled_control<'a>(
     column![text(label).size(13), control.into()]
         .spacing(5)
         .width(Fill)
+}
+
+fn labeled_control_with_help<'a>(
+    label: &'a str,
+    control: impl Into<Element<'a, Message>>,
+    help: &'a str,
+) -> iced::widget::Column<'a, Message> {
+    column![
+        row![text(label).size(13), settings_help(help)]
+            .spacing(5)
+            .align_y(Center),
+        control.into(),
+    ]
+    .spacing(5)
+    .width(Fill)
 }
 
 fn localized_choices<T: Copy>(
@@ -10269,6 +10339,26 @@ fn open_path(path: &Path, locale: Locale) -> Result<(), String> {
     Ok(())
 }
 
+fn open_external_url(url: &str) -> Result<(), String> {
+    let mut command = if cfg!(windows) {
+        let mut command = Command::new("explorer.exe");
+        command.arg(url);
+        command
+    } else if cfg!(target_os = "macos") {
+        let mut command = Command::new("open");
+        command.arg(url);
+        command
+    } else {
+        let mut command = Command::new("xdg-open");
+        command.arg(url);
+        command
+    };
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("could not open {url}: {error}"))
+}
+
 #[cfg(test)]
 mod localization_tests {
     use super::*;
@@ -10823,7 +10913,7 @@ mod localization_tests {
         );
         assert_eq!(
             setting_presets(SettingKind::WriteBack),
-            &["0s", "5s", "30s", "1m"]
+            &["0s", "1s", "5s", "30s", "1m"]
         );
         assert_eq!(setting_presets(SettingKind::Transfers), &["4", "8", "12"]);
         assert_eq!(
