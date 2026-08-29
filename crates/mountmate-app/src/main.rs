@@ -3318,7 +3318,9 @@ impl App {
             Message::WinFspInstallDecision(result) => {
                 if result == rfd::MessageDialogResult::Yes {
                     if let Err(error) = open_external_url("https://winfsp.dev/rel/") {
-                        diagnostic_trace(&format!("could not open WinFsp installation guide: {error}"));
+                        diagnostic_trace(&format!(
+                            "could not open WinFsp installation guide: {error}"
+                        ));
                         self.status = error;
                     }
                 }
@@ -5214,7 +5216,9 @@ impl App {
                 }
             };
             let description = match locale {
-                Locale::English => "WinFsp is required to mount on Windows. Open the WinFsp installation page?",
+                Locale::English => {
+                    "WinFsp is required to mount on Windows. Open the WinFsp installation page?"
+                }
                 Locale::Chinese => "Windows 挂载需要 WinFsp。是否打开 WinFsp 安装页面？",
             };
             return Task::perform(
@@ -8602,8 +8606,12 @@ fn settings_help<'a>(help: &'a str) -> Element<'a, Message> {
 
 fn transport_help(locale: Locale) -> &'static str {
     match locale {
-        Locale::English => "Selects the SSH connection backend. Native SFTP handles authentication here; OpenSSH and interactive shared SSH use the SSH configuration or terminal for authentication.",
-        Locale::Chinese => "选择 SSH 连接后端。原生 SFTP 会在此处使用身份验证；OpenSSH 和交互式共享 SSH 则由 SSH 配置或终端负责身份验证。",
+        Locale::English => {
+            "Selects the SSH connection backend. Native SFTP handles authentication here; OpenSSH and interactive shared SSH use the SSH configuration or terminal for authentication."
+        }
+        Locale::Chinese => {
+            "选择 SSH 连接后端。原生 SFTP 会在此处使用身份验证；OpenSSH 和交互式共享 SSH 则由 SSH 配置或终端负责身份验证。"
+        }
     }
 }
 
