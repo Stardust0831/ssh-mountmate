@@ -43,6 +43,8 @@ jobs:
           fi
       - name: Audit dependency licenses and sources
         uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe
+        env:
+          RUSTUP_TOOLCHAIN: 1.85.0
         with:
           command: check
           command-arguments: licenses sources

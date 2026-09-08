@@ -1205,6 +1205,7 @@ enum Message {
     InstallUpdateDecision(bool),
     CheckDependencies,
     DependenciesChecked(Result<DependencyStatus, String>),
+    #[cfg(windows)]
     StartupDependenciesChecked(Result<DependencyStatus, String>),
     CapacityTick,
     CapacitiesLoaded(Vec<(String, Result<Option<CapacityInfo>, String>)>),
@@ -3263,6 +3264,7 @@ impl App {
                     Err(error) => self.status = error,
                 }
             }
+            #[cfg(windows)]
             Message::StartupDependenciesChecked(result) => {
                 self.dependency_checking = false;
                 if let Ok(status) = result {
@@ -3331,13 +3333,13 @@ impl App {
                 }
             }
             Message::WinFspInstallDecision(result) => {
-                if result == rfd::MessageDialogResult::Yes {
-                    if let Err(error) = open_external_url("https://winfsp.dev/rel/") {
+                if result == rfd::MessageDialogResult::Yes
+                    && let Err(error) = open_external_url("https://winfsp.dev/rel/")
+                {
                         diagnostic_trace(&format!(
                             "could not open WinFsp installation guide: {error}"
                         ));
                         self.status = error;
-                    }
                 }
             }
             Message::Mount(id) => return self.start_mount_operation(id, None),
