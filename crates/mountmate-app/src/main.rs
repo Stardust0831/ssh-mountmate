@@ -3336,10 +3336,10 @@ impl App {
                 if result == rfd::MessageDialogResult::Yes
                     && let Err(error) = open_external_url("https://winfsp.dev/rel/")
                 {
-                        diagnostic_trace(&format!(
-                            "could not open WinFsp installation guide: {error}"
-                        ));
-                        self.status = error;
+                    diagnostic_trace(&format!(
+                        "could not open WinFsp installation guide: {error}"
+                    ));
+                    self.status = error;
                 }
             }
             Message::Mount(id) => return self.start_mount_operation(id, None),
