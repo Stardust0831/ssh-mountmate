@@ -4551,6 +4551,7 @@ impl App {
         )
     }
 
+    #[cfg(windows)]
     fn win_fsp_install_prompt(&self) -> Task<Message> {
         let description = match self.locale() {
             Locale::English => {
