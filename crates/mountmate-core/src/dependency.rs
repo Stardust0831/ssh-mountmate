@@ -69,6 +69,10 @@ pub fn mount_dependency_status(
     }
 }
 
+pub fn mount_dependency_available(selected_backend: MountBackend) -> bool {
+    mount_dependency_status(selected_backend, MountPlatform::current()).1
+}
+
 #[cfg(windows)]
 fn fuse_dependency_installed() -> bool {
     ["ProgramFiles", "ProgramFiles(x86)"]
