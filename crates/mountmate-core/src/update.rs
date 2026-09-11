@@ -753,51 +753,48 @@ fn fetch_latest_release_redirect(
         .map_err(|error| error.to_string())?
         .error_for_status()
         .map_err(|error| error.to_string())?;
-    let final_url = response.url().clone();
-    let marker = "/releases/tag/";
-    let Some(index) = final_url.path().find(marker) else {
-        return Err("latest-release redirect did not include a tag".into());
-    };
-    let encoded_tag = &final_url.path()[index + marker.len()..];
-    let latest_version = percent_decode(encoded_tag)?;
-    let is_newer = compare_versions(current_version, &latest_version)
-        .map_err(|error| error.to_string())?
-        .is_lt();
-    Ok(UpdateInfo {
-        current_version: current_version.into(),
-        latest_version: latest_version.clone(),
-        release_name: format!("SSH MountMate {latest_version}"),
-        release_url: final_url.to_string(),
-        body: String::new(),
-        is_newer,
-        expected_asset: expected_asset_name(),
-        asset: None,
-        trust_error: Some(UpdateTrustError::MissingManifest),
+    update_info_from_latest_redirect(response.url(), |release| {
+        update_info_from_signed_tag(client, current_version, release)
     })
 }
 
-fn percent_decode(value: &str) -> Result<String, String> {
-    let mut decoded = Vec::with_capacity(value.len());
-    let bytes = value.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            let Some(pair) = bytes.get(index + 1..index + 3) else {
-                return Err("release tag contains invalid percent encoding".into());
-            };
-            let text = std::str::from_utf8(pair)
-                .map_err(|_| "release tag contains invalid percent encoding")?;
-            decoded.push(
-                u8::from_str_radix(text, 16)
-                    .map_err(|_| "release tag contains invalid percent encoding")?,
-            );
-            index += 3;
-        } else {
-            decoded.push(bytes[index]);
-            index += 1;
-        }
+fn update_info_from_latest_redirect(
+    final_url: &Url,
+    load_signed: impl FnOnce(GithubRelease) -> Result<UpdateInfo, UpdateError>,
+) -> Result<UpdateInfo, String> {
+    let prefix = format!("/{REPOSITORY}/releases/tag/");
+    if final_url.scheme() != "https"
+        || !matches!(final_url.host_str(), Some("github.com" | "www.github.com"))
+        || final_url.port_or_known_default() != Some(443)
+        || !final_url.username().is_empty()
+        || final_url.password().is_some()
+        || final_url.query().is_some()
+        || final_url.fragment().is_some()
+    {
+        return Err("latest-release redirect did not use a trusted repository tag URL".into());
     }
-    String::from_utf8(decoded).map_err(|_| "release tag is not valid UTF-8".into())
+    let tag = final_url
+        .path()
+        .strip_prefix(&prefix)
+        .ok_or("latest-release redirect did not identify this repository")?;
+    let version = tag
+        .strip_prefix('v')
+        .and_then(|value| Version::parse(value).ok())
+        .filter(|version| version.pre.is_empty() && tag == format!("v{version}"))
+        .ok_or("latest-release redirect did not include a canonical stable tag")?;
+    // The release page only discovers the tag. Trust still comes from the
+    // embedded Ed25519 key and the signed version/channel/six-asset manifest,
+    // exactly as it does for the existing prerelease feed fallback.
+    load_signed(GithubRelease {
+        tag_name: format!("v{version}"),
+        name: String::new(),
+        html_url: final_url.to_string(),
+        body: String::new(),
+        draft: false,
+        prerelease: false,
+        assets: Vec::new(),
+    })
+    .map_err(|error| error.to_string())
 }
 
 pub fn download_verified_asset(
@@ -1283,6 +1280,88 @@ mod tests {
     }
 
     #[test]
+    fn stable_redirect_uses_signed_verification_instead_of_reporting_missing_manifest() {
+        let expected_asset = expected_asset_name();
+        let expected = UpdateInfo {
+            current_version: "0.6.1".into(),
+            latest_version: "v1.0.0".into(),
+            release_name: "SSH MountMate v1.0.0".into(),
+            release_url: format!("https://github.com/{REPOSITORY}/releases/tag/v1.0.0"),
+            body: String::new(),
+            is_newer: true,
+            asset: Some(VerifiedUpdateAsset::for_test(
+                b"signed payload",
+                &expected_asset,
+            )),
+            expected_asset,
+            trust_error: None,
+        };
+        // Both supported GitHub hostnames must delegate to the same signed
+        // loader even though the REST release asset list is unavailable.
+        for host in ["github.com", "www.github.com"] {
+            let url =
+                Url::parse(&format!("https://{host}/{REPOSITORY}/releases/tag/v1.0.0")).unwrap();
+            let mut invoked = false;
+            let actual = update_info_from_latest_redirect(&url, |release| {
+                invoked = true;
+                assert_eq!(release.tag_name, "v1.0.0");
+                assert_eq!(release.html_url, url.as_str());
+                assert!(!release.prerelease);
+                assert!(!release.draft);
+                assert!(release.assets.is_empty());
+                Ok(expected.clone())
+            })
+            .unwrap();
+            assert!(invoked);
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn stable_redirect_rejects_untrusted_or_noncanonical_urls_before_loading_assets() {
+        for url in [
+            "http://github.com/Stardust0831/ssh-mountmate/releases/tag/v0.6.2",
+            "https://example.com/Stardust0831/ssh-mountmate/releases/tag/v0.6.2",
+            "https://github.com:8443/Stardust0831/ssh-mountmate/releases/tag/v0.6.2",
+            "https://user@github.com/Stardust0831/ssh-mountmate/releases/tag/v0.6.2",
+            "https://github.com/other/ssh-mountmate/releases/tag/v0.6.2",
+            "https://github.com/Stardust0831/other/releases/tag/v0.6.2",
+            "https://github.com/Stardust0831/ssh-mountmate/releases/latest",
+            "https://github.com/Stardust0831/ssh-mountmate/releases/tag/0.6.2",
+            "https://github.com/Stardust0831/ssh-mountmate/releases/tag/v0.6",
+            "https://github.com/Stardust0831/ssh-mountmate/releases/tag/v0.6.2-alpha.1",
+            "https://github.com/Stardust0831/ssh-mountmate/releases/tag/%760.6.2",
+            "https://github.com/Stardust0831/ssh-mountmate/releases/tag/v0.6.2/extra",
+            "https://github.com/Stardust0831/ssh-mountmate/releases/tag/v0.6.2?other=tag",
+            "https://github.com/Stardust0831/ssh-mountmate/releases/tag/v0.6.2#other",
+        ] {
+            let result = update_info_from_latest_redirect(&Url::parse(url).unwrap(), |_| {
+                panic!("untrusted redirect must not trigger signed asset loading: {url}")
+            });
+            assert!(result.is_err(), "unexpectedly accepted {url}");
+        }
+    }
+
+    #[test]
+    fn stable_redirect_preserves_network_and_signature_verification_failures() {
+        let url = Url::parse(&format!(
+            "https://github.com/{REPOSITORY}/releases/tag/v0.6.2"
+        ))
+        .unwrap();
+        for failure in [
+            UpdateError::Request("signature download timed out".into()),
+            UpdateError::Trust(UpdateTrustError::InvalidSignature),
+            UpdateError::Trust(UpdateTrustError::UnknownKeyId("unexpected-key".into())),
+            UpdateError::Trust(UpdateTrustError::VersionMismatch),
+            UpdateError::Trust(UpdateTrustError::ChannelMismatch),
+        ] {
+            let expected_error = failure.to_string();
+            let result = update_info_from_latest_redirect(&url, |_| Err(failure));
+            assert_eq!(result.unwrap_err(), expected_error);
+        }
+    }
+
+    #[test]
     #[ignore = "requires the live GitHub releases API"]
     fn update_live_release_channels_decode_and_select_expected_versions() {
         let client = update_client(Duration::from_secs(30)).unwrap();
@@ -1298,6 +1377,22 @@ mod tests {
         assert!(parse_version(&stable.tag_name).unwrap().pre.is_empty());
         assert!(!stable.prerelease);
         assert!(!stable.draft);
+    }
+
+    #[test]
+    #[ignore = "requires live GitHub stable release pages and signed assets"]
+    fn update_live_stable_fallback_returns_a_verified_platform_asset() {
+        let client = update_client(Duration::from_secs(30)).unwrap();
+        let info = fetch_latest_release_redirect(&client, "v0.6.1").unwrap();
+        assert!(info.is_newer);
+        assert!(parse_version(&info.latest_version).unwrap().pre.is_empty());
+        assert!(info.trust_error.is_none());
+        let asset = info
+            .asset
+            .expect("stable fallback must verify a signed asset");
+        assert_eq!(asset.name(), expected_asset_name());
+        assert_eq!(asset.channel(), ReleaseChannel::Stable);
+        assert_eq!(format!("v{}", asset.version()), info.latest_version);
     }
 
     #[test]
