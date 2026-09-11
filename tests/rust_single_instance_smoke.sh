@@ -146,6 +146,7 @@ for _ in {1..400}; do
 done
 [[ -n "$window_id" ]] || { echo "Main window did not become visible" >&2; exit 1; }
 [[ "$(xdotool getwindowpid "$window_id")" == "$app_pid" ]] || { echo "Main window belongs to another process" >&2; exit 1; }
+bash "$(dirname "$0")/rust_linux_icon_smoke.sh" "$window_id" "$XDG_DATA_HOME" "$binary"
 
 xdotool windowactivate --sync "$window_id"
 xdotool key --clearmodifiers alt+F4

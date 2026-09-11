@@ -74,6 +74,7 @@ use mountmate_platform::{
 
 mod cli;
 mod i18n;
+mod icons;
 mod transfer_center;
 mod tray;
 
@@ -224,7 +225,7 @@ fn run() -> Result<(), String> {
                 let confirmed = rfd::MessageDialog::new()
                     .set_title(APP_NAME)
                     .set_description(format!(
-                        "A different SSH MountMate instance is already running.\n\nRunning: {version}\n{}\n\nCurrent: {VERSION}\n{}\n\nExit the running interface and start this version? Mounted drives and background rclone transfers will remain active.\n\n检测到托盘中运行的是另一个版本或路径。是否退出旧界面并启动当前版本？现有挂载和后台 rclone 传输会继续。",
+                        "A different SSH MountMate instance is already running.\n\nRunning: {version}\n{}\n\nCurrent: {VERSION}\n{}\n\nExit the running interface and start this version? Native SFTP and OpenSSH mounts can remain active. Finish uploads and unmount interactive shared SSH connections first, because exiting ends their authenticated sessions.\n\n检测到托盘中运行的是另一个版本或路径。是否退出旧界面并启动当前版本？原生 SFTP 和 OpenSSH 挂载可以继续；交互式共享 SSH 会话会随退出而结束，请先完成上传并卸载这类连接。",
                         running.executable.display(),
                         current_executable.display()
                     ))
@@ -280,6 +281,18 @@ fn run() -> Result<(), String> {
             command: initial_command,
             update_health,
         } => {
+            if let Err(error) = std::env::current_exe()
+                .map_err(|error| error.to_string())
+                .and_then(|executable| {
+                    mountmate_platform::ensure_application_identity(&executable)
+                        .map_err(|error| error.to_string())
+                })
+            {
+                eprintln!("Could not register the application icon and launcher: {error}");
+                diagnostic_trace(&format!(
+                    "application identity registration failed: {error}"
+                ));
+            }
             let (command_sender, command_receiver) = async_channel::unbounded();
             let command_server = Arc::new(
                 AppCommandServer::start_with_version(
@@ -3737,6 +3750,9 @@ impl App {
                 Task::batch(tasks)
             }
             AppCommand::ExitForReplacement => {
+                if self.block_update_for_interactive_mounts() {
+                    return self.show_main_window();
+                }
                 if self.busy.is_empty() {
                     self.request_exit()
                 } else {
@@ -4574,6 +4590,9 @@ impl App {
     }
 
     fn prepare_update_task(&mut self) -> Task<Message> {
+        if self.block_update_for_interactive_mounts() {
+            return Task::none();
+        }
         let Some(asset) = self
             .update_info
             .as_ref()
@@ -4637,6 +4656,9 @@ impl App {
     }
 
     fn confirm_prepared_update(&mut self) -> Task<Message> {
+        if self.block_update_for_interactive_mounts() {
+            return Task::none();
+        }
         let active = self
             .transfers
             .values()
@@ -4677,6 +4699,12 @@ impl App {
     }
 
     fn launch_prepared_update(&mut self) -> Task<Message> {
+        // A login or mount may have started while downloading or while the
+        // confirmation dialog was open. Recheck before launching the helper:
+        // exiting this GUI also terminates its interactive SSH masters.
+        if self.block_update_for_interactive_mounts() {
+            return Task::none();
+        }
         let Some(prepared) = self.prepared_update.take() else {
             return Task::none();
         };
@@ -4694,6 +4722,43 @@ impl App {
                 Task::none()
             }
         }
+    }
+
+    fn block_update_for_interactive_mounts(&mut self) -> bool {
+        let names = self
+            .servers
+            .iter()
+            .filter(|server| {
+                interactive_mount_blocks_update(
+                    server.connection_method,
+                    self.mount_statuses.get(&server.id).copied(),
+                    self.busy.contains(&server.id),
+                    self.interactive_terminals
+                        .get(&server.id)
+                        .is_some_and(|session| session.queued_mount),
+                    self.paths.state_file(&server.id).exists(),
+                )
+            })
+            .map(|server| server.display_name())
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            return false;
+        }
+        let names = names.join(", ");
+        let message = match self.locale() {
+            Locale::English => format!(
+                "Updating or replacing the app ends interactive shared SSH sessions and interrupts their mounts. Cancel pending interactive logins and unmount these connections before retrying: {names}"
+            ),
+            Locale::Chinese => format!(
+                "更新或替换程序会结束交互式共享 SSH 会话并中断挂载。请先取消等待中的交互登录，并卸载这些连接后重试：{names}"
+            ),
+        };
+        if let Some(prepared) = self.prepared_update.take() {
+            prepared.cancel();
+        }
+        self.update_error = Some(message.clone());
+        self.status = message;
+        true
     }
 
     fn status_task(&mut self, policy: StatusPublishPolicy) -> Task<Message> {
@@ -10121,8 +10186,31 @@ fn automatic_install_blocked_message(locale: Locale, error: &UpdateTrustError) -
     }
 }
 
+fn interactive_mount_blocks_update(
+    method: ConnectionMethod,
+    status: Option<MountStatus>,
+    busy: bool,
+    queued_login: bool,
+    recorded_mount: bool,
+) -> bool {
+    method == ConnectionMethod::Interactive
+        && (busy
+            || queued_login
+            || matches!(status, Some(MountStatus::Mounted | MountStatus::Starting))
+            // An older asynchronous poll may report Unmounted after a mount
+            // finishes. Its persisted state remains authoritative until
+            // unmount/stale cleanup removes it.
+            || recorded_mount)
+}
+
 fn main_window_settings() -> window::Settings {
     window::Settings {
+        icon: Some(icons::window_icon()),
+        #[cfg(target_os = "linux")]
+        platform_specific: window::settings::PlatformSpecific {
+            application_id: mountmate_platform::APPLICATION_ID.into(),
+            ..Default::default()
+        },
         size: Size::new(1120.0, 800.0),
         min_size: Some(Size::new(760.0, 560.0)),
         position: window::Position::Centered,
@@ -10133,6 +10221,12 @@ fn main_window_settings() -> window::Settings {
 
 fn log_window_settings() -> window::Settings {
     window::Settings {
+        icon: Some(icons::window_icon()),
+        #[cfg(target_os = "linux")]
+        platform_specific: window::settings::PlatformSpecific {
+            application_id: mountmate_platform::APPLICATION_ID.into(),
+            ..Default::default()
+        },
         size: Size::new(980.0, 680.0),
         min_size: Some(Size::new(680.0, 480.0)),
         position: window::Position::Centered,
@@ -10143,6 +10237,12 @@ fn log_window_settings() -> window::Settings {
 
 fn terminal_window_settings() -> window::Settings {
     window::Settings {
+        icon: Some(icons::window_icon()),
+        #[cfg(target_os = "linux")]
+        platform_specific: window::settings::PlatformSpecific {
+            application_id: mountmate_platform::APPLICATION_ID.into(),
+            ..Default::default()
+        },
         size: Size::new(1080.0, 740.0),
         min_size: Some(Size::new(720.0, 520.0)),
         position: window::Position::Centered,
@@ -10211,6 +10311,12 @@ fn interactive_session_config_compatible(previous: &ServerConfig, next: &ServerC
 
 fn transfer_window_settings() -> window::Settings {
     let settings = window::Settings {
+        icon: Some(icons::window_icon()),
+        #[cfg(target_os = "linux")]
+        platform_specific: window::settings::PlatformSpecific {
+            application_id: mountmate_platform::APPLICATION_ID.into(),
+            ..Default::default()
+        },
         size: transfer_popup_size(false),
         position: window::Position::SpecificWith(bottom_right_position),
         visible: !cfg!(windows),
@@ -10426,6 +10532,47 @@ fn open_external_url(url: &str) -> Result<(), String> {
 #[cfg(test)]
 mod localization_tests {
     use super::*;
+
+    #[test]
+    fn interactive_updates_require_completed_unmount_and_no_pending_login() {
+        for (status, busy, queued, recorded) in [
+            (Some(MountStatus::Mounted), false, false, true),
+            (Some(MountStatus::Starting), false, false, false),
+            (Some(MountStatus::Unmounted), true, false, false),
+            (Some(MountStatus::Unmounted), false, true, false),
+            (Some(MountStatus::Unmounted), false, false, true),
+            (None, false, false, true),
+            (Some(MountStatus::Stale), false, false, true),
+        ] {
+            assert!(interactive_mount_blocks_update(
+                ConnectionMethod::Interactive,
+                status,
+                busy,
+                queued,
+                recorded,
+            ));
+        }
+        // A completed unmount permits updating even if its idle terminal
+        // remains open; an initial empty configuration permits it as well.
+        for status in [None, Some(MountStatus::Unmounted), Some(MountStatus::Stale)] {
+            assert!(!interactive_mount_blocks_update(
+                ConnectionMethod::Interactive,
+                status,
+                false,
+                false,
+                false,
+            ));
+        }
+        for method in [ConnectionMethod::Native, ConnectionMethod::Openssh] {
+            assert!(!interactive_mount_blocks_update(
+                method,
+                Some(MountStatus::Mounted),
+                false,
+                false,
+                true,
+            ));
+        }
+    }
 
     #[test]
     fn mount_error_summary_is_bounded_to_two_lines_and_compact_content() {

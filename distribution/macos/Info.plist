@@ -10,6 +10,8 @@
     <string>SSHMountMate</string>
     <key>CFBundleIdentifier</key>
     <string>io.github.stardust0831.ssh-mountmate</string>
+    <key>CFBundleIconFile</key>
+    <string>ssh-mountmate-logo.icns</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>

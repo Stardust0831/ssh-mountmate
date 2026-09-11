@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -21,7 +22,7 @@ pub enum RcloneConfigError {
     InvalidRemoteName(String),
     #[error("invalid value for {field}")]
     InvalidValue { field: &'static str },
-    #[error("SSH config resolution is required for an SSH config connection")]
+    #[error("SSH config resolution is required for a legacy connection with missing target fields")]
     MissingResolvedSshConfig,
     #[error("interactive SSH requires a verified shared-session connector")]
     MissingInteractiveConnector,
@@ -91,22 +92,10 @@ impl RcloneRemote {
             return Ok(Self { name, options });
         }
 
-        let ssh_config_connection = server.mode == "ssh_config";
-        let resolved = if ssh_config_connection {
-            Some(resolved.ok_or(RcloneConfigError::MissingResolvedSshConfig)?)
-        } else {
-            None
-        };
-        let host = resolved
-            .map(|config| config.first("hostname", &server.host))
-            .unwrap_or(&server.host);
-        let default_user = default_username();
-        let user = resolved
-            .map(|config| config.first("user", default_user.as_str()))
-            .unwrap_or(&server.user);
-        let port = resolved
-            .map(|config| config.first("port", &server.port))
-            .unwrap_or(&server.port);
+        let server = native_server_with_defaults(server, resolved)?;
+        let host = &server.host;
+        let user = &server.user;
+        let port = &server.port;
         validate_scalar(host, "host")?;
         validate_scalar(user, "user")?;
         validate_port(port)?;
@@ -116,35 +105,21 @@ impl RcloneRemote {
             ("port".into(), port.to_owned()),
         ]);
 
-        if ssh_config_connection {
-            if let Some(key_file) =
-                resolved.and_then(|config| config.first_existing_path("identityfile"))
-            {
-                options.push(("key_file".into(), key_file.display().to_string()));
+        match server.auth {
+            AuthMethod::Password => {
+                validate_scalar(&server.password_obscured, "password")?;
+                options.push(("pass".into(), server.password_obscured.clone()));
+            }
+            AuthMethod::Key if !server.key_file.is_empty() => {
+                validate_scalar(&server.key_file, "key file")?;
+                options.push(("key_file".into(), server.key_file.clone()));
                 if !server.key_pass_obscured.is_empty() {
                     validate_scalar(&server.key_pass_obscured, "key passphrase")?;
                     options.push(("key_file_pass".into(), server.key_pass_obscured.clone()));
                 }
-            } else {
-                options.push(("key_use_agent".into(), "true".into()));
             }
-        } else {
-            match server.auth {
-                AuthMethod::Password => {
-                    validate_scalar(&server.password_obscured, "password")?;
-                    options.push(("pass".into(), server.password_obscured.clone()));
-                }
-                AuthMethod::Key if !server.key_file.is_empty() => {
-                    validate_scalar(&server.key_file, "key file")?;
-                    options.push(("key_file".into(), server.key_file.clone()));
-                    if !server.key_pass_obscured.is_empty() {
-                        validate_scalar(&server.key_pass_obscured, "key passphrase")?;
-                        options.push(("key_file_pass".into(), server.key_pass_obscured.clone()));
-                    }
-                }
-                AuthMethod::Key => {
-                    options.push(("key_use_agent".into(), "true".into()));
-                }
+            AuthMethod::Key => {
+                options.push(("key_use_agent".into(), "true".into()));
             }
         }
         let known_hosts = known_hosts
@@ -172,6 +147,41 @@ impl RcloneRemote {
         );
         Ok(())
     }
+}
+
+pub(crate) fn native_server_needs_ssh_defaults(server: &ServerConfig) -> bool {
+    server.connection_method == ConnectionMethod::Native
+        && server.mode == "ssh_config"
+        && (server.host.is_empty() || server.user.is_empty() || server.port.is_empty())
+}
+
+/// Old alias-only profiles did not save the resolved target. Complete imports
+/// already contain editable defaults and must never be overwritten by ssh -G.
+pub(crate) fn native_server_with_defaults<'a>(
+    server: &'a ServerConfig,
+    resolved: Option<&ResolvedSshConfig>,
+) -> Result<Cow<'a, ServerConfig>, RcloneConfigError> {
+    if !native_server_needs_ssh_defaults(server) {
+        return Ok(Cow::Borrowed(server));
+    }
+    let resolved = resolved.ok_or(RcloneConfigError::MissingResolvedSshConfig)?;
+    let mut effective = server.clone();
+    let alias_only = server.host.is_empty() && server.user.is_empty();
+    if effective.host.is_empty() {
+        effective.host = resolved.first("hostname", &server.host_alias).into();
+    }
+    if effective.user.is_empty() {
+        effective.user = resolved.first("user", &default_username()).into();
+    }
+    if effective.port.is_empty() || alias_only {
+        effective.port = resolved.first("port", "22").into();
+    }
+    if effective.auth == AuthMethod::Key && effective.key_file.is_empty() {
+        effective.key_file = resolved
+            .first_existing_path("identityfile")
+            .map_or_else(String::new, |path| path.display().to_string());
+    }
+    Ok(Cow::Owned(effective))
 }
 
 pub fn write_rclone_remote(
@@ -280,39 +290,61 @@ fn default_username() -> String {
 
 fn openssh_command(server: &ServerConfig, windows: bool) -> Result<String, RcloneConfigError> {
     let mut arguments = vec!["ssh".to_owned(), "-o".into(), "BatchMode=yes".into()];
-    if (server.source == "ssh_config" || server.ssh_config_managed) && !server.host_alias.is_empty()
-    {
-        if server.source == "ssh_config" && !server.ssh_config_path.trim().is_empty() {
-            validate_scalar(&server.ssh_config_path, "SSH config path")?;
-            arguments.extend(["-F".into(), server.ssh_config_path.clone()]);
-        }
-        validate_host_alias(&server.host_alias)
-            .map_err(|_| RcloneConfigError::InvalidValue { field: "SSH host" })?;
-        arguments.push(server.host_alias.clone());
-    } else {
-        validate_scalar(&server.host, "host")?;
-        validate_port(&server.port)?;
-        if !server.user.is_empty() {
-            validate_scalar(&server.user, "user")?;
-            arguments.extend(["-l".into(), server.user.clone()]);
-        }
-        arguments.extend(["-p".into(), server.port.clone()]);
-        if !server.key_file.is_empty() {
-            validate_scalar(&server.key_file, "key file")?;
-            arguments.extend([
-                "-i".into(),
-                server.key_file.clone(),
-                "-o".into(),
-                "IdentitiesOnly=yes".into(),
-            ]);
-        }
-        arguments.push(server.host.clone());
-    }
+    arguments.extend(openssh_target_arguments(server)?);
     Ok(arguments
         .iter()
         .map(|argument| quote_command_argument(argument, windows))
         .collect::<Vec<_>>()
         .join(" "))
+}
+
+/// Retain the original alias for Host/Include/ProxyJump processing, while
+/// command-line options make the saved editable target take precedence.
+pub(crate) fn openssh_target_arguments(
+    server: &ServerConfig,
+) -> Result<Vec<String>, RcloneConfigError> {
+    let imported = server.mode == "ssh_config"
+        || matches!(server.source.as_str(), "ssh_config" | "ssh_config_batch");
+    let use_alias = (imported || server.ssh_config_managed) && !server.host_alias.is_empty();
+    let mut arguments = Vec::new();
+    if use_alias {
+        if imported && !server.ssh_config_path.trim().is_empty() {
+            validate_scalar(&server.ssh_config_path, "SSH config path")?;
+            arguments.extend(["-F".into(), server.ssh_config_path.clone()]);
+        }
+        validate_host_alias(&server.host_alias)
+            .map_err(|_| RcloneConfigError::InvalidValue { field: "SSH host" })?;
+        if !server.host.is_empty() {
+            validate_scalar(&server.host, "host")?;
+            arguments.extend(["-o".into(), format!("HostName={}", server.host)]);
+        }
+    } else {
+        validate_scalar(&server.host, "host")?;
+    }
+    if !server.user.is_empty() {
+        validate_scalar(&server.user, "user")?;
+        arguments.extend(["-l".into(), server.user.clone()]);
+    }
+    // A legacy alias-only record's default 22 was not a user-selected port.
+    if !use_alias || !server.host.is_empty() || !server.user.is_empty() {
+        validate_port(&server.port)?;
+        arguments.extend(["-p".into(), server.port.clone()]);
+    }
+    if !server.key_file.is_empty() {
+        validate_scalar(&server.key_file, "key file")?;
+        arguments.extend([
+            "-i".into(),
+            server.key_file.clone(),
+            "-o".into(),
+            "IdentitiesOnly=yes".into(),
+        ]);
+    }
+    arguments.push(if use_alias {
+        server.host_alias.clone()
+    } else {
+        server.host.clone()
+    });
+    Ok(arguments)
 }
 
 fn quote_command_argument(value: &str, windows: bool) -> String {
@@ -934,6 +966,58 @@ mod tests {
             .1;
         assert!(command.contains("-F '/home/user/ssh configs/research'"));
         assert!(command.ends_with("cluster"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edited_openssh_import_overrides_target_without_losing_includes_or_proxyjump() {
+        let temp = tempdir().unwrap();
+        let config = temp.path().join("ssh config");
+        let included = temp.path().join("included");
+        let original_key = temp.path().join("original key");
+        let edited_key = temp.path().join("edited key");
+        fs::write(&original_key, "PRIVATE KEY").unwrap();
+        fs::write(&edited_key, "PRIVATE KEY").unwrap();
+        fs::write(&config, format!("Include \"{}\"\n", included.display())).unwrap();
+        fs::write(&included, format!(
+            "Host cluster\n HostName original.example\n User original-user\n Port 2202\n IdentityFile \"{}\"\n ProxyJump gateway\n",
+            original_key.display()
+        )).unwrap();
+        for source in ["ssh_config", "ssh_config_batch"] {
+            let server = ServerConfig {
+                id: "cluster".into(),
+                mode: "ssh_config".into(),
+                source: source.into(),
+                host_alias: "cluster".into(),
+                host: "edited.example".into(),
+                user: "edited-user".into(),
+                port: "2303".into(),
+                key_file: edited_key.display().to_string(),
+                ssh_config_path: config.display().to_string(),
+                connection_method: ConnectionMethod::Openssh,
+                ..ServerConfig::default()
+            };
+            let output = std::process::Command::new("ssh")
+                .arg("-G")
+                .args(openssh_target_arguments(&server).unwrap())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let resolved = ResolvedSshConfig::parse(&String::from_utf8_lossy(&output.stdout));
+            assert_eq!(resolved.first("hostname", ""), "edited.example");
+            assert_eq!(resolved.first("user", ""), "edited-user");
+            assert_eq!(resolved.first("port", ""), "2303");
+            assert_eq!(resolved.first("proxyjump", ""), "gateway");
+            assert_eq!(
+                resolved.first("identityfile", ""),
+                edited_key.to_str().unwrap()
+            );
+            assert_eq!(resolved.first("identitiesonly", ""), "yes");
+        }
     }
 
     #[test]

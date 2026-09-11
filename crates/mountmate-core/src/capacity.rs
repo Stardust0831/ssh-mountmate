@@ -10,6 +10,7 @@ use serde::Deserialize;
 use thiserror::Error;
 use wait_timeout::ChildExt;
 
+use crate::rclone::openssh_target_arguments;
 use crate::{AuthMethod, MountState, ServerConfig};
 
 #[cfg(windows)]
@@ -109,30 +110,27 @@ pub fn mounted_capacity(
     server: &ServerConfig,
     state: &MountState,
     rclone_config: &Path,
+    external_ssh: Option<&[String]>,
 ) -> Result<Option<CapacityInfo>, CapacityError> {
-    if server.source == "sai_cluster"
-        && let Some(capacity) = lustre_project_capacity(server)?
-    {
-        return Ok(Some(capacity));
+    // Project quotas describe the directory's actual allowance; a successful
+    // statfs on the mount usually describes the entire backing filesystem.
+    let project_result = lustre_project_capacity(server, external_ssh);
+    if let Ok(Some(capacity)) = &project_result {
+        return Ok(Some(*capacity));
     }
     if let Some(capacity) = local_mount_capacity(&state.mountpoint) {
-        return Ok(Some(capacity));
-    }
-    if server.source != "sai_cluster"
-        && let Some(capacity) = lustre_project_capacity(server)?
-    {
         return Ok(Some(capacity));
     }
     let rclone_result = rclone_about_capacity(&state.rclone, rclone_config, &state.remote);
     if let Ok(Some(capacity)) = &rclone_result {
         return Ok(Some(*capacity));
     }
-    let remote_result = remote_filesystem_capacity(server);
+    let remote_result = remote_filesystem_capacity(server, external_ssh);
     if let Ok(Some(capacity)) = &remote_result {
         return Ok(Some(*capacity));
     }
-    match (rclone_result, remote_result) {
-        (Err(error), _) | (_, Err(error)) => Err(error),
+    match (rclone_result, remote_result, project_result) {
+        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
         _ => Ok(None),
     }
 }
@@ -187,8 +185,11 @@ fn capacity_from_about(about: RcloneAbout) -> Option<CapacityInfo> {
     )
 }
 
-fn lustre_project_capacity(server: &ServerConfig) -> Result<Option<CapacityInfo>, CapacityError> {
-    let Some(output) = ssh_capacity_output(server, LUSTRE_CAPACITY_SCRIPT)? else {
+fn lustre_project_capacity(
+    server: &ServerConfig,
+    external_ssh: Option<&[String]>,
+) -> Result<Option<CapacityInfo>, CapacityError> {
+    let Some(output) = ssh_capacity_output(server, LUSTRE_CAPACITY_SCRIPT, external_ssh)? else {
         return Ok(None);
     };
     Ok(parse_lustre_quota(&output))
@@ -196,8 +197,10 @@ fn lustre_project_capacity(server: &ServerConfig) -> Result<Option<CapacityInfo>
 
 fn remote_filesystem_capacity(
     server: &ServerConfig,
+    external_ssh: Option<&[String]>,
 ) -> Result<Option<CapacityInfo>, CapacityError> {
-    let Some(output) = ssh_capacity_output(server, FILESYSTEM_CAPACITY_SCRIPT)? else {
+    let Some(output) = ssh_capacity_output(server, FILESYSTEM_CAPACITY_SCRIPT, external_ssh)?
+    else {
         return Ok(None);
     };
     Ok(parse_filesystem_capacity(&output))
@@ -206,51 +209,36 @@ fn remote_filesystem_capacity(
 fn ssh_capacity_output(
     server: &ServerConfig,
     script: &str,
+    external_ssh: Option<&[String]>,
 ) -> Result<Option<String>, CapacityError> {
-    if server.auth == AuthMethod::Password
-        && server.source != "ssh_config"
-        && !server.ssh_config_managed
-    {
+    if external_ssh.is_none() && !supports_system_ssh_capacity(server) {
         return Ok(None);
     }
-    let Some(ssh) =
-        crate::rclone_binary::find_system_executable(if cfg!(windows) { "ssh.exe" } else { "ssh" })
-    else {
-        return Ok(None);
-    };
-    let mut arguments = vec![
-        "-o".to_owned(),
-        "BatchMode=yes".to_owned(),
-        "-o".to_owned(),
-        "ConnectTimeout=8".to_owned(),
-    ];
-    if (server.source == "ssh_config" || server.ssh_config_managed)
-        && !server.host_alias.trim().is_empty()
-    {
-        let config = if !server.managed_ssh_config_path.trim().is_empty() {
-            &server.managed_ssh_config_path
-        } else {
-            &server.ssh_config_path
+    let (ssh, mut arguments) = if let Some(connector) = external_ssh {
+        let Some((program, arguments)) = connector.split_first() else {
+            return Err(CapacityError::Command("empty shared SSH connector".into()));
         };
-        if !config.trim().is_empty() {
-            arguments.extend(["-F".into(), config.clone()]);
-        }
-        arguments.push(server.host_alias.clone());
+        (std::path::PathBuf::from(program), arguments.to_vec())
     } else {
-        if !server.user.trim().is_empty() {
-            arguments.extend(["-l".into(), server.user.clone()]);
-        }
-        arguments.extend(["-p".into(), server.port.clone()]);
-        if !server.key_file.trim().is_empty() {
-            arguments.extend([
-                "-i".into(),
-                server.key_file.clone(),
-                "-o".into(),
-                "IdentitiesOnly=yes".into(),
-            ]);
-        }
-        arguments.push(server.host.clone());
-    }
+        let Some(ssh) = crate::rclone_binary::find_system_executable(if cfg!(windows) {
+            "ssh.exe"
+        } else {
+            "ssh"
+        }) else {
+            return Ok(None);
+        };
+        let mut arguments = vec![
+            "-o".into(),
+            "BatchMode=yes".into(),
+            "-o".into(),
+            "ConnectTimeout=8".into(),
+        ];
+        arguments.extend(
+            openssh_target_arguments(server)
+                .map_err(|error| CapacityError::Command(error.to_string()))?,
+        );
+        (ssh, arguments)
+    };
     arguments.extend([
         "sh".into(),
         "-s".into(),
@@ -270,6 +258,13 @@ fn ssh_capacity_output(
         return Ok(None);
     }
     Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
+}
+
+fn supports_system_ssh_capacity(server: &ServerConfig) -> bool {
+    server.auth != AuthMethod::Password
+        || server.mode == "ssh_config"
+        || matches!(server.source.as_str(), "ssh_config" | "ssh_config_batch")
+        || server.ssh_config_managed
 }
 
 fn run_with_timeout(
@@ -397,6 +392,97 @@ fn inode_from_usage(total: u64, used: u64) -> Option<InodeInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_password_capacity_probe_accepts_single_batch_and_legacy_imports() {
+        let mut server = ServerConfig {
+            auth: AuthMethod::Password,
+            connection_method: crate::ConnectionMethod::Native,
+            ..ServerConfig::default()
+        };
+        assert!(!supports_system_ssh_capacity(&server));
+
+        for source in ["ssh_config", "ssh_config_batch"] {
+            server.source = source.into();
+            assert!(supports_system_ssh_capacity(&server), "source {source}");
+        }
+
+        // Legacy records may identify the import only through their mode.
+        server.source = "manual".into();
+        server.mode = "ssh_config".into();
+        assert!(supports_system_ssh_capacity(&server));
+
+        server.mode = "manual".into();
+        server.ssh_config_managed = true;
+        assert!(supports_system_ssh_capacity(&server));
+
+        server.ssh_config_managed = false;
+        assert!(!supports_system_ssh_capacity(&server));
+        server.auth = AuthMethod::Key;
+        assert!(supports_system_ssh_capacity(&server));
+    }
+
+    #[cfg(unix)]
+    fn mounted_state(path: &Path) -> MountState {
+        serde_json::from_value(serde_json::json!({
+            "pid": 1, "server_id": "quota-test", "remote": "quota-test:",
+            "mountpoint": path, "log": path.join("log"), "rc_addr": "127.0.0.1:1",
+            "rclone": path.join("unused-rclone")
+        }))
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_quota_precedes_available_mount_capacity_for_every_import_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = mounted_state(temp.path());
+        assert!(local_mount_capacity(temp.path()).is_some());
+        // The already-verified connector stands in for an MFA-only session:
+        // no separate system SSH login is needed for the quota command.
+        let connector = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "cat >/dev/null; printf '/lustre 10 0 100 - 0 0 0\\n'".into(),
+        ];
+        for source in ["manual", "ssh_config", "sai_cluster"] {
+            let server = ServerConfig {
+                source: source.into(),
+                connection_method: crate::ConnectionMethod::Interactive,
+                ..ServerConfig::default()
+            };
+            let capacity = mounted_capacity(
+                &server,
+                &state,
+                &temp.path().join("rclone.conf"),
+                Some(&connector),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(capacity.source, CapacitySource::LustreProjectQuota);
+            assert_eq!((capacity.used, capacity.total), (10 * 1024, 100 * 1024));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_project_query_falls_back_to_available_mount_capacity() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = ServerConfig {
+            source: "sai_cluster".into(),
+            ..ServerConfig::default()
+        };
+        let connector = vec![temp.path().join("missing-ssh").display().to_string()];
+        let result = mounted_capacity(
+            &server,
+            &mounted_state(temp.path()),
+            &temp.path().join("rclone.conf"),
+            Some(&connector),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.source, CapacitySource::LocalMountpoint);
+    }
 
     #[test]
     fn lustre_quota_uses_the_hard_limit_and_clamps_percentage() {

@@ -18,8 +18,9 @@ use crate::paths::AppPaths;
 use crate::process::MountStatus;
 use crate::rc::{HttpRcClient, RcError, RefreshResult};
 use crate::rclone::{
-    RcloneConfigError, RcloneRemote, clear_rclone_remote_secrets, normalize_explorer_refresh_path,
-    normalize_refresh_relative_path, write_rclone_remote,
+    RcloneConfigError, RcloneRemote, clear_rclone_remote_secrets, native_server_needs_ssh_defaults,
+    native_server_with_defaults, normalize_explorer_refresh_path, normalize_refresh_relative_path,
+    write_rclone_remote,
 };
 use crate::rclone_binary::{RcloneBinaryError, resolve_rclone};
 use crate::runtime::{
@@ -158,8 +159,13 @@ impl MountService {
         let external_ssh = self.interactive_ssh_arguments(server)?;
         let prepared_server = self.prepare_server_credentials(server)?;
         self.ensure_remote(&prepared_server, external_ssh.as_deref())?;
-        let result = mounted_capacity(&prepared_server, &state, &self.paths.rclone_config())
-            .map_err(ServiceError::from);
+        let result = mounted_capacity(
+            &prepared_server,
+            &state,
+            &self.paths.rclone_config(),
+            external_ssh.as_deref(),
+        )
+        .map_err(ServiceError::from);
         self.finish_secret_use(server, &result)?;
         result
     }
@@ -331,9 +337,7 @@ impl MountService {
         server: &ServerConfig,
         external_ssh_arguments: Option<&[String]>,
     ) -> Result<(), ServiceError> {
-        let resolved = if server.mode == "ssh_config"
-            && server.connection_method == ConnectionMethod::Native
-        {
+        let resolved = if native_server_needs_ssh_defaults(server) {
             let config_value = if !server.ssh_config_path.trim().is_empty() {
                 &server.ssh_config_path
             } else {
@@ -349,13 +353,14 @@ impl MountService {
         } else {
             None
         };
+        let server = native_server_with_defaults(server, resolved.as_ref())?;
         let known_hosts = if server.connection_method != ConnectionMethod::Native {
             None
         } else {
-            self.known_hosts_for(server, resolved.as_ref())?
+            self.known_hosts_for(&server, resolved.as_ref())?
         };
         let mut remote = RcloneRemote::for_server_with_external_ssh(
-            server,
+            &server,
             resolved.as_ref(),
             known_hosts.as_deref(),
             cfg!(windows),
@@ -434,31 +439,35 @@ impl MountService {
         server: &ServerConfig,
         resolved: Option<&ResolvedSshConfig>,
     ) -> Result<Option<PathBuf>, ServiceError> {
-        let host = resolved
-            .map(|config| config.first("hostname", &server.host))
-            .unwrap_or(&server.host);
-        let port = resolved
-            .map(|config| config.first("port", &server.port))
-            .unwrap_or(&server.port);
         let default = directories::BaseDirs::new()
             .map(|directories| directories.home_dir().join(".ssh/known_hosts"))
             .unwrap_or_else(|| PathBuf::from(".ssh/known_hosts"));
+        self.known_hosts_for_with_tools(
+            server,
+            resolved,
+            &default,
+            Path::new("ssh"),
+            Path::new("ssh-keyscan"),
+        )
+    }
+
+    fn known_hosts_for_with_tools(
+        &self,
+        server: &ServerConfig,
+        resolved: Option<&ResolvedSshConfig>,
+        default: &Path,
+        ssh: &Path,
+        keyscan: &Path,
+    ) -> Result<Option<PathBuf>, ServiceError> {
         let manager = KnownHostsManager::new(&self.paths);
-        match manager.pin_first_seen(Path::new("ssh-keyscan"), host, port) {
+        let fallback = || fallback_known_hosts(&self.paths, resolved, default, server, ssh);
+        match manager.pin_first_seen(keyscan, &server.host, &server.port) {
             Ok(Some(path)) => Ok(Some(path)),
-            Ok(None) => Ok(fallback_known_hosts(
-                &self.paths,
-                resolved,
-                &default,
-                host,
-                port,
-            )),
+            Ok(None) => Ok(fallback()),
             Err(error @ (SshError::InvalidHost(_) | SshError::InvalidPort(_))) => {
                 Err(ServiceError::Ssh(error))
             }
-            Err(error) => fallback_known_hosts(&self.paths, resolved, &default, host, port)
-                .map(Some)
-                .ok_or(ServiceError::Ssh(error)),
+            Err(error) => fallback().map(Some).ok_or(ServiceError::Ssh(error)),
         }
     }
 
@@ -567,15 +576,32 @@ fn fallback_known_hosts(
     paths: &AppPaths,
     resolved: Option<&ResolvedSshConfig>,
     default: &Path,
-    host: &str,
-    port: &str,
+    server: &ServerConfig,
+    ssh: &Path,
 ) -> Option<PathBuf> {
-    select_known_hosts_for_marker(
-        Some(&paths.known_hosts()),
-        resolved,
-        default,
-        &known_hosts_marker(host, port),
-    )
+    let marker = known_hosts_marker(&server.host, &server.port);
+    if let Some(path) =
+        select_known_hosts_for_marker(Some(&paths.known_hosts()), resolved, default, &marker)
+    {
+        return Some(path);
+    }
+    // Complete imports no longer need their source to resolve the target.
+    // Consult it only as a last-resort source of trust files, never to replace
+    // the saved host, user, port, or authentication settings.
+    let imported = server.mode == "ssh_config"
+        || matches!(server.source.as_str(), "ssh_config" | "ssh_config_batch");
+    if resolved.is_some() || (!imported && !server.ssh_config_managed) {
+        return None;
+    }
+    let config_value = if !server.ssh_config_path.trim().is_empty() {
+        &server.ssh_config_path
+    } else {
+        &server.managed_ssh_config_path
+    };
+    let config =
+        (!config_value.trim().is_empty()).then(|| expand_home_path(Path::new(config_value)));
+    let source = resolve_ssh_config(ssh, &server.host_alias, config.as_deref()).ok()?;
+    select_known_hosts_for_marker(None, Some(&source), default, &marker)
 }
 
 fn expand_home_path(path: &Path) -> PathBuf {
@@ -656,6 +682,215 @@ mod tests {
         assert_eq!(server.connection_method, ConnectionMethod::Native);
         assert_eq!(server.ssh_config_path, "/tmp/custom ssh config");
         assert!(server.key_file.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complete_native_import_uses_source_trust_file_only_for_the_saved_target() {
+        let temp = tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: temp.path().join("config"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            data_dir: temp.path().join("data"),
+        };
+        let source_config = temp.path().join("source config");
+        let custom_hosts = temp.path().join("custom-known-hosts");
+        let default_hosts = temp.path().join("missing-default-known-hosts");
+        let missing_keyscan = temp.path().join("missing-keyscan");
+        fs::write(
+            &source_config,
+            format!(
+                "Host cluster\n HostName original.example\n User original-user\n Port 2202\n UserKnownHostsFile \"{}\"\n",
+                custom_hosts.display()
+            ),
+        )
+        .unwrap();
+        let server = ServerConfig {
+            id: "edited-import".into(),
+            mode: "ssh_config".into(),
+            source: "ssh_config_batch".into(),
+            host_alias: "cluster".into(),
+            host: "edited.example".into(),
+            user: "edited-user".into(),
+            port: "2303".into(),
+            ssh_config_path: source_config.display().to_string(),
+            ..ServerConfig::default()
+        };
+        assert!(!native_server_needs_ssh_defaults(&server));
+        let service = MountService::new(paths, temp.path().into());
+        let key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
+        fs::write(&custom_hosts, format!("[edited.example]:2303 {key}\n")).unwrap();
+
+        let selected = service
+            .known_hosts_for_with_tools(
+                &server,
+                None,
+                &default_hosts,
+                Path::new("ssh"),
+                &missing_keyscan,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected, custom_hosts);
+        let remote = RcloneRemote::for_server(&server, None, Some(&selected), false).unwrap();
+        for (option, expected) in [
+            ("host", "edited.example"),
+            ("user", "edited-user"),
+            ("port", "2303"),
+        ] {
+            assert!(remote.options.contains(&(option.into(), expected.into())));
+        }
+
+        for wrong_marker in ["[original.example]:2202", "[edited.example]:2202"] {
+            fs::write(&custom_hosts, format!("{wrong_marker} {key}\n")).unwrap();
+            assert!(
+                service
+                    .known_hosts_for_with_tools(
+                        &server,
+                        None,
+                        &default_hosts,
+                        Path::new("ssh"),
+                        &missing_keyscan,
+                    )
+                    .is_err(),
+                "must not trust {wrong_marker} for the saved target"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_import_with_existing_trust_does_not_require_source_config_or_ssh() {
+        let temp = tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: temp.path().join("config"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            data_dir: temp.path().join("data"),
+        };
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        let default_hosts = temp.path().join("default-known-hosts");
+        let server = ServerConfig {
+            mode: "ssh_config".into(),
+            host_alias: "cluster".into(),
+            host: "edited.example".into(),
+            user: "edited-user".into(),
+            port: "2303".into(),
+            ssh_config_path: temp.path().join("missing-source").display().to_string(),
+            ..ServerConfig::default()
+        };
+        let service = MountService::new(paths.clone(), temp.path().into());
+        for trusted in [paths.known_hosts(), default_hosts.clone()] {
+            fs::write(
+                &trusted,
+                "[edited.example]:2303 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti\n",
+            )
+            .unwrap();
+            assert_eq!(
+                service
+                    .known_hosts_for_with_tools(
+                        &server,
+                        None,
+                        &default_hosts,
+                        &temp.path().join("missing-ssh"),
+                        &temp.path().join("missing-keyscan"),
+                    )
+                    .unwrap(),
+                Some(trusted.clone())
+            );
+            fs::remove_file(trusted).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edited_native_import_uses_saved_target_and_auth_after_source_config_is_removed() {
+        use crate::connection::ConnectionDraft;
+        use crate::storage::{load_servers, save_servers};
+
+        let temp = tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: temp.path().join("config"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            data_dir: temp.path().join("data"),
+        };
+        let source_config = temp.path().join("source config");
+        let original_key = temp.path().join("original key");
+        let edited_key = temp.path().join("edited key");
+        fs::write(&original_key, "PRIVATE KEY").unwrap();
+        fs::write(&edited_key, "PRIVATE KEY").unwrap();
+        fs::write(&source_config, "Host cluster\n HostName original.example\n").unwrap();
+        let original = ResolvedSshConfig::parse(&format!(
+            "hostname original.example\nuser original-user\nport 2202\nidentityfile {}\n",
+            original_key.display()
+        ));
+        let mut imported = imported_ssh_server("cluster", &source_config, &original, true).unwrap();
+        imported.id = "edited-connection".into();
+        let mut draft = ConnectionDraft::from_server(&imported);
+        draft.host = "edited.example".into();
+        draft.user = "edited-user".into();
+        draft.port = "2303".into();
+        draft.key_file = edited_key.display().to_string();
+        draft.key_passphrase = "new passphrase".into();
+        let saved = draft
+            .validate(&[imported])
+            .unwrap()
+            .apply_secrets(None, Some("obscured-new-key".into()))
+            .unwrap();
+        save_servers(&paths, &[saved]).unwrap();
+        let saved = load_servers(&paths).unwrap().remove(0);
+        fs::remove_file(source_config).unwrap();
+        fs::write(paths.known_hosts(),
+            "[edited.example]:2303 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti\n").unwrap();
+        let service = MountService::new(paths.clone(), temp.path().into());
+        service.ensure_remote(&saved, None).unwrap();
+        let mut config = configparser::ini::Ini::new_cs();
+        config.load(paths.rclone_config()).unwrap();
+        for (option, expected) in [
+            ("host", "edited.example"),
+            ("user", "edited-user"),
+            ("port", "2303"),
+            ("key_file", saved.key_file.as_str()),
+            ("key_file_pass", "obscured-new-key"),
+        ] {
+            assert_eq!(
+                config.get(saved.remote_name(), option).as_deref(),
+                Some(expected)
+            );
+        }
+        // Even a caller supplying stale resolved defaults cannot redirect this import.
+        let remote =
+            RcloneRemote::for_server(&saved, Some(&original), Some(&paths.known_hosts()), false)
+                .unwrap();
+        assert!(
+            remote
+                .options
+                .contains(&("host".into(), "edited.example".into()))
+        );
+
+        let mut draft = ConnectionDraft::from_server(&saved);
+        draft.auth = crate::AuthMethod::Password;
+        draft.password = "new password".into();
+        let password = draft
+            .validate(&[saved])
+            .unwrap()
+            .apply_secrets(Some("obscured-new-password".into()), None)
+            .unwrap();
+        service.ensure_remote(&password, None).unwrap();
+        config.load(paths.rclone_config()).unwrap();
+        assert_eq!(
+            config.get(password.remote_name(), "pass").as_deref(),
+            Some("obscured-new-password")
+        );
+        assert!(config.get(password.remote_name(), "key_file").is_none());
+        assert!(
+            config
+                .get(password.remote_name(), "key_use_agent")
+                .is_none()
+        );
     }
 
     #[test]

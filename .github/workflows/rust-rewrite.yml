@@ -37,7 +37,7 @@ jobs:
           command-arguments: licenses sources
           arguments: --all-features
       - name: Linux GUI dependencies
-        run: sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 update && sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dri libgtk-3-dev libayatana-appindicator3-dev xvfb xdotool openbox dbus-x11 dunst haskell-gtk-sni-tray-utils weston
+        run: sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 update && sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dri libgtk-3-dev libayatana-appindicator3-dev xvfb xdotool x11-utils openbox dbus-x11 dunst haskell-gtk-sni-tray-utils weston
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
@@ -135,7 +135,7 @@ jobs:
             grep -Rqs 'https://mirror.leaseweb.com/ubuntu-ports' /etc/apt
           fi
           sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 update
-          sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dri libgtk-3-dev libayatana-appindicator3-dev zip xvfb xdotool openbox xterm dbus-x11 fuse3 jq kmod openssh-client
+          sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dri libgtk-3-dev libayatana-appindicator3-dev zip xvfb xdotool x11-utils openbox xterm dbus-x11 fuse3 jq kmod openssh-client
       - name: Install verified FUSE-T for macOS mount integration
         if: runner.os == 'macOS'
         shell: bash
@@ -154,8 +154,21 @@ jobs:
       - run: cargo test --workspace --all-features
       - name: Exercise native system credential store
         if: runner.os == 'Windows' || runner.os == 'macOS'
-        run: cargo test --package mountmate-core live_system_credential_roundtrip --all-features -- --ignored --exact --test-threads=1
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="${RUNNER_TEMP}/native-credential-roundtrip.log"
+          cargo test --package mountmate-core --lib --all-features \
+            credential::tests::live_system_credential_roundtrip -- \
+            --ignored --exact --test-threads=1 --color never | tr -d '\r' | tee "${output}"
+          grep -Fx 'test credential::tests::live_system_credential_roundtrip ... ok' "${output}"
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "${output}"
       - run: cargo build --release --package ssh-mountmate
+
+      - name: Verify Windows icon resources
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./tests/rust_windows_icon_smoke.ps1 -Binary target/release/SSHMountMate.exe
 
       - name: Verify Windows execution manifest
         if: runner.os == 'Windows'
@@ -358,12 +371,14 @@ jobs:
           mkdir -p "${contents}/MacOS" "${contents}/Resources/bin" "${contents}/Resources/licenses"
           cp target/release/SSHMountMate "${contents}/MacOS/SSHMountMate"
           cp target/release/bin/rclone target/release/bin/rclone.sha256 "${contents}/Resources/bin/"
+          cp assets/ssh-mountmate-logo.icns "${contents}/Resources/"
           cp THIRD_PARTY_NOTICES.md licenses/*.txt "${contents}/Resources/licenses/"
           version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
           sed -e "s/@VERSION@/${version}/g" -e "s/@BUILD_VERSION@/${GITHUB_RUN_NUMBER}/g" \
             distribution/macos/Info.plist > "${contents}/Info.plist"
           chmod 755 "${contents}/MacOS/SSHMountMate" "${contents}/Resources/bin/rclone"
           plutil -lint "${contents}/Info.plist"
+          bash tests/rust_macos_icon_smoke.sh "${app}"
           codesign --force --deep --sign - "${app}"
           codesign --verify --deep --strict --verbose=2 "${app}"
           "${contents}/MacOS/SSHMountMate" --version
@@ -401,6 +416,7 @@ jobs:
           ditto -c -k --keepParent "target/package/SSH MountMate.app" "${archive}"
           ditto -x -k "${archive}" "${extracted}"
           app="${extracted}/SSH MountMate.app"
+          bash tests/rust_macos_icon_smoke.sh "${app}"
           codesign --verify --deep --strict --verbose=2 "${app}"
           "${app}/Contents/MacOS/SSHMountMate" --version
           "${app}/Contents/Resources/bin/rclone" version
@@ -463,6 +479,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "onefile build failed" }
           New-Item -ItemType Directory -Force target/onefile | Out-Null
           Copy-Item target/release/SSHMountMate.exe target/onefile/SSHMountMate.exe
+          ./tests/rust_windows_icon_smoke.ps1 -Binary target/onefile/SSHMountMate.exe
           $onefileHome = Join-Path $env:RUNNER_TEMP 'onefile-home'
           $env:HOME = $onefileHome
           $env:USERPROFILE = $onefileHome

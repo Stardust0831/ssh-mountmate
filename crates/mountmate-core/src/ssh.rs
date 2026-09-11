@@ -375,8 +375,8 @@ fn ensure_managed_include(
     permissions: &dyn SshPermissionControl,
 ) -> Result<(), SshError> {
     let config = ssh_dir.join("config");
-    let include = "Include ~/.ssh/ssh-mountmate.d/*.conf";
-    let mut content = match fs::read_to_string(&config) {
+    let managed_pattern = "~/.ssh/ssh-mountmate.d/*.conf";
+    let content = match fs::read_to_string(&config) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(source) => {
@@ -386,16 +386,28 @@ fn ensure_managed_include(
             });
         }
     };
-    if !content
-        .lines()
-        .any(|line| line.trim().eq_ignore_ascii_case(include))
-    {
-        if !content.is_empty() && !content.ends_with(['\n', '\r']) {
-            content.push('\n');
+    // Include inherits its caller's Host/Match scope. Put it before all user
+    // directives, and migrate the dedicated Include that older versions
+    // appended inside the final Host/Match block. OpenSSH restores the outer
+    // scope after an Include, so the user's global defaults still apply.
+    let newline = if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut updated = format!("Include {managed_pattern}{newline}");
+    for line in content.split_inclusive('\n') {
+        let is_managed_include = parse_ssh_directive(line).is_some_and(|(keyword, arguments)| {
+            keyword.eq_ignore_ascii_case("include")
+                && arguments.len() == 1
+                && arguments[0] == managed_pattern
+        });
+        if !is_managed_include {
+            updated.push_str(line);
         }
-        content.push_str(include);
-        content.push('\n');
-        atomic_write(&config, content.as_bytes())?;
+    }
+    if updated != content {
+        atomic_write(&config, updated.as_bytes())?;
     }
     restrict_path(permissions, &config, false)
 }
@@ -510,12 +522,11 @@ fn visit_ssh_config(
         source,
     })?;
     for (line_index, raw) in content.lines().enumerate() {
-        let words = split_ssh_words(raw);
-        let Some(keyword) = words.first() else {
+        let Some((keyword, arguments)) = parse_ssh_directive(raw) else {
             continue;
         };
         if keyword.eq_ignore_ascii_case("include") {
-            for pattern in &words[1..] {
+            for pattern in &arguments {
                 let pattern = resolve_include_pattern(include_base, pattern);
                 let pattern_text = pattern.to_string_lossy().into_owned();
                 let matches = glob(&pattern_text).map_err(|error| SshError::IncludePattern {
@@ -529,7 +540,7 @@ fn visit_ssh_config(
                 }
             }
         } else if keyword.eq_ignore_ascii_case("host") {
-            for host in &words[1..] {
+            for host in &arguments {
                 if !host.contains(['*', '?', '!']) {
                     entries.push(SshHostEntry {
                         host: host.to_owned(),
@@ -551,6 +562,22 @@ fn resolve_include_pattern(include_base: &Path, pattern: &str) -> PathBuf {
     } else {
         include_base.join(expanded)
     }
+}
+
+fn parse_ssh_directive(line: &str) -> Option<(&str, Vec<String>)> {
+    let line = line.trim_start();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    // OpenSSH permits one optional '=' between the keyword and its arguments,
+    // with or without surrounding whitespace. '=' within an argument is data.
+    let keyword_end = line
+        .find(|character: char| character.is_whitespace() || character == '=')
+        .unwrap_or(line.len());
+    let (keyword, arguments) = line.split_at(keyword_end);
+    let arguments = arguments.trim_start();
+    let arguments = arguments.strip_prefix('=').unwrap_or(arguments);
+    Some((keyword, split_ssh_words(arguments)))
 }
 
 fn split_ssh_words(line: &str) -> Vec<String> {
@@ -960,6 +987,65 @@ mod tests {
     }
 
     #[test]
+    fn discovers_hosts_with_equals_separators_and_quoted_include_paths() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("config");
+        let includes = temp.path().join("config = # files");
+        fs::create_dir_all(&includes).unwrap();
+        fs::write(
+            &root,
+            "Include=\"config = # files/*.conf\" # include comment\nHost=direct *.wild !excluded\nHost = spaced\nHost =adjacent\nHost= separated\n",
+        )
+        .unwrap();
+        fs::write(
+            includes.join("cluster.conf"),
+            "Include = config\nHost = \"cluster\" other # host comment\n",
+        )
+        .unwrap();
+
+        let entries = list_ssh_config_hosts_with_base(&root, temp.path()).unwrap();
+        let hosts: Vec<_> = entries.iter().map(|entry| entry.host.as_str()).collect();
+
+        assert_eq!(
+            hosts,
+            [
+                "cluster",
+                "other",
+                "direct",
+                "spaced",
+                "adjacent",
+                "separated"
+            ]
+        );
+        assert_eq!(entries[0].path, includes.join("cluster.conf"));
+        assert_eq!(entries[2].line, 2);
+        assert_eq!(entries[2].raw, "Host=direct *.wild !excluded");
+    }
+
+    #[test]
+    fn directive_separator_preserves_equals_quotes_comments_and_escapes_in_arguments() {
+        let (keyword, arguments) = parse_ssh_directive(
+            r#"  Include = "config = # files/*.conf" escaped\ path\#file.conf C:\Users\Agent\file=key # ignored"#,
+        )
+        .unwrap();
+
+        assert_eq!(keyword, "Include");
+        assert_eq!(
+            arguments,
+            [
+                "config = # files/*.conf",
+                "escaped path#file.conf",
+                r"C:\Users\Agent\file=key"
+            ]
+        );
+        assert_eq!(
+            parse_ssh_directive("Host=alias=with=equals").unwrap().1,
+            ["alias=with=equals"]
+        );
+        assert!(parse_ssh_directive(" \t# Host=ignored").is_none());
+    }
+
+    #[test]
     fn parses_resolved_config_and_detects_proxy_requirements() {
         let config = ResolvedSshConfig::parse(
             "hostname c1.example\nport 12022\nidentityfile ~/.ssh/id_ed25519\nproxyjump bastion\n",
@@ -1178,6 +1264,95 @@ mod tests {
                 .iter()
                 .any(|(path, directory)| { path == &managed && !directory })
         );
+    }
+
+    #[test]
+    fn managed_include_migrates_old_scoped_directives_without_changing_user_config() {
+        let temp = tempdir().unwrap();
+        let config = temp.path().join("config");
+        let permissions = FakePermissions::default();
+        let original = "# User defaults\r\nUser default-user\r\nHost existing\r\n    HostName existing.example\r\nMatch host restricted\r\n    Include custom/*.conf\r\n    Port 2200";
+        fs::write(
+            &config,
+            format!(
+                "Include ~/.ssh/ssh-mountmate.d/*.conf\r\n{original}\r\n    iNcLuDe = \"~/.ssh/ssh-mountmate.d/*.conf\" # old app include\r\n"
+            ),
+        )
+        .unwrap();
+
+        ensure_managed_include(temp.path(), &permissions).unwrap();
+        let updated = fs::read_to_string(&config).unwrap();
+        assert_eq!(
+            updated,
+            format!("Include ~/.ssh/ssh-mountmate.d/*.conf\r\n{original}\r\n")
+        );
+        ensure_managed_include(temp.path(), &permissions).unwrap();
+        assert_eq!(fs::read_to_string(&config).unwrap(), updated);
+        assert_eq!(
+            permissions.paths.borrow().as_slice(),
+            [(config.clone(), false), (config, false)]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn openssh_resolves_managed_hosts_and_preserves_user_host_match_and_defaults() {
+        // `ssh -G` only parses these temporary files; it never connects or
+        // changes the user's ~/.ssh. Keep the pure parser tests usable on
+        // developer machines without OpenSSH installed.
+        match Command::new("ssh").arg("-V").output() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            result => assert!(result.unwrap().status.success()),
+        }
+        let temp = tempdir().unwrap();
+        let managed_dir = temp.path().join("ssh-mountmate.d");
+        fs::create_dir(&managed_dir).unwrap();
+        fs::write(
+            managed_dir.join("managed.conf"),
+            "Host managed\n    HostName managed.example\n    User managed-user\n    Port 2244\n",
+        )
+        .unwrap();
+        let config = temp.path().join("config");
+        let effective_config = temp.path().join("effective-config");
+        let write_effective_config = |content: &str| {
+            fs::write(
+                &effective_config,
+                content.replace(
+                    "~/.ssh/ssh-mountmate.d/*.conf",
+                    &quote_ssh_value(&format!("{}/*.conf", managed_dir.display())),
+                ),
+            )
+            .unwrap();
+        };
+        let resolve = |host: &str| {
+            resolve_ssh_config(Path::new("ssh"), host, Some(&effective_config)).unwrap()
+        };
+
+        for scope in ["Host restricted", "Match host restricted"] {
+            let original = format!(
+                "User default-user\nServerAliveInterval 41\nHost existing\n    HostName existing.example\n    Port 2222\nMatch host matched\n    HostName matched.example\n    Port 3333\nHost *\n    ConnectTimeout 13\n{scope}\n    Compression yes\n"
+            );
+            write_effective_config(&original);
+            let unchanged_hosts = ["existing", "matched", "restricted", "unlisted"];
+            let before: Vec<_> = unchanged_hosts.iter().map(|host| resolve(host)).collect();
+            let legacy = format!("{original}Include ~/.ssh/ssh-mountmate.d/*.conf\n");
+            write_effective_config(&legacy);
+            assert_eq!(resolve("managed").first("hostname", ""), "managed");
+            fs::write(&config, legacy).unwrap();
+
+            ensure_managed_include(temp.path(), &FakePermissions::default()).unwrap();
+            write_effective_config(&fs::read_to_string(&config).unwrap());
+
+            let managed = resolve("managed");
+            assert_eq!(managed.first("hostname", ""), "managed.example");
+            assert_eq!(managed.first("user", ""), "managed-user");
+            assert_eq!(managed.first("port", ""), "2244");
+            assert_eq!(managed.first("serveraliveinterval", ""), "41");
+            assert_eq!(managed.first("connecttimeout", ""), "13");
+            for (host, before) in unchanged_hosts.into_iter().zip(before) {
+                assert_eq!(resolve(host), before, "scope {scope}, host {host}");
+            }
+        }
     }
 
     #[test]

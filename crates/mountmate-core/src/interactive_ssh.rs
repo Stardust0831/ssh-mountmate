@@ -18,6 +18,7 @@ use thiserror::Error;
 use crate::ServerConfig;
 use crate::paths::AppPaths;
 use crate::plink_binary::resolve_plink;
+use crate::rclone::openssh_target_arguments;
 use crate::rclone_binary::{RcloneBinaryError, find_system_executable};
 use crate::ssh::resolve_ssh_config;
 
@@ -232,7 +233,8 @@ impl InteractiveSshSession {
         let control = control_dir.join(format!("{}.sock", &id_hash[..16]));
         #[cfg(unix)]
         validate_optional_control_socket(&control)?;
-        let target = openssh_target_arguments(server);
+        let target = openssh_target_arguments(server)
+            .map_err(|error| InteractiveSshError::Process(error.to_string()))?;
         let mut connector = vec![
             ssh.display().to_string(),
             "-S".into(),
@@ -578,34 +580,6 @@ fn control_path_io_error(path: &Path, error: std::io::Error) -> InteractiveSshEr
     ))
 }
 
-fn openssh_target_arguments(server: &ServerConfig) -> Vec<String> {
-    if (server.source == "ssh_config" || server.ssh_config_managed) && !server.host_alias.is_empty()
-    {
-        let mut arguments = Vec::new();
-        if server.source == "ssh_config" && !server.ssh_config_path.trim().is_empty() {
-            arguments.extend(["-F".into(), server.ssh_config_path.clone()]);
-        }
-        arguments.push(server.host_alias.clone());
-        return arguments;
-    }
-    let mut arguments = vec![
-        "-l".into(),
-        server.user.clone(),
-        "-p".into(),
-        server.port.clone(),
-    ];
-    if !server.key_file.is_empty() {
-        arguments.extend([
-            "-i".into(),
-            server.key_file.clone(),
-            "-o".into(),
-            "IdentitiesOnly=yes".into(),
-        ]);
-    }
-    arguments.push(server.host.clone());
-    arguments
-}
-
 fn plink_target_arguments(server: &ServerConfig) -> Vec<String> {
     let mut arguments = vec![
         "-P".into(),
@@ -706,7 +680,7 @@ mod tests {
 
     #[test]
     fn openssh_connector_uses_exact_control_socket_and_noninteractive_mode() {
-        let arguments = openssh_target_arguments(&server());
+        let arguments = openssh_target_arguments(&server()).unwrap();
         assert_eq!(
             arguments,
             vec![
@@ -732,8 +706,22 @@ mod tests {
             ..server()
         };
         assert_eq!(
-            openssh_target_arguments(&imported),
-            vec!["-F", "/config/custom ssh", "cluster"]
+            openssh_target_arguments(&imported).unwrap(),
+            vec![
+                "-F",
+                "/config/custom ssh",
+                "-o",
+                "HostName=host.example",
+                "-l",
+                "alice",
+                "-p",
+                "2202",
+                "-i",
+                "/keys/id with space",
+                "-o",
+                "IdentitiesOnly=yes",
+                "cluster",
+            ]
         );
     }
 

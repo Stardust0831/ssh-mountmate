@@ -52,6 +52,71 @@ pub trait PlatformIntegration: Send + Sync {
 
 pub struct Platform;
 
+/// Stable desktop identity shared by launchers, windows, and notifications.
+pub const APPLICATION_ID: &str = "io.github.stardust0831.ssh-mountmate";
+
+/// Register the portable executable and its icon for the current Linux user.
+#[cfg(target_os = "linux")]
+pub fn ensure_application_identity(executable: &Path) -> Result<(), PlatformError> {
+    install_linux_application_identity(&linux_data_home()?, executable)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn ensure_application_identity(_executable: &Path) -> Result<(), PlatformError> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_data_home() -> Result<std::path::PathBuf, PlatformError> {
+    match std::env::var_os("XDG_DATA_HOME").map(std::path::PathBuf::from) {
+        Some(path) if path.is_absolute() => Ok(path),
+        _ => Ok(home_directory()?.join(".local/share")),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn install_linux_application_identity(
+    data_home: &Path,
+    executable: &Path,
+) -> Result<(), PlatformError> {
+    let executable = executable
+        .to_str()
+        .filter(|_| executable.is_absolute())
+        .ok_or_else(|| {
+            PlatformError::Failed("application executable path must be absolute UTF-8".into())
+        })?;
+    let command = desktop_exec_command(executable);
+    let content = format!(
+        "[Desktop Entry]\nType=Application\nName=SSH MountMate\nComment=Mount and manage remote SSH storage\nExec={command}\nIcon={APPLICATION_ID}\nStartupWMClass={APPLICATION_ID}\nTerminal=false\nCategories=Network;FileTransfer;\n"
+    );
+    // Install the icon first so the new launcher can resolve it immediately.
+    write_if_changed(
+        &data_home.join(format!("icons/hicolor/256x256/apps/{APPLICATION_ID}.png")),
+        include_bytes!("../../../assets/ssh-mountmate-logo-256.png"),
+    )?;
+    write_if_changed(
+        &data_home.join(format!("applications/{APPLICATION_ID}.desktop")),
+        content.as_bytes(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn write_if_changed(path: &Path, content: &[u8]) -> Result<(), PlatformError> {
+    match std::fs::read(path) {
+        Ok(existing) if existing == content => return Ok(()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(PlatformError::Failed(format!(
+                "could not read {}: {error}",
+                path.display()
+            )));
+        }
+    }
+    mountmate_core::storage::atomic_write(path, content)
+        .map_err(|error| PlatformError::Failed(error.to_string()))
+}
+
 impl SshPermissionControl for Platform {
     fn restrict_private_path(&self, path: &Path, directory: bool) -> Result<(), String> {
         restrict_private_path(path, directory)
@@ -98,6 +163,11 @@ fn show_notification(notification: &Notification) -> Result<(), PlatformError> {
         .appname(mountmate_core::APP_NAME)
         .summary(&notification.title)
         .body(&notification.body);
+
+    #[cfg(target_os = "linux")]
+    native
+        .icon(APPLICATION_ID)
+        .hint(notify_rust::Hint::DesktopEntry(APPLICATION_ID.into()));
 
     #[cfg(windows)]
     {
@@ -527,10 +597,7 @@ fn register_file_manager_menu(executable: &Path) -> Result<(), PlatformError> {
 fn register_file_manager_menu(executable: &Path) -> Result<(), PlatformError> {
     use std::os::unix::fs::PermissionsExt;
 
-    let home = home_directory()?;
-    let data_home = std::env::var_os("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| home.join(".local/share"));
+    let data_home = linux_data_home()?;
     for entry in linux_file_manager_entries(&data_home, executable)? {
         mountmate_core::storage::atomic_write(&entry.path, entry.content.as_bytes())
             .map_err(|error| PlatformError::Failed(error.to_string()))?;
@@ -591,10 +658,7 @@ fn unregister_file_manager_menu() -> Result<(), PlatformError> {
 
 #[cfg(target_os = "linux")]
 fn unregister_file_manager_menu() -> Result<(), PlatformError> {
-    let home = home_directory()?;
-    let data_home = std::env::var_os("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| home.join(".local/share"));
+    let data_home = linux_data_home()?;
     for entry in linux_file_manager_entries(&data_home, Path::new("/unused"))? {
         remove_if_present(&entry.path)?;
     }
@@ -761,20 +825,20 @@ fn linux_file_manager_entries(
         .to_str()
         .ok_or_else(|| PlatformError::Failed("file-manager executable path is not UTF-8".into()))?;
     let shell_executable = shell_single_quote(executable);
-    let desktop_executable = desktop_exec_argument(executable);
+    let desktop_executable = desktop_exec_command(executable);
     let refresh_script = format!(
         "#!/bin/sh\nset -eu\nselected=${{NAUTILUS_SCRIPT_SELECTED_FILE_PATHS:-${{NEMO_SCRIPT_SELECTED_FILE_PATHS:-}}}}\nif [ -n \"$selected\" ]; then\n  path=$(printf '%s\\n' \"$selected\" | head -n 1)\nelse\n  path=$PWD\nfi\nexec {shell_executable} --refresh-path \"$path\"\n"
     );
     let transfers_script =
         format!("#!/bin/sh\nset -eu\nexec {shell_executable} --show-transfers\n");
     let nemo_refresh = format!(
-        "[Nemo Action]\nName=Refresh with SSH MountMate\nComment=Refresh the selected mounted directory\nExec={desktop_executable} --refresh-path %P\nSelection=any\nExtensions=dir;\n"
+        "[Nemo Action]\nName=Refresh with SSH MountMate\nComment=Refresh the selected mounted directory\nIcon-Name={APPLICATION_ID}\nExec={desktop_executable} --refresh-path %P\nSelection=any\nExtensions=dir;\n"
     );
     let nemo_transfers = format!(
-        "[Nemo Action]\nName=Open SSH MountMate transfers\nExec={desktop_executable} --show-transfers\nSelection=any\nExtensions=dir;\n"
+        "[Nemo Action]\nName=Open SSH MountMate transfers\nIcon-Name={APPLICATION_ID}\nExec={desktop_executable} --show-transfers\nSelection=any\nExtensions=dir;\n"
     );
     let dolphin = format!(
-        "[Desktop Entry]\nType=Service\nMimeType=inode/directory;\nActions=SSHMountMateRefresh;SSHMountMateTransfers;\nX-KDE-ServiceTypes=KonqPopupMenu/Plugin\n\n[Desktop Action SSHMountMateRefresh]\nName=Refresh with SSH MountMate\nExec={desktop_executable} --refresh-path %f\n\n[Desktop Action SSHMountMateTransfers]\nName=Open SSH MountMate transfers\nExec={desktop_executable} --show-transfers\n"
+        "[Desktop Entry]\nType=Service\nIcon={APPLICATION_ID}\nMimeType=inode/directory;\nActions=SSHMountMateRefresh;SSHMountMateTransfers;\nX-KDE-ServiceTypes=KonqPopupMenu/Plugin\n\n[Desktop Action SSHMountMateRefresh]\nName=Refresh with SSH MountMate\nIcon={APPLICATION_ID}\nExec={desktop_executable} --refresh-path %f\n\n[Desktop Action SSHMountMateTransfers]\nName=Open SSH MountMate transfers\nIcon={APPLICATION_ID}\nExec={desktop_executable} --show-transfers\n"
     );
     let mut entries = Vec::new();
     for manager in ["nautilus", "nemo"] {
@@ -896,9 +960,9 @@ fn set_login_startup(executable: &Path, enabled: bool) -> Result<(), PlatformErr
     let executable = executable
         .to_str()
         .ok_or_else(|| PlatformError::Failed("startup executable path is not UTF-8".into()))?;
-    let command = desktop_exec_argument(executable);
+    let command = desktop_exec_command(executable);
     let content = format!(
-        "[Desktop Entry]\nType=Application\nName=SSH MountMate\nExec={command} --mount-startup\nTerminal=false\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n"
+        "[Desktop Entry]\nType=Application\nName=SSH MountMate\nExec={command} --mount-startup\nIcon={APPLICATION_ID}\nStartupWMClass={APPLICATION_ID}\nTerminal=false\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n"
     );
     mountmate_core::storage::atomic_write(&path, content.as_bytes())
         .map_err(|error| PlatformError::Failed(error.to_string()))
@@ -970,13 +1034,31 @@ fn install_directory_atomically(staging: &Path, destination: &Path) -> Result<()
 }
 
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn desktop_exec_command(executable: &str) -> String {
+    let argument = desktop_exec_argument(executable);
+    if executable.contains('%') {
+        // Gio checks the executable before expanding %% into %. Keeping the
+        // path in argv lets it expand the field code before env executes it.
+        format!("env -- {argument}")
+    } else {
+        argument
+    }
+}
+
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
 fn desktop_exec_argument(value: &str) -> String {
+    // Exec quoting is decoded after the Desktop Entry string escapes, so each
+    // backslash protecting a reserved Exec character must itself be escaped.
     let escaped = value
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('`', "\\`")
         .replace('$', "\\$")
-        .replace('%', "%%");
+        .replace('%', "%%")
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
     format!("\"{escaped}\"")
 }
 
@@ -1062,7 +1144,7 @@ mod tests {
         );
         assert_eq!(
             desktop_exec_argument("/home/user/SSH MountMate/bin/$current"),
-            r#""/home/user/SSH MountMate/bin/\$current""#
+            r#""/home/user/SSH MountMate/bin/\\$current""#
         );
         assert_eq!(
             desktop_exec_argument("/opt/100%free/SSHMountMate"),
@@ -1099,6 +1181,108 @@ mod tests {
                 .path
                 .ends_with("nemo/actions/ssh-mountmate-refresh.nemo_action")
         }));
+        for entry in entries.iter().filter(|entry| !entry.executable) {
+            let icon_key = if entry.path.extension().unwrap() == "nemo_action" {
+                "Icon-Name"
+            } else {
+                "Icon"
+            };
+            assert!(
+                entry
+                    .content
+                    .lines()
+                    .any(|line| line == format!("{icon_key}={APPLICATION_ID}"))
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_application_identity_is_idempotent_and_tracks_a_moved_executable() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempdir().unwrap();
+        let data_home = temp.path().join("desktop data");
+        let executable = temp.path().join("SSH MountMate/SSHMountMate");
+        install_linux_application_identity(&data_home, &executable).unwrap();
+
+        let launcher = data_home.join(format!("applications/{APPLICATION_ID}.desktop"));
+        let icon = data_home.join(format!("icons/hicolor/256x256/apps/{APPLICATION_ID}.png"));
+        let launcher_metadata = std::fs::metadata(&launcher).unwrap();
+        let icon_metadata = std::fs::metadata(&icon).unwrap();
+        let content = std::fs::read_to_string(&launcher).unwrap();
+        assert!(content.contains(&format!("\nIcon={APPLICATION_ID}\n")));
+        assert!(content.contains(&format!("\nStartupWMClass={APPLICATION_ID}\n")));
+        let png = std::fs::read(&icon).unwrap();
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), 256);
+        assert_eq!(u32::from_be_bytes(png[20..24].try_into().unwrap()), 256);
+
+        install_linux_application_identity(&data_home, &executable).unwrap();
+        assert_eq!(
+            std::fs::metadata(&launcher).unwrap().ino(),
+            launcher_metadata.ino()
+        );
+        assert_eq!(std::fs::metadata(&icon).unwrap().ino(), icon_metadata.ino());
+
+        let moved = temp.path().join("Moved here/SSHMountMate");
+        install_linux_application_identity(&data_home, &moved).unwrap();
+        let content = std::fs::read_to_string(&launcher).unwrap();
+        assert!(content.contains(&format!("\nExec=\"{}\"\n", moved.display())));
+        assert!(!content.contains(executable.to_str().unwrap()));
+        assert_eq!(std::fs::metadata(&icon).unwrap().ino(), icon_metadata.ino());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_application_identity_rejects_relative_executables_without_writing() {
+        let temp = tempdir().unwrap();
+        let data_home = temp.path().join("data");
+        assert!(
+            install_linux_application_identity(&data_home, Path::new("./SSHMountMate")).is_err()
+        );
+        assert!(!data_home.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_desktop_launcher_executes_paths_with_spaces_percent_and_quotes() {
+        use std::process::Command;
+
+        match Command::new("gio").arg("version").output() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => panic!("could not check Gio availability: {error}"),
+            Ok(output) => assert!(output.status.success(), "Gio is not usable"),
+        }
+        let temp = tempdir().unwrap();
+        let executable = temp
+            .path()
+            .join("SSH MountMate 100% user's \"quoted\" \\ $cash `tick`");
+        let launched = temp.path().join("launched.txt");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' \"$0\" \"$@\" > \"$MOUNTMATE_LAUNCH_RESULT\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let data_home = temp.path().join("desktop data");
+        install_linux_application_identity(&data_home, &executable).unwrap();
+        let launcher = data_home.join(format!("applications/{APPLICATION_ID}.desktop"));
+        let output = Command::new("gio")
+            .arg("launch")
+            .arg(&launcher)
+            .env("MOUNTMATE_LAUNCH_RESULT", &launched)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "desktop launch failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(launched).unwrap(),
+            format!("{}\n", executable.display())
+        );
     }
 }
 

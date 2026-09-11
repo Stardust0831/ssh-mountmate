@@ -1,5 +1,5 @@
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use crate::i18n::{Locale, TextKey};
 use mountmate_core::APP_NAME;
@@ -87,7 +87,7 @@ impl TrayController {
         .map_err(|error| TrayError::Permanent(error.to_string()))?;
         let icon = TrayIconBuilder::new()
             .with_tooltip(APP_NAME)
-            .with_icon(application_icon().map_err(TrayError::Permanent)?)
+            .with_icon(crate::icons::tray_icon().map_err(TrayError::Permanent)?)
             .with_menu(Box::new(menu))
             .with_menu_on_left_click(true)
             .with_menu_on_right_click(true)
@@ -142,41 +142,6 @@ fn action_for_id(id: &str) -> Option<TrayAction> {
         EXIT_ID => Some(TrayAction::Exit),
         _ => None,
     }
-}
-
-fn application_icon() -> Result<Icon, String> {
-    const SIZE: u32 = 32;
-    let mut rgba = vec![0; (SIZE * SIZE * 4) as usize];
-    for y in 3..29 {
-        for x in 3..29 {
-            let dx = x as i32 - 16;
-            let dy = y as i32 - 16;
-            if dx * dx + dy * dy <= 13 * 13 {
-                set_pixel(&mut rgba, SIZE, x, y, [31, 139, 112, 255]);
-            }
-        }
-    }
-    for y in 9..14 {
-        for x in 8..24 {
-            set_pixel(&mut rgba, SIZE, x, y, [245, 249, 248, 255]);
-        }
-    }
-    for y in 18..23 {
-        for x in 8..24 {
-            set_pixel(&mut rgba, SIZE, x, y, [245, 249, 248, 255]);
-        }
-    }
-    for y in 14..18 {
-        for x in 14..18 {
-            set_pixel(&mut rgba, SIZE, x, y, [245, 249, 248, 255]);
-        }
-    }
-    Icon::from_rgba(rgba, SIZE, SIZE).map_err(|error| error.to_string())
-}
-
-fn set_pixel(rgba: &mut [u8], width: u32, x: u32, y: u32, color: [u8; 4]) {
-    let offset = ((y * width + x) * 4) as usize;
-    rgba[offset..offset + 4].copy_from_slice(&color);
 }
 
 #[cfg(target_os = "linux")]
@@ -269,15 +234,5 @@ mod tests {
         assert_eq!(action_for_id(UNMOUNT_ALL_ID), Some(TrayAction::UnmountAll));
         assert_eq!(action_for_id(EXIT_ID), Some(TrayAction::Exit));
         assert_eq!(action_for_id("unknown"), None);
-    }
-
-    #[test]
-    fn generated_icon_has_transparency_and_visible_content() {
-        let icon = application_icon().unwrap();
-        drop(icon);
-
-        let mut rgba = vec![0; 32 * 32 * 4];
-        set_pixel(&mut rgba, 32, 4, 7, [1, 2, 3, 4]);
-        assert_eq!(&rgba[(7 * 32 + 4) * 4..(7 * 32 + 5) * 4], &[1, 2, 3, 4]);
     }
 }

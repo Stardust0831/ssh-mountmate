@@ -160,7 +160,9 @@ SSHMountMate --check-update
 
 验证通过后，更新器会拒绝不安全的 ZIP 路径，把新的可执行文件或 macOS 应用暂存在当前安装
 目录旁，并在用户确认后重启 SSH MountMate。新版本通过启动健康握手后才提交更新；超时或
-失败会恢复并重新启动旧版本。GUI 重启期间，已有 rclone 挂载和上传会继续运行。
+失败会恢复并重新启动旧版本。GUI 重启期间，已有原生 SFTP 和 OpenSSH 挂载及上传可以继续
+运行。交互式共享 SSH 依赖应用内登录会话：存在已挂载、正在启动或等待登录的交互式连接时，
+程序会阻止安装更新。请先完成或取消待处理的登录，等待上传完成，并卸载这些连接，再安装更新。
 
 自动安装要求 SSH MountMate 已完整解压到固定且当前用户可写的目录。从 ZIP 临时目录直接
 运行，或 Release 未通过签名 manifest、平台、大小及摘要中的任一检查时，只提供手动更新。
@@ -183,6 +185,11 @@ uname -m
 Linux 每个架构只提供一个规范 onefile 包，可执行文件首次使用时会把内嵌工具物化为按内容
 摘要命名的受管副本；Windows 包含 rclone 和 Plink，Linux 包含 rclone。macOS 每个架构只
 提供一个原生 `.app` 包。发行矩阵固定为六个 ZIP，不再分别提供 onefile 和 onedir 变体。
+
+Linux GUI 首次启动时会在 `$XDG_DATA_HOME` 的 `applications/` 和 `icons/hicolor/` 下
+注册当前用户的应用启动器和图标。`XDG_DATA_HOME` 未设置、为空或为相对路径时，使用
+`~/.local/share`。后续 GUI 启动会更新发生变化的文件；移动可执行文件后，再启动一次即可
+更新启动器路径。ZIP 内仍只有一个可执行文件。
 
 Intel Mac 选择 `x64`，Apple Silicon 选择 `arm64`；两者都包含原生应用包。
 
@@ -226,7 +233,9 @@ SSH MountMate 会读取 OpenSSH config 中具体的 `Host` 条目。选择后会
 - 端口
 - 密钥文件
 
-导入后，连接会作为可编辑的 rclone SFTP 配置保存。实际挂载行为由 GUI 中看到的字段决定，而不是隐藏地实时调用某条 SSH 命令。
+导入后，连接会保存为可编辑的配置。原生 SFTP 使用已保存的主机、用户名、端口和认证设置。旧版仅保存 Host 别名的配置，仍会从源 SSH config 解析缺少的默认值。
+
+OpenSSH 和受支持的交互式共享 SSH 连接会应用已保存的主机、用户名和端口，同时保留原 Host 别名与 config，以支持 `ProxyJump`、`Include` 等功能。选定的密钥会优先使用；源 config 中其他 `IdentityFile` 仍可作为 OpenSSH 的备用认证密钥。使用这些连接方式时，请保留源 config。
 
 批量导入会使用用户选择的 config 文件，并通过 OpenSSH 的 `ssh -F <config> -G <host>` 行为解析每个 Host。这样可以复用 OpenSSH 的 Include 和默认值处理，同时仍然保存为普通可编辑的 SSH MountMate 连接。
 
@@ -287,11 +296,13 @@ rclone obscure
 
 设置页还提供需要用户手动启用的“系统凭据库”模式。它通过平台原生提供者使用 Windows
 Credential Manager、macOS Keychain 或 Linux Secret Service。启用时会先要求确认，在本机
-解开已有的 rclone-obscured 值，把密码和私钥短语写入系统凭据库，再逐项回读验证；只有全部
-成功后才会从 SSH MountMate 文件中移除这些值。私钥文件本身和一次性 2FA/OAuth token 永远
-不会存入凭据库。挂载时只会短暂为 rclone 填充秘密，启动后立即从持久配置清除；清理失败会
-停止新挂载，而不会显示一个虚假的“已保护”状态。恢复为 `rclone obscure` 也需要再次明确
-确认并执行反向迁移。
+解开已有的 rclone-obscured 值，把密码和私钥短语写入系统凭据库，再逐项回读验证。SSH
+MountMate 私有配置仍会保留一份可逆的 rclone-obscured 兼容副本，此模式下新保存的秘密也
+一样。原生 SFTP 操作在存在凭据引用时会读取系统凭据库；读取失败会停止操作，不会回退
+使用兼容副本。私钥文件本身和一次性 2FA/OAuth token 永远不会存入凭据库。原生 SFTP 挂载
+时会短暂为 rclone 配置填充所需秘密，启动后立即清除其中的秘密字段；这项清理不会删除
+SSH MountMate 配置中的兼容副本。清理失败会停止新挂载。恢复为 `rclone obscure` 也需要
+再次明确确认并执行反向迁移。
 
 交互式共享 SSH 会刻意绕过这两种持久凭据模式。密码、OAuth 响应和轮换的 2FA 验证码只在
 OpenSSH 或 Plink 自己的终端中输入。
@@ -321,7 +332,7 @@ OpenSSH 和交互式共享 SSH 连接则继续使用各自 SSH 实现的主机�
 
 ## 传输进度和远端刷新
 
-已挂载连接的卡片会显示 rclone 真实的 VFS 上传队列。推荐缓存配置保留 rclone 上游默认的 5 秒写回窗口，让资源管理器或 Finder 先完成关闭文件、重命名和属性更新，再开始远端上传。文件进入队列或开始上传时，对应配置会在右下角显示自己的进度窗；多个正在上传的配置会分别堆叠显示。传输中心继续作为手动查看全部挂载的汇总入口。只有 rclone 报告队列与活动上传均为空时，程序才显示“云端已同步”。仍有上传时取消挂载或退出，程序会先警告。
+已挂载连接的卡片会显示 rclone 真实的 VFS 上传队列。推荐缓存配置保留 rclone 上游默认的 5 秒写回窗口，让资源管理器或 Finder 先完成关闭文件、重命名和属性更新，再开始远端上传。启用自动显示传输后，文件进入队列或开始上传时，右下角会打开一个共享进度窗，汇总有传输任务的连接，并可展开查看详情。传输中心继续作为手动查看全部挂载的汇总入口。只有 rclone 报告队列与活动上传均为空时，程序才显示“云端已同步”。仍有上传时取消挂载或退出，程序会先警告。
 
 “同时上传文件数”限制 rclone 同时上传多少个不同的缓存文件。默认值为 4，可选择 8、12，或在 1 到 32 之间自定义；超出数量的文件继续留在本地缓存排队。同一路径被再次修改不会形成可靠的并行版本：rclone 会取消或重新安排该路径的写回，最新的本地内容仍可能覆盖其他写入者的远端修改。
 
@@ -329,9 +340,18 @@ OpenSSH 和交互式共享 SSH 连接则继续使用各自 SSH 实现的主机�
 
 右键连接卡片可以打开目录、刷新、查看传输或日志。Settings 可以把刷新和传输命令注册到 Windows 资源管理器、macOS Finder 快速操作，以及 Linux 的 Nautilus、Nemo 或 KDE 文件管理器。这些命令仍由同一个 SSH MountMate 可执行文件处理，不安装辅助程序。文件管理器启动的短生命周期进程会通过带认证的本机 IPC 把请求转发给正在运行的主程序，然后立即退出。
 
+Rust 程序在 Windows 上提供原生系统托盘图标，在 macOS 上提供菜单栏图标，在支持的 Linux 桌面上提供 AppIndicator。关闭主窗口只会隐藏窗口，不会停止挂载或传输监控。托盘菜单可以恢复主窗口、打开传输中心、挂载或卸载全部连接，以及显式退出界面。存在活动上传或云端状态未知时，退出会要求确认。原生 SFTP 和 OpenSSH 挂载可以在 GUI 退出后继续运行；交互式共享 SSH 依赖应用内会话，应用退出时可能失去传输通道。
+
 ## 容量显示
 
-对已挂载连接，SSH MountMate 会在连接卡片上显示已用容量和总容量。对于 Lustre 路径，程序会优先用 `lfs project -d` 读取远端目录的 project ID，再用 `lfs quota -p` 读取 project quota。如果路径不在 Lustre 上、远端没有 `lfs`，或该 project 没有非零 hard block limit，则回退使用 `rclone about`；当 SSH 配置支持非交互登录时，还会继续尝试远端 `df -Pk`。
+对已挂载连接，SSH MountMate 会在连接卡片上显示已用容量和总容量。程序会优先用
+`lfs project -d` 读取远端目录的 Lustre project ID，再用 `lfs quota -p` 读取配额。如果查询
+失败、Lustre 不可用，或没有非零 hard block limit，则依次尝试本地挂载点报告的文件系统
+容量、`rclone about`，最后尝试非交互式远端 `df -Pk` 查询。
+
+交互式连接的 Lustre 和 `df` 查询会复用现有的已验证共享 SSH 会话。其他受支持的配置需要
+系统 SSH 可以无交互登录；原生 SFTP 保存的密码和密钥短语不会传给 `ssh`。使用密码认证且
+没有导入或由应用托管的 SSH 配置的原生连接，会跳过这些 SSH 查询。
 
 ## 设置
 
@@ -355,7 +375,7 @@ Settings 页面包含：
 
 每个设置项在 GUI 中都有 `?` 帮助图标。鼠标悬停到图标上可以查看该选项的含义。批量挂载和批量取消挂载的并行数由程序固定为 4 和 8，不再作为用户设置项。
 
-登录启动会使用当前用户的 Windows Run 注册表项、macOS `~/Library/LaunchAgents/` 下的 LaunchAgent，或 Linux XDG autostart 条目，并在登录后调用 Rust 程序的无界面 `--mount-startup-all` 入口。
+登录启动会使用当前用户的 Windows Run 注册表项、macOS `~/Library/LaunchAgents/` 下的 LaunchAgent，或 Linux XDG autostart 条目，并在登录后调用 Rust 程序的无界面 `--mount-startup` 入口，挂载已选择登录自启的连接。交互式共享 SSH 需要应用内登录会话，不参与登录自动挂载。旧选项 `--mount-startup-all` 保留为 `--mount-all` 的兼容别名，会尝试挂载全部已保存连接。
 
 ## 从源码构建
 

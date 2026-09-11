@@ -124,7 +124,7 @@ In the Settings window, `Check dependencies` reports rclone, OpenSSH, and the cu
 
 ## Bundled And Managed rclone
 
-Release workflows download a pinned official rclone archive for the target platform and architecture, verify its SHA-256 digest, and place rclone beside the Rust application inside the package. At runtime SSH MountMate verifies the bundled digest again and materializes a content-addressed managed copy in the application data directory. Explicitly configured and existing legacy managed copies remain supported for migration; a compatible system rclone is the final source-build fallback.
+Release workflows download a pinned official rclone archive for the target platform and architecture, verify its SHA-256 digest, and include the verified binary in the release artifacts. At runtime SSH MountMate verifies the bundled digest again and materializes a content-addressed managed copy in the application data directory. Explicitly configured and existing legacy managed copies remain supported for migration; a compatible system rclone is the final source-build fallback.
 
 The remote server is assumed to be a Linux server reachable over SSH/SFTP.
 
@@ -166,7 +166,10 @@ automatic installation with an explicit reason.
 After verification, the updater rejects unsafe ZIP paths, stages the new executable or macOS
 application beside the current installation, and restarts SSH MountMate after confirmation. A
 startup health handshake commits the update; timeout or failure restores and relaunches the
-previous build. Existing rclone mounts and uploads continue while the GUI restarts.
+previous build. Existing native SFTP and OpenSSH mounts and uploads can continue while the GUI
+restarts. Interactive shared SSH depends on the application's login session: installation is
+blocked while an interactive mount is active, starting, or waiting for login. Finish or cancel
+pending login, wait for uploads to finish, and unmount those connections before installing.
 
 Automatic installation requires SSH MountMate to be extracted to a permanent, user-writable
 folder. Builds launched directly from a ZIP temporary directory and releases that fail any signed
@@ -193,6 +196,12 @@ materializes embedded tools as content-addressed managed copies on first use. Wi
 rclone and Plink, while Linux includes rclone. macOS provides one canonical native `.app` package
 per architecture. The release matrix intentionally has six ZIPs instead of separate onefile and
 onedir variants.
+
+On the first Linux GUI launch, SSH MountMate registers a per-user application launcher and installs
+its icon under `$XDG_DATA_HOME`, using `applications/` and `icons/hicolor/`. An unset, empty, or
+relative `XDG_DATA_HOME` falls back to `~/.local/share`. Later GUI launches update changed files;
+after moving the executable, launch it again to update the launcher path. The ZIP still contains
+only the executable.
 
 On macOS, choose the `x64` asset for Intel Macs and `arm64` for Apple Silicon; both contain the native application bundle.
 
@@ -236,7 +245,9 @@ SSH MountMate can read your OpenSSH config and list concrete `Host` entries. Sel
 - port
 - key file
 
-After import, the connection is saved as an editable rclone SFTP configuration. The mount behavior follows the values shown in the GUI, not a hidden live SSH command.
+After import, the connection is saved as an editable profile. Native SFTP uses the saved host, username, port, and authentication settings. Older alias-only profiles still resolve missing defaults from the source SSH config.
+
+OpenSSH and supported interactive shared SSH connections apply the saved host, username, and port while retaining the original alias and config for features such as `ProxyJump` and `Include`. The selected key is preferred; other `IdentityFile` entries in that config remain available as OpenSSH authentication fallbacks. Keep the source config available when using these methods.
 
 Batch import uses the selected config file and resolves each host with OpenSSH's `ssh -F <config> -G <host>` behavior. This keeps OpenSSH include/default handling while still saving normal editable SSH MountMate connections.
 
@@ -304,12 +315,15 @@ local user account and its config directory as sensitive.
 The Settings page also offers a manually enabled `System credential store` mode. It uses Windows
 Credential Manager, macOS Keychain, or the Linux Secret Service through the platform's native
 credential provider. Enabling it asks for confirmation, reveals existing rclone-obscured values
-locally, writes passwords and private-key passphrases to the OS store, reads every value back for
-verification, and only then removes those values from SSH MountMate's files. Private key files and
-one-time 2FA/OAuth tokens are never stored in the vault. Mounts temporarily hydrate the rclone
-configuration and remove its secret fields immediately after startup; a cleanup failure stops the
-new mount instead of leaving a misleading protected state. Returning to `rclone obscure` is an
-explicit confirmed migration in the other direction.
+locally, writes passwords and private-key passphrases to the OS store, and reads every value back
+for verification. SSH MountMate's private configuration retains a reversible rclone-obscured
+compatibility copy, including for newly saved secrets in this mode. Native SFTP operations read
+the system store whenever a credential reference exists; a failed read stops the operation without
+falling back to the compatibility copy. Private key files and one-time 2FA/OAuth tokens are never
+stored in the vault. Native SFTP mounts temporarily fill the rclone configuration with the required
+secrets and remove its secret fields immediately after startup; this cleanup does not remove the
+compatibility copy from SSH MountMate's configuration. A cleanup failure stops the new mount.
+Returning to `rclone obscure` is an explicit confirmed migration in the other direction.
 
 Interactive shared SSH deliberately bypasses both stored credential modes. Passwords, OAuth
 responses, and rotating 2FA codes are entered only in the terminal owned by OpenSSH or Plink.
@@ -342,7 +356,7 @@ slow local connection cannot monopolize the listener or delay normal shutdown in
 
 ## Transfers And Remote Refresh
 
-Mounted connection cards show rclone's real VFS upload queue. The recommended cache profile keeps rclone's upstream five-second write-back window so Explorer/Finder can finish close, rename, and metadata operations before remote upload begins. When an upload is queued or starts, that connection gets its own bottom-right progress window; multiple active connections are stacked separately. The Transfer center remains available for manually viewing all mounts together. A file is only shown as cloud-synced after rclone reports no queued or active uploads. SSH MountMate warns before unmounting or exiting while uploads remain.
+Mounted connection cards show rclone's real VFS upload queue. The recommended cache profile keeps rclone's upstream five-second write-back window so Explorer/Finder can finish close, rename, and metadata operations before remote upload begins. When automatic transfer display is enabled, queued or active uploads open one shared bottom-right progress window that summarizes active connections and can expand to show details. The Transfer center remains available for manually viewing all mounts together. A file is only shown as cloud-synced after rclone reports no queued or active uploads. SSH MountMate warns before unmounting or exiting while uploads remain.
 
 The simultaneous-upload setting limits how many different cached files rclone may upload at once. The default is 4, with presets for 8 and 12 and a custom range of 1 through 32. Extra files remain queued in the local cache. Rewriting the same path does not create reliable parallel revisions: rclone cancels or reschedules that path's write-back and the latest local content may overwrite another writer's remote change.
 
@@ -350,11 +364,20 @@ Refresh clears the VFS directory cache, actively reloads the requested directory
 
 Right-click a connection card for Open, Refresh, Transfers, and Log actions. Settings can register Refresh and Transfers commands in Windows Explorer, macOS Finder Quick Actions, and Nautilus, Nemo, or KDE file managers on Linux. The commands point back to the same SSH MountMate executable; no helper program is installed. A short-lived file-manager process forwards its request to the running app over authenticated loopback IPC and exits.
 
-The Rust application keeps a native system-tray icon on Windows, a menu-bar item on macOS, and an AppIndicator on supported Linux desktops. Closing the main window hides it without stopping mounts or transfer monitoring. The tray menu can restore the main window, open Transfers, mount or unmount all connections, and explicitly exit the interface. Exit asks for confirmation when uploads are active or cloud state is unknown; rclone mount processes remain independent of the GUI.
+The Rust application keeps a native system-tray icon on Windows, a menu-bar item on macOS, and an AppIndicator on supported Linux desktops. Closing the main window hides it without stopping mounts or transfer monitoring. The tray menu can restore the main window, open Transfers, mount or unmount all connections, and explicitly exit the interface. Exit asks for confirmation when uploads are active or cloud state is unknown. Native SFTP and OpenSSH mounts can continue after the GUI exits; interactive shared SSH depends on the app-managed session and may lose its transport when the application exits.
 
 ## Capacity Display
 
-For mounted connections, SSH MountMate shows used and total capacity on each card. On Lustre paths, it first tries to read the remote directory's project ID with `lfs project -d` and then reads project quota with `lfs quota -p`. If the path is not on Lustre, `lfs` is unavailable, or the project has no nonzero hard block limit, the app falls back to `rclone about` and then a non-interactive remote `df -Pk` query when the SSH profile supports it.
+For mounted connections, SSH MountMate shows used and total capacity on each card. It first tries
+to read the remote directory's Lustre project ID with `lfs project -d` and its quota with
+`lfs quota -p`. If that query fails, Lustre is unavailable, or there is no nonzero hard block limit,
+the app tries the filesystem capacity reported by the local mountpoint, then `rclone about`, and
+finally a non-interactive remote `df -Pk` query.
+
+Interactive connections reuse their existing verified shared SSH session for the Lustre and `df`
+queries. Other supported profiles need a working non-interactive system SSH login; native SFTP's
+saved passwords and key passphrases are not passed to `ssh`. Password-based native connections
+without an imported or app-managed SSH profile skip these SSH queries.
 
 ## Settings
 
@@ -378,7 +401,7 @@ The Settings window contains:
 
 Each setting option has a `?` help icon in the GUI. Hover the icon to see what the option does. Batch mount and unmount concurrency are fixed internally at 4 and 8 workers.
 
-Login startup uses the current user's Windows Run key, a macOS LaunchAgent under `~/Library/LaunchAgents/`, or a Linux XDG autostart entry. It calls the Rust application's headless `--mount-startup-all` entrypoint after login.
+Login startup uses the current user's Windows Run key, a macOS LaunchAgent under `~/Library/LaunchAgents/`, or a Linux XDG autostart entry. It calls the Rust application's headless `--mount-startup` entrypoint after login to mount the connections selected for login startup. Interactive shared SSH connections are excluded because they require an app-managed login session. The older `--mount-startup-all` option remains a compatibility alias for `--mount-all` and attempts all saved connections.
 
 ## Building From Source
 

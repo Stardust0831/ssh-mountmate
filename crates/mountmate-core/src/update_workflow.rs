@@ -150,6 +150,40 @@ mod tests {
     use crate::update::verified_asset_for_test;
 
     #[test]
+    fn cancelling_a_prepared_update_removes_its_plan_and_payload_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let installed = temp.path().join("installed");
+        let staged = temp.path().join("prepared");
+        let plan = temp.path().join("plan.json");
+        fs::write(&installed, b"running application").unwrap();
+        fs::write(&staged, b"downloaded update").unwrap();
+        fs::write(&plan, b"authorized update plan").unwrap();
+        let prepared = PreparedUpdateLaunch {
+            helper_executable: temp.path().join("must-not-launch"),
+            authorization: UpdateHelperAuthorization {
+                plan_path: plan.clone(),
+                token: "test-only-token".into(),
+            },
+            prepared: PreparedPayload {
+                replace_path: staged.clone(),
+                executable: staged.clone(),
+                executable_sha256: "a".repeat(64),
+                tree_sha256: "b".repeat(64),
+            },
+            transaction: TransactionPaths {
+                prepared: staged.clone(),
+                backup: temp.path().join("backup"),
+            },
+        };
+
+        prepared.cancel();
+
+        assert!(!plan.exists());
+        assert!(!staged.exists());
+        assert_eq!(fs::read(installed).unwrap(), b"running application");
+    }
+
+    #[test]
     fn cleanup_never_removes_a_path_not_owned_by_the_transaction() {
         let temp = tempfile::tempdir().unwrap();
         let owned = temp.path().join("prepared");
