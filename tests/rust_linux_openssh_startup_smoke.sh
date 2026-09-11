@@ -335,9 +335,9 @@ grep -F "BatchMode=yes" "${config_dir}/rclone.conf"
 
 rclone_config="${config_dir}/rclone.conf"
 grep -F '[local-openssh-a]' "${rclone_config}"
-grep -F "ssh = ssh -o BatchMode=yes -F ${ssh_config} local-openssh-a" "${rclone_config}"
+grep -Fx "ssh = ssh -o BatchMode=yes -F ${ssh_config} -o HostName=127.0.0.1 -l mountmate -p ${port} local-openssh-a" "${rclone_config}"
 grep -F '[local-openssh-b]' "${rclone_config}"
-grep -F "ssh = ssh -o BatchMode=yes -F ${ssh_config} local-openssh-b" "${rclone_config}"
+grep -Fx "ssh = ssh -o BatchMode=yes -F ${ssh_config} -o HostName=127.0.0.1 -l mountmate -p ${port} local-openssh-b" "${rclone_config}"
 if sed -n '/\[local-openssh-a\]/,/^$/p;/\[local-openssh-b\]/,/^$/p' "${rclone_config}" \
   | grep -Eq '^(pass|key_file|key_file_pass|key_use_agent) ='; then
   echo 'OpenSSH remotes unexpectedly contain a native-auth fallback' >&2
