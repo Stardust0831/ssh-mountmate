@@ -3131,7 +3131,7 @@ dependencies = [
 
 [[package]]
 name = "mountmate-core"
-version = "0.5.0"
+version = "0.6.2"
 dependencies = [
  "base64 0.22.1",
  "bcrypt",
@@ -3164,7 +3164,7 @@ dependencies = [
 
 [[package]]
 name = "mountmate-platform"
-version = "0.5.0"
+version = "0.6.2"
 dependencies = [
  "mountmate-core",
  "notify-rust",
@@ -5332,7 +5332,7 @@ dependencies = [
 
 [[package]]
 name = "ssh-mountmate"
-version = "0.5.0"
+version = "0.6.2"
 dependencies = [
  "async-channel 2.5.0",
  "dark-light",
