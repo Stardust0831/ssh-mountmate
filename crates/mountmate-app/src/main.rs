@@ -2955,7 +2955,9 @@ impl App {
             }
             Message::MountpointChoiceChanged(choice) => {
                 if let Some(draft) = &mut self.connection_draft {
-                    if mountpoint_choice(&draft.mountpoint) == "custom" {
+                    if mountpoint_choice(&draft.mountpoint) == "custom"
+                        && draft.mountpoint != CUSTOM_MOUNTPOINT_PENDING
+                    {
                         self.connection_custom_mountpoint =
                             custom_mountpoint_value(&draft.mountpoint);
                     }
@@ -9154,7 +9156,10 @@ fn custom_mountpoint_value(value: &str) -> String {
 }
 
 fn custom_mountpoint_draft_value(value: String) -> String {
-    if value.trim().is_empty() {
+    // Keep the custom textbox visible while typing a drive prefix (C:) or a
+    // string that happens to match a preset. The raw text stays in the editor
+    // buffer; only the dropdown can switch to a drive/automatic preset.
+    if value.trim().is_empty() || mountpoint_choice(&value) != "custom" {
         CUSTOM_MOUNTPOINT_PENDING.into()
     } else {
         value
@@ -12377,6 +12382,33 @@ mod localization_tests {
             "C:\\old",
             Some("C:\\mount")
         ));
+    }
+
+    #[test]
+    fn typing_a_windows_custom_folder_does_not_switch_to_a_drive_preset() {
+        let mut typed = String::new();
+        for character in r"C:\data\mount".chars() {
+            typed.push(character);
+            let draft_value = custom_mountpoint_draft_value(typed.clone());
+            assert_eq!(mountpoint_choice(&draft_value), "custom", "{typed}");
+            let displayed = if draft_value == CUSTOM_MOUNTPOINT_PENDING {
+                &typed
+            } else {
+                &draft_value
+            };
+            assert_eq!(displayed, &typed);
+        }
+        for typed in ["C:", "auto", HOME_MOUNTPOINT_VALUE] {
+            assert_eq!(
+                custom_mountpoint_draft_value(typed.into()),
+                CUSTOM_MOUNTPOINT_PENDING
+            );
+            assert_eq!(
+                mountpoint_value_for_choice("custom", typed),
+                CUSTOM_MOUNTPOINT_PENDING
+            );
+        }
+        assert_eq!(mountpoint_value_for_choice("Z:", r"C:\data\mount"), "Z:");
     }
 
     #[test]
