@@ -164,14 +164,43 @@ fn unix_device_changed(path: &Path) -> bool {
 }
 
 #[cfg(windows)]
-fn windows_drive_in_use(drive: char) -> bool {
+fn windows_logical_drive_mask() -> u32 {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetLogicalDrives() -> u32;
     }
 
     // GetLogicalDrives has no parameters and returns a bitmask owned by the OS.
-    let mask = unsafe { GetLogicalDrives() };
+    unsafe { GetLogicalDrives() }
+}
+
+/// Available drive letters without opening drive roots (which can block on
+/// disconnected network drives). A failed OS query exposes no drive choices.
+pub fn available_windows_drive_letters() -> Vec<char> {
+    #[cfg(windows)]
+    {
+        drive_letters_from_mask(windows_logical_drive_mask())
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+#[cfg(any(windows, test))]
+fn drive_letters_from_mask(mask: u32) -> Vec<char> {
+    if mask == 0 {
+        return Vec::new();
+    }
+    ('D'..='Z')
+        .rev()
+        .filter(|drive| mask & (1 << (u32::from(*drive) - u32::from('A'))) == 0)
+        .collect()
+}
+
+#[cfg(windows)]
+fn windows_drive_in_use(drive: char) -> bool {
+    let mask = windows_logical_drive_mask();
     let drive = drive.to_ascii_uppercase();
     if mask != 0 && drive.is_ascii_alphabetic() {
         mask & (1 << (u32::from(drive) - u32::from('A'))) != 0
@@ -616,6 +645,19 @@ mod tests {
             mountpoint: mountpoint.into(),
             ..ServerConfig::default()
         }
+    }
+
+    #[test]
+    fn drive_choices_use_the_os_mask_and_fail_closed_without_probing_roots() {
+        let occupied = (1 << 2) | (1 << 3) | (1 << 25);
+        let choices = drive_letters_from_mask(occupied);
+        assert_eq!(choices.first(), Some(&'Y'));
+        assert_eq!(choices.last(), Some(&'E'));
+        assert!(!choices.contains(&'D'));
+        assert!(!choices.contains(&'Z'));
+        assert_eq!(choices.len(), 21);
+        assert!(drive_letters_from_mask(0).is_empty());
+        assert!(drive_letters_from_mask(u32::MAX).is_empty());
     }
 
     #[test]

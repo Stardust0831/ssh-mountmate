@@ -211,8 +211,24 @@ fn initialize_desktop_menu_runtime() -> Result<(), TrayError> {
 
 #[cfg(target_os = "linux")]
 fn desktop_menu_iteration() {
-    while gtk::events_pending() {
+    pump_desktop_events(gtk::events_pending, || {
         gtk::main_iteration_do(false);
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn pump_desktop_events(mut pending: impl FnMut() -> bool, mut iteration: impl FnMut()) {
+    let started = std::time::Instant::now();
+    // GTK shares iced's UI thread. A continuously ready GLib source must not
+    // keep us here indefinitely; leave remaining work for the next tray tick.
+    for _ in 0..64 {
+        if !pending() {
+            break;
+        }
+        iteration();
+        if started.elapsed() >= std::time::Duration::from_millis(4) {
+            break;
+        }
     }
 }
 
@@ -234,5 +250,50 @@ mod tests {
         assert_eq!(action_for_id(UNMOUNT_ALL_ID), Some(TrayAction::UnmountAll));
         assert_eq!(action_for_id(EXIT_ID), Some(TrayAction::Exit));
         assert_eq!(action_for_id("unknown"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn desktop_pump_yields_with_a_continuously_ready_glib_source() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let context = gtk::glib::MainContext::new();
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let callback_count = dispatched.clone();
+        // Cap the source itself too, so an unbounded-pump regression fails
+        // with an assertion instead of hanging the entire test suite.
+        let source =
+            gtk::glib::idle_source_new(None, gtk::glib::Priority::DEFAULT_IDLE, move || {
+                if callback_count.fetch_add(1, Ordering::Relaxed) < 128 {
+                    gtk::glib::ControlFlow::Continue
+                } else {
+                    gtk::glib::ControlFlow::Break
+                }
+            });
+        source.attach(Some(&context));
+
+        pump_desktop_events(
+            || context.pending(),
+            || {
+                context.iteration(false);
+            },
+        );
+        let first_batch = dispatched.load(Ordering::Relaxed);
+        assert!((1..=64).contains(&first_batch));
+        assert!(
+            context.pending(),
+            "remaining events must wait for the next tick"
+        );
+        pump_desktop_events(
+            || context.pending(),
+            || {
+                context.iteration(false);
+            },
+        );
+        assert!(dispatched.load(Ordering::Relaxed) > first_batch);
+        source.destroy();
     }
 }

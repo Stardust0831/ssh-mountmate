@@ -43,7 +43,9 @@ use mountmate_core::interactive_ssh::{
 use mountmate_core::model::{
     MAX_CONNECTION_TAGS, MAX_TAG_CHARS, MAX_VFS_UPLOAD_TRANSFERS, MIN_VFS_UPLOAD_TRANSFERS,
 };
-use mountmate_core::mountpoint::{HOME_MOUNTPOINT_VALUE, preflight_custom_mountpoint};
+use mountmate_core::mountpoint::{
+    HOME_MOUNTPOINT_VALUE, available_windows_drive_letters, preflight_custom_mountpoint,
+};
 use mountmate_core::paths::AppPaths;
 use mountmate_core::plink_binary::resolve_plink;
 use mountmate_core::process::MountStatus;
@@ -79,6 +81,28 @@ mod transfer_center;
 mod tray;
 
 const CUSTOM_MOUNTPOINT_PENDING: &str = "__ui_custom_mountpoint_pending__";
+const EDITOR_FOCUS_SCOPE: &str = "editor-form";
+const CUSTOM_SETTING_FOCUS_SCOPE: &str = "custom-setting-form";
+
+fn scoped_focus(scope: &'static str, id: &'static str) -> Task<Message> {
+    use iced::advanced::widget::{operate, operation};
+    operate(operation::scope(
+        scope.into(),
+        operation::focusable::focus(id.into()),
+    ))
+}
+
+fn editor_focus_operation(
+    scope: &'static str,
+    backwards: bool,
+) -> Box<dyn iced::advanced::widget::Operation<Message>> {
+    use iced::advanced::widget::operation::{focusable, scope as within};
+    if backwards {
+        Box::new(within(scope.into(), focusable::focus_previous()))
+    } else {
+        Box::new(within(scope.into(), focusable::focus_next()))
+    }
+}
 
 use cli::LaunchAction;
 use i18n::{Choice, LanguagePreference as Language, Locale, TextKey};
@@ -362,6 +386,38 @@ fn tray_stream(subscription: &TraySubscription) -> async_channel::Receiver<TrayA
     subscription.0.clone()
 }
 
+fn tray_retry_stream(deadline: &Instant) -> impl iced::futures::Stream<Item = Message> + use<> {
+    let deadline = *deadline;
+    iced::futures::stream::once(async move {
+        tokio::time::sleep_until(deadline.into()).await;
+        Message::TrayTick
+    })
+}
+
+fn editor_keyboard_event(
+    event: iced::Event,
+    status: iced::event::Status,
+    window: window::Id,
+) -> Option<Message> {
+    if let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+        key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
+        modifiers,
+        ..
+    }) = event
+        && status == iced::event::Status::Ignored
+        && !modifiers.control()
+        && !modifiers.alt()
+        && !modifiers.logo()
+    {
+        Some(Message::FocusEditorField {
+            window,
+            backwards: modifiers.shift(),
+        })
+    } else {
+        None
+    }
+}
+
 fn run_headless(paths: &AppPaths, command: AppCommand) -> Result<(), String> {
     let settings = storage::load_settings(paths).map_err(|error| error.to_string())?;
     let servers = storage::load_servers(paths).map_err(|error| error.to_string())?;
@@ -544,8 +600,9 @@ struct App {
     connection_draft: Option<ConnectionDraft>,
     connection_tags_input: String,
     connection_custom_mountpoint: String,
+    windows_drive_letters: Vec<char>,
     mountpoint_preflight: MountpointPreflight,
-    mountpoint_preflight_generation: u64,
+    mountpoint_preflight_queue: MountpointPreflightQueue,
     settings_draft: Option<SettingsDraft>,
     log_view: Option<MountLogView>,
     log_window: Option<window::Id>,
@@ -729,6 +786,56 @@ impl MountpointPreflight {
     }
 }
 
+#[derive(Default)]
+struct MountpointPreflightQueue {
+    generation: u64,
+    in_flight: Option<u64>,
+    pending: Option<PendingMountpointPreflight>,
+}
+
+struct PendingMountpointPreflight {
+    generation: u64,
+    value: String,
+    ready: bool,
+}
+
+impl MountpointPreflightQueue {
+    fn replace(&mut self, value: Option<String>) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.pending = value.map(|value| PendingMountpointPreflight {
+            generation: self.generation,
+            value,
+            ready: false,
+        });
+        // A blocking filesystem probe cannot be cancelled. Keep its slot
+        // occupied across edits and cancellation until it actually finishes.
+        self.generation
+    }
+
+    fn mark_ready(&mut self, generation: u64) {
+        if let Some(pending) = &mut self.pending
+            && pending.generation == generation
+        {
+            pending.ready = true;
+        }
+    }
+
+    fn take_ready(&mut self) -> Option<PendingMountpointPreflight> {
+        if self.in_flight.is_some() || !self.pending.as_ref().is_some_and(|pending| pending.ready) {
+            return None;
+        }
+        let pending = self.pending.take()?;
+        self.in_flight = Some(pending.generation);
+        Some(pending)
+    }
+
+    fn finish(&mut self, generation: u64) {
+        if self.in_flight == Some(generation) {
+            self.in_flight = None;
+        }
+    }
+}
+
 fn mountpoint_preflight_result_is_current(
     result_generation: u64,
     current_generation: u64,
@@ -902,6 +1009,15 @@ struct CustomSettingDraft {
     raw_value: Option<String>,
 }
 
+impl CustomSettingDraft {
+    fn set_input(&mut self, value: String) {
+        if self.raw_value.is_some() {
+            self.raw_value = Some(value.clone());
+        }
+        self.digits = value;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CacheMode {
     Off,
@@ -1063,6 +1179,11 @@ enum Message {
     AppCommand(AppCommand),
     TrayAction(TrayAction),
     TrayTick,
+    UpdateProgressTick,
+    FocusEditorField {
+        window: window::Id,
+        backwards: bool,
+    },
     InteractiveTick,
     InteractiveReadinessChecked {
         id: String,
@@ -1162,6 +1283,7 @@ enum Message {
     CustomMountpointChanged(String),
     BrowseMountpoint,
     MountpointPicked(Option<PathBuf>),
+    MountpointPreflightReady(u64),
     MountpointPreflightFinished {
         generation: u64,
         value: String,
@@ -1268,6 +1390,59 @@ struct ServerMutation {
     warning: Option<String>,
 }
 
+fn is_editor_mutation(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::CancelEditor
+            | Message::ConnectionSourceChanged(_)
+            | Message::ConnectionFieldChanged(_, _)
+            | Message::ConnectionTagsChanged(_)
+            | Message::RemoteBaseChanged(_)
+            | Message::RemoteSuffixChanged(_)
+            | Message::MountpointChoiceChanged(_)
+            | Message::CustomMountpointChanged(_)
+            | Message::BrowseMountpoint
+            | Message::MountpointPicked(_)
+            | Message::ConnectionAuthChanged(_)
+            | Message::ConnectionMethodChanged(_)
+            | Message::PasswordChanged(_)
+            | Message::KeyPassphraseChanged(_)
+            | Message::ClearSecret(_)
+            | Message::ManagedSshChanged(_)
+            | Message::CopyKeyChanged(_)
+            | Message::ConnectionStartupChanged(_)
+            | Message::LoadSshConfig
+            | Message::BrowseSshConfig
+            | Message::SshConfigPicked(_)
+            | Message::BrowsePrivateKey
+            | Message::PrivateKeyPicked(_)
+            | Message::SshHostSelected(_)
+            | Message::SshImportActionChanged(_, _)
+            | Message::SettingsFieldChanged(_, _)
+            | Message::BrowseCacheRoot
+            | Message::CacheRootPicked(_)
+            | Message::CacheModeChanged(_)
+            | Message::MountBackendChanged(_)
+            | Message::CredentialStorageChanged(_)
+            | Message::CredentialStorageDecision { .. }
+            | Message::SettingOptionChanged(_)
+            | Message::CustomSettingDigitsChanged(_)
+            | Message::CustomSettingUnitChanged(_)
+            | Message::SaveCustomSetting
+            | Message::CancelCustomSetting
+            | Message::AutoTransfersChanged(_)
+            | Message::AutoTransfersDecision(_)
+            | Message::AutoUpdatesChanged(_)
+            | Message::LanguageChanged(_)
+            | Message::AppearanceModeChanged(_)
+            | Message::AccentColorChanged(_)
+            | Message::FontScaleChanged(_)
+            | Message::SettingsConnectionStartupChanged(_, _)
+            | Message::ToggleSettingsConnectionPreferences
+            | Message::OpenBatchManagement
+    )
+}
+
 #[derive(Debug, Clone)]
 struct SettingsMutation {
     settings: Settings,
@@ -1322,13 +1497,44 @@ impl App {
             Subscription::run_with(self.command_receiver.clone(), command_stream)
                 .map(Message::AppCommand),
             Subscription::run_with(self.tray_actions.clone(), tray_stream).map(Message::TrayAction),
-            iced::time::every(Duration::from_millis(100)).map(|_| Message::TrayTick),
-            iced::time::every(Duration::from_millis(500)).map(|_| Message::InteractiveTick),
-            iced::time::every(Duration::from_secs(1)).map(|_| Message::TransferTick),
-            iced::time::every(Duration::from_secs(30)).map(|_| Message::CapacityTick),
             window::close_requests().map(Message::CloseRequested),
             window::close_events().map(Message::WindowClosed),
         ];
+        // Even no-op messages rebuild and redraw every iced window. Only poll
+        // services with work to do; Windows/macOS tray actions arrive as events.
+        if cfg!(target_os = "linux") && self.tray.is_some() {
+            subscriptions
+                .push(iced::time::every(Duration::from_millis(100)).map(|_| Message::TrayTick));
+        } else if self.main_window_ready
+            && self.tray.is_none()
+            && let Some(deadline) = self.tray_retry_at
+        {
+            subscriptions.push(Subscription::run_with(deadline, tray_retry_stream));
+        }
+        if self.interactive_terminals.values().any(|session| {
+            session.queued_mount && session.lifecycle == InteractiveTerminalLifecycle::Starting
+        }) {
+            subscriptions.push(
+                iced::time::every(Duration::from_millis(500)).map(|_| Message::InteractiveTick),
+            );
+        }
+        if self.servers.iter().any(|server| {
+            self.mount_statuses.get(&server.id) == Some(&MountStatus::Mounted)
+                && !self.busy.contains(&server.id)
+        }) {
+            subscriptions
+                .push(iced::time::every(Duration::from_secs(1)).map(|_| Message::TransferTick));
+            subscriptions
+                .push(iced::time::every(Duration::from_secs(30)).map(|_| Message::CapacityTick));
+        }
+        if self.update_downloading {
+            subscriptions.push(
+                iced::time::every(Duration::from_millis(250)).map(|_| Message::UpdateProgressTick),
+            );
+        }
+        if matches!(self.screen, Screen::ConnectionEditor | Screen::Settings) {
+            subscriptions.push(iced::event::listen_with(editor_keyboard_event));
+        }
         subscriptions.extend(self.interactive_terminals.values().map(|session| {
             session
                 .terminal
@@ -1498,8 +1704,9 @@ impl App {
             connection_draft: None,
             connection_tags_input: String::new(),
             connection_custom_mountpoint: String::new(),
+            windows_drive_letters: Vec::new(),
             mountpoint_preflight: MountpointPreflight::NotRequired,
-            mountpoint_preflight_generation: 0,
+            mountpoint_preflight_queue: MountpointPreflightQueue::default(),
             settings_draft: None,
             log_view: None,
             log_window: None,
@@ -1553,8 +1760,34 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        if self.editor_saving && is_editor_mutation(&message) {
+            return Task::none();
+        }
+        let task = self.update_message(message);
+        self.sync_tray();
+        task
+    }
+
+    fn update_message(&mut self, message: Message) -> Task<Message> {
         let locale = self.locale();
         match message {
+            Message::UpdateProgressTick => {}
+            Message::FocusEditorField { window, backwards } => {
+                if window == self.main_window
+                    && !self.editor_saving
+                    && matches!(self.screen, Screen::ConnectionEditor | Screen::Settings)
+                {
+                    let scope = if self.screen == Screen::Settings && self.custom_setting.is_some()
+                    {
+                        CUSTOM_SETTING_FOCUS_SCOPE
+                    } else {
+                        EDITOR_FOCUS_SCOPE
+                    };
+                    return iced::advanced::widget::operate(editor_focus_operation(
+                        scope, backwards,
+                    ));
+                }
+            }
             Message::AppCommand(command) => {
                 diagnostic_trace(&format!("app received {command:?}"));
                 return self.handle_app_command(command);
@@ -1622,7 +1855,6 @@ impl App {
             Message::TrayTick => {
                 if self.tray.is_some() {
                     TrayController::desktop_iteration();
-                    self.sync_tray();
                 } else if self.main_window_ready {
                     self.initialize_tray();
                 }
@@ -1969,13 +2201,15 @@ impl App {
                 let mut draft = ConnectionDraft::default();
                 draft.ssh_config_path = default_ssh_config_path().display().to_string();
                 self.connection_draft = Some(draft);
+                self.windows_drive_letters = available_windows_drive_letters();
                 self.connection_tags_input.clear();
                 self.connection_custom_mountpoint.clear();
-                self.mountpoint_preflight = MountpointPreflight::NotRequired;
+                self.invalidate_mountpoint_preflight();
                 self.ssh_import_plan = None;
                 self.ssh_import_actions.clear();
                 self.screen = Screen::ConnectionEditor;
                 self.status = locale.text(TextKey::NewConnection).into();
+                return scoped_focus(EDITOR_FOCUS_SCOPE, "connection-name");
             }
             Message::ConnectionSearchChanged(value) => self.connection_search = value,
             Message::ConnectionSortMenuChanged(action) => match action {
@@ -2582,7 +2816,10 @@ impl App {
                 self.screen = Screen::Settings;
                 self.status = locale.text(TextKey::Settings).into();
                 self.dependency_checking = true;
-                return self.dependency_check_task();
+                return Task::batch([
+                    self.dependency_check_task(),
+                    scoped_focus(EDITOR_FOCUS_SCOPE, "settings-cache-root"),
+                ]);
             }
             Message::OpenLogChooser => return self.open_log_window(None),
             Message::LogWindowOpened(id) => {
@@ -2655,7 +2892,7 @@ impl App {
                     self.settings_draft = None;
                     self.ssh_import_plan = None;
                     self.ssh_import_actions.clear();
-                    self.mountpoint_preflight = MountpointPreflight::NotRequired;
+                    self.invalidate_mountpoint_preflight();
                     self.screen = Screen::Connections;
                     self.status = self.locale().text(TextKey::Ready).into();
                     self.sync_tray();
@@ -2685,8 +2922,7 @@ impl App {
                         ConnectionField::HostAlias => draft.host_alias = value,
                         ConnectionField::Host => draft.host = value,
                         ConnectionField::User => {
-                            draft.user = value;
-                            draft.apply_sai_name();
+                            draft.set_user(value);
                         }
                         ConnectionField::Port => draft.port = value,
                         ConnectionField::KeyFile => draft.key_file = value,
@@ -2729,7 +2965,7 @@ impl App {
                 if choice == "custom" {
                     return self.start_mountpoint_preflight();
                 }
-                self.mountpoint_preflight = MountpointPreflight::NotRequired;
+                self.invalidate_mountpoint_preflight();
             }
             Message::CustomMountpointChanged(value) => {
                 self.connection_custom_mountpoint = value.clone();
@@ -2768,11 +3004,16 @@ impl App {
                 return self.start_mountpoint_preflight();
             }
             Message::MountpointPicked(None) => {}
+            Message::MountpointPreflightReady(generation) => {
+                self.mountpoint_preflight_queue.mark_ready(generation);
+                return self.run_ready_mountpoint_preflight();
+            }
             Message::MountpointPreflightFinished {
                 generation,
                 value,
                 result,
             } => {
+                self.mountpoint_preflight_queue.finish(generation);
                 let current = self.connection_draft.as_ref().map(|draft| {
                     if draft.mountpoint == CUSTOM_MOUNTPOINT_PENDING {
                         self.connection_custom_mountpoint.trim()
@@ -2780,18 +3021,18 @@ impl App {
                         draft.mountpoint.trim()
                     }
                 });
-                if !mountpoint_preflight_result_is_current(
+                if mountpoint_preflight_result_is_current(
                     generation,
-                    self.mountpoint_preflight_generation,
+                    self.mountpoint_preflight_queue.generation,
                     &value,
                     current,
                 ) {
-                    return Task::none();
+                    self.mountpoint_preflight = match result {
+                        Ok(()) => MountpointPreflight::Valid(value),
+                        Err(error) => MountpointPreflight::Invalid { value, error },
+                    };
                 }
-                self.mountpoint_preflight = match result {
-                    Ok(()) => MountpointPreflight::Valid(value),
-                    Err(error) => MountpointPreflight::Invalid { value, error },
-                };
+                return self.run_ready_mountpoint_preflight();
             }
             Message::ConnectionAuthChanged(auth) => {
                 if let Some(draft) = &mut self.connection_draft {
@@ -2800,13 +3041,7 @@ impl App {
             }
             Message::ConnectionMethodChanged(method) => {
                 if let Some(draft) = &mut self.connection_draft {
-                    draft.connection_method = method;
-                    if method != ConnectionMethod::Native {
-                        draft.auth = AuthMethod::Key;
-                    }
-                    if method == ConnectionMethod::Interactive {
-                        draft.auto_mount_at_login = false;
-                    }
+                    draft.set_connection_method(method);
                 }
             }
             Message::PasswordChanged(value) => {
@@ -2891,6 +3126,9 @@ impl App {
                 result,
             } => {
                 self.ssh_import_loading = false;
+                if self.editor_saving {
+                    return Task::none();
+                }
                 let request_is_current = self.connection_draft.as_ref().is_some_and(|draft| {
                     matches!(
                         draft.source,
@@ -2974,7 +3212,7 @@ impl App {
                         let terminal_task = self.reconcile_interactive_sessions(&outcome.servers);
                         self.servers = outcome.servers;
                         self.connection_draft = None;
-                        self.mountpoint_preflight = MountpointPreflight::NotRequired;
+                        self.invalidate_mountpoint_preflight();
                         self.screen = Screen::Connections;
                         self.status = outcome
                             .warning
@@ -3091,21 +3329,14 @@ impl App {
                         raw_value: (!custom_setting_is_supported(option.kind, current))
                             .then(|| current.to_owned()),
                     });
+                    return scoped_focus(CUSTOM_SETTING_FOCUS_SCOPE, "custom-setting-value");
                 } else if let Some(draft) = &mut self.settings_draft {
                     set_setting_value(draft, option.kind, option.value);
                 }
             }
             Message::CustomSettingDigitsChanged(value) => {
                 if let Some(custom) = &mut self.custom_setting {
-                    if custom.raw_value.is_some() {
-                        custom.digits = value.clone();
-                        custom.raw_value = Some(value);
-                    } else {
-                        custom.digits = value
-                            .chars()
-                            .filter(|character| character.is_ascii_digit())
-                            .collect();
-                    }
+                    custom.set_input(value);
                 }
             }
             Message::CustomSettingUnitChanged(unit) => {
@@ -3453,6 +3684,7 @@ impl App {
                 let can_modify = self.can_modify(&id);
                 if let Some(server) = self.servers.iter().find(|server| server.id == id) {
                     self.connection_draft = Some(ConnectionDraft::from_server(server));
+                    self.windows_drive_letters = available_windows_drive_letters();
                     self.connection_tags_input = server.tags.join(", ");
                     if let Some(draft) = &mut self.connection_draft {
                         draft.auto_mount_at_login |= self.settings.startup_all;
@@ -3474,7 +3706,7 @@ impl App {
                     if can_modify && mountpoint_choice(&server.mountpoint) == "custom" {
                         return self.start_mountpoint_preflight();
                     }
-                    self.mountpoint_preflight = MountpointPreflight::NotRequired;
+                    self.invalidate_mountpoint_preflight();
                 }
             }
             Message::Remove(id) => {
@@ -3611,6 +3843,9 @@ impl App {
     }
 
     fn sync_tray(&mut self) {
+        if self.tray.is_none() {
+            return;
+        }
         let locale = self.locale();
         let can_mount = self.servers.iter().any(|server| {
             !self.busy.contains(&server.id)
@@ -3620,7 +3855,11 @@ impl App {
                 )
         });
         let can_unmount = self.servers.iter().any(|server| {
-            !self.busy.contains(&server.id) && self.paths.state_file(&server.id).exists()
+            !self.busy.contains(&server.id)
+                && matches!(
+                    self.mount_statuses.get(&server.id),
+                    Some(MountStatus::Mounted | MountStatus::Starting | MountStatus::Stale)
+                )
         });
         if let Some(tray) = &mut self.tray {
             tray.sync(locale, can_mount, can_unmount);
@@ -3910,6 +4149,11 @@ impl App {
         let Some(draft) = &self.connection_draft else {
             return Task::none();
         };
+        if mountpoint_choice(&draft.mountpoint) == "custom"
+            && !self.mountpoint_preflight.allows_save()
+        {
+            return Task::none();
+        }
         let validated = match draft.validate(&self.servers) {
             Ok(validated) => validated,
             Err(error) => {
@@ -4066,11 +4310,11 @@ impl App {
 
     fn start_mountpoint_preflight(&mut self) -> Task<Message> {
         let Some(draft) = &self.connection_draft else {
-            self.mountpoint_preflight = MountpointPreflight::NotRequired;
+            self.invalidate_mountpoint_preflight();
             return Task::none();
         };
         if mountpoint_choice(&draft.mountpoint) != "custom" {
-            self.mountpoint_preflight = MountpointPreflight::NotRequired;
+            self.invalidate_mountpoint_preflight();
             return Task::none();
         }
         let value = if draft.mountpoint == CUSTOM_MOUNTPOINT_PENDING {
@@ -4079,6 +4323,7 @@ impl App {
             draft.mountpoint.trim().to_owned()
         };
         if value.is_empty() {
+            self.mountpoint_preflight_queue.replace(None);
             self.mountpoint_preflight = MountpointPreflight::Invalid {
                 value,
                 error: match self.locale() {
@@ -4089,9 +4334,27 @@ impl App {
             return Task::none();
         }
         self.mountpoint_preflight = MountpointPreflight::Checking(value.clone());
-        self.mountpoint_preflight_generation =
-            self.mountpoint_preflight_generation.saturating_add(1);
-        let generation = self.mountpoint_preflight_generation;
+        let generation = self.mountpoint_preflight_queue.replace(Some(value));
+        Task::perform(
+            async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                generation
+            },
+            Message::MountpointPreflightReady,
+        )
+    }
+
+    fn invalidate_mountpoint_preflight(&mut self) {
+        self.mountpoint_preflight_queue.replace(None);
+        self.mountpoint_preflight = MountpointPreflight::NotRequired;
+    }
+
+    fn run_ready_mountpoint_preflight(&mut self) -> Task<Message> {
+        let Some(pending) = self.mountpoint_preflight_queue.take_ready() else {
+            return Task::none();
+        };
+        let generation = pending.generation;
+        let value = pending.value;
         let checked_value = value.clone();
         let failed_value = value.clone();
         Task::perform(
@@ -5575,8 +5838,16 @@ impl App {
             match self.screen {
                 Screen::Connections => self.main_view(),
                 Screen::TransferCenter => self.transfer_center_view(),
-                Screen::ConnectionEditor => self.connection_editor_view(),
-                Screen::Settings => self.settings_view(),
+                Screen::ConnectionEditor => container(self.connection_editor_view())
+                    .id(EDITOR_FOCUS_SCOPE)
+                    .width(Fill)
+                    .height(Fill)
+                    .into(),
+                Screen::Settings => container(self.settings_view())
+                    .id(EDITOR_FOCUS_SCOPE)
+                    .width(Fill)
+                    .height(Fill)
+                    .into(),
             }
         } else if self.log_window == Some(window) {
             self.log_viewer_view()
@@ -6255,6 +6526,10 @@ impl App {
         .spacing(10)
         .align_y(Center);
 
+        if self.editor_saving {
+            return saving_editor_shell(header, &self.status, locale);
+        }
+
         let source_options = localized_choices(
             ConnectionSource::ALL.into_iter().filter(|source| {
                 draft.editing_id.is_none() || *source != ConnectionSource::SshConfigBatch
@@ -6516,7 +6791,11 @@ impl App {
                 AuthMethod::Password => {
                     auth_fields = auth_fields.push(secret_input_control(
                         locale.text(TextKey::Password),
-                        locale.text(TextKey::PasswordRequired),
+                        locale.text(if requirements.password {
+                            TextKey::PasswordRequired
+                        } else {
+                            TextKey::Optional
+                        }),
                         &draft.password,
                         draft.preserved_secret_state(CredentialKind::Password),
                         CredentialKind::Password,
@@ -6560,7 +6839,10 @@ impl App {
                     .label(locale.text(TextKey::WriteManagedProfile))
                     .on_toggle(Message::ManagedSshChanged),
             );
-            if draft.ssh_config_managed && draft.auth == AuthMethod::Key {
+            if draft.ssh_config_managed
+                && draft.connection_method == ConnectionMethod::Native
+                && draft.auth == AuthMethod::Key
+            {
                 managed_fields = managed_fields.push(
                     checkbox(draft.copy_key_to_ssh_dir)
                         .label(locale.text(TextKey::CopyPrivateKey))
@@ -6578,11 +6860,17 @@ impl App {
                     Message::RemoteBaseChanged,
                 )
                 .width(Length::Fixed(120.0)),
-                text_input(locale.text(TextKey::RemotePath), &remote_suffix)
+                text_input("projects/data", &remote_suffix)
+                    .id("connection-remote-path")
                     .on_input(Message::RemoteSuffixChanged)
                     .width(Fill),
             ]
             .spacing(8),
+            text(match locale {
+                Locale::English => "Leave blank to use the selected root directory.",
+                Locale::Chinese => "留空使用左侧选中的根目录。",
+            })
+            .size(12),
         ]
         .spacing(5)
         .width(Fill);
@@ -6595,7 +6883,7 @@ impl App {
             ]
             .spacing(5),
             pick_list(
-                mountpoint_options(locale),
+                mountpoint_options(locale, &self.windows_drive_letters, &draft.mountpoint),
                 Some(mountpoint_option_label(&mountpoint_choice, locale)),
                 move |label| Message::MountpointChoiceChanged(mountpoint_option_value(
                     &label, locale
@@ -6614,6 +6902,7 @@ impl App {
             mountpoint = mountpoint.push(
                 row![
                     text_input(locale.text(TextKey::Mountpoint), custom_value,)
+                        .id("connection-mountpoint")
                         .on_input(Message::CustomMountpointChanged)
                         .width(Fill),
                     button(locale.text(TextKey::Browse)).on_press(Message::BrowseMountpoint),
@@ -6677,6 +6966,7 @@ impl App {
                     },
                     &self.connection_tags_input,
                 )
+                .id("connection-tags")
                 .on_input(Message::ConnectionTagsChanged)
                 .width(Fill),
             ),
@@ -6714,7 +7004,8 @@ impl App {
         let header = row![
             text(title).size(28),
             Space::new().width(Fill),
-            button(locale.text(TextKey::Cancel)).on_press(Message::CancelEditor),
+            button(locale.text(TextKey::Cancel))
+                .on_press_maybe((!self.editor_saving).then_some(Message::CancelEditor)),
             button(if self.editor_saving {
                 locale.text(TextKey::Saving)
             } else {
@@ -6724,6 +7015,9 @@ impl App {
         ]
         .spacing(10)
         .align_y(Center);
+        if self.editor_saving {
+            return saving_editor_shell(header, &self.status, locale);
+        }
         let mut content = column![
             container(text(match locale {
                 Locale::English => "The connection is mounted or busy. Connection, authentication, and mount fields remain read-only; tags and login startup can still be changed.",
@@ -6745,6 +7039,7 @@ impl App {
                         },
                         &self.connection_tags_input,
                     )
+                    .id("connection-tags")
                     .on_input(Message::ConnectionTagsChanged)
                     .width(Fill),
                 ),
@@ -6893,6 +7188,9 @@ impl App {
         ]
         .spacing(10)
         .align_y(Center);
+        if self.editor_saving {
+            return saving_editor_shell(header, &self.status, locale);
+        }
         let cache_profile = row![
             settings_folder_input(
                 locale.text(TextKey::CacheRoot),
@@ -7386,6 +7684,7 @@ impl App {
                     &custom.digits,
                 )
                 .on_input(Message::CustomSettingDigitsChanged)
+                .id("custom-setting-value")
                 .width(Length::Fixed(180.0))
             ]
             .spacing(10);
@@ -7399,19 +7698,27 @@ impl App {
                     .width(Length::Fixed(120.0)),
                 );
             }
+            let mut dialog_content = column![text(title).size(22), custom_value].spacing(14);
+            if custom.raw_value.is_none() {
+                dialog_content = dialog_content.push(
+                    text(match locale {
+                        Locale::English => "Enter a non-negative whole number (digits 0–9).",
+                        Locale::Chinese => "请输入非负整数（仅含数字 0–9）。",
+                    })
+                    .size(12),
+                );
+            }
             let dialog = container(
-                column![
-                    text(title).size(22),
-                    custom_value,
+                dialog_content.push(
                     row![
                         button(locale.text(TextKey::Cancel)).on_press(Message::CancelCustomSetting),
                         button(locale.text(TextKey::Save)).on_press(Message::SaveCustomSetting),
                     ]
                     .spacing(10),
-                ]
-                .spacing(14),
+                ),
             )
             .padding(20)
+            .id(CUSTOM_SETTING_FOCUS_SCOPE)
             .width(Length::Fixed(380.0))
             .style(container::rounded_box);
             stack![
@@ -8236,12 +8543,39 @@ fn connection_input<'a>(
 ) -> iced::widget::Column<'a, Message> {
     column![
         connection_field_label(label, required),
-        text_input(label, value)
+        text_input(connection_input_placeholder(field), value)
+            .id(connection_input_id(field))
             .on_input(move |value| Message::ConnectionFieldChanged(field, value))
             .width(Fill),
     ]
     .spacing(5)
     .width(Fill)
+}
+
+fn connection_input_id(field: ConnectionField) -> &'static str {
+    match field {
+        ConnectionField::Name => "connection-name",
+        ConnectionField::HostAlias => "connection-host-alias",
+        ConnectionField::Host => "connection-host",
+        ConnectionField::User => "connection-user",
+        ConnectionField::Port => "connection-port",
+        ConnectionField::KeyFile => "connection-key-file",
+        ConnectionField::SshConfigPath => "connection-ssh-config-path",
+    }
+}
+
+fn connection_input_placeholder(field: ConnectionField) -> &'static str {
+    match field {
+        ConnectionField::Name => "research-server",
+        ConnectionField::HostAlias => "research",
+        ConnectionField::Host => "server.example.com / 192.168.1.10",
+        ConnectionField::User => "alice",
+        ConnectionField::Port => "22",
+        ConnectionField::KeyFile if cfg!(windows) => r"C:\Users\alice\.ssh\id_ed25519",
+        ConnectionField::KeyFile => "~/.ssh/id_ed25519",
+        ConnectionField::SshConfigPath if cfg!(windows) => r"C:\Users\alice\.ssh\config",
+        ConnectionField::SshConfigPath => "~/.ssh/config",
+    }
 }
 
 fn connection_read_only_field<'a>(
@@ -8261,6 +8595,10 @@ fn secret_input_control<'a>(
     required: bool,
 ) -> iced::widget::Column<'a, Message> {
     let input = text_input(placeholder, value)
+        .id(match kind {
+            CredentialKind::Password => "connection-password",
+            CredentialKind::KeyPassphrase => "connection-key-passphrase",
+        })
         .secure(true)
         .on_input(move |value| match kind {
             CredentialKind::Password => Message::PasswordChanged(SecretInput(value)),
@@ -8272,6 +8610,16 @@ fn secret_input_control<'a>(
         .width(Fill);
     if state != PreservedSecretState::Absent {
         let state_text = match (locale, state) {
+            (Locale::English, _) if required => {
+                "The connection details changed. Enter the password again for this connection."
+            }
+            (Locale::Chinese, _) if required => "连接信息已更改，请重新输入此连接的密码。",
+            (Locale::English, _) if kind == CredentialKind::KeyPassphrase => {
+                "A passphrase is stored. Leaving this blank keeps it only if the connection and private key are unchanged; otherwise enter it again."
+            }
+            (Locale::Chinese, _) if kind == CredentialKind::KeyPassphrase => {
+                "已保存密钥口令。连接和私钥未更改时，留空会保留；否则请重新输入。"
+            }
             (Locale::English, PreservedSecretState::System) => {
                 "Stored in the system credential store. Leave blank to keep it, or type to replace it."
             }
@@ -8313,7 +8661,8 @@ fn connection_file_input<'a>(
     column![
         connection_field_label(label, required),
         row![
-            text_input(label, value)
+            text_input(connection_input_placeholder(field), value)
+                .id(connection_input_id(field))
                 .on_input(move |value| Message::ConnectionFieldChanged(field, value))
                 .width(Fill),
             button(browse_label).on_press(browse),
@@ -8497,6 +8846,18 @@ fn custom_setting_value(custom: &CustomSettingDraft, locale: Locale) -> Result<S
     }
     if let Some(raw_value) = &custom.raw_value {
         return Ok(raw_value.clone());
+    }
+    if !custom
+        .digits
+        .chars()
+        .all(|character| character.is_ascii_digit())
+    {
+        return Err(match locale {
+            Locale::English => {
+                "Custom value must be a non-negative whole number (digits 0–9)".into()
+            }
+            Locale::Chinese => "自定义数值必须是非负整数（仅含数字 0–9）".into(),
+        });
     }
     if custom.kind == SettingKind::Transfers {
         return validate_upload_transfers(&custom.digits, locale).map(|value| value.to_string());
@@ -8757,23 +9118,19 @@ fn auto_transfer_help(locale: Locale) -> &'static str {
 }
 
 fn split_remote_path(value: &str) -> (String, String) {
-    let path = value.trim();
-    if path.starts_with('/') {
-        ("/".into(), path.trim_start_matches('/').into())
+    // Keep the editable suffix intact. Normalizing here would erase a newly
+    // typed separator or space before the user can enter the next component.
+    if let Some(suffix) = value.strip_prefix('/') {
+        ("/".into(), suffix.into())
     } else {
-        ("$HOME".into(), path.trim_matches('/').into())
+        ("$HOME".into(), value.into())
     }
 }
 
 fn compose_remote_path(base: &str, suffix: &str) -> String {
-    let suffix = suffix.trim().replace('\\', "/");
-    let suffix = suffix.trim_matches('/');
+    // ConnectionDraft::validate normalizes the completed path when saving.
     if base == "/" {
-        if suffix.is_empty() {
-            "/".into()
-        } else {
-            format!("/{suffix}")
-        }
+        format!("/{suffix}")
     } else {
         suffix.into()
     }
@@ -8846,18 +9203,16 @@ fn mountpoint_option_value(label: &str, locale: Locale) -> String {
     label.into()
 }
 
-fn mountpoint_options(locale: Locale) -> Vec<String> {
+fn mountpoint_options(locale: Locale, free_drives: &[char], selected: &str) -> Vec<String> {
     let mut options = vec![
         mountpoint_option_label("auto", locale),
         mountpoint_option_label("home", locale),
     ];
-    if cfg!(windows) {
-        options.extend(
-            "ZYXWVUTSRQPONMLKJIHGFED"
-                .chars()
-                .map(|letter| format!("{letter}:"))
-                .filter(|drive| !PathBuf::from(format!("{drive}\\")).exists()),
-        );
+    options.extend(free_drives.iter().map(|letter| format!("{letter}:")));
+    // Editing an existing connection must retain its selected drive even when
+    // it is occupied. Actual availability is checked again when mounting.
+    if is_drive_mountpoint(selected) && !options.iter().any(|option| option == selected) {
+        options.push(selected.to_owned());
     }
     options.push(mountpoint_option_label("custom", locale));
     options
@@ -9291,6 +9646,9 @@ fn settings_folder_input<'a>(
         label,
         row![
             text_input(label, value)
+                .id(match field {
+                    SettingsField::CacheRoot => "settings-cache-root",
+                })
                 .on_input(move |value| Message::SettingsFieldChanged(field, value))
                 .width(Fill),
             button(browse_label).on_press(browse),
@@ -9393,6 +9751,23 @@ fn localized_draft_field(field: &str) -> &str {
         "SSH config file" => "SSH 配置文件",
         _ => field,
     }
+}
+
+fn saving_editor_shell<'a>(
+    header: impl Into<Element<'a, Message>>,
+    status: &'a str,
+    locale: Locale,
+) -> Element<'a, Message> {
+    editor_shell(
+        header,
+        container(text(match locale {
+            Locale::English => "Saving changes. Please wait...",
+            Locale::Chinese => "正在保存修改，请稍候……",
+        }))
+        .center_x(Fill)
+        .center_y(Fill),
+        status,
+    )
 }
 
 fn editor_shell<'a>(
@@ -11182,6 +11557,38 @@ mod localization_tests {
     }
 
     #[test]
+    fn custom_numeric_input_rejects_decimals_and_negatives_without_changing_them() {
+        for kind in [
+            SettingKind::MaxSize,
+            SettingKind::WriteBack,
+            SettingKind::Transfers,
+        ] {
+            let mut draft = CustomSettingDraft {
+                kind,
+                digits: String::new(),
+                unit: custom_units(kind)
+                    .first()
+                    .copied()
+                    .unwrap_or_default()
+                    .into(),
+                raw_value: None,
+            };
+            for value in ["1.5", "-1", "2a3"] {
+                draft.set_input(value.into());
+                assert_eq!(draft.digits, value);
+                for locale in [Locale::English, Locale::Chinese] {
+                    assert!(custom_setting_value(&draft, locale).is_err());
+                }
+            }
+            draft.set_input("15".into());
+            assert_eq!(
+                custom_setting_value(&draft, Locale::English),
+                Ok(format!("15{}", draft.unit))
+            );
+        }
+    }
+
+    #[test]
     fn unsupported_custom_values_round_trip_without_coercion() {
         for (kind, value) in [
             (SettingKind::MaxAge, "1h30m"),
@@ -11637,6 +12044,38 @@ mod localization_tests {
     }
 
     #[test]
+    fn saving_blocks_queued_editor_inputs_and_dialog_results() {
+        for message in [
+            Message::ConnectionFieldChanged(ConnectionField::Host, "late.example".into()),
+            Message::PasswordChanged(SecretInput("late-password".into())),
+            Message::PrivateKeyPicked(Some(PathBuf::from("late-key"))),
+            Message::SshConfigPicked(Some(PathBuf::from("late-config"))),
+            Message::MountpointPicked(Some(PathBuf::from("late-mountpoint"))),
+            Message::ConnectionSourceChanged(ConnectionSource::SshConfig),
+            Message::CacheRootPicked(Some(PathBuf::from("late-cache"))),
+            Message::CredentialStorageDecision {
+                target: CredentialStorage::System,
+                result: rfd::MessageDialogResult::Yes,
+            },
+            Message::AutoTransfersDecision(rfd::MessageDialogResult::Yes),
+            Message::SettingsConnectionStartupChanged("connection".into(), true),
+        ] {
+            assert!(is_editor_mutation(&message));
+        }
+        assert!(!is_editor_mutation(&Message::ConnectionSaved(Err(
+            "save failed".into()
+        ))));
+        assert!(!is_editor_mutation(&Message::SettingsSaved(Err(
+            "save failed".into()
+        ))));
+        assert!(!is_editor_mutation(&Message::SshImportLoaded {
+            config_path: PathBuf::from("config"),
+            result: Err("load failed".into()),
+        }));
+        assert!(!is_editor_mutation(&Message::TransferTick));
+    }
+
+    #[test]
     fn structured_remote_path_round_trips_home_and_root() {
         assert_eq!(
             split_remote_path("project/data"),
@@ -11649,6 +12088,56 @@ mod localization_tests {
         );
         assert_eq!(compose_remote_path("/", "srv/data"), "/srv/data");
         assert_eq!(compose_remote_path("/", ""), "/");
+    }
+
+    #[test]
+    fn structured_remote_path_supports_typing_and_deleting_nested_paths() {
+        for base in ["$HOME", "/"] {
+            let mut path = compose_remote_path(base, "");
+            let mut expected = String::new();
+            for character in "project/data set/子目录\\next/".chars() {
+                let (current_base, mut suffix) = split_remote_path(&path);
+                suffix.push(character);
+                path = compose_remote_path(&current_base, &suffix);
+                expected.push(character);
+                assert_eq!(split_remote_path(&path), (base.into(), expected.clone()));
+            }
+            while expected.pop().is_some() {
+                let (current_base, mut suffix) = split_remote_path(&path);
+                suffix.pop();
+                path = compose_remote_path(&current_base, &suffix);
+                assert_eq!(split_remote_path(&path), (base.into(), expected.clone()));
+            }
+        }
+    }
+
+    #[test]
+    fn structured_remote_path_keeps_incomplete_input_until_save() {
+        let suffix = "  project\\data set/  ";
+        let relative = compose_remote_path("$HOME", suffix);
+        let (_, editable_suffix) = split_remote_path(&relative);
+        assert_eq!(editable_suffix, suffix);
+        let absolute = compose_remote_path("/", &editable_suffix);
+        assert_eq!(split_remote_path(&absolute), ("/".into(), suffix.into()));
+        let (_, editable_suffix) = split_remote_path(&absolute);
+        assert_eq!(compose_remote_path("$HOME", &editable_suffix), relative);
+
+        let mut draft = ConnectionDraft::default();
+        draft.name = "Example".into();
+        draft.host = "example.com".into();
+        draft.user = "alice".into();
+        draft.auth = AuthMethod::Password;
+        draft.password = "test-password".into();
+        draft.remote_path = relative;
+        assert_eq!(
+            draft.validate(&[]).unwrap().server.remote_path,
+            "project/data set"
+        );
+        draft.remote_path = compose_remote_path("/", "srv\\data set/");
+        assert_eq!(
+            draft.validate(&[]).unwrap().server.remote_path,
+            "/srv/data set"
+        );
     }
 
     #[test]
@@ -11805,6 +12294,70 @@ mod localization_tests {
     }
 
     #[test]
+    fn mountpoint_preflight_coalesces_typing_until_the_latest_debounce_finishes() {
+        let mut queue = MountpointPreflightQueue::default();
+        let first = queue.replace(Some("/mount/a".into()));
+        let latest = queue.replace(Some("/mount/abc".into()));
+        queue.mark_ready(first);
+        assert!(queue.take_ready().is_none());
+        queue.mark_ready(latest);
+        let request = queue.take_ready().unwrap();
+        assert_eq!(request.value, "/mount/abc");
+        assert_eq!(request.generation, latest);
+        assert!(queue.take_ready().is_none());
+    }
+
+    #[test]
+    fn mountpoint_preflight_limits_slow_probes_and_discards_intermediate_paths() {
+        let mut queue = MountpointPreflightQueue::default();
+        let slow = queue.replace(Some("/slow-network/mount".into()));
+        queue.mark_ready(slow);
+        assert!(queue.take_ready().is_some());
+        let intermediate = queue.replace(Some("/local/m".into()));
+        queue.mark_ready(intermediate);
+        assert!(queue.take_ready().is_none());
+        let latest = queue.replace(Some("/local/mount".into()));
+        queue.mark_ready(latest);
+        assert!(queue.take_ready().is_none());
+
+        queue.finish(slow);
+        let request = queue.take_ready().unwrap();
+        assert_eq!(request.value, "/local/mount");
+        assert_eq!(request.generation, latest);
+        // A delayed or duplicate completion must not release a newer probe.
+        queue.finish(slow);
+        assert_eq!(queue.in_flight, Some(latest));
+    }
+
+    #[test]
+    fn mountpoint_preflight_cancel_and_reopen_same_path_preserves_single_worker() {
+        let mut queue = MountpointPreflightQueue::default();
+        let old = queue.replace(Some("/mount".into()));
+        queue.mark_ready(old);
+        assert!(queue.take_ready().is_some());
+
+        // Cancel, clearing the field, and choosing Auto all invalidate pending
+        // work without freeing the still-running filesystem probe's slot.
+        queue.replace(None);
+        queue.mark_ready(old);
+        assert!(queue.take_ready().is_none());
+        queue.replace(Some("/different".into()));
+        let reopened = queue.replace(Some("/mount".into()));
+        queue.mark_ready(reopened);
+        assert!(queue.take_ready().is_none());
+        assert!(!mountpoint_preflight_result_is_current(
+            old,
+            queue.generation,
+            "/mount",
+            Some("/mount"),
+        ));
+        queue.finish(old);
+        let request = queue.take_ready().unwrap();
+        assert_eq!(request.generation, reopened);
+        assert_eq!(request.value, "/mount");
+    }
+
+    #[test]
     fn mountpoint_preflight_rejects_stale_generations_even_for_the_same_path() {
         assert!(mountpoint_preflight_result_is_current(
             3,
@@ -11887,6 +12440,105 @@ mod localization_tests {
             Some("authentication failed")
         );
         assert_eq!(interactive_terminal_error(&error, "mounted"), None);
+    }
+
+    #[test]
+    fn editor_tab_keeps_other_windows_and_modal_background_out_of_the_focus_cycle() {
+        use iced::Rectangle;
+        use iced::advanced::widget::{
+            Id, Operation,
+            operation::{Outcome, focusable::Focusable},
+        };
+
+        struct Focus(bool);
+        impl Focusable for Focus {
+            fn is_focused(&self) -> bool {
+                self.0
+            }
+            fn focus(&mut self) {
+                self.0 = true;
+            }
+            fn unfocus(&mut self) {
+                self.0 = false;
+            }
+        }
+        fn apply(
+            mut op: Box<dyn Operation<Message>>,
+            editor: &mut [Focus],
+            terminal: &mut Focus,
+            modal: &mut Focus,
+        ) {
+            for _ in 0..8 {
+                op.container(Some(&Id::new(EDITOR_FOCUS_SCOPE)), Rectangle::default());
+                op.traverse(&mut |op| {
+                    for field in &mut *editor {
+                        op.focusable(None, Rectangle::default(), field);
+                    }
+                    op.container(
+                        Some(&Id::new(CUSTOM_SETTING_FOCUS_SCOPE)),
+                        Rectangle::default(),
+                    );
+                    op.traverse(&mut |op| op.focusable(None, Rectangle::default(), modal));
+                });
+                op.container(Some(&Id::new("terminal-window")), Rectangle::default());
+                op.traverse(&mut |op| op.focusable(None, Rectangle::default(), terminal));
+                match op.finish() {
+                    Outcome::Chain(next) => op = next,
+                    _ => return,
+                }
+            }
+            panic!("focus operation did not finish");
+        }
+
+        let mut fields = [Focus(true), Focus(false)];
+        let mut terminal = Focus(true);
+        let mut modal = Focus(false);
+        apply(
+            editor_focus_operation(EDITOR_FOCUS_SCOPE, false),
+            &mut fields,
+            &mut terminal,
+            &mut modal,
+        );
+        assert!(!fields[0].0 && fields[1].0);
+        assert!(terminal.0, "Tab must not unfocus an interactive terminal");
+        apply(
+            editor_focus_operation(EDITOR_FOCUS_SCOPE, true),
+            &mut fields,
+            &mut terminal,
+            &mut modal,
+        );
+        assert!(fields[0].0 && !fields[1].0);
+        apply(
+            editor_focus_operation(CUSTOM_SETTING_FOCUS_SCOPE, false),
+            &mut fields,
+            &mut terminal,
+            &mut modal,
+        );
+        assert!(modal.0);
+        assert!(fields[0].0 && !fields[1].0 && terminal.0);
+    }
+
+    #[test]
+    fn mountpoint_options_keep_an_occupied_selected_drive_without_duplicate_choices() {
+        let options = mountpoint_options(Locale::English, &['Y', 'X'], "Z:");
+        assert_eq!(
+            options,
+            [
+                "Auto",
+                "User folder (~/mnt/name)",
+                "Y:",
+                "X:",
+                "Z:",
+                "Custom folder..."
+            ]
+        );
+        let options = mountpoint_options(Locale::Chinese, &['Z', 'Y'], "Z:");
+        assert_eq!(options.iter().filter(|value| *value == "Z:").count(), 1);
+        assert!(
+            !mountpoint_options(Locale::English, &[], "/data/Z:/folder")
+                .iter()
+                .any(|value| value == "/data/Z:/folder")
+        );
     }
 
     #[test]

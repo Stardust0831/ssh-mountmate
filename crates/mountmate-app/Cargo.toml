@@ -10,7 +10,7 @@ repository.workspace = true
 directories.workspace = true
 async-channel.workspace = true
 dark-light.workspace = true
-iced.workspace = true
+iced = { workspace = true, features = ["advanced"] }
 iced_term.workspace = true
 mountmate-core = { path = "../mountmate-core" }
 mountmate-platform = { path = "../mountmate-platform" }

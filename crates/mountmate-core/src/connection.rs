@@ -151,6 +151,30 @@ impl Default for ConnectionDraft {
 }
 
 impl ConnectionDraft {
+    pub fn set_user(&mut self, user: String) {
+        let previous_name = format!("SAI-{}", self.user.trim());
+        if self.source == ConnectionSource::SaiCluster && !user.trim().is_empty() {
+            let name = format!("SAI-{}", user.trim());
+            if self.name == previous_name {
+                self.name.clone_from(&name);
+            }
+            if self.host_alias == previous_name {
+                self.host_alias = name;
+            }
+        }
+        self.user = user;
+        self.apply_sai_name();
+    }
+
+    pub fn set_connection_method(&mut self, method: ConnectionMethod) {
+        self.connection_method = method;
+        // OpenSSH decides authentication itself. Preserve the Native choice so
+        // switching back does not unexpectedly hide an entered password.
+        if method == ConnectionMethod::Interactive {
+            self.auto_mount_at_login = false;
+        }
+    }
+
     pub fn requirements(&self) -> ConnectionRequirements {
         let native = self.connection_method == ConnectionMethod::Native;
         let ssh_config_source = matches!(
@@ -280,13 +304,10 @@ impl ConnectionDraft {
             return;
         }
         let name = format!("SAI-{}", self.user.trim());
-        if self.name.trim().is_empty() || self.name == "SAI" || self.name.starts_with("SAI-") {
+        if self.name.trim().is_empty() || self.name == "SAI" {
             self.name.clone_from(&name);
         }
-        if self.host_alias.trim().is_empty()
-            || self.host_alias == "SAI"
-            || self.host_alias.starts_with("SAI-")
-        {
+        if self.host_alias.trim().is_empty() || self.host_alias == "SAI" {
             self.host_alias = name;
         }
     }
@@ -402,6 +423,7 @@ impl ConnectionDraft {
             ssh_config_managed,
             copy_key_to_ssh_dir: self.copy_key_to_ssh_dir
                 && ssh_config_managed
+                && connection_method == ConnectionMethod::Native
                 && auth == AuthMethod::Key,
             managed_ssh_config_path: self
                 .existing
@@ -1001,6 +1023,63 @@ mod tests {
             password_obscured: "kept-secret".into(),
             ..ServerConfig::default()
         }
+    }
+
+    #[test]
+    fn sai_user_changes_update_suggestions_but_preserve_custom_names() {
+        let mut draft = ConnectionDraft {
+            source: ConnectionSource::SaiCluster,
+            ..ConnectionDraft::default()
+        };
+        draft.apply_source_defaults();
+        draft.set_user("alice".into());
+        assert_eq!(draft.name, "SAI-alice");
+        assert_eq!(draft.host_alias, "SAI-alice");
+        draft.set_user("bob".into());
+        assert_eq!(draft.name, "SAI-bob");
+        assert_eq!(draft.host_alias, "SAI-bob");
+        draft.name = "SAI-work".into();
+        draft.host_alias = "SAI-backup".into();
+        draft.set_user("carol".into());
+        assert_eq!(draft.name, "SAI-work");
+        assert_eq!(draft.host_alias, "SAI-backup");
+    }
+
+    #[test]
+    fn transport_switch_preserves_native_authentication_and_secret_input() {
+        let mut draft = ConnectionDraft::from_server(&password_server());
+        draft.password = "replacement-password".into();
+        draft.auto_mount_at_login = true;
+        for method in [ConnectionMethod::Openssh, ConnectionMethod::Interactive] {
+            draft.set_connection_method(method);
+            assert_eq!(draft.auth, AuthMethod::Password);
+            assert_eq!(draft.password, "replacement-password");
+            assert!(!draft.requirements().password);
+            assert!(!draft.requirements().key_file);
+            let validated = draft.validate(&[]).unwrap();
+            assert_eq!(validated.server.auth, AuthMethod::Key);
+            assert_eq!(validated.password, SecretAction::Clear);
+        }
+        assert!(!draft.auto_mount_at_login);
+        draft.set_connection_method(ConnectionMethod::Native);
+        let validated = draft.validate(&[]).unwrap();
+        assert_eq!(validated.server.auth, AuthMethod::Password);
+        assert_eq!(
+            validated.password,
+            SecretAction::Obscure("replacement-password".into())
+        );
+    }
+
+    #[test]
+    fn openssh_transport_does_not_apply_a_hidden_native_key_copy_preference() {
+        let mut draft = ConnectionDraft::from_server(&password_server());
+        draft.ssh_config_managed = true;
+        draft.copy_key_to_ssh_dir = true;
+        draft.set_connection_method(ConnectionMethod::Openssh);
+        let validated = draft.validate(&[]).unwrap();
+        assert!(validated.server.ssh_config_managed);
+        assert!(!validated.server.copy_key_to_ssh_dir);
+        assert!(draft.copy_key_to_ssh_dir);
     }
 
     #[test]
