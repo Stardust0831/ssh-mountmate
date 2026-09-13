@@ -766,11 +766,18 @@ mod tests {
         let started = Instant::now();
         let result =
             read_message_until::<CommandRequest>(&mut stream, started + Duration::from_millis(150));
+        // Measure the reader's deadline, not the time the peer takes to notice
+        // a closed socket. Buffered writes can keep succeeding after drop on
+        // some platforms, so joining the writer can outlast the read timeout.
+        let elapsed = started.elapsed();
         drop(stream);
         writer.join().unwrap();
 
         assert!(result.is_err());
-        assert!(started.elapsed() < Duration::from_millis(400));
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "read took {elapsed:?}"
+        );
     }
 
     #[test]
