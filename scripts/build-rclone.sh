@@ -15,6 +15,8 @@ archive="rclone-${version}.tar.gz"
 sha256=23fb09cd209ac6f4540f75cbcfc913fb1e2a35b90cf1a9d67292e2239b4f3a24
 work="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/ssh-mountmate-${version}-rclone"
 mkdir -p "$work"
+# Git Bash receives RUNNER_TEMP as C:\..., which tar interprets as a remote archive.
+work=$(cd "$work" && pwd)
 archive_path="$work/$archive"
 if [[ ! -f "$archive_path" ]]; then
   curl --fail --location --silent --show-error \
