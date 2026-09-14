@@ -56,7 +56,7 @@ use mountmate_core::ssh::{
     default_ssh_config_path, prepare_managed_ssh_server, remove_managed_ssh_server,
 };
 use mountmate_core::storage::{self, read_json};
-use mountmate_core::transfer::TransferSnapshot;
+use mountmate_core::transfer::{TransferFile, TransferSnapshot};
 use mountmate_core::update::{UpdateInfo, check_for_updates};
 use mountmate_core::update_helper::{
     UpdateHealthAuthorization, run_update_helper, write_update_health_marker,
@@ -573,6 +573,7 @@ struct App {
     mount_statuses: HashMap<String, MountStatus>,
     busy: HashSet<String>,
     transfers: HashMap<String, TransferSnapshot>,
+    transfer_history: HashMap<String, TransferProgressHistory>,
     transfer_errors: HashMap<String, String>,
     operation_errors: HashMap<String, ConnectionOperationError>,
     transfer_failures: HashMap<String, u8>,
@@ -639,6 +640,13 @@ struct App {
 struct UpdateDownloadProgress {
     received: u64,
     total: u64,
+}
+
+#[derive(Debug, Default)]
+struct TransferProgressHistory {
+    active: bool,
+    completed_bytes: u64,
+    known_files: HashMap<String, (u64, u64)>,
 }
 
 #[derive(Default)]
@@ -1677,6 +1685,7 @@ impl App {
             mount_statuses: HashMap::new(),
             busy: HashSet::new(),
             transfers: HashMap::new(),
+            transfer_history: HashMap::new(),
             transfer_errors: HashMap::new(),
             operation_errors: HashMap::new(),
             transfer_failures: HashMap::new(),
@@ -2030,6 +2039,7 @@ impl App {
                 for (id, result) in results {
                     match result {
                         Ok(snapshot) => {
+                            let snapshot = self.smooth_transfer_snapshot(&id, snapshot);
                             self.transfer_failures.remove(&id);
                             let synced_polls = if snapshot.synced {
                                 let polls = self.synced_polls.entry(id.clone()).or_default();
@@ -5221,6 +5231,92 @@ impl App {
         )
     }
 
+    fn smooth_transfer_snapshot(
+        &mut self,
+        server_id: &str,
+        snapshot: TransferSnapshot,
+    ) -> TransferSnapshot {
+        let history = self
+            .transfer_history
+            .entry(server_id.to_owned())
+            .or_default();
+        Self::smooth_transfer_snapshot_with_history(history, snapshot)
+    }
+
+    fn smooth_transfer_snapshot_with_history(
+        history: &mut TransferProgressHistory,
+        mut snapshot: TransferSnapshot,
+    ) -> TransferSnapshot {
+        let has_work = transfer_is_active(&snapshot);
+        // A new queue after a confirmed idle period starts a fresh progress
+        // session. This prevents bytes from unrelated transfers being mixed.
+        if has_work && !history.active {
+            *history = TransferProgressHistory::default();
+            history.active = true;
+        }
+
+        if history.active {
+            let current_keys: HashSet<String> =
+                snapshot.files.iter().map(transfer_file_key).collect();
+
+            // A file disappearing from a non-empty queue is rclone's normal
+            // completion signal. Do not infer completion when the endpoint
+            // returned no per-file details at all; that can be transient.
+            if !snapshot.files.is_empty() || !has_work {
+                let completed = history
+                    .known_files
+                    .keys()
+                    .filter(|key| !current_keys.contains(*key))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for key in completed {
+                    if let Some((size, bytes)) = history.known_files.remove(&key) {
+                        history.completed_bytes =
+                            history.completed_bytes.saturating_add(size.max(bytes));
+                    }
+                }
+            }
+
+            for file in &snapshot.files {
+                let key = transfer_file_key(file);
+                let entry = history
+                    .known_files
+                    .entry(key)
+                    .or_insert((file.size, file.bytes));
+                entry.0 = entry.0.max(file.size);
+                entry.1 = entry.1.max(file.bytes);
+            }
+
+            if history.completed_bytes > 0 {
+                let current_queued_bytes = snapshot.queued_bytes;
+                snapshot.queued_bytes = snapshot
+                    .queued_bytes
+                    .saturating_add(history.completed_bytes);
+                snapshot.transferred_bytes = snapshot
+                    .transferred_bytes
+                    .saturating_add(history.completed_bytes);
+                snapshot.percentage = if has_work && current_queued_bytes == 0 {
+                    // rclone can briefly report upload counters without any
+                    // per-file byte total. Keep the percentage indeterminate
+                    // instead of presenting completed bytes as 100%.
+                    0.0
+                } else if snapshot.queued_bytes == 0 {
+                    100.0
+                } else {
+                    (snapshot.transferred_bytes as f64 * 100.0 / snapshot.queued_bytes as f64)
+                        .clamp(0.0, 100.0)
+                };
+            }
+
+            if !has_work {
+                history.active = false;
+                history.known_files.clear();
+            }
+        }
+
+        snapshot
+    }
+
     fn reconcile_transfer_popups(&mut self) -> Task<Message> {
         let active = self.active_transfer_ids();
         let mut tasks = Vec::new();
@@ -5273,6 +5369,7 @@ impl App {
     fn close_popups_for_server(&mut self, server_id: &str) -> Task<Message> {
         self.dismissed_popups.remove(server_id);
         self.transfers.remove(server_id);
+        self.transfer_history.remove(server_id);
         self.transfer_errors.remove(server_id);
         self.transfer_failures.remove(server_id);
         self.synced_polls.remove(server_id);
@@ -10395,6 +10492,15 @@ fn transfer_label(locale: Locale, snapshot: &TransferSnapshot) -> String {
     }
 }
 
+fn transfer_file_key(file: &TransferFile) -> String {
+    let name = mountmate_core::transfer::normalized_transfer_name(&file.name);
+    if !name.is_empty() {
+        format!("name:{}", name)
+    } else {
+        format!("id:{}", file.id)
+    }
+}
+
 fn transfer_is_active(snapshot: &TransferSnapshot) -> bool {
     snapshot.queued > 0 || snapshot.uploading > 0 || snapshot.errors > 0 || snapshot.out_of_space
 }
@@ -11523,6 +11629,51 @@ mod localization_tests {
             capacity_soft_limit_help(Some(&lustre_capacity), Locale::Chinese),
             Some("软配额：30.0 MB（30%）\n已超过软配额".into())
         );
+    }
+
+    #[test]
+    fn transfer_progress_keeps_completed_bytes_when_queue_shrinks() {
+        fn snapshot(name: &str, bytes: u64, queued: usize) -> TransferSnapshot {
+            TransferSnapshot {
+                files: vec![TransferFile {
+                    id: Default::default(),
+                    name: name.into(),
+                    size: 100,
+                    bytes,
+                    percentage: bytes as f64,
+                    speed: 0.0,
+                    eta: None,
+                    uploading: true,
+                    tries: 0,
+                }],
+                queued,
+                uploading: queued,
+                queued_bytes: 100,
+                transferred_bytes: bytes,
+                percentage: bytes as f64,
+                errors: 0,
+                out_of_space: false,
+                synced: false,
+            }
+        }
+
+        let mut history = TransferProgressHistory::default();
+        let first =
+            App::smooth_transfer_snapshot_with_history(&mut history, snapshot("first.bin", 100, 1));
+        assert_eq!(
+            (
+                first.queued_bytes,
+                first.transferred_bytes,
+                first.percentage
+            ),
+            (100, 100, 100.0)
+        );
+
+        let second =
+            App::smooth_transfer_snapshot_with_history(&mut history, snapshot("second.bin", 0, 1));
+        assert_eq!(second.queued_bytes, 200);
+        assert_eq!(second.transferred_bytes, 100);
+        assert_eq!(second.percentage, 50.0);
     }
 
     #[test]

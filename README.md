@@ -360,6 +360,18 @@ Mounted connection cards show rclone's real VFS upload queue. The recommended ca
 
 The simultaneous-upload setting limits how many different cached files rclone may upload at once. The default is 4, with presets for 8 and 12 and a custom range of 1 through 32. Extra files remain queued in the local cache. Rewriting the same path does not create reliable parallel revisions: rclone cancels or reschedules that path's write-back and the latest local content may overwrite another writer's remote change.
 
+The transfer display keeps completed bytes in the current upload session when rclone removes a file
+from `vfs/queue`, so the overall progress denominator does not shrink as files finish. The display
+still waits for rclone's queue and disk-cache counters to report an idle state before declaring the
+remote synchronized. rclone's own queue is intentionally short-lived and does not expose a durable
+history, so this smoothing is kept in the app and is reset after each confirmed idle period.
+
+rclone writes a closed file back to the remote after `--vfs-write-back` (5 seconds by default), and
+`--vfs-cache-min-free-space` is a cache eviction target rather than a reserved per-file allowance.
+Open or recently written files can temporarily exceed cache limits and cannot be evicted while in
+use. The app therefore keeps the existing full-file VFS cache semantics; allowing a small uncached
+tail would weaken read-after-write consistency and cannot guarantee that the remote copy is complete.
+
 Refresh clears the VFS directory cache, actively reloads the requested directory, and verifies it with a direct remote listing. If local writes are still queued, the result states that the verified remote snapshot does not yet include those uploads.
 
 Right-click a connection card for Open, Refresh, Transfers, and Log actions. Settings can register Refresh and Transfers commands in Windows Explorer, macOS Finder Quick Actions, and Nautilus, Nemo, or KDE file managers on Linux. The commands point back to the same SSH MountMate executable; no helper program is installed. A short-lived file-manager process forwards its request to the running app over authenticated loopback IPC and exits.
