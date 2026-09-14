@@ -22,7 +22,7 @@ if [[ ! -f "$archive_path" ]]; then
   curl --fail --location --silent --show-error \
     "https://downloads.rclone.org/${version}/${archive}" --output "$archive_path"
 fi
-if command -v sha256sum >/dev/null 2>&1; then
+if [[ "$(uname -s)" != Darwin ]] && command -v sha256sum >/dev/null 2>&1; then
   echo "$sha256  $archive_path" | sha256sum --check
 else
   echo "$sha256  $archive_path" | shasum -a 256 --check
