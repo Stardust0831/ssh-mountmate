@@ -147,7 +147,7 @@ jq -n '{
   settings_schema_version: 8,
   vfs_cache_mode: "full",
   vfs_cache_max_age: "30m",
-  vfs_write_back: "90s",
+  vfs_write_back: "10m",
   dir_cache_time: "5m",
   auto_show_transfers: false,
   auto_check_updates: false,
@@ -179,6 +179,18 @@ export SSH_MOUNTMATE_ACTIVE_STATE_FILE="${XDG_STATE_HOME}/rsshmount/local-sftp.j
 cargo test --package mountmate-core --test packaged_update --all-features \
   packaged_update_preserves_real_active_mount -- \
   --ignored --exact --test-threads=1
+
+# Keep the upload queued throughout package copying and verification, including
+# on slower ARM64 runners. Release it explicitly only after the update test has
+# verified that the original mount process and pending upload both survived.
+rc_args=(
+  --url "http://$(jq -r .rc_addr "${SSH_MOUNTMATE_ACTIVE_STATE_FILE}")"
+  --user "$(jq -r .rc_user "${SSH_MOUNTMATE_ACTIVE_STATE_FILE}")"
+  --pass "$(jq -r .rc_pass "${SSH_MOUNTMATE_ACTIVE_STATE_FILE}")"
+)
+queue="$("${rclone}" rc "${rc_args[@]}" vfs/queue)"
+upload_id="$(jq -er '.queue[] | select(.name == "upload.bin" and .uploading == false) | .id' <<<"${queue}")"
+"${rclone}" rc "${rc_args[@]}" vfs/queue-set-expiry "id=${upload_id}" expiry=-1
 
 for _ in $(seq 1 1200); do
   if [[ -f "${remote_root}/upload.bin" ]] \
