@@ -44,7 +44,22 @@ jobs:
       - name: Verify live stable and prerelease update channels
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: cargo test --package mountmate-core update_live_ --all-features -- --ignored --test-threads=1
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/live-update-check.log"
+          for attempt in 1 2 3; do
+            if cargo test --package mountmate-core update_live_ --all-features -- --ignored --test-threads=1 2>&1 | tee "$log"; then
+              exit 0
+            else
+              status=${PIPESTATUS[0]}
+            fi
+            if [ "$attempt" -eq 3 ] || ! grep -Eq 'HTTP status server error \(50[234]|operation timed out|connection reset by peer' "$log"; then
+              exit "$status"
+            fi
+            echo "Retrying live update checks after a transient network failure ($attempt/3)"
+            sleep 10
+          done
       - name: Install stable Cargo for cross-target license metadata
         run: rustup toolchain install 1.88.0 --profile minimal
       - name: Verify generated Rust license inventory
