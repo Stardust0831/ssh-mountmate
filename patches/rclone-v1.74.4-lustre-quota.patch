@@ -1,0 +1,79 @@
+diff --git a/backend/sftp/sftp.go b/backend/sftp/sftp.go
+index 5055c4a..2d97bcf 100644
+--- a/backend/sftp/sftp.go
++++ b/backend/sftp/sftp.go
+@@ -202,6 +202,11 @@ E.g. the second example above should be rewritten as:
+ 			Default:  true,
+ 			Help:     "Set the modified time on the remote if set.",
+ 			Advanced: true,
++		}, {
++			Name:    "lustre_quota",
++			Default: false,
++			Help:    "Use Lustre project hard quota for filesystem usage when available.",
++			Advanced: true,
+ 		}, {
+ 			Name:     "shell_type",
+ 			Default:  "",
+@@ -571,6 +576,7 @@ type Options struct {
+ 	PathOverride            string          `config:"path_override"`
+ 	SetModTime              bool            `config:"set_modtime"`
+ 	ShellType               string          `config:"shell_type"`
++	LustreQuota             bool            `config:"lustre_quota"`
+ 	Hashes                  fs.CommaSepList `config:"hashes"`
+ 	Md5sumCommand           string          `config:"md5sum_command"`
+ 	Sha1sumCommand          string          `config:"sha1sum_command"`
+@@ -1857,6 +1863,13 @@ func (f *Fs) Hashes() hash.Set {
+ 
+ // About gets usage stats
+ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
++	if f.opt.LustreQuota && f.shellType != shellTypeNotSupported && f.shellType != "cmd" && f.shellType != "powershell" {
++		if usage, err := f.aboutLustreQuota(ctx); err == nil && usage != nil {
++			return usage, nil
++		} else if err != nil {
++			fs.Debugf(f, "Lustre quota lookup failed, falling back to filesystem statistics: %v", err)
++		}
++	}
+ 	// If server implements the vendor-specific VFS statistics extension prefer that
+ 	// (OpenSSH implements it on using syscall.Statfs on Linux and API function GetDiskFreeSpace on Windows)
+ 	c, err := f.getSftpConnection(ctx)
+@@ -1954,6 +1967,40 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
+ 	return usage, nil
+ }
+ 
++// aboutLustreQuota returns project quota usage for Lustre paths. It falls back
++// to the normal statvfs/df paths when Lustre tools or project quotas are unavailable.
++func (f *Fs) aboutLustreQuota(ctx context.Context) (*fs.Usage, error) {
++	aboutPath := f.remoteShellPath("")
++	if aboutPath == "" {
++		aboutPath = "."
++	}
++	pathArg, err := f.quoteOrEscapeShellPath(aboutPath)
++	if err != nil {
++		return nil, err
++	}
++	cmd := "p=" + pathArg + "; command -v lfs >/dev/null 2>&1 || exit 1; r=$(readlink -f -- \"$p\" 2>/dev/null || printf '%s' \"$p\"); t=$(df -P -T \"$r\" 2>/dev/null | awk 'NR==2 {print $2}'); [ \"$t\" = lustre ] || exit 1; id=$(lfs project -d \"$r\" 2>/dev/null | awk 'NF >= 3 && $1 ~ /^[0-9]+$/ {print $1; exit}'); [ -n \"$id\" ] || exit 1; lfs quota -p \"$id\" \"$r\" 2>/dev/null | awk 'NF >= 4 && $2 ~ /^[0-9]+[*]?$/{gsub(/[*]/,\"\",$2); gsub(/[*]/,\"\",$4); print $2, $4; exit}'"
++	stdout, err := f.run(ctx, cmd)
++	if err != nil {
++		return nil, err
++	}
++	fields := strings.Fields(string(stdout))
++	if len(fields) < 2 {
++		return nil, nil
++	}
++	used, errUsed := strconv.ParseInt(fields[0], 10, 64)
++	hard, errHard := strconv.ParseInt(fields[1], 10, 64)
++	if errUsed != nil || errHard != nil || used < 0 || hard <= 0 {
++		return nil, nil
++	}
++	used *= 1024
++	hard *= 1024
++	free := hard - used
++	if free < 0 {
++		free = 0
++	}
++	return &fs.Usage{Total: fs.NewUsageValue(hard), Used: fs.NewUsageValue(used), Free: fs.NewUsageValue(free)}, nil
++}
++
+ // Shutdown the backend, closing any background tasks and any
+ // cached connections.
+ func (f *Fs) Shutdown(ctx context.Context) error {

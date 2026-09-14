@@ -63,6 +63,7 @@ impl RcloneRemote {
             ("type".into(), "sftp".into()),
             ("shell_type".into(), "unix".into()),
             ("disable_hashcheck".into(), "true".into()),
+            ("lustre_quota".into(), "true".into()),
         ];
         if server.connection_method != ConnectionMethod::Native {
             let arguments = match server.connection_method {
@@ -810,6 +811,9 @@ mod tests {
                 .contains(&("known_hosts_file".into(), known_hosts.display().to_string()))
         );
         assert!(!remote.options.iter().any(|(key, _)| key == "key_file"));
+        assert!(remote
+            .options
+            .contains(&("lustre_quota".into(), "true".into())));
     }
 
     #[test]

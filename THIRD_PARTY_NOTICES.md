@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-SSH MountMate release builds bundle the official rclone binary for the target platform.
+SSH MountMate release builds bundle rclone v1.74.4 rebuilt from source with the small Lustre project quota patch in `patches/rclone-v1.74.4-lustre-quota.patch`.
 
 The complete generated inventory and license text for every Rust crate linked on the six release
 targets is available in `licenses/RUST-THIRD-PARTY.txt`. CI regenerates it from `Cargo.lock` with
@@ -13,10 +13,10 @@ cargo-about and rejects stale output.
 - License: MIT
 - License text: `licenses/rclone-COPYING.txt`
 
-The bundled rclone binary is downloaded from the official rclone download host during the SSH MountMate build. Release workflows currently pin rclone v1.74.4:
+The release workflow verifies the upstream v1.74.4 source archive, applies the patch above, and builds rclone for each target platform:
 
 ```text
-https://downloads.rclone.org/v1.74.4/rclone-v1.74.4-<platform>-<arch>.zip
+https://downloads.rclone.org/v1.74.4/rclone-v1.74.4.tar.gz
 ```
 
 Platform is `windows`, `osx`, or `linux`; architecture is selected from the build machine, usually `amd64` or `arm64`.
