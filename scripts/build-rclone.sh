@@ -25,11 +25,10 @@ if command -v sha256sum >/dev/null 2>&1; then
 else
   echo "$sha256  $archive_path" | shasum -a 256 --check
 fi
-src="$work/rclone-${version}"
-if [[ ! -d "$src" ]]; then
-  tar -xzf "$archive_path" -C "$work"
-  patch --forward --batch -d "$src" -p1 < "$(cd "$(dirname "$0")/.." && pwd)/patches/rclone-v1.74.4-lustre-quota.patch"
-fi
+src=$(mktemp -d "$work/source.XXXXXX")
+trap 'rm -rf "$src"' EXIT
+tar -xzf "$archive_path" -C "$src" --strip-components=1
+patch --forward --batch -d "$src" -p1 < "$(cd "$(dirname "$0")/.." && pwd)/patches/rclone-v1.74.4-lustre-quota.patch"
 mkdir -p "$output_dir"
 case "$goos" in
   linux|darwin) cgo_enabled=1 ;;
@@ -42,14 +41,20 @@ case "$goarch" in
 esac
 (
   cd "$src"
+  # Run the upstream SFTP unit suite against the patched source before the
+  # platform build. This exercises the option/config path without requiring a
+  # live Lustre cluster. Packaged mount integration runs later in CI; upstream
+  # TestIntegration cases require separately provisioned test servers.
+  go test ./backend/sftp -skip '^TestIntegration'
   GOOS="$goos" GOARCH="$goarch" CGO_ENABLED="$cgo_enabled" \
-    go build -tags cmount -trimpath \
+    go build -tags cmount -trimpath -buildvcs=false \
       -ldflags "-s -w -X github.com/rclone/rclone/fs.Version=${custom_version}" \
       -o "$output" .
 )
-version_output="$($output version 2>&1)"
+version_output="$("$output" version 2>&1)"
 grep -F "${custom_version}" <<<"$version_output" >/dev/null
-mount_help="$($output mount --help 2>&1)"
-grep -Eiq '(^|[[:space:]])mount([[:space:]]|$)' <<<"$mount_help"
+grep -Eq '^- go/tags:.*cmount' <<<"$version_output"
+"$output" mount --help >/dev/null
+"$output" help flags sftp | grep -F -- '--sftp-lustre-quota' >/dev/null
 printf 'Built patched rclone %s for %s/%s (CGO_ENABLED=%s, tags=cmount)\n' \
   "$custom_version" "$goos" "$goarch" "$cgo_enabled" >&2

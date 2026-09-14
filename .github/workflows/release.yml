@@ -122,11 +122,6 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.tag || github.ref }}
-      - name: Install pinned Go for patched rclone
-        uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
-        with:
-          go-version: '1.25.0'
-          check-latest: false
       - name: Validate release version
         shell: bash
         env:
@@ -157,7 +152,7 @@ jobs:
             grep -Rqs 'https://mirror.leaseweb.com/ubuntu-ports' /etc/apt
           fi
           sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 update
-          sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dri libgtk-3-dev libayatana-appindicator3-dev libfuse-dev zip xvfb xdotool x11-utils openbox xterm dbus-x11 dunst haskell-gtk-sni-tray-utils weston fuse3 jq kmod openssh-client golang-go
+          sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dri libgtk-3-dev libayatana-appindicator3-dev libfuse-dev zip xvfb xdotool x11-utils openbox xterm dbus-x11 dunst haskell-gtk-sni-tray-utils weston fuse3 jq kmod openssh-client
       - name: Install verified FUSE-T for macOS mount integration
         if: runner.os == 'macOS'
         shell: bash
@@ -186,12 +181,6 @@ jobs:
           grep -Fx 'test credential::tests::live_system_credential_roundtrip ... ok' "${output}"
           grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "${output}"
       - run: cargo build --release --package ssh-mountmate
-
-      - name: Install pinned Go for patched rclone
-        uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
-        with:
-          go-version: '1.25.0'
-          check-latest: false
 
       - name: Verify Windows icon resources
         if: runner.os == 'Windows'
@@ -244,6 +233,12 @@ jobs:
         shell: pwsh
         run: ./tests/rust_windows_gui_smoke.ps1 -Binary target/release/SSHMountMate.exe
 
+      - name: Install pinned Go for patched rclone
+        uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version: '1.25.0'
+          check-latest: false
+          cache: false
       - name: Build patched rclone
         if: runner.os != 'Windows'
         shell: bash
@@ -274,6 +269,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force target/release/bin | Out-Null
           bash scripts/build-rclone.sh target/release/bin/rclone.exe windows ${{ matrix.rclone_arch }}
+          if ($LASTEXITCODE -ne 0) { throw "patched rclone build failed" }
           (Get-FileHash -Algorithm SHA256 target/release/bin/rclone.exe).Hash.ToLowerInvariant() |
             Set-Content -NoNewline target/release/bin/rclone.exe.sha256
           $plinkUrl = "https://the.earth.li/~sgtatham/putty/$env:PLINK_VERSION/$env:PLINK_ARCH/plink.exe"

@@ -1,20 +1,27 @@
 diff --git a/backend/sftp/sftp.go b/backend/sftp/sftp.go
-index 5055c4a..2d97bcf 100644
 --- a/backend/sftp/sftp.go
 +++ b/backend/sftp/sftp.go
-@@ -202,6 +202,11 @@ E.g. the second example above should be rewritten as:
+@@ -10,6 +10,7 @@
+ 	"fmt"
+ 	"io"
+ 	iofs "io/fs"
++	"math"
+ 	"net/url"
+ 	"os"
+ 	"path"
+@@ -201,6 +202,11 @@
+ 			Name:     "set_modtime",
  			Default:  true,
  			Help:     "Set the modified time on the remote if set.",
- 			Advanced: true,
-+		}, {
-+			Name:    "lustre_quota",
-+			Default: false,
-+			Help:    "Use Lustre project hard quota for filesystem usage when available.",
 +			Advanced: true,
++		}, {
++			Name:     "lustre_quota",
++			Default:  false,
++			Help:     "Use Lustre project hard quota for filesystem usage when available.",
+ 			Advanced: true,
  		}, {
  			Name:     "shell_type",
- 			Default:  "",
-@@ -571,6 +576,7 @@ type Options struct {
+@@ -571,6 +577,7 @@
  	PathOverride            string          `config:"path_override"`
  	SetModTime              bool            `config:"set_modtime"`
  	ShellType               string          `config:"shell_type"`
@@ -22,7 +29,7 @@ index 5055c4a..2d97bcf 100644
  	Hashes                  fs.CommaSepList `config:"hashes"`
  	Md5sumCommand           string          `config:"md5sum_command"`
  	Sha1sumCommand          string          `config:"sha1sum_command"`
-@@ -1857,6 +1863,13 @@ func (f *Fs) Hashes() hash.Set {
+@@ -1857,6 +1864,13 @@
  
  // About gets usage stats
  func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
@@ -36,10 +43,12 @@ index 5055c4a..2d97bcf 100644
  	// If server implements the vendor-specific VFS statistics extension prefer that
  	// (OpenSSH implements it on using syscall.Statfs on Linux and API function GetDiskFreeSpace on Windows)
  	c, err := f.getSftpConnection(ctx)
-@@ -1954,6 +1967,40 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
+@@ -1952,6 +1966,58 @@
+ 		usage.Free = fs.NewUsageValue(usageAvail)
+ 	}
  	return usage, nil
- }
- 
++}
++
 +// aboutLustreQuota returns project quota usage for Lustre paths. It falls back
 +// to the normal statvfs/df paths when Lustre tools or project quotas are unavailable.
 +func (f *Fs) aboutLustreQuota(ctx context.Context) (*fs.Usage, error) {
@@ -51,19 +60,37 @@ index 5055c4a..2d97bcf 100644
 +	if err != nil {
 +		return nil, err
 +	}
-+	cmd := "p=" + pathArg + "; command -v lfs >/dev/null 2>&1 || exit 1; r=$(readlink -f -- \"$p\" 2>/dev/null || printf '%s' \"$p\"); t=$(df -P -T \"$r\" 2>/dev/null | awk 'NR==2 {print $2}'); [ \"$t\" = lustre ] || exit 1; id=$(lfs project -d \"$r\" 2>/dev/null | awk 'NF >= 3 && $1 ~ /^[0-9]+$/ {print $1; exit}'); [ -n \"$id\" ] || exit 1; lfs quota -p \"$id\" \"$r\" 2>/dev/null | awk 'NF >= 4 && $2 ~ /^[0-9]+[*]?$/{gsub(/[*]/,\"\",$2); gsub(/[*]/,\"\",$4); print $2, $4; exit}'"
-+	stdout, err := f.run(ctx, cmd)
++	stdout, err := f.run(ctx, lustreQuotaCommand(pathArg))
 +	if err != nil {
 +		return nil, err
 +	}
++	return parseLustreQuota(stdout), nil
++}
++
++// pathArg has already been escaped for the remote Unix shell.
++func lustreQuotaCommand(pathArg string) string {
++	return "p=" + pathArg + `; command -v lfs >/dev/null 2>&1 || exit 1
++r=$(readlink -f -- "$p" 2>/dev/null || printf '%s' "$p")
++t=$(LC_ALL=C df -P -T "$r" 2>/dev/null | awk 'NR==2 {print $2}')
++[ "$t" = lustre ] || exit 1
++id=$(lfs project -d "$r" 2>/dev/null | awk 'NF >= 3 && $1 ~ /^[0-9]+$/ {print $1; exit}')
++[ -n "$id" ] || exit 1
++q=$(LC_ALL=C lfs quota -p "$id" "$r" 2>/dev/null) || exit 1
++printf '%s\n' "$q" | awk '
++NF >= 3 && $1 ~ /^[0-9]+[*]?$/ {used=$1; hard=$3}
++NF >= 4 && $2 ~ /^[0-9]+[*]?$/ && $1 !~ /^[0-9]+[*]?$/ {used=$2; hard=$4}
++used != "" {gsub(/[*]/,"",used); gsub(/[*]/,"",hard); print used, hard; exit}'`
++}
++
++func parseLustreQuota(stdout []byte) *fs.Usage {
 +	fields := strings.Fields(string(stdout))
-+	if len(fields) < 2 {
-+		return nil, nil
++	if len(fields) != 2 {
++		return nil
 +	}
 +	used, errUsed := strconv.ParseInt(fields[0], 10, 64)
 +	hard, errHard := strconv.ParseInt(fields[1], 10, 64)
-+	if errUsed != nil || errHard != nil || used < 0 || hard <= 0 {
-+		return nil, nil
++	if errUsed != nil || errHard != nil || used < 0 || hard <= 0 || used > math.MaxInt64/1024 || hard > math.MaxInt64/1024 {
++		return nil
 +	}
 +	used *= 1024
 +	hard *= 1024
@@ -71,9 +98,96 @@ index 5055c4a..2d97bcf 100644
 +	if free < 0 {
 +		free = 0
 +	}
-+	return &fs.Usage{Total: fs.NewUsageValue(hard), Used: fs.NewUsageValue(used), Free: fs.NewUsageValue(free)}, nil
++	return &fs.Usage{Total: fs.NewUsageValue(hard), Used: fs.NewUsageValue(used), Free: fs.NewUsageValue(free)}
+ }
+ 
+ // Shutdown the backend, closing any background tasks and any
+diff --git a/backend/sftp/lustre_quota_test.go b/backend/sftp/lustre_quota_test.go
+new file mode 100644
+--- /dev/null
++++ b/backend/sftp/lustre_quota_test.go
+@@ -0,0 +1,84 @@
++//go:build !plan9
++
++package sftp
++
++import (
++	"os"
++	"os/exec"
++	"path/filepath"
++	"runtime"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestParseLustreQuota(t *testing.T) {
++	for _, tc := range []struct {
++		input             string
++		total, used, free int64
++	}{
++		{"40000 100000\n", 102400000, 40960000, 61440000},
++		{"1200 1000", 1024000, 1228800, 0},
++		{"1000 1000", 1024000, 1024000, 0},
++		{"0 1000", 1024000, 0, 1024000},
++	} {
++		u := parseLustreQuota([]byte(tc.input))
++		require.NotNil(t, u, tc.input)
++		require.Equal(t, tc.total, *u.Total)
++		require.Equal(t, tc.used, *u.Used)
++		require.Equal(t, tc.free, *u.Free)
++	}
++	for _, input := range []string{"", "banner", "1 2 extra", "1 0", "1 -", "1 --", "-1 2", "1 -2", "9223372036854775807 2", "1 9223372036854775807"} {
++		require.Nil(t, parseLustreQuota([]byte(input)), input)
++	}
 +}
 +
- // Shutdown the backend, closing any background tasks and any
- // cached connections.
- func (f *Fs) Shutdown(ctx context.Context) error {
++func TestLustreQuotaCommand(t *testing.T) {
++	if runtime.GOOS == "windows" {
++		t.Skip("remote Unix shell fixture runs on Linux and macOS")
++	}
++	bin := t.TempDir()
++	writeTool := func(name, body string) {
++		require.NoError(t, os.WriteFile(filepath.Join(bin, name), []byte("#!/bin/sh\n"+body), 0700))
++	}
++	writeTool("df", `printf 'Filesystem Type Blocks Used Available Use%% Mounted\nmock %s 100 100 0 100%% /lustre\n' "$TEST_FS"`)
++	writeTool("readlink", `[ "$3" = "$TEST_PATH" ] || exit 1; printf '%s\n' "$TEST_RESOLVED"`)
++	writeTool("lfs", `case "$1" in
++project) [ "$3" = "$TEST_RESOLVED" ] || exit 1; printf '42 P %s\n' "$3" ;;
++quota) [ "$3" = 42 ] && [ "$4" = "$TEST_RESOLVED" ] || exit 1
++       printf '%s\n' "$TEST_QUOTA"; exit "$TEST_QUOTA_EXIT" ;;
++esac`)
++	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
++	t.Setenv("TEST_RESOLVED", "/lustre/project with spaces")
++	const remotePath = "/link with spaces/$(exit 19);'file"
++	t.Setenv("TEST_PATH", remotePath)
++	for _, tc := range []struct {
++		name, fs, quota, exit string
++		wantFree              int64
++	}{
++		{"over soft quota", "lustre", "/lustre 40000* 30000 100000 - 3 0 0 -", "0", 61440000},
++		{"wrapped filesystem", "lustre", "/very/long/filesystem\n 40000* 30000 100000* - 3 0 0 -", "0", 61440000},
++		{"hard limit reached", "lustre", "/lustre 100000 30000 100000 - 3 0 0 -", "0", 0},
++		{"no hard limit", "lustre", "/lustre 40000 30000 0 - 3 0 0 -", "0", -1},
++		{"quota command failed", "lustre", "/lustre 40000 30000 100000 - 3 0 0 -", "1", -1},
++		{"not Lustre", "ext4", "/lustre 40000 30000 100000 - 3 0 0 -", "0", -1},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Setenv("TEST_FS", tc.fs)
++			t.Setenv("TEST_QUOTA", tc.quota)
++			t.Setenv("TEST_QUOTA_EXIT", tc.exit)
++			// Paths are literal data even with shell metacharacters.
++			pathArg, err := quoteOrEscapeShellPath("unix", remotePath)
++			require.NoError(t, err)
++			out, err := exec.Command("sh", "-c", lustreQuotaCommand(pathArg)).Output()
++			if tc.wantFree < 0 {
++				require.True(t, err != nil || parseLustreQuota(out) == nil)
++				return
++			}
++			require.NoError(t, err)
++			u := parseLustreQuota(out)
++			require.NotNil(t, u)
++			require.Equal(t, tc.wantFree, *u.Free)
++		})
++	}
++}

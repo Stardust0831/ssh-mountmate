@@ -68,11 +68,6 @@ jobs:
           sh scripts/generate-rust-licenses.sh "${cargo_about}" "${generated}" online
           cmp "${generated}" licenses/RUST-THIRD-PARTY.txt
       - run: cargo build --package ssh-mountmate
-      - name: Install pinned Go for patched rclone
-        uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
-        with:
-          go-version: '1.25.0'
-          check-latest: false
       - name: Build Freedesktop notification protocol probe
         run: cargo build --package ssh-mountmate --example freedesktop_notification_probe
       - name: Single-instance GUI smoke test
@@ -89,36 +84,30 @@ jobs:
             artifact: SSHMountMate-rust-windows-x64
             rclone_platform: windows
             rclone_arch: amd64
-            rclone_sha256: ef097ef9de37a57feb7d9f9c7afb34148ad3c65be8025f1d8f7f521554a701ea
             plink_arch: w64
             plink_sha256: e5621ffe4879f0ec39ed40f688db9399c2d43054d41ef14472fa335c4693b915
           - os: windows-11-arm
             artifact: SSHMountMate-rust-windows-arm64
             rclone_platform: windows
             rclone_arch: arm64
-            rclone_sha256: 72194ad0aaf210d7a55808801191fecc7e175444dab7be7491b7a63074521f3a
             plink_arch: wa64
             plink_sha256: 998011ef455dabbb66c176913ea897a58e176402d53dc01607a5b36610a7f5fa
           - os: macos-15-intel
             artifact: SSHMountMate-rust-macos-x64
             rclone_platform: osx
             rclone_arch: amd64
-            rclone_sha256: 4188aa84043d7a6240912923f47639a9d2da21f3b40a521c065c8d92e66563f6
           - os: macos-14
             artifact: SSHMountMate-rust-macos-arm64
             rclone_platform: osx
             rclone_arch: arm64
-            rclone_sha256: c2100e2d4a4b3be04c55cd45380cafe7647e1ad772bb055f52f00876ed701167
           - os: ubuntu-latest
             artifact: SSHMountMate-rust-linux-x64
             rclone_platform: linux
             rclone_arch: amd64
-            rclone_sha256: fe435e0c36228e7c2f116a8701f01127bb1f694005fc11d1f27186c8bca4115d
           - os: ubuntu-24.04-arm
             artifact: SSHMountMate-rust-linux-arm64
             rclone_platform: linux
             rclone_arch: arm64
-            rclone_sha256: 97685285c9ad6a0cf17d5844115d2a67245af6444db672187074bd9c358de419
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -140,7 +129,7 @@ jobs:
             grep -Rqs 'https://mirror.leaseweb.com/ubuntu-ports' /etc/apt
           fi
           sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 update
-          sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dri libgtk-3-dev libayatana-appindicator3-dev libfuse-dev zip xvfb xdotool x11-utils openbox xterm dbus-x11 fuse3 jq kmod openssh-client golang-go
+          sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dri libgtk-3-dev libayatana-appindicator3-dev libfuse-dev zip xvfb xdotool x11-utils openbox xterm dbus-x11 fuse3 jq kmod openssh-client
       - name: Install verified FUSE-T for macOS mount integration
         if: runner.os == 'macOS'
         shell: bash
@@ -312,6 +301,12 @@ jobs:
         timeout-minutes: 3
         shell: pwsh
         run: ./tests/rust_windows_gui_smoke.ps1 -Binary target/release/SSHMountMate.exe
+      - name: Install pinned Go for patched rclone
+        uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version: '1.25.0'
+          check-latest: false
+          cache: false
       - name: Build patched rclone
         if: runner.os != 'Windows'
         shell: bash
@@ -338,6 +333,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force target/release/bin | Out-Null
           bash scripts/build-rclone.sh target/release/bin/rclone.exe windows ${{ matrix.rclone_arch }}
+          if ($LASTEXITCODE -ne 0) { throw "patched rclone build failed" }
           (Get-FileHash -Algorithm SHA256 target/release/bin/rclone.exe).Hash.ToLowerInvariant() |
             Set-Content -NoNewline target/release/bin/rclone.exe.sha256
           $plinkUrl = "https://the.earth.li/~sgtatham/putty/$env:PLINK_VERSION/$env:PLINK_ARCH/plink.exe"

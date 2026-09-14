@@ -19,6 +19,9 @@ The release workflow verifies the upstream v1.74.4 source archive, applies the p
 https://downloads.rclone.org/v1.74.4/rclone-v1.74.4.tar.gz
 ```
 
+Source archive SHA-256: `23fb09cd209ac6f4540f75cbcfc913fb1e2a35b90cf1a9d67292e2239b4f3a24`.
+The resulting binary reports the build version `v1.74.4-lustre-quota`.
+
 Platform is `windows`, `osx`, or `linux`; architecture is selected from the build machine, usually `amd64` or `arm64`.
 
 ## rfd
