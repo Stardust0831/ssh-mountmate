@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use iced::widget::{
     Space, button, checkbox, column, container, keyed_column, pick_list, progress_bar, responsive,
-    row, scrollable, stack, text, text_editor, text_input, toggler, tooltip,
+    row, rule, scrollable, stack, text, text_editor, text_input, toggler, tooltip,
 };
 use iced::{
     Center, Color, Element, Fill, Length, Point, Size, Subscription, Task, Theme, clipboard,
@@ -8040,8 +8040,43 @@ fn capacity_progress_view(
     locale: Locale,
 ) -> Element<'static, Message> {
     let (percentage, label) = capacity_progress_state(capacity, checking, locale);
-    stack![
-        progress_bar(0.0..=100.0, percentage).girth(Length::Fixed(22.0)),
+    let soft_limit_exceeded = capacity.is_some_and(CapacityInfo::soft_limit_exceeded);
+    let bar = progress_bar(0.0..=100.0, percentage)
+        .girth(Length::Fixed(22.0))
+        .style(move |theme| {
+            if soft_limit_exceeded {
+                iced::widget::progress_bar::warning(theme)
+            } else {
+                iced::widget::progress_bar::primary(theme)
+            }
+        });
+
+    // Keep the hard limit as the bar's range and use a thin marker for the
+    // Lustre soft limit. The marker is only a visual warning; it does not
+    // change the hard-capacity percentage. Upload enforcement remains
+    // controlled by the server's Lustre policy.
+    let soft_marker = capacity
+        .and_then(CapacityInfo::soft_limit_percent)
+        .map(|percent| {
+            let left = (percent.clamp(0.0, 100.0) * 100.0).round() as u16;
+            let right = 10_000u16.saturating_sub(left);
+            row![
+                Space::new().width(Length::FillPortion(left.max(1))),
+                rule::vertical(2).style(|theme: &Theme| rule::Style {
+                    color: theme.extended_palette().warning.strong.color,
+                    radius: 0.0.into(),
+                    fill_mode: rule::FillMode::Full,
+                    snap: true,
+                }),
+                Space::new().width(Length::FillPortion(right.max(1))),
+            ]
+            .width(Fill)
+            .height(Length::Fixed(22.0))
+        });
+
+    let content: Element<'static, Message> = stack![
+        bar,
+        soft_marker,
         container(text(label).size(12))
             .width(Fill)
             .height(Length::Fixed(22.0))
@@ -8050,7 +8085,20 @@ fn capacity_progress_view(
     ]
     .width(Fill)
     .height(Length::Fixed(22.0))
-    .into()
+    .into();
+
+    if let Some(help) = capacity_soft_limit_help(capacity, locale) {
+        tooltip(
+            content,
+            container(text(help).size(12))
+                .padding(8)
+                .style(container::rounded_box),
+            tooltip::Position::FollowCursor,
+        )
+        .into()
+    } else {
+        content
+    }
 }
 
 fn inode_progress_view(inode: &InodeInfo, locale: Locale) -> Element<'static, Message> {
@@ -8117,6 +8165,30 @@ fn capacity_progress_state(
             },
         )
     }
+}
+
+fn capacity_soft_limit_help(capacity: Option<&CapacityInfo>, locale: Locale) -> Option<String> {
+    let capacity = capacity?;
+    let percent = capacity.soft_limit_percent()?;
+    let exceeded = capacity.soft_limit_exceeded();
+    Some(match locale {
+        Locale::English if exceeded => format!(
+            "Soft limit: {} ({percent:.0}%)\nSoft limit exceeded",
+            format_bytes(capacity.soft_total?)
+        ),
+        Locale::English => format!(
+            "Soft limit: {} ({percent:.0}%)",
+            format_bytes(capacity.soft_total?)
+        ),
+        Locale::Chinese if exceeded => format!(
+            "软配额：{}（{percent:.0}%）\n已超过软配额",
+            format_bytes(capacity.soft_total?)
+        ),
+        Locale::Chinese => format!(
+            "软配额：{}（{percent:.0}%）",
+            format_bytes(capacity.soft_total?)
+        ),
+    })
 }
 
 fn connection_card<'a>(
@@ -11411,6 +11483,7 @@ mod localization_tests {
             total: 1024 * 1024,
             percent: 25,
             source: mountmate_core::capacity::CapacitySource::RemoteFilesystem,
+            soft_total: None,
             inode: None,
         };
         assert_eq!(
@@ -11424,6 +11497,31 @@ mod localization_tests {
         assert_eq!(
             capacity_progress_state(None, false, Locale::Chinese),
             (0.0, "容量：未知".into())
+        );
+
+        let lustre_capacity = CapacityInfo {
+            used: 40 * 1024 * 1024,
+            total: 100 * 1024 * 1024,
+            percent: 40,
+            source: mountmate_core::capacity::CapacitySource::LustreProjectQuota,
+            soft_total: Some(30 * 1024 * 1024),
+            inode: None,
+        };
+        assert_eq!(
+            capacity_progress_state(Some(&lustre_capacity), false, Locale::English),
+            (40.0, "Capacity: 40.0 MB / 100.0 MB used (40%)".into())
+        );
+        assert_eq!(
+            capacity_progress_state(Some(&lustre_capacity), false, Locale::Chinese),
+            (40.0, "容量：已用 40.0 MB / 100.0 MB（40%）".into())
+        );
+        assert_eq!(
+            capacity_soft_limit_help(Some(&lustre_capacity), Locale::English),
+            Some("Soft limit: 30.0 MB (30%)\nSoft limit exceeded".into())
+        );
+        assert_eq!(
+            capacity_soft_limit_help(Some(&lustre_capacity), Locale::Chinese),
+            Some("软配额：30.0 MB（30%）\n已超过软配额".into())
         );
     }
 

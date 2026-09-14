@@ -37,7 +37,7 @@ project_out=$(lfs project -d "$resolved" 2>/dev/null || true)
 project_id=$(printf '%s\n' "$project_out" | awk 'NF >= 3 && $1 ~ /^[0-9]+$/ {print $1; exit}')
 if [ -z "$project_id" ]; then exit 0; fi
 quota_out=$(lfs quota -p "$project_id" "$resolved" 2>/dev/null || true)
-if ! printf '%s\n' "$quota_out" | awk 'NF >= 4 && $2 ~ /^[0-9]+$/ {found=1} END {exit !found}'; then
+if ! printf '%s\n' "$quota_out" | awk 'NF >= 4 && $2 ~ /^[0-9]+[*]?$/ {found=1} END {exit !found}'; then
   quota_out=$(lfs quota -p "$project_id" "$mountpoint" 2>/dev/null || true)
 fi
 printf '%s\n' "$quota_out"
@@ -76,6 +76,9 @@ pub struct CapacityInfo {
     pub total: u64,
     pub percent: u8,
     pub source: CapacitySource,
+    /// The Lustre block soft limit, when the capacity came from a project
+    /// quota. The hard limit remains `total` and is the primary capacity.
+    pub soft_total: Option<u64>,
     /// Optional inode usage for filesystems (notably Lustre) that expose it.
     pub inode: Option<InodeInfo>,
 }
@@ -85,6 +88,21 @@ pub struct InodeInfo {
     pub used: u64,
     pub total: u64,
     pub percent: u8,
+}
+
+impl CapacityInfo {
+    /// Returns the soft-limit position on the hard-limit capacity bar.
+    pub fn soft_limit_percent(&self) -> Option<f32> {
+        let soft = self.soft_total?;
+        if self.total == 0 {
+            return None;
+        }
+        Some((soft as f64 * 100.0 / self.total as f64).clamp(0.0, 100.0) as f32)
+    }
+
+    pub fn soft_limit_exceeded(&self) -> bool {
+        self.soft_total.is_some_and(|soft| self.used >= soft)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -312,30 +330,54 @@ pub fn parse_lustre_quota(output: &str) -> Option<CapacityInfo> {
         if fields.len() < 4 {
             continue;
         }
-        let (Ok(used_kib), Ok(limit_kib)) = (fields[1].parse::<u64>(), fields[3].parse::<u64>())
-        else {
+        let Some(used_kib) = parse_quota_used_token(fields[1]) else {
             continue;
         };
-        if limit_kib == 0 {
-            return None;
-        }
+        let Some(limit_kib) = parse_quota_limit_token(fields[3]) else {
+            continue;
+        };
         let mut capacity = capacity_from_usage(
             limit_kib.saturating_mul(1024),
             used_kib.saturating_mul(1024),
             CapacitySource::LustreProjectQuota,
         )?;
+        if let Some(soft_kib) = parse_quota_limit_token(fields[2])
+            && soft_kib <= limit_kib
+        {
+            capacity.soft_total = Some(soft_kib.saturating_mul(1024));
+        }
         // lfs quota columns after the byte quota are: files used, quota, limit, grace.
         // A zero limit means unlimited, so leave inode information unavailable.
         if fields.len() >= 8
-            && let (Ok(inode_used), Ok(inode_limit)) =
-                (fields[5].parse::<u64>(), fields[7].parse::<u64>())
-            && inode_limit > 0
+            && let (Some(inode_used), Some(inode_limit)) = (
+                parse_quota_used_token(fields[5]),
+                parse_quota_limit_token(fields[7]),
+            )
         {
             capacity.inode = inode_from_usage(inode_limit, inode_used);
         }
         return Some(capacity);
     }
     None
+}
+
+/// Parse a Lustre quota usage column. Lustre appends `*` when a quota is over
+/// its soft or hard threshold; the marker is presentation metadata rather than
+/// part of the numeric value.
+fn parse_quota_used_token(value: &str) -> Option<u64> {
+    value.strip_suffix('*').unwrap_or(value).parse::<u64>().ok()
+}
+
+/// Parse a Lustre quota limit column. `-`, `--`, and zero represent an
+/// unlimited limit. The caller can distinguish an unavailable hard limit from
+/// a real numeric capacity by checking the returned `Option`.
+fn parse_quota_limit_token(value: &str) -> Option<u64> {
+    let value = value.strip_suffix('*').unwrap_or(value);
+    if matches!(value, "-" | "--") {
+        return None;
+    }
+    let value = value.parse::<u64>().ok()?;
+    (value > 0).then_some(value)
 }
 
 pub fn parse_filesystem_capacity(output: &str) -> Option<CapacityInfo> {
@@ -372,6 +414,7 @@ fn capacity_from_usage(total: u64, used: u64, source: CapacitySource) -> Option<
         total,
         percent,
         source,
+        soft_total: None,
         inode: None,
     })
 }
@@ -494,7 +537,57 @@ mod tests {
         assert_eq!(capacity.total, 1000 * 1024);
         assert_eq!(capacity.percent, 100);
         assert_eq!(capacity.source, CapacitySource::LustreProjectQuota);
+        assert_eq!(capacity.soft_total, None);
         assert_eq!(capacity.inode, None);
+    }
+
+    #[test]
+    fn lustre_quota_keeps_the_soft_limit_as_a_marker_but_uses_hard_limit_for_capacity() {
+        let capacity = parse_lustre_quota("/lustre 40000 30000 100000 - 3 0 0 -\n").unwrap();
+        assert_eq!(capacity.used, 40000 * 1024);
+        assert_eq!(capacity.total, 100000 * 1024);
+        assert_eq!(capacity.soft_total, Some(30000 * 1024));
+        assert_eq!(capacity.percent, 40);
+        assert_eq!(capacity.soft_limit_percent(), Some(30.0));
+        assert!(capacity.soft_limit_exceeded());
+
+        let below_soft = parse_lustre_quota("/lustre 20000 30000 100000 - 3 0 0 -\n").unwrap();
+        assert!(!below_soft.soft_limit_exceeded());
+        assert_eq!(below_soft.soft_limit_percent(), Some(30.0));
+    }
+
+    #[test]
+    fn lustre_quota_ignores_unlimited_or_invalid_soft_limits() {
+        let unlimited = parse_lustre_quota("/lustre 1200 0 1000 - 3 0 0 -\n").unwrap();
+        assert_eq!(unlimited.soft_total, None);
+
+        let invalid = parse_lustre_quota("/lustre 1200 2000 1000 - 3 0 0 -\n").unwrap();
+        assert_eq!(invalid.soft_total, None);
+
+        let non_numeric = parse_lustre_quota("/lustre 1200 - 1000  - 3 0 0 -\n").unwrap();
+        assert_eq!(non_numeric.soft_total, None);
+    }
+
+    #[test]
+    fn lustre_quota_accepts_over_limit_markers() {
+        let capacity = parse_lustre_quota("/lustre 1200* 1000* 2000* - 300* 0 1000* -\n").unwrap();
+        assert_eq!(capacity.used, 1200 * 1024);
+        assert_eq!(capacity.total, 2000 * 1024);
+        assert_eq!(capacity.soft_total, Some(1000 * 1024));
+        assert_eq!(
+            capacity.inode,
+            Some(InodeInfo {
+                used: 300,
+                total: 1000,
+                percent: 30,
+            })
+        );
+    }
+
+    #[test]
+    fn lustre_quota_skips_rows_without_a_hard_limit() {
+        assert!(parse_lustre_quota("/lustre 1200 1000 - -\n").is_none());
+        assert!(parse_lustre_quota("/lustre 1200 1000 -- -\n").is_none());
     }
 
     #[test]
