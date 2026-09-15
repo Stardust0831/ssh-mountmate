@@ -345,7 +345,11 @@ impl ConnectionDraft {
         } else {
             self.auth
         };
-        let key_file = self.key_file.trim().to_owned();
+        let key_file = if auth == AuthMethod::Password {
+            String::new()
+        } else {
+            self.key_file.trim().to_owned()
+        };
         if requirements.key_file {
             validate_private_key(&key_file)?;
         }
@@ -1157,6 +1161,31 @@ mod tests {
                 .password_obscured,
             "kept-secret"
         );
+    }
+
+    #[test]
+    fn switching_to_password_drops_hidden_private_key_fields() {
+        let existing = ServerConfig {
+            auth: AuthMethod::Key,
+            key_file: "/missing/old-private-key".into(),
+            key_pass_obscured: "old-key-passphrase".into(),
+            copy_key_to_ssh_dir: true,
+            ssh_config_managed: true,
+            ..password_server()
+        };
+        let mut draft = ConnectionDraft::from_server(&existing);
+        draft.auth = AuthMethod::Password;
+        draft.password = "new-password".into();
+        assert!(!draft.requirements().key_file);
+        let validated = draft.validate(&[existing]).unwrap();
+        assert!(validated.server.key_file.is_empty());
+        assert!(!validated.server.copy_key_to_ssh_dir);
+        assert_eq!(validated.key_passphrase, SecretAction::Clear);
+        let saved = validated
+            .apply_secrets(Some("obscured-password".into()), None)
+            .unwrap();
+        assert_eq!(saved.auth, AuthMethod::Password);
+        assert!(saved.key_pass_obscured.is_empty());
     }
 
     #[test]

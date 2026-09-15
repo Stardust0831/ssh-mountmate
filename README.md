@@ -39,7 +39,7 @@ Windows:
 
 Copyable Windows dependency commands:
 
-WinFsp can be downloaded directly from https://winfsp.dev/rel/ . If winget works well on your network, this command is also available:
+When WinFsp is missing, the app offers to install `WinFsp.WinFsp` from the winget source. Installation starts after you accept the prompt and may require Windows administrator approval. If winget is unavailable or fails, the app opens https://winfsp.dev/rel/ for manual installation. You can also install it yourself:
 
 ```powershell
 winget install --id WinFsp.WinFsp -e
@@ -247,7 +247,9 @@ SSH MountMate can read your OpenSSH config and list concrete `Host` entries. Sel
 
 After import, the connection is saved as an editable profile. Native SFTP uses the saved host, username, port, and authentication settings. Older alias-only profiles still resolve missing defaults from the source SSH config.
 
-OpenSSH and supported interactive shared SSH connections apply the saved host, username, and port while retaining the original alias and config for features such as `ProxyJump` and `Include`. The selected key is preferred; other `IdentityFile` entries in that config remain available as OpenSSH authentication fallbacks. Keep the source config available when using these methods.
+For `OpenSSH`, an imported connection uses `ssh -o BatchMode=yes -F <config> <alias>`. The displayed host, user, port, and key are an import snapshot; they do not override the live config. Keep the source config available. Its `Include`, `Match`, proxy, agent, certificate, and host-key settings remain in effect. Edit that config to change how the alias connects, or select Native SFTP to use the saved editable fields.
+
+Interactive shared SSH uses the saved host, username, and port. On macOS/Linux it also retains the alias and config for OpenSSH options; Windows uses Plink's supported direct-connection settings.
 
 Batch import uses the selected config file and resolves each host with OpenSSH's `ssh -F <config> -G <host>` behavior. This keeps OpenSSH include/default handling while still saving normal editable SSH MountMate connections.
 
@@ -287,7 +289,7 @@ mounts and capacity probes that need it will ask for login again; already runnin
 not automatically unmounted, but they can report transport errors until a shared session is
 re-established.
 
-When `OpenSSH` is selected, SSH MountMate does not save or pass key passphrases to `ssh`. Add passphrase-protected keys to your agent first:
+`OpenSSH` runs without login prompts and does not receive saved passwords or key passphrases from the app. Use Native SFTP for a saved password, or Interactive shared SSH for terminal password, passphrase, MFA, and first-use host-key prompts. For non-interactive OpenSSH, add passphrase-protected keys to your agent first:
 
 ```bash
 ssh-add ~/.ssh/id_ed25519
@@ -332,14 +334,14 @@ responses, and rotating 2FA codes are entered only in the terminal owned by Open
 
 SSH MountMate requires host key validation for native rclone SFTP connections.
 
-For rclone SFTP remotes, the app maintains its own `known_hosts` file. The first connection to a host and port records the keys returned by `ssh-keyscan`; later connections keep those pinned keys instead of replacing them from the network.
+For rclone SFTP remotes, the app first looks for an existing host-and-port binding in its managed `known_hosts`, SSH config trust files, or the user's default `known_hosts`. Only when no existing binding is available does it record keys returned by `ssh-keyscan` in its managed file. Existing trusted keys are not replaced by network scan results.
 
 If host key scanning fails or returns no usable key, the app may use an existing readable
 `known_hosts` file only when it already contains a binding for the exact host and port. Otherwise
 the mount stops. Native SFTP never silently starts without a host-key binding. OpenSSH and
 interactive shared-SSH transports continue to apply their own SSH host-key policy.
 
-If rclone reports `knownhosts: key mismatch`, SSH MountMate stops the mount rather than disabling validation. Verify the new fingerprint with the server administrator before removing that host's old entry from the app-managed `known_hosts` file and trying again.
+If rclone reports `knownhosts: key mismatch`, SSH MountMate stops the mount rather than disabling validation. Verify the new fingerprint with the server administrator before updating the host's entry in the applicable `known_hosts` file. A server host-key fingerprint is separate from your login password or client private key.
 
 ## Local Control Authentication
 

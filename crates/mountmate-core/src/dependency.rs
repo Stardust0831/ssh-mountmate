@@ -8,6 +8,54 @@ use crate::rclone_binary::{
     RcloneBinaryError, ResolvedRclone, find_system_executable, resolve_rclone,
 };
 
+pub const WINFSP_INSTALL_URL: &str = "https://winfsp.dev/rel/";
+
+fn winfsp_install_command(winget: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new(winget);
+    command.args([
+        "install",
+        "--id",
+        "WinFsp.WinFsp",
+        "--exact",
+        "--source",
+        "winget",
+        "--silent",
+        "--accept-package-agreements",
+        "--accept-source-agreements",
+        "--disable-interactivity",
+    ]);
+    command.stdin(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    command
+}
+
+/// Called only after the user accepts the installation prompt. The installer
+/// may still show Windows' elevation prompt; winget handles the signed package.
+pub fn install_winfsp_via_winget() -> Result<(), String> {
+    if !cfg!(windows) {
+        return Err("WinFsp installation is only available on Windows".into());
+    }
+    if mount_dependency_available(MountBackend::Fuse) {
+        return Ok(());
+    }
+    let winget = find_system_executable("winget.exe")
+        .ok_or_else(|| "winget.exe was not found".to_owned())?;
+    let output = winfsp_install_command(&winget)
+        .output()
+        .map_err(|error| format!("Could not start winget: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("winget exited with {}", output.status));
+    }
+    if !mount_dependency_available(MountBackend::Fuse) {
+        return Err("WinFsp is not available yet; Windows may need to restart".into());
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct DependencyStatus {
     pub rclone: Option<ResolvedRclone>,
@@ -80,7 +128,14 @@ fn fuse_dependency_installed() -> bool {
         .filter_map(std::env::var_os)
         .map(PathBuf::from)
         .map(|root| root.join("WinFsp"))
-        .any(|root| root.is_dir())
+        .any(|root| winfsp_runtime_installed_at(&root))
+}
+
+#[cfg(any(windows, test))]
+fn winfsp_runtime_installed_at(root: &Path) -> bool {
+    ["winfsp-x64.dll", "winfsp-x86.dll", "winfsp-a64.dll"]
+        .into_iter()
+        .any(|name| root.join("bin").join(name).is_file())
 }
 
 #[cfg(target_os = "macos")]
@@ -116,6 +171,35 @@ fn fuse_dependency_installed() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn winget_install_selects_only_the_exact_winfsp_package() {
+        let command = winfsp_install_command(Path::new("C:/Program Files/winget.exe"));
+        assert_eq!(command.get_program(), "C:/Program Files/winget.exe");
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+        assert_eq!(args[0], "install");
+        assert!(
+            args.windows(2)
+                .any(|args| args == ["--id", "WinFsp.WinFsp"])
+        );
+        assert!(args.windows(2).any(|args| args == ["--source", "winget"]));
+        assert!(args.contains(&"--exact"));
+        assert!(args.contains(&"--disable-interactivity"));
+        assert!(args.contains(&"--accept-package-agreements"));
+    }
+
+    #[test]
+    fn empty_winfsp_directory_does_not_count_as_installed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("WinFsp");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        assert!(!winfsp_runtime_installed_at(&root));
+        std::fs::write(root.join("bin/winfsp-x64.dll"), b"runtime fixture").unwrap();
+        assert!(winfsp_runtime_installed_at(&root));
+    }
 
     #[test]
     fn missing_dependencies_have_stable_user_facing_names() {

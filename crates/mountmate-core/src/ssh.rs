@@ -293,7 +293,10 @@ fn prepare_managed_ssh_server_at(
     restrict_path(permissions, &managed_dir, true)?;
     let _lock = FileLock::acquire(&lock_path, Duration::from_secs(30))?;
 
-    if server.copy_key_to_ssh_dir {
+    // A saved key path can remain after switching to password authentication.
+    // It must not be validated, copied, or exported for password profiles.
+    let uses_key = server.auth == crate::AuthMethod::Key;
+    if uses_key && server.copy_key_to_ssh_dir {
         server.key_file = copy_private_key(
             Path::new(&server.key_file),
             ssh_dir,
@@ -302,7 +305,10 @@ fn prepare_managed_ssh_server_at(
         )?
         .display()
         .to_string();
-    } else if !server.key_file.trim().is_empty() && !expand_home(&server.key_file).is_file() {
+    } else if uses_key
+        && !server.key_file.trim().is_empty()
+        && !expand_home(&server.key_file).is_file()
+    {
         return Err(SshError::InvalidPrivateKey(expand_home(&server.key_file)));
     }
 
@@ -315,7 +321,7 @@ fn prepare_managed_ssh_server_at(
         quote_ssh_value(&server.user),
         server.port,
     );
-    if !server.key_file.trim().is_empty() {
+    if uses_key && !server.key_file.trim().is_empty() {
         content.push_str(&format!(
             "    IdentityFile {}\n    IdentitiesOnly yes\n",
             quote_ssh_value(&home_relative_ssh_path(Path::new(&server.key_file)))
@@ -1264,6 +1270,30 @@ mod tests {
                 .iter()
                 .any(|(path, directory)| { path == &managed && !directory })
         );
+    }
+
+    #[test]
+    fn password_profile_ignores_old_private_key_and_copy_preferences() {
+        let temp = tempdir().unwrap();
+        let ssh_dir = temp.path().join(".ssh");
+        for copy_key in [false, true] {
+            let mut server = crate::ServerConfig {
+                host_alias: "password-login".into(),
+                host: "login.example".into(),
+                user: "alice".into(),
+                auth: crate::AuthMethod::Password,
+                ssh_config_managed: true,
+                key_file: temp.path().join("missing-old-key").display().to_string(),
+                copy_key_to_ssh_dir: copy_key,
+                ..crate::ServerConfig::default()
+            };
+            prepare_managed_ssh_server_at(&mut server, &FakePermissions::default(), &ssh_dir)
+                .unwrap();
+            let content = fs::read_to_string(&server.managed_ssh_config_path).unwrap();
+            assert!(content.contains("Host password-login"));
+            assert!(!content.contains("IdentityFile"));
+            assert!(!content.contains("IdentitiesOnly"));
+        }
     }
 
     #[test]

@@ -39,7 +39,7 @@ Windows：
 
 Windows 依赖可复制命令：
 
-WinFsp 可以直接从 https://winfsp.dev/rel/ 下载。如果当前网络下 winget 可用，也可以使用下面的命令：
+缺少 WinFsp 时，程序会提示通过 winget 源安装 `WinFsp.WinFsp`，确认后开始安装，可能需要 Windows 管理员授权。若 winget 不可用或安装失败，会打开 https://winfsp.dev/rel/ 供手动安装。也可以自行运行：
 
 ```powershell
 winget install --id WinFsp.WinFsp -e
@@ -235,7 +235,9 @@ SSH MountMate 会读取 OpenSSH config 中具体的 `Host` 条目。选择后会
 
 导入后，连接会保存为可编辑的配置。原生 SFTP 使用已保存的主机、用户名、端口和认证设置。旧版仅保存 Host 别名的配置，仍会从源 SSH config 解析缺少的默认值。
 
-OpenSSH 和受支持的交互式共享 SSH 连接会应用已保存的主机、用户名和端口，同时保留原 Host 别名与 config，以支持 `ProxyJump`、`Include` 等功能。选定的密钥会优先使用；源 config 中其他 `IdentityFile` 仍可作为 OpenSSH 的备用认证密钥。使用这些连接方式时，请保留源 config。
+选择 `OpenSSH` 时，导入连接使用 `ssh -o BatchMode=yes -F <config> <alias>`。界面中的主机、用户名、端口和密钥只是导入快照，不会覆盖当前 config。请保留源 config；其中的 `Include`、`Match`、代理、证书和主机密钥校验设置继续生效。要改变别名的连接行为，请修改该 config；若要使用软件中保存的可编辑字段，请选择原生 SFTP。
+
+交互式共享 SSH 使用已保存的主机、用户名和端口。macOS/Linux 还会保留别名与 config 以读取 OpenSSH 选项；Windows 则使用 Plink 支持的直连配置。
 
 批量导入会使用用户选择的 config 文件，并通过 OpenSSH 的 `ssh -F <config> -G <host>` 行为解析每个 Host。这样可以复用 OpenSSH 的 Include 和默认值处理，同时仍然保存为普通可编辑的 SSH MountMate 连接。
 
@@ -270,7 +272,7 @@ macOS 和 Linux 使用位于私有状态目录中的 OpenSSH ControlMaster socke
 支持。结束应用内会话会终止可复用会话，之后的新挂载或依赖该会话的容量查询会要求重新登录；
 已经运行的 rclone 挂载不会被程序自动卸载，但在重新建立共享会话前可能报告传输错误。
 
-选择 `OpenSSH` 时，SSH MountMate 不会保存或传递密钥短语给 `ssh`。带短语的密钥需要先加入 agent：
+`OpenSSH` 以非交互方式运行，不会接收软件中保存的密码或私钥密码。要使用保存的登录密码，请选择原生 SFTP；需要在终端输入密码、私钥密码、MFA 或首次确认主机指纹时，请选择交互式共享 SSH。非交互式 OpenSSH 使用带密码的私钥时，需要先将它加入 agent：
 
 ```bash
 ssh-add ~/.ssh/id_ed25519
@@ -311,13 +313,13 @@ OpenSSH 或 Plink 自己的终端中输入。
 
 SSH MountMate 要求 rclone 原生 SFTP 连接必须启用 host key 校验。
 
-对于 rclone SFTP remote，程序会维护自己的 `known_hosts` 文件。首次连接某个 host 和 port 时，会记录 `ssh-keyscan` 返回的 key；后续连接会固定使用这些 key，不再用网络扫描结果覆盖。
+对于 rclone SFTP remote，程序会优先查找托管 `known_hosts`、SSH config 指定的信任文件或用户默认 `known_hosts` 中已有的主机与端口绑定。只有找不到已有绑定时，才将 `ssh-keyscan` 返回的 key 记录到托管文件。已有信任记录不会被网络扫描结果覆盖。
 
 如果 host key 扫描失败或没有返回可用 key，程序只会在现有可读 `known_hosts` 文件已经包含
 该 host 和 port 的精确绑定时使用它，否则停止挂载。原生 SFTP 不会静默跳过主机指纹校验。
 OpenSSH 和交互式共享 SSH 连接则继续使用各自 SSH 实现的主机指纹策略。
 
-如果 rclone 报 `knownhosts: key mismatch`，SSH MountMate 会停止挂载，不会关闭校验重试。请先向服务器管理员核实新指纹，再从程序托管的 `known_hosts` 文件中删除该主机的旧记录并重试。
+如果 rclone 报 `knownhosts: key mismatch`，SSH MountMate 会停止挂载，不会关闭校验重试。请先向服务器管理员核实新指纹，再更新实际使用的 `known_hosts` 中该主机的记录。服务器主机指纹与用户登录密码、客户端私钥是不同的信息。
 
 ## 本机控制接口认证
 

@@ -533,7 +533,7 @@ fn english(key: TextKey) -> &'static str {
         TextKey::LogsHelp => {
             "Open a read-only mount log viewer. Select any range to copy it, or use Copy log for the full visible log."
         }
-        TextKey::ManagedByOpenSsh => "Private key (managed by OpenSSH)",
+        TextKey::ManagedByOpenSsh => "SSH config / agent (non-interactive)",
         TextKey::MaximumAge => "Maximum age",
         TextKey::MaximumSize => "Maximum size",
         TextKey::MinimumFreeSpace => "Minimum free space",
@@ -667,7 +667,7 @@ fn chinese(key: TextKey) -> &'static str {
         TextKey::LogsHelp => {
             "打开只读挂载日志窗口，可选中任意部分复制，或用“复制日志”复制当前显示的全部内容。"
         }
-        TextKey::ManagedByOpenSsh => "私钥（由 OpenSSH 管理）",
+        TextKey::ManagedByOpenSsh => "SSH 配置 / 代理（非交互式）",
         TextKey::MaximumAge => "最长保留时间",
         TextKey::MaximumSize => "最大大小",
         TextKey::MinimumFreeSpace => "最小剩余空间",

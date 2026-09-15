@@ -299,8 +299,8 @@ fn openssh_command(server: &ServerConfig, windows: bool) -> Result<String, Rclon
         .join(" "))
 }
 
-/// Retain the original alias for Host/Include/ProxyJump processing, while
-/// command-line options make the saved editable target take precedence.
+/// Plain OpenSSH imports are live config references, so their cached target
+/// fields must not override the alias. Other modes keep their saved target.
 pub(crate) fn openssh_target_arguments(
     server: &ServerConfig,
 ) -> Result<Vec<String>, RcloneConfigError> {
@@ -315,6 +315,10 @@ pub(crate) fn openssh_target_arguments(
         }
         validate_host_alias(&server.host_alias)
             .map_err(|_| RcloneConfigError::InvalidValue { field: "SSH host" })?;
+        if imported && server.connection_method == ConnectionMethod::Openssh {
+            arguments.push(server.host_alias.clone());
+            return Ok(arguments);
+        }
         if !server.host.is_empty() {
             validate_scalar(&server.host, "host")?;
             arguments.extend(["-o".into(), format!("HostName={}", server.host)]);
@@ -976,7 +980,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn edited_openssh_import_overrides_target_without_losing_includes_or_proxyjump() {
+    fn openssh_import_uses_live_config_instead_of_cached_native_fields() {
         let temp = tempdir().unwrap();
         let config = temp.path().join("ssh config");
         let included = temp.path().join("included");
@@ -986,7 +990,7 @@ mod tests {
         fs::write(&edited_key, "PRIVATE KEY").unwrap();
         fs::write(&config, format!("Include \"{}\"\n", included.display())).unwrap();
         fs::write(&included, format!(
-            "Host cluster\n HostName original.example\n User original-user\n Port 2202\n IdentityFile \"{}\"\n ProxyJump gateway\n",
+            "Host cluster\n HostName original.example\n User original-user\n Port 2202\n IdentityFile \"{}\"\n ProxyJump gateway\n HostKeyAlias trusted-cluster\n UserKnownHostsFile /trusted/hosts\n",
             original_key.display()
         )).unwrap();
         for source in ["ssh_config", "ssh_config_batch"] {
@@ -1014,15 +1018,17 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
             let resolved = ResolvedSshConfig::parse(&String::from_utf8_lossy(&output.stdout));
-            assert_eq!(resolved.first("hostname", ""), "edited.example");
-            assert_eq!(resolved.first("user", ""), "edited-user");
-            assert_eq!(resolved.first("port", ""), "2303");
+            assert_eq!(resolved.first("hostname", ""), "original.example");
+            assert_eq!(resolved.first("user", ""), "original-user");
+            assert_eq!(resolved.first("port", ""), "2202");
             assert_eq!(resolved.first("proxyjump", ""), "gateway");
+            assert_eq!(resolved.first("hostkeyalias", ""), "trusted-cluster");
+            assert_eq!(resolved.first("userknownhostsfile", ""), "/trusted/hosts");
             assert_eq!(
                 resolved.first("identityfile", ""),
-                edited_key.to_str().unwrap()
+                original_key.to_str().unwrap()
             );
-            assert_eq!(resolved.first("identitiesonly", ""), "yes");
+            assert_eq!(resolved.first("identitiesonly", ""), "no");
         }
     }
 

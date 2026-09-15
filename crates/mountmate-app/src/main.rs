@@ -35,7 +35,8 @@ use mountmate_core::credential::{
     replace_verified, rollback_change,
 };
 use mountmate_core::dependency::{
-    DependencyStatus, check_dependencies, mount_dependency_available,
+    DependencyStatus, WINFSP_INSTALL_URL, check_dependencies, install_winfsp_via_winget,
+    mount_dependency_available,
 };
 use mountmate_core::interactive_ssh::{
     InteractiveSshError, InteractiveSshLoginCommand, InteractiveSshSession,
@@ -630,6 +631,7 @@ struct App {
     prepared_update: Option<PreparedUpdateLaunch>,
     dependency_status: Option<DependencyStatus>,
     dependency_checking: bool,
+    win_fsp_install_pending: bool,
     capacities: HashMap<String, CapacityInfo>,
     capacity_errors: HashSet<String>,
     capacity_refreshing: bool,
@@ -1228,6 +1230,7 @@ enum Message {
     CloseRequested(window::Id),
     ExitDecision(bool),
     WinFspInstallDecision(rfd::MessageDialogResult),
+    WinFspInstallFinished(Result<(), String>),
     WindowClosed(window::Id),
     AddConnection,
     ConnectionSearchChanged(String),
@@ -1537,10 +1540,16 @@ impl App {
             subscriptions
                 .push(iced::time::every(Duration::from_secs(30)).map(|_| Message::CapacityTick));
         }
-        if self.capacities.values().any(|capacity| {
-            capacity.soft_limit_exceeded()
-                || capacity.inode.is_some_and(InodeInfo::soft_limit_exceeded)
-        }) {
+        if self.main_window_ready
+            && self.screen == Screen::Connections
+            && self.capacities.values().any(|capacity| {
+                capacity.soft_limit_exceeded()
+                    || capacity
+                        .inode
+                        .as_ref()
+                        .is_some_and(InodeInfo::soft_limit_exceeded)
+            })
+        {
             subscriptions.push(
                 iced::time::every(Duration::from_millis(700)).map(|_| Message::QuotaAnimationTick),
             );
@@ -1752,6 +1761,7 @@ impl App {
             prepared_update: None,
             dependency_status: None,
             dependency_checking: false,
+            win_fsp_install_pending: false,
             capacities: HashMap::new(),
             capacity_errors: HashSet::new(),
             capacity_refreshing: false,
@@ -3603,13 +3613,44 @@ impl App {
                 }
             }
             Message::WinFspInstallDecision(result) => {
-                if result == rfd::MessageDialogResult::Yes
-                    && let Err(error) = open_external_url("https://winfsp.dev/rel/")
-                {
-                    diagnostic_trace(&format!(
-                        "could not open WinFsp installation guide: {error}"
-                    ));
-                    self.status = error;
+                if result == rfd::MessageDialogResult::Yes {
+                    self.status = match locale {
+                        Locale::English => "Installing WinFsp with winget. Accept the Windows administrator prompt if shown...".into(),
+                        Locale::Chinese => "正在通过 winget 安装 WinFsp。如出现 Windows 管理员授权提示，请确认…".into(),
+                    };
+                    return Task::perform(
+                        async {
+                            tokio::task::spawn_blocking(install_winfsp_via_winget)
+                                .await
+                                .unwrap_or_else(|error| Err(error.to_string()))
+                        },
+                        Message::WinFspInstallFinished,
+                    );
+                }
+                self.win_fsp_install_pending = false;
+            }
+            Message::WinFspInstallFinished(result) => {
+                self.win_fsp_install_pending = false;
+                match result {
+                    Ok(()) => {
+                        self.dependency_checking = true;
+                        return self.dependency_check_task();
+                    }
+                    Err(error) => {
+                        self.status = match locale {
+                            Locale::English => format!(
+                                "WinFsp installation did not finish: {error}. Install from {WINFSP_INSTALL_URL}, then retry mounting."
+                            ),
+                            Locale::Chinese => format!(
+                                "WinFsp 安装未完成：{error}。请从 {WINFSP_INSTALL_URL} 安装后重试挂载。"
+                            ),
+                        };
+                        if let Err(open_error) = open_external_url(WINFSP_INSTALL_URL) {
+                            diagnostic_trace(&format!(
+                                "could not open WinFsp installation guide: {open_error}"
+                            ));
+                        }
+                    }
                 }
             }
             Message::Mount(id) => return self.start_mount_operation(id, None),
@@ -4856,13 +4897,18 @@ impl App {
         )
     }
 
-    #[cfg(windows)]
-    fn win_fsp_install_prompt(&self) -> Task<Message> {
+    fn win_fsp_install_prompt(&mut self) -> Task<Message> {
+        if self.win_fsp_install_pending {
+            return Task::none();
+        }
+        self.win_fsp_install_pending = true;
         let description = match self.locale() {
             Locale::English => {
-                "WinFsp is required for Windows mounts. Open the WinFsp installation page?"
+                "WinFsp is required for Windows mounts. Install it using winget? This accepts the package and source agreements and may show a Windows administrator prompt. If winget is unavailable or installation fails, the official download page will open."
             }
-            Locale::Chinese => "Windows 挂载需要 WinFsp。是否打开 WinFsp 安装页面？",
+            Locale::Chinese => {
+                "Windows 挂载需要 WinFsp。是否通过 winget 安装？这将接受软件包和源协议，可能需要 Windows 管理员授权。若 winget 不可用或安装失败，将打开官网下载页面。"
+            }
         };
         Task::perform(
             async move {
@@ -5703,6 +5749,9 @@ impl App {
             && cfg!(windows)
             && !mount_dependency_available(MountBackend::Fuse)
         {
+            if self.win_fsp_install_pending {
+                return Task::none();
+            }
             let locale = self.locale();
             self.status = match locale {
                 Locale::English => {
@@ -5712,24 +5761,7 @@ impl App {
                     "Windows 挂载需要 WinFsp。请从 https://winfsp.dev/rel/ 安装后重试。".into()
                 }
             };
-            let description = match locale {
-                Locale::English => {
-                    "WinFsp is required to mount on Windows. Open the WinFsp installation page?"
-                }
-                Locale::Chinese => "Windows 挂载需要 WinFsp。是否打开 WinFsp 安装页面？",
-            };
-            return Task::perform(
-                async move {
-                    rfd::AsyncMessageDialog::new()
-                        .set_title(APP_NAME)
-                        .set_description(description)
-                        .set_level(rfd::MessageLevel::Warning)
-                        .set_buttons(rfd::MessageButtons::YesNo)
-                        .show()
-                        .await
-                },
-                Message::WinFspInstallDecision,
-            );
+            return self.win_fsp_install_prompt();
         }
         if operation == MountOperation::Unmount
             && !self.confirmed_unmounts.remove(&id)
@@ -6787,7 +6819,7 @@ impl App {
         ]
         .spacing(12);
         let ssh_config_authoritative = draft.source == ConnectionSource::SshConfig
-            && draft.connection_method != ConnectionMethod::Native;
+            && draft.connection_method == ConnectionMethod::Openssh;
         let target = if ssh_config_authoritative {
             row![
                 connection_read_only_field(locale.text(TextKey::IpHost), &draft.host),
@@ -9371,10 +9403,10 @@ fn settings_help<'a>(help: &'a str) -> Element<'a, Message> {
 fn transport_help(locale: Locale) -> &'static str {
     match locale {
         Locale::English => {
-            "Selects the SSH connection backend. Native SFTP handles authentication here; OpenSSH and interactive shared SSH use the SSH configuration or terminal for authentication."
+            "Native SFTP uses the password or private key entered here. OpenSSH uses SSH config and agents without prompts; imported profiles follow the config file, including its host-key checks. For passwords, key passphrases, first-use host-key confirmation, or MFA prompts in a terminal, use interactive shared SSH."
         }
         Locale::Chinese => {
-            "选择 SSH 连接后端。原生 SFTP 会在此处使用身份验证；OpenSSH 和交互式共享 SSH 则由 SSH 配置或终端负责身份验证。"
+            "原生 SFTP 使用此处填写的密码或私钥。OpenSSH 使用 SSH 配置和代理，不弹出登录提示；导入连接沿用配置文件及其主机密钥校验。需要在终端输入密码、私钥密码、首次确认主机指纹或进行 MFA 验证时，请使用交互式共享 SSH。"
         }
     }
 }
@@ -9878,7 +9910,7 @@ fn display_draft_mountpoint(draft: &ConnectionDraft, locale: Locale) -> &str {
 
 fn openssh_command_preview(config_path: &str, host_alias: &str) -> String {
     format!(
-        "ssh -F {} {}",
+        "ssh -o BatchMode=yes -F {} {}",
         quote_command_preview_argument(config_path),
         quote_command_preview_argument(host_alias)
     )
@@ -11565,11 +11597,11 @@ mod localization_tests {
     fn openssh_command_preview_quotes_unsafe_arguments_without_interpreting_them() {
         assert_eq!(
             openssh_command_preview("C:\\Users\\A B\\.ssh\\config", "host alias"),
-            "ssh -F \"C:\\\\Users\\\\A B\\\\.ssh\\\\config\" \"host alias\""
+            "ssh -o BatchMode=yes -F \"C:\\\\Users\\\\A B\\\\.ssh\\\\config\" \"host alias\""
         );
         assert_eq!(
             openssh_command_preview("C:\\Users\\me\\.ssh\\config", "host-a"),
-            "ssh -F C:\\Users\\me\\.ssh\\config host-a"
+            "ssh -o BatchMode=yes -F C:\\Users\\me\\.ssh\\config host-a"
         );
     }
 

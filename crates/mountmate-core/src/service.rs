@@ -461,6 +461,12 @@ impl MountService {
     ) -> Result<Option<PathBuf>, ServiceError> {
         let manager = KnownHostsManager::new(&self.paths);
         let fallback = || fallback_known_hosts(&self.paths, resolved, default, server, ssh);
+        // Honor an existing host-key binding before scanning. Otherwise a
+        // fresh app profile silently replaces OpenSSH's trusted key with the
+        // key currently offered by the network endpoint.
+        if let Some(path) = fallback() {
+            return Ok(Some(path));
+        }
         match manager.pin_first_seen(keyscan, &server.host, &server.port) {
             Ok(Some(path)) => Ok(Some(path)),
             Ok(None) => Ok(fallback()),
@@ -801,6 +807,64 @@ mod tests {
                 Some(trusted.clone())
             );
             fs::remove_file(trusted).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_host_key_is_used_before_a_successful_network_scan() {
+        let temp = tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: temp.path().join("config"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            data_dir: temp.path().join("data"),
+        };
+        let trusted = temp.path().join("known_hosts");
+        let key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
+        let trusted_content = format!("[login.example]:2222 {key}\n");
+        fs::write(&trusted, &trusted_content).unwrap();
+        let scanner = temp.path().join("ssh-keyscan");
+        fs::write(
+            &scanner,
+            format!("#!/bin/sh\nprintf '%s\\n' '[login.example]:2222 {key}'\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&scanner, fs::Permissions::from_mode(0o700)).unwrap();
+        let server = ServerConfig {
+            host: "login.example".into(),
+            port: "2222".into(),
+            ..ServerConfig::default()
+        };
+        let service = MountService::new(paths.clone(), temp.path().into());
+        for resolved in [
+            None,
+            Some(ResolvedSshConfig::parse(&format!(
+                "userknownhostsfile \"{}\"\n",
+                trusted.display()
+            ))),
+        ] {
+            let default = if resolved.is_some() {
+                temp.path().join("missing")
+            } else {
+                trusted.clone()
+            };
+            assert_eq!(
+                service
+                    .known_hosts_for_with_tools(
+                        &server,
+                        resolved.as_ref(),
+                        &default,
+                        Path::new("ssh"),
+                        &scanner
+                    )
+                    .unwrap(),
+                Some(trusted.clone())
+            );
+            // A successful scan would create this file and mask the old binding.
+            assert!(!paths.known_hosts().exists());
+            assert_eq!(fs::read_to_string(&trusted).unwrap(), trusted_content);
         }
     }
 
