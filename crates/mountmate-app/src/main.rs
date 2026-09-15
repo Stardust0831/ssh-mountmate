@@ -8137,43 +8137,11 @@ fn capacity_progress_view(
     locale: Locale,
 ) -> Element<'static, Message> {
     let (percentage, label) = capacity_progress_state(capacity, checking, locale);
-    let soft_limit_exceeded = capacity.is_some_and(CapacityInfo::soft_limit_exceeded);
-    let bar = progress_bar(0.0..=100.0, percentage)
-        .girth(Length::Fixed(22.0))
-        .style(move |theme| {
-            if soft_limit_exceeded {
-                iced::widget::progress_bar::warning(theme)
-            } else {
-                iced::widget::progress_bar::primary(theme)
-            }
-        });
-
-    // Keep the hard limit as the bar's range and use a thin marker for the
-    // Lustre soft limit. The marker is only a visual warning; it does not
-    // change the hard-capacity percentage. Upload enforcement remains
-    // controlled by the server's Lustre policy.
-    let soft_marker = capacity
-        .and_then(CapacityInfo::soft_limit_percent)
-        .map(|percent| {
-            let left = (percent.clamp(0.0, 100.0) * 100.0).round() as u16;
-            let right = 10_000u16.saturating_sub(left);
-            row![
-                Space::new().width(Length::FillPortion(left.max(1))),
-                rule::vertical(2).style(|theme: &Theme| rule::Style {
-                    color: theme.extended_palette().warning.strong.color,
-                    radius: 0.0.into(),
-                    fill_mode: rule::FillMode::Full,
-                    snap: true,
-                }),
-                Space::new().width(Length::FillPortion(right.max(1))),
-            ]
-            .width(Fill)
-            .height(Length::Fixed(22.0))
-        });
-
     let content: Element<'static, Message> = stack![
-        bar,
-        soft_marker,
+        quota_progress_layers(
+            percentage,
+            capacity.and_then(CapacityInfo::soft_limit_percent),
+        ),
         container(text(label).size(12))
             .width(Fill)
             .height(Length::Fixed(22.0))
@@ -8209,8 +8177,8 @@ fn inode_progress_view(inode: &InodeInfo, locale: Locale) -> Element<'static, Me
             inode.used, inode.total, inode.percent
         ),
     };
-    stack![
-        progress_bar(0.0..=100.0, inode.percent as f32).girth(Length::Fixed(22.0)),
+    let content: Element<'static, Message> = stack![
+        quota_progress_layers(inode.percent as f32, inode.soft_limit_percent()),
         container(text(label).size(12))
             .width(Fill)
             .height(Length::Fixed(22.0))
@@ -8219,7 +8187,85 @@ fn inode_progress_view(inode: &InodeInfo, locale: Locale) -> Element<'static, Me
     ]
     .width(Fill)
     .height(Length::Fixed(22.0))
+    .into();
+
+    if let Some(help) = inode_soft_limit_help(inode, locale) {
+        tooltip(
+            content,
+            container(text(help).size(12))
+                .padding(8)
+                .style(container::rounded_box),
+            tooltip::Position::FollowCursor,
+        )
+        .into()
+    } else {
+        content
+    }
+}
+
+/// The soft-quota color is intentionally separate from the theme's amber
+/// warning color used by settings controls.
+fn soft_quota_color() -> Color {
+    Color::from_rgb(0.86, 0.22, 0.48)
+}
+
+fn quota_progress_layers(percentage: f32, soft_percent: Option<f32>) -> Element<'static, Message> {
+    let percentage = percentage.clamp(0.0, 100.0);
+    let soft_percent = soft_percent
+        .map(|percent| percent.clamp(0.0, 100.0))
+        .filter(|percent| *percent < 100.0);
+    let exceeded_segment = quota_exceeded_segment(percentage, soft_percent).map(|(soft, _)| {
+        let start = (soft * 100.0).round() as u16;
+        let end = (percentage * 100.0).round() as u16;
+        let middle = end.saturating_sub(start).max(1);
+        let right = 10_000u16.saturating_sub(end).max(1);
+        row![
+            Space::new().width(Length::FillPortion(start.max(1))),
+            progress_bar(0.0..=100.0, 100.0)
+                .girth(Length::Fixed(22.0))
+                .style(|theme| {
+                    let mut style = iced::widget::progress_bar::primary(theme);
+                    style.bar = soft_quota_color().into();
+                    style
+                })
+                .length(Length::FillPortion(middle)),
+            Space::new().width(Length::FillPortion(right)),
+        ]
+        .width(Fill)
+        .height(Length::Fixed(22.0))
+    });
+    let soft_marker = soft_percent.map(|percent| {
+        let left = (percent * 100.0).round() as u16;
+        let right = 10_000u16.saturating_sub(left);
+        row![
+            Space::new().width(Length::FillPortion(left.max(1))),
+            rule::vertical(2).style(|_| rule::Style {
+                color: soft_quota_color(),
+                radius: 0.0.into(),
+                fill_mode: rule::FillMode::Full,
+                snap: true,
+            }),
+            Space::new().width(Length::FillPortion(right.max(1))),
+        ]
+        .width(Fill)
+        .height(Length::Fixed(22.0))
+    });
+    stack![
+        progress_bar(0.0..=100.0, percentage).girth(Length::Fixed(22.0)),
+        exceeded_segment,
+        soft_marker,
+    ]
+    .width(Fill)
+    .height(Length::Fixed(22.0))
     .into()
+}
+
+fn quota_exceeded_segment(percentage: f32, soft_percent: Option<f32>) -> Option<(f32, f32)> {
+    let percentage = percentage.clamp(0.0, 100.0);
+    let soft_percent = soft_percent.map(|percent| percent.clamp(0.0, 100.0));
+    soft_percent
+        .filter(|soft| *soft < 100.0 && percentage > *soft)
+        .map(|soft| (soft, percentage))
 }
 
 fn capacity_progress_state(
@@ -8285,6 +8331,23 @@ fn capacity_soft_limit_help(capacity: Option<&CapacityInfo>, locale: Locale) -> 
             "软配额：{}（{percent:.0}%）",
             format_bytes(capacity.soft_total?)
         ),
+    })
+}
+
+fn inode_soft_limit_help(inode: &InodeInfo, locale: Locale) -> Option<String> {
+    let percent = inode.soft_limit_percent()?;
+    let exceeded = inode.soft_limit_exceeded();
+    Some(match locale {
+        Locale::English if exceeded => format!(
+            "Soft inode limit: {} ({percent:.0}%)\nSoft inode limit exceeded",
+            inode.soft_total?
+        ),
+        Locale::English => format!("Soft inode limit: {} ({percent:.0}%)", inode.soft_total?),
+        Locale::Chinese if exceeded => format!(
+            "inode 软配额：{}（{percent:.0}%）\n已超过 inode 软配额",
+            inode.soft_total?
+        ),
+        Locale::Chinese => format!("inode 软配额：{}（{percent:.0}%）", inode.soft_total?),
     })
 }
 
@@ -11629,6 +11692,14 @@ mod localization_tests {
             capacity_soft_limit_help(Some(&lustre_capacity), Locale::Chinese),
             Some("软配额：30.0 MB（30%）\n已超过软配额".into())
         );
+    }
+
+    #[test]
+    fn quota_progress_marks_only_the_range_after_the_soft_limit() {
+        assert_eq!(quota_exceeded_segment(40.0, Some(30.0)), Some((30.0, 40.0)));
+        assert_eq!(quota_exceeded_segment(30.0, Some(30.0)), None);
+        assert_eq!(quota_exceeded_segment(20.0, Some(30.0)), None);
+        assert_eq!(quota_exceeded_segment(40.0, None), None);
     }
 
     #[test]

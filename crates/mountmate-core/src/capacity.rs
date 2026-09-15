@@ -88,20 +88,39 @@ pub struct InodeInfo {
     pub used: u64,
     pub total: u64,
     pub percent: u8,
+    /// The inode soft limit, when the filesystem exposes one.
+    pub soft_total: Option<u64>,
 }
 
 impl CapacityInfo {
     /// Returns the soft-limit position on the hard-limit capacity bar.
     pub fn soft_limit_percent(&self) -> Option<f32> {
         let soft = self.soft_total?;
-        if self.total == 0 {
+        if self.total == 0 || soft >= self.total {
             return None;
         }
         Some((soft as f64 * 100.0 / self.total as f64).clamp(0.0, 100.0) as f32)
     }
 
     pub fn soft_limit_exceeded(&self) -> bool {
-        self.soft_total.is_some_and(|soft| self.used >= soft)
+        self.soft_total
+            .is_some_and(|soft| soft < self.total && self.used > soft)
+    }
+}
+
+impl InodeInfo {
+    /// Returns the inode soft-limit position on the hard-limit bar.
+    pub fn soft_limit_percent(&self) -> Option<f32> {
+        let soft = self.soft_total?;
+        if self.total == 0 || soft >= self.total {
+            return None;
+        }
+        Some((soft as f64 * 100.0 / self.total as f64).clamp(0.0, 100.0) as f32)
+    }
+
+    pub fn soft_limit_exceeded(&self) -> bool {
+        self.soft_total
+            .is_some_and(|soft| soft < self.total && self.used > soft)
     }
 }
 
@@ -354,7 +373,14 @@ pub fn parse_lustre_quota(output: &str) -> Option<CapacityInfo> {
                 parse_quota_limit_token(fields[7]),
             )
         {
-            capacity.inode = inode_from_usage(inode_limit, inode_used);
+            capacity.inode = inode_from_usage(inode_limit, inode_used).map(|mut inode| {
+                if let Some(inode_soft) = parse_quota_limit_token(fields[6])
+                    && inode_soft <= inode_limit
+                {
+                    inode.soft_total = Some(inode_soft);
+                }
+                inode
+            });
         }
         return Some(capacity);
     }
@@ -429,6 +455,7 @@ fn inode_from_usage(total: u64, used: u64) -> Option<InodeInfo> {
         used,
         total,
         percent,
+        soft_total: None,
     })
 }
 
@@ -554,6 +581,12 @@ mod tests {
         let below_soft = parse_lustre_quota("/lustre 20000 30000 100000 - 3 0 0 -\n").unwrap();
         assert!(!below_soft.soft_limit_exceeded());
         assert_eq!(below_soft.soft_limit_percent(), Some(30.0));
+        let at_soft = parse_lustre_quota("/lustre 30000 30000 100000 - 3 0 0 -\n").unwrap();
+        assert!(!at_soft.soft_limit_exceeded());
+
+        let equal_limits = parse_lustre_quota("/lustre 30000 100000 100000 - 3 0 0 -\n").unwrap();
+        assert_eq!(equal_limits.soft_limit_percent(), None);
+        assert!(!equal_limits.soft_limit_exceeded());
     }
 
     #[test]
@@ -580,6 +613,7 @@ mod tests {
                 used: 300,
                 total: 1000,
                 percent: 30,
+                soft_total: None,
             })
         );
     }
@@ -598,15 +632,32 @@ mod tests {
 
     #[test]
     fn lustre_quota_parses_inode_limit_when_present() {
-        let capacity = parse_lustre_quota("/lustre 1200 0 2000 - 300 0 1000 -\n").unwrap();
+        let capacity = parse_lustre_quota("/lustre 1200 0 2000 - 300 500 1000 -\n").unwrap();
         assert_eq!(
             capacity.inode,
             Some(InodeInfo {
                 used: 300,
                 total: 1000,
                 percent: 30,
+                soft_total: Some(500),
             })
         );
+        let inode = capacity.inode.unwrap();
+        assert_eq!(inode.soft_limit_percent(), Some(50.0));
+        assert!(!inode.soft_limit_exceeded());
+
+        let exceeded = parse_lustre_quota("/lustre 1200 0 2000 - 700 500 1000 -\n")
+            .unwrap()
+            .inode
+            .unwrap();
+        assert!(exceeded.soft_limit_exceeded());
+
+        let equal_limits = parse_lustre_quota("/lustre 1200 0 2000 - 700 1000 1000 -\n")
+            .unwrap()
+            .inode
+            .unwrap();
+        assert_eq!(equal_limits.soft_limit_percent(), None);
+        assert!(!equal_limits.soft_limit_exceeded());
     }
 
     #[test]
@@ -618,6 +669,7 @@ mod tests {
                 used: 10,
                 total: 10,
                 percent: 100,
+                soft_total: None,
             })
         );
 
