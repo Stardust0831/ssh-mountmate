@@ -634,6 +634,7 @@ struct App {
     capacity_errors: HashSet<String>,
     capacity_refreshing: bool,
     capacity_refresh_pending: bool,
+    quota_animation_phase: f32,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1351,6 +1352,7 @@ enum Message {
     #[cfg(windows)]
     StartupDependenciesChecked(Result<DependencyStatus, String>),
     CapacityTick,
+    QuotaAnimationTick,
     CapacitiesLoaded(Vec<(String, Result<Option<CapacityInfo>, String>)>),
     LanguageChanged(Language),
     AppearanceModeChanged(AppearanceMode),
@@ -1534,6 +1536,14 @@ impl App {
                 .push(iced::time::every(Duration::from_secs(1)).map(|_| Message::TransferTick));
             subscriptions
                 .push(iced::time::every(Duration::from_secs(30)).map(|_| Message::CapacityTick));
+        }
+        if self.capacities.values().any(|capacity| {
+            capacity.soft_limit_exceeded()
+                || capacity.inode.is_some_and(InodeInfo::soft_limit_exceeded)
+        }) {
+            subscriptions.push(
+                iced::time::every(Duration::from_millis(700)).map(|_| Message::QuotaAnimationTick),
+            );
         }
         if self.update_downloading {
             subscriptions.push(
@@ -1746,6 +1756,7 @@ impl App {
             capacity_errors: HashSet::new(),
             capacity_refreshing: false,
             capacity_refresh_pending: false,
+            quota_animation_phase: 0.0,
         };
         let mut tasks = vec![
             open_window.map(Message::MainWindowOpened),
@@ -1781,6 +1792,9 @@ impl App {
         let locale = self.locale();
         match message {
             Message::UpdateProgressTick => {}
+            Message::QuotaAnimationTick => {
+                self.quota_animation_phase = (self.quota_animation_phase + 0.18) % 1.0;
+            }
             Message::FocusEditorField { window, backwards } => {
                 if window == self.main_window
                     && !self.editor_saving
@@ -6385,6 +6399,7 @@ impl App {
                         can_move_up: can_move_connection(&self.servers, &server.id, -1),
                         can_move_down: can_move_connection(&self.servers, &server.id, 1),
                         connection_list_saving: self.connection_list_saving,
+                        quota_animation_phase: self.quota_animation_phase,
                     },
                     locale,
                 ));
@@ -8129,18 +8144,21 @@ struct ConnectionCardState<'a> {
     can_move_up: bool,
     can_move_down: bool,
     connection_list_saving: bool,
+    quota_animation_phase: f32,
 }
 
 fn capacity_progress_view(
     capacity: Option<&CapacityInfo>,
     checking: bool,
     locale: Locale,
+    quota_animation_phase: f32,
 ) -> Element<'static, Message> {
     let (percentage, label) = capacity_progress_state(capacity, checking, locale);
     let content: Element<'static, Message> = stack![
         quota_progress_layers(
             percentage,
             capacity.and_then(CapacityInfo::soft_limit_percent),
+            quota_animation_phase,
         ),
         container(text(label).size(12))
             .width(Fill)
@@ -8166,7 +8184,11 @@ fn capacity_progress_view(
     }
 }
 
-fn inode_progress_view(inode: &InodeInfo, locale: Locale) -> Element<'static, Message> {
+fn inode_progress_view(
+    inode: &InodeInfo,
+    locale: Locale,
+    quota_animation_phase: f32,
+) -> Element<'static, Message> {
     let label = match locale {
         Locale::English => format!(
             "Inodes: {} / {} used ({}%)",
@@ -8178,7 +8200,11 @@ fn inode_progress_view(inode: &InodeInfo, locale: Locale) -> Element<'static, Me
         ),
     };
     let content: Element<'static, Message> = stack![
-        quota_progress_layers(inode.percent as f32, inode.soft_limit_percent()),
+        quota_progress_layers(
+            inode.percent as f32,
+            inode.soft_limit_percent(),
+            quota_animation_phase,
+        ),
         container(text(label).size(12))
             .width(Fill)
             .height(Length::Fixed(22.0))
@@ -8203,13 +8229,11 @@ fn inode_progress_view(inode: &InodeInfo, locale: Locale) -> Element<'static, Me
     }
 }
 
-/// The soft-quota color is intentionally separate from the theme's amber
-/// warning color used by settings controls.
-fn soft_quota_color() -> Color {
-    Color::from_rgb(0.86, 0.22, 0.48)
-}
-
-fn quota_progress_layers(percentage: f32, soft_percent: Option<f32>) -> Element<'static, Message> {
+fn quota_progress_layers(
+    percentage: f32,
+    soft_percent: Option<f32>,
+    quota_animation_phase: f32,
+) -> Element<'static, Message> {
     let percentage = percentage.clamp(0.0, 100.0);
     let soft_percent = soft_percent
         .map(|percent| percent.clamp(0.0, 100.0))
@@ -8221,14 +8245,21 @@ fn quota_progress_layers(percentage: f32, soft_percent: Option<f32>) -> Element<
         let right = 10_000u16.saturating_sub(end).max(1);
         row![
             Space::new().width(Length::FillPortion(start.max(1))),
-            progress_bar(0.0..=100.0, 100.0)
-                .girth(Length::Fixed(22.0))
-                .style(|theme| {
-                    let mut style = iced::widget::progress_bar::primary(theme);
-                    style.bar = soft_quota_color().into();
-                    style
-                })
-                .length(Length::FillPortion(middle)),
+            stack![
+                progress_bar(0.0..=100.0, 100.0)
+                    .girth(Length::Fixed(22.0))
+                    .length(Fill),
+                container(text("✦").size(11).color(Color::WHITE.scale_alpha(
+                    0.18 + 0.42
+                        * (0.5 + 0.5 * (quota_animation_phase * std::f32::consts::TAU).sin()),
+                )))
+                .width(Fill)
+                .height(Length::Fixed(22.0))
+                .center_x(Fill)
+                .center_y(Length::Fixed(22.0)),
+            ]
+            .width(Length::FillPortion(middle))
+            .height(Length::Fixed(22.0)),
             Space::new().width(Length::FillPortion(right)),
         ]
         .width(Fill)
@@ -8239,8 +8270,19 @@ fn quota_progress_layers(percentage: f32, soft_percent: Option<f32>) -> Element<
         let right = 10_000u16.saturating_sub(left);
         row![
             Space::new().width(Length::FillPortion(left.max(1))),
-            rule::vertical(2).style(|_| rule::Style {
-                color: soft_quota_color(),
+            rule::vertical(1).style(|theme: &Theme| rule::Style {
+                color: if theme
+                    .extended_palette()
+                    .background
+                    .base
+                    .color
+                    .relative_luminance()
+                    > 0.5
+                {
+                    Color::from_rgb(0.25, 0.25, 0.25)
+                } else {
+                    Color::from_rgb(0.75, 0.75, 0.75)
+                },
                 radius: 0.0.into(),
                 fill_mode: rule::FillMode::Full,
                 snap: true,
@@ -8375,6 +8417,7 @@ fn connection_card<'a>(
         can_move_up,
         can_move_down,
         connection_list_saving,
+        quota_animation_phase,
     } = state;
     let id = server.id.clone();
     let host = format!("{}@{}:{}", server.user, server.host, server.port);
@@ -8460,9 +8503,14 @@ fn connection_card<'a>(
     .spacing(4)
     .width(Fill);
     if status == MountStatus::Mounted {
-        details = details.push(capacity_progress_view(capacity, capacity_checking, locale));
+        details = details.push(capacity_progress_view(
+            capacity,
+            capacity_checking,
+            locale,
+            quota_animation_phase,
+        ));
         if let Some(inode) = capacity.and_then(|capacity| capacity.inode.as_ref()) {
-            details = details.push(inode_progress_view(inode, locale));
+            details = details.push(inode_progress_view(inode, locale, quota_animation_phase));
         }
         if transfer_unavailable {
             details = details.push(text(locale.text(TextKey::TransferStateUnavailable)).size(13));
