@@ -191,6 +191,8 @@ control_candidates=(
 )
 mkdir -p "${config_dir}"
 
+# Imported OpenSSH snapshots are deliberately stale: the original config and
+# alias must still control host, user, port, and identity during real mounts.
 jq -n \
   --arg port "${port}" \
   --arg key "${client_key}" \
@@ -214,15 +216,15 @@ jq -n \
     },
     {
       id: "openssh-a", name: "OpenSSH A", mode: "ssh_config", source: "ssh_config",
-      host_alias: "local-openssh-a", host: "127.0.0.1", user: "mountmate",
-      port: $port, auth: "key", connection_method: "openssh",
+      host_alias: "local-openssh-a", host: "127.0.0.2", user: "stale-user",
+      port: "1", key_file: "/nonexistent/stale-key", auth: "key", connection_method: "openssh",
       ssh_config_path: $ssh_config, remote_path: "openssh-a",
       mountpoint: $openssh_a_mount, auto_mount_at_login: true, cache_mode: "full"
     },
     {
       id: "openssh-b", name: "OpenSSH B", mode: "ssh_config", source: "ssh_config",
-      host_alias: "local-openssh-b", host: "127.0.0.1", user: "mountmate",
-      port: $port, auth: "key", connection_method: "openssh",
+      host_alias: "local-openssh-b", host: "127.0.0.2", user: "stale-user",
+      port: "1", key_file: "/nonexistent/stale-key", auth: "key", connection_method: "openssh",
       ssh_config_path: $ssh_config, remote_path: "openssh-b",
       mountpoint: $openssh_b_mount, cache_mode: "full"
     }
@@ -335,9 +337,9 @@ grep -F "BatchMode=yes" "${config_dir}/rclone.conf"
 
 rclone_config="${config_dir}/rclone.conf"
 grep -F '[local-openssh-a]' "${rclone_config}"
-grep -Fx "ssh = ssh -o BatchMode=yes -F ${ssh_config} -o HostName=127.0.0.1 -l mountmate -p ${port} local-openssh-a" "${rclone_config}"
+grep -Fx "ssh = ssh -o BatchMode=yes -F ${ssh_config} local-openssh-a" "${rclone_config}"
 grep -F '[local-openssh-b]' "${rclone_config}"
-grep -Fx "ssh = ssh -o BatchMode=yes -F ${ssh_config} -o HostName=127.0.0.1 -l mountmate -p ${port} local-openssh-b" "${rclone_config}"
+grep -Fx "ssh = ssh -o BatchMode=yes -F ${ssh_config} local-openssh-b" "${rclone_config}"
 if sed -n '/\[local-openssh-a\]/,/^$/p;/\[local-openssh-b\]/,/^$/p' "${rclone_config}" \
   | grep -Eq '^(pass|key_file|key_file_pass|key_use_agent) ='; then
   echo 'OpenSSH remotes unexpectedly contain a native-auth fallback' >&2
