@@ -7,7 +7,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.6.6"
+version = "0.6.7"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -34,7 +34,7 @@ objc2-foundation = { version = "0.3.2", default-features = false }
 plist = "1.7"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
-rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio", "common-controls-v6"] }
 ring = "0.17"
 roxmltree = "0.20"
 rustix = { version = "1.1", features = ["fs", "process"] }

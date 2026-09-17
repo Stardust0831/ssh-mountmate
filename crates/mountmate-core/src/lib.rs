@@ -22,6 +22,7 @@ pub mod update_helper;
 pub mod update_install;
 pub mod update_manifest;
 pub mod update_workflow;
+pub mod winfsp;
 
 pub use model::{
     AccentColor, AppearanceMode, AuthMethod, ConnectionMethod, CredentialStorage, FontScale,

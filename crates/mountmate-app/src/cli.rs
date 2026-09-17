@@ -19,6 +19,8 @@ pub(crate) enum LaunchAction {
     CheckUpdate,
     RclonePath,
     PlinkPath,
+    WinFspInstallerPath,
+    InstallWinFsp,
     RegisterFileManagerMenu,
     UnregisterFileManagerMenu,
     RegisterLoginStartup,
@@ -66,6 +68,8 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Launc
             "--check-update" => Some(LaunchAction::CheckUpdate),
             "--rclone-path" => Some(LaunchAction::RclonePath),
             "--plink-path" => Some(LaunchAction::PlinkPath),
+            "--winfsp-installer-path" => Some(LaunchAction::WinFspInstallerPath),
+            "--install-winfsp" => Some(LaunchAction::InstallWinFsp),
             "--register-file-manager-menu" | "--register-shell-menu" => {
                 Some(LaunchAction::RegisterFileManagerMenu)
             }
@@ -236,6 +240,8 @@ Usage: SSHMountMate [COMMAND]
   --check-update                 Check GitHub for a verified platform update
   --rclone-path                  Print the verified rclone executable path
   --plink-path                   Print the verified Windows Plink executable path
+  --winfsp-installer-path        Extract and print the bundled WinFsp MSI path
+  --install-winfsp               Install the bundled Windows mounting component
   --licenses                     Print bundled third-party notices
   -h, --help                     Print this help
   -V, --version                  Print the version"#
@@ -251,6 +257,8 @@ pub(crate) fn licenses() -> &'static str {
         include_str!("../../../licenses/rclone-COPYING.txt"),
         "\n\n--- PuTTY Plink license ---\n\n",
         include_str!("../../../licenses/putty-LICENCE.txt"),
+        "\n\n--- WinFsp license ---\n\n",
+        include_str!("../../../licenses/winfsp-LICENSE.txt"),
         "\n\n--- rfd license ---\n\n",
         include_str!("../../../licenses/rfd-LICENSE.txt"),
         "\n\n--- sys-locale license ---\n\n",

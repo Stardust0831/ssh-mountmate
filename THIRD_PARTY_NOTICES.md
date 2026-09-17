@@ -124,3 +124,16 @@ Windows packages include the official architecture-specific Plink executable so 
 selected interactive SSH connection can establish and reuse PuTTY connection sharing without
 storing one-time authentication codes. SSH MountMate verifies the pinned executable SHA-256 before
 packaging and again before materializing it from a onefile build.
+
+## WinFsp
+
+WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos
+
+- Project and source: https://github.com/winfsp/winfsp
+- Version: 2.1.25156 (release v2.1)
+- License: GPLv3 with the WinFsp FLOSS exception allowing distribution of the unmodified installer
+- License text: `licenses/winfsp-LICENSE.txt`
+
+Only Windows binaries embed the unmodified official MSI. Its version, download URL, and SHA-256
+are pinned in `distribution/winfsp.json`. CI verifies the checksum and Authenticode signature
+before embedding; the application verifies the checksum again before installation.

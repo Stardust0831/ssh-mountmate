@@ -27,7 +27,7 @@ $mounted = $false
 $mountedId = $null
 $succeeded = $false
 
-function Invoke-SSHMountMate([string[]] $Arguments, [switch] $NoCapture) {
+function Invoke-SSHMountMate([string[]] $Arguments, [switch] $NoCapture, [int] $TimeoutMs = 60000) {
   $processInfo = [System.Diagnostics.ProcessStartInfo]::new($binary)
   $processInfo.UseShellExecute = $false
   $processInfo.CreateNoWindow = $true
@@ -39,7 +39,7 @@ function Invoke-SSHMountMate([string[]] $Arguments, [switch] $NoCapture) {
     $stdout = $process.StandardOutput.ReadToEndAsync()
     $stderr = $process.StandardError.ReadToEndAsync()
   }
-  $exited = $process.WaitForExit(60000)
+  $exited = $process.WaitForExit($TimeoutMs)
   if (-not $exited) {
     $process.Kill($true)
     $process.WaitForExit()
@@ -95,21 +95,16 @@ try {
   $hostKeyBlob = $hostKeyFields[1]
 
   Write-Host '[windows-mount-e2e] installing WinFsp'
-  $winFspUrl = 'https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi'
-  $winFspSha256 = '073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a'
-  $winFspMsi = Join-Path $testRoot 'winfsp-2.1.25156.msi'
-  Invoke-WebRequest $winFspUrl -OutFile $winFspMsi
+  $pin = Get-Content (Join-Path $PSScriptRoot '../distribution/winfsp.json') -Raw | ConvertFrom-Json
+  $winFspSha256 = $pin.sha256
+  $winFspMsi = (Invoke-SSHMountMate @('--winfsp-installer-path')).Trim()
+  if (-not (Test-Path $winFspMsi -PathType Leaf)) { throw 'Embedded WinFsp MSI is missing' }
   $actualWinFspSha256 = (Get-FileHash -Algorithm SHA256 $winFspMsi).Hash.ToLowerInvariant()
   if ($actualWinFspSha256 -ne $winFspSha256) {
     throw "WinFsp MSI SHA-256 mismatch: $actualWinFspSha256"
   }
-  $installer = Start-Process msiexec.exe -ArgumentList @(
-    '/i', "`"$winFspMsi`"", '/qn', '/norestart', 'INSTALLLEVEL=1000',
-    '/l*v', "`"$winFspLog`""
-  ) -Wait -PassThru
-  if ($installer.ExitCode -notin @(0, 3010)) {
-    throw "WinFsp installation failed with $($installer.ExitCode)"
-  }
+  $winFspLog = Join-Path $env:LOCALAPPDATA 'rsshmount/State/winfsp-install.log'
+  Invoke-SSHMountMate @('--install-winfsp') -TimeoutMs 180000 | Write-Host
   Get-Service 'WinFsp.Launcher' -ErrorAction Stop | Out-Null
 
   Write-Host '[windows-mount-e2e] starting local SFTP server'

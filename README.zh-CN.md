@@ -37,9 +37,11 @@ Windows：
 - WinFsp
 - OpenSSH Client
 
-Windows 依赖可复制命令：
+Windows Release 二进制（x64 和 ARM64）内置未经修改的官方 WinFsp **2.1.25156** 安装包，并通过 SHA-256 固定版本。Linux 和 macOS 二进制不包含该安装包。缺少组件时，弹窗会解释它用于将远程目录显示为 Windows 盘符。选择「安装组件」即可安装内置副本，无需再次下载；也可选择「稍后」。Windows 会请求管理员授权，通常只需安装一次。安装成功后会自动继续刚才的挂载；若安装程序要求重启，会提示重启后再挂载。
 
-缺少 WinFsp 时，程序会提示通过 winget 源安装 `WinFsp.WinFsp`，确认后开始安装，可能需要 Windows 管理员授权。若 winget 不可用或安装失败，会打开 https://winfsp.dev/rel/ 供手动安装。也可以自行运行：
+WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos — https://github.com/winfsp/winfsp。许可详情见[第三方声明](THIRD_PARTY_NOTICES.md)。
+
+未内置安装包的源码构建需要手动安装 WinFsp。以下为可选的 Windows 依赖安装命令：
 
 ```powershell
 winget install --id WinFsp.WinFsp -e

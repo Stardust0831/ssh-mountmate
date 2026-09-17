@@ -435,6 +435,8 @@ pub struct Settings {
     pub appearance_mode: AppearanceMode,
     #[serde(default = "default_accent_color")]
     pub accent_color: AccentColor,
+    #[serde(default)]
+    pub custom_accent_color: Option<String>,
     #[serde(default = "default_font_scale")]
     pub font_scale: FontScale,
 }
@@ -468,6 +470,7 @@ impl Default for Settings {
             language: default_language(),
             appearance_mode: default_appearance_mode(),
             accent_color: default_accent_color(),
+            custom_accent_color: None,
             font_scale: default_font_scale(),
         }
     }

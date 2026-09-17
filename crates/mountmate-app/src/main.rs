@@ -35,8 +35,7 @@ use mountmate_core::credential::{
     replace_verified, rollback_change,
 };
 use mountmate_core::dependency::{
-    DependencyStatus, WINFSP_INSTALL_URL, check_dependencies, install_winfsp_via_winget,
-    mount_dependency_available,
+    DependencyStatus, WINFSP_INSTALL_URL, check_dependencies, mount_dependency_available,
 };
 use mountmate_core::interactive_ssh::{
     InteractiveSshError, InteractiveSshLoginCommand, InteractiveSshSession,
@@ -64,6 +63,7 @@ use mountmate_core::update_helper::{
 };
 use mountmate_core::update_manifest::UpdateTrustError;
 use mountmate_core::update_workflow::{PreparedUpdateLaunch, prepare_update_install};
+use mountmate_core::winfsp::{self, InstallOutcome as WinFspInstallOutcome};
 use mountmate_core::{
     APP_NAME, AccentColor, AppearanceMode, AuthMethod, ConnectionMethod, CredentialStorage,
     FontScale, MountBackend, MountState, ServerConfig, Settings, VERSION,
@@ -78,6 +78,7 @@ use mountmate_platform::{
 mod cli;
 mod i18n;
 mod icons;
+mod read_only;
 mod transfer_center;
 mod tray;
 
@@ -167,6 +168,25 @@ fn run() -> Result<(), String> {
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| "verified Plink is not available".to_owned())?;
             println!("{}", resolved.path.display());
+            return Ok(());
+        }
+        LaunchAction::WinFspInstallerPath => {
+            println!(
+                "{}",
+                winfsp::installer_path(&AppPaths::discover())?.display()
+            );
+            return Ok(());
+        }
+        LaunchAction::InstallWinFsp => {
+            match winfsp::install(&AppPaths::discover())? {
+                WinFspInstallOutcome::Installed => println!("WinFsp installed"),
+                WinFspInstallOutcome::RestartRequired => {
+                    println!("WinFsp installed; restart Windows before mounting")
+                }
+                WinFspInstallOutcome::Cancelled => {
+                    return Err("WinFsp installation cancelled".into());
+                }
+            }
             return Ok(());
         }
         LaunchAction::RegisterFileManagerMenu => {
@@ -632,6 +652,7 @@ struct App {
     dependency_status: Option<DependencyStatus>,
     dependency_checking: bool,
     win_fsp_install_pending: bool,
+    win_fsp_pending_mount: Option<String>,
     capacities: HashMap<String, CapacityInfo>,
     capacity_errors: HashSet<String>,
     capacity_refreshing: bool,
@@ -1080,6 +1101,7 @@ struct SettingsDraft {
     language: Language,
     appearance_mode: AppearanceMode,
     accent_color: AccentColor,
+    custom_accent_color: String,
     font_scale: FontScale,
 }
 
@@ -1126,6 +1148,7 @@ impl SettingsDraft {
             language: Language::from_value(&settings.language),
             appearance_mode: settings.appearance_mode,
             accent_color: settings.accent_color,
+            custom_accent_color: settings.custom_accent_color.clone().unwrap_or_default(),
             font_scale: settings.font_scale,
         }
     }
@@ -1180,6 +1203,19 @@ impl SettingsDraft {
         settings.language = self.language.value().into();
         settings.appearance_mode = self.appearance_mode;
         settings.accent_color = self.accent_color;
+        let custom_accent = self.custom_accent_color.trim();
+        settings.custom_accent_color = if custom_accent.is_empty() {
+            None
+        } else if parse_accent_color(custom_accent).is_some() {
+            Some(custom_accent.to_ascii_uppercase())
+        } else {
+            return Err(match locale {
+                Locale::English => {
+                    "Enter an accent color as #RRGGBB, or leave it blank to use a preset.".into()
+                }
+                Locale::Chinese => "请按 #RRGGBB 格式填写强调色，或留空使用预设颜色。".into(),
+            });
+        };
         settings.font_scale = self.font_scale;
         Ok(settings)
     }
@@ -1229,8 +1265,8 @@ enum Message {
     TogglePopupDetails,
     CloseRequested(window::Id),
     ExitDecision(bool),
-    WinFspInstallDecision(rfd::MessageDialogResult),
-    WinFspInstallFinished(Result<(), String>),
+    WinFspInstallDecision(bool),
+    WinFspInstallFinished(Result<WinFspInstallOutcome, String>),
     WindowClosed(window::Id),
     AddConnection,
     ConnectionSearchChanged(String),
@@ -1322,8 +1358,6 @@ enum Message {
     SshImportActionChanged(usize, ImportAction),
     SaveConnection,
     ConnectionSaved(Result<ServerMutation, String>),
-    SaveConnectionPreferences,
-    ConnectionPreferencesSaved(Result<SettingsMutation, String>),
     SettingsFieldChanged(SettingsField, String),
     BrowseCacheRoot,
     CacheRootPicked(Option<PathBuf>),
@@ -1360,6 +1394,7 @@ enum Message {
     LanguageChanged(Language),
     AppearanceModeChanged(AppearanceMode),
     AccentColorChanged(AccentColor),
+    CustomAccentColorChanged(String),
     FontScaleChanged(FontScale),
     RegisterFileManagerMenu,
     UnregisterFileManagerMenu,
@@ -1449,6 +1484,7 @@ fn is_editor_mutation(message: &Message) -> bool {
             | Message::LanguageChanged(_)
             | Message::AppearanceModeChanged(_)
             | Message::AccentColorChanged(_)
+            | Message::CustomAccentColorChanged(_)
             | Message::FontScaleChanged(_)
             | Message::SettingsConnectionStartupChanged(_, _)
             | Message::ToggleSettingsConnectionPreferences
@@ -1502,7 +1538,18 @@ impl App {
 
     fn theme(&self, _window: window::Id) -> Theme {
         let (mode, accent) = effective_appearance(&self.settings, self.settings_draft.as_ref());
-        application_theme(mode, accent, self.system_theme_dark)
+        let theme = application_theme(mode, accent, self.system_theme_dark);
+        let custom = self.settings_draft.as_ref().map_or_else(
+            || self.settings.custom_accent_color.as_deref(),
+            |draft| Some(draft.custom_accent_color.as_str()),
+        );
+        if let Some(color) = custom.and_then(parse_accent_color) {
+            let mut palette = theme.palette();
+            palette.primary = color;
+            Theme::custom("SSH MountMate", palette)
+        } else {
+            theme
+        }
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -1762,6 +1809,7 @@ impl App {
             dependency_status: None,
             dependency_checking: false,
             win_fsp_install_pending: false,
+            win_fsp_pending_mount: None,
             capacities: HashMap::new(),
             capacity_errors: HashSet::new(),
             capacity_refreshing: false,
@@ -1791,6 +1839,16 @@ impl App {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         if self.editor_saving && is_editor_mutation(&message) {
+            return Task::none();
+        }
+        if self
+            .connection_draft
+            .as_ref()
+            .and_then(|draft| draft.editing_id.as_deref())
+            .is_some_and(|id| !self.can_modify(id))
+            && is_editor_mutation(&message)
+            && !matches!(message, Message::CancelEditor)
+        {
             return Task::none();
         }
         let task = self.update_message(message);
@@ -3170,6 +3228,10 @@ impl App {
                         draft.source,
                         ConnectionSource::SshConfig | ConnectionSource::SshConfigBatch
                     ) && Path::new(draft.ssh_config_path.trim()) == config_path
+                        && draft
+                            .editing_id
+                            .as_deref()
+                            .is_none_or(|id| self.can_modify(id))
                 });
                 if !request_is_current {
                     return Task::none();
@@ -3262,24 +3324,7 @@ impl App {
                     Err(error) => self.status = error,
                 }
             }
-            Message::SaveConnectionPreferences => return self.save_connection_preferences(),
-            Message::ConnectionPreferencesSaved(result) => {
-                self.editor_saving = false;
-                match result {
-                    Ok(outcome) => {
-                        self.settings = outcome.settings;
-                        self.servers = outcome.servers;
-                        self.connection_draft = None;
-                        self.screen = Screen::Connections;
-                        self.status = outcome.warning.unwrap_or_else(|| match locale {
-                            Locale::English => "Connection organization saved".into(),
-                            Locale::Chinese => "连接整理设置已保存".into(),
-                        });
-                        return self.status_task(StatusPublishPolicy::Silent);
-                    }
-                    Err(error) => self.status = error,
-                }
-            }
+
             Message::SettingsFieldChanged(field, value) => {
                 if let Some(draft) = &mut self.settings_draft {
                     match field {
@@ -3569,6 +3614,12 @@ impl App {
             Message::AccentColorChanged(accent) => {
                 if let Some(draft) = &mut self.settings_draft {
                     draft.accent_color = accent;
+                    draft.custom_accent_color.clear();
+                }
+            }
+            Message::CustomAccentColorChanged(value) => {
+                if let Some(draft) = &mut self.settings_draft {
+                    draft.custom_accent_color = value;
                 }
             }
             Message::FontScaleChanged(font_scale) => {
@@ -3613,14 +3664,15 @@ impl App {
                 }
             }
             Message::WinFspInstallDecision(result) => {
-                if result == rfd::MessageDialogResult::Yes {
+                if result {
                     self.status = match locale {
-                        Locale::English => "Installing WinFsp with winget. Accept the Windows administrator prompt if shown...".into(),
-                        Locale::Chinese => "正在通过 winget 安装 WinFsp。如出现 Windows 管理员授权提示，请确认…".into(),
+                        Locale::English => "Installing the Windows mounting component. Please allow the Windows administrator prompt...".into(),
+                        Locale::Chinese => "正在安装 Windows 挂载组件，请在系统管理员授权提示中选择允许…".into(),
                     };
+                    let paths = self.paths.clone();
                     return Task::perform(
-                        async {
-                            tokio::task::spawn_blocking(install_winfsp_via_winget)
+                        async move {
+                            tokio::task::spawn_blocking(move || winfsp::install(&paths))
                                 .await
                                 .unwrap_or_else(|error| Err(error.to_string()))
                         },
@@ -3628,13 +3680,49 @@ impl App {
                     );
                 }
                 self.win_fsp_install_pending = false;
+                self.win_fsp_pending_mount = None;
+                self.status = match locale {
+                    Locale::English => "Mounting component installation postponed. You can install it the next time you mount.".into(),
+                    Locale::Chinese => "已暂缓安装挂载组件，下次点击挂载时可继续安装。".into(),
+                };
             }
             Message::WinFspInstallFinished(result) => {
                 self.win_fsp_install_pending = false;
+                let pending_mount = self.win_fsp_pending_mount.take();
                 match result {
-                    Ok(()) => {
+                    Ok(WinFspInstallOutcome::Installed) => {
+                        self.status = match locale {
+                            Locale::English => {
+                                "Mounting component installed. Ready to mount.".into()
+                            }
+                            Locale::Chinese => "挂载组件安装完成，可以开始挂载。".into(),
+                        };
                         self.dependency_checking = true;
+                        if let Some(id) = pending_mount {
+                            return Task::batch([
+                                self.dependency_check_task(),
+                                self.start_mount_operation(id, Some(MountOperation::Mount)),
+                            ]);
+                        }
                         return self.dependency_check_task();
+                    }
+                    Ok(WinFspInstallOutcome::Cancelled) => {
+                        self.status = match locale {
+                            Locale::English => {
+                                "Installation cancelled. You can try again the next time you mount."
+                                    .into()
+                            }
+                            Locale::Chinese => "已取消安装，下次点击挂载时可重试。".into(),
+                        };
+                    }
+                    Ok(WinFspInstallOutcome::RestartRequired) => {
+                        self.status = match locale {
+                            Locale::English => {
+                                "Mounting component installed. Restart Windows, then mount again."
+                                    .into()
+                            }
+                            Locale::Chinese => "挂载组件安装完成。请重启 Windows 后再挂载。".into(),
+                        };
                     }
                     Err(error) => {
                         self.status = match locale {
@@ -3645,11 +3733,6 @@ impl App {
                                 "WinFsp 安装未完成：{error}。请从 {WINFSP_INSTALL_URL} 安装后重试挂载。"
                             ),
                         };
-                        if let Err(open_error) = open_external_url(WINFSP_INSTALL_URL) {
-                            diagnostic_trace(&format!(
-                                "could not open WinFsp installation guide: {open_error}"
-                            ));
-                        }
                     }
                 }
             }
@@ -4546,108 +4629,6 @@ impl App {
         )
     }
 
-    fn save_connection_preferences(&mut self) -> Task<Message> {
-        if self.editor_saving {
-            return Task::none();
-        }
-        let Some(draft) = &self.connection_draft else {
-            return Task::none();
-        };
-        let Some(id) = draft.editing_id.clone() else {
-            return Task::none();
-        };
-        let existing_tags = self
-            .servers
-            .iter()
-            .find(|server| server.id == id)
-            .map(|server| server.tags.as_slice());
-        let tags =
-            match validated_connection_tags_for_existing(&draft.tags, existing_tags, self.locale())
-            {
-                Ok(tags) => tags,
-                Err(error) => {
-                    self.status = error;
-                    return Task::none();
-                }
-            };
-        let auto_mount_at_login =
-            draft.auto_mount_at_login && draft.connection_method != ConnectionMethod::Interactive;
-        self.editor_saving = true;
-        self.status = self.locale().text(TextKey::SavingSettings).into();
-        let paths = self.paths.clone();
-        let previous_servers = self.servers.clone();
-        let previous_settings = self.settings.clone();
-        let mut result_settings = previous_settings.clone();
-        let startup_lock = self.startup_integration_lock.clone();
-        let locale = self.locale();
-        Task::perform(
-            async move {
-                tokio::task::spawn_blocking(move || {
-                    let updates = if previous_settings.startup_all {
-                        previous_servers
-                            .iter()
-                            .map(|server| {
-                                let selected = server.connection_method
-                                    != ConnectionMethod::Interactive;
-                                if server.id == id {
-                                    storage::ServerPreferenceUpdate {
-                                        id: id.clone(),
-                                        tags: Some(tags.clone()),
-                                        auto_mount_at_login: Some(auto_mount_at_login),
-                                    }
-                                } else {
-                                    storage::ServerPreferenceUpdate {
-                                        id: server.id.clone(),
-                                        tags: None,
-                                        auto_mount_at_login: Some(selected),
-                                    }
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                    } else {
-                        vec![storage::ServerPreferenceUpdate {
-                            id,
-                            tags: Some(tags),
-                            auto_mount_at_login: Some(auto_mount_at_login),
-                        }]
-                    };
-                    let servers = storage::update_server_preferences_batch(&paths, &updates)
-                        .map_err(|error| error.to_string())?;
-                    if previous_settings.startup_all {
-                        result_settings.startup_all = false;
-                        if let Err(error) = storage::save_settings(&paths, &result_settings) {
-                            let mut message = error.to_string();
-                            if let Err(rollback) = storage::save_servers(&paths, &previous_servers) {
-                                message.push_str(&format!(
-                                    "; server rollback failed: {rollback}"
-                                ));
-                            }
-                            return Err(message);
-                        }
-                    }
-                    let warning = reconcile_login_startup(&paths, &startup_lock)
-                        .err()
-                        .map(|error| match locale {
-                            Locale::English => format!(
-                                "Preferences were saved, but login startup integration will be retried next launch: {error}"
-                            ),
-                            Locale::Chinese => format!(
-                                "整理设置已保存，但登录自启集成失败，将在下次启动时重试：{error}"
-                            ),
-                        });
-                    Ok(SettingsMutation {
-                        settings: result_settings,
-                        servers,
-                        warning,
-                    })
-                })
-                .await
-                .unwrap_or_else(|error| Err(error.to_string()))
-            },
-            Message::ConnectionPreferencesSaved,
-        )
-    }
-
     fn save_settings(&mut self) -> Task<Message> {
         if self.editor_saving {
             return Task::none();
@@ -4901,26 +4882,62 @@ impl App {
         if self.win_fsp_install_pending {
             return Task::none();
         }
+        if !winfsp::installer_is_embedded() {
+            self.win_fsp_pending_mount = None;
+            self.status = match self.locale() {
+                Locale::English => format!(
+                    "This source build does not include the Windows mounting component. Install WinFsp from {WINFSP_INSTALL_URL}, then retry mounting."
+                ),
+                Locale::Chinese => format!(
+                    "此源码构建未附带 Windows 底层挂载组件。请从 {WINFSP_INSTALL_URL} 安装 WinFsp 后重试挂载。"
+                ),
+            };
+            return Task::none();
+        }
         self.win_fsp_install_pending = true;
-        let description = match self.locale() {
+        let mut description = match self.locale() {
             Locale::English => {
-                "WinFsp is required for Windows mounts. Install it using winget? This accepts the package and source agreements and may show a Windows administrator prompt. If winget is unavailable or installation fails, the official download page will open."
+                "To show a remote folder as a drive in File Explorer, SSH MountMate needs the WinFsp mounting component.\n\nIt is already included in this app; no download is needed. This is normally a one-time setup, and Windows will ask for administrator permission.\n\nYou can choose Later and install it the next time you mount."
             }
             Locale::Chinese => {
-                "Windows 挂载需要 WinFsp。是否通过 winget 安装？这将接受软件包和源协议，可能需要 Windows 管理员授权。若 winget 不可用或安装失败，将打开官网下载页面。"
+                "要将远程目录显示为资源管理器中的盘符，SSH MountMate 需要先安装 WinFsp 底层挂载组件。\n\n组件已随软件附带，无需再次下载，通常只需安装一次。Windows 会请求管理员授权。\n\n也可以选择「稍后」，下次挂载时再安装。"
             }
+        }.to_owned();
+        if self.win_fsp_pending_mount.is_some() {
+            description.push_str(match self.locale() {
+                Locale::English => {
+                    "\n\nAfter installation, your pending mount will continue automatically."
+                }
+                Locale::Chinese => "\n\n安装完成后，刚才的挂载操作会自动继续。",
+            });
+        }
+        let (install, later) = match self.locale() {
+            Locale::English => ("Install component", "Later"),
+            Locale::Chinese => ("安装组件", "稍后"),
+        };
+        let title = match self.locale() {
+            Locale::English => "Set up Windows mounting",
+            Locale::Chinese => "首次使用：安装挂载组件",
         };
         Task::perform(
             async move {
                 rfd::AsyncMessageDialog::new()
-                    .set_title(APP_NAME)
+                    .set_title(title)
                     .set_description(description)
-                    .set_level(rfd::MessageLevel::Warning)
-                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .set_level(rfd::MessageLevel::Info)
+                    .set_buttons(rfd::MessageButtons::OkCancelCustom(
+                        install.into(),
+                        later.into(),
+                    ))
                     .show()
                     .await
             },
-            Message::WinFspInstallDecision,
+            move |result| {
+                Message::WinFspInstallDecision(
+                    result == rfd::MessageDialogResult::Ok
+                        || result == rfd::MessageDialogResult::Custom(install.into()),
+                )
+            },
         )
     }
 
@@ -5752,13 +5769,14 @@ impl App {
             if self.win_fsp_install_pending {
                 return Task::none();
             }
+            self.win_fsp_pending_mount = Some(id);
             let locale = self.locale();
             self.status = match locale {
                 Locale::English => {
-                    "WinFsp is required for Windows mounts. Install it from https://winfsp.dev/rel/ and retry.".into()
+                    "Install the Windows mounting component to continue. This is normally a one-time setup.".into()
                 }
                 Locale::Chinese => {
-                    "Windows 挂载需要 WinFsp。请从 https://winfsp.dev/rel/ 安装后重试。".into()
+                    "需要先安装 Windows 底层挂载组件，通常只需安装一次。".into()
                 }
             };
             return self.win_fsp_install_prompt();
@@ -6643,13 +6661,11 @@ impl App {
         } else {
             locale.text(TextKey::AddConnection)
         };
-        if draft
+        let locked = draft
             .editing_id
             .as_deref()
-            .is_some_and(|id| !self.can_modify(id))
-        {
-            return self.read_only_connection_settings_view(draft, title);
-        }
+            .is_some_and(|id| !self.can_modify(id));
+        let controls = ConnectionEditorControls { locale, locked };
         let requirements = draft.requirements();
         let mountpoint_allows_save = mountpoint_choice(&draft.mountpoint) != "custom"
             || self.mountpoint_preflight.allows_save();
@@ -6666,7 +6682,8 @@ impl App {
                 locale.text(TextKey::Save)
             })
             .on_press_maybe(
-                (!self.editor_saving && mountpoint_allows_save).then_some(Message::SaveConnection),
+                (!locked && !self.editor_saving && mountpoint_allows_save)
+                    .then_some(Message::SaveConnection),
             ),
         ]
         .spacing(10)
@@ -6690,6 +6707,7 @@ impl App {
                 Some(locale.choice(draft.source, locale.connection_source(draft.source))),
                 |source| Message::ConnectionSourceChanged(source.value),
             )
+            .style(move |theme, status| connection_pick_list_style(theme, status, locked))
             .width(Fill),
         );
         let mut ssh_config_controls = column![].spacing(12);
@@ -6699,20 +6717,21 @@ impl App {
         ) {
             ssh_config_controls = ssh_config_controls.push(
                 row![
-                    connection_input(
+                    controls.input(
                         locale.text(TextKey::SshConfigFile),
                         &draft.ssh_config_path,
                         ConnectionField::SshConfigPath,
                         requirements.ssh_config_path,
                     ),
-                    button(locale.text(TextKey::Browse)).on_press(Message::BrowseSshConfig),
+                    button(locale.text(TextKey::Browse))
+                        .on_press_maybe((!locked).then_some(Message::BrowseSshConfig)),
                     button(if self.ssh_import_loading {
                         locale.text(TextKey::Loading)
                     } else {
                         locale.text(TextKey::Load)
                     })
                     .on_press_maybe(
-                        (!self.ssh_import_loading && !self.editor_saving)
+                        (!locked && !self.ssh_import_loading && !self.editor_saving)
                             .then_some(Message::LoadSshConfig),
                     ),
                 ]
@@ -6780,7 +6799,7 @@ impl App {
             let content = column![source, ssh_config_controls, items]
                 .spacing(16)
                 .max_width(900);
-            return editor_shell(header, scrollable(content), &self.status);
+            return editor_shell(header, scrollable(controls.freeze(content)), &self.status);
         }
         if draft.source == ConnectionSource::SshConfig {
             let hosts: Vec<_> = self
@@ -6799,18 +6818,19 @@ impl App {
                         Some(draft.host_alias.clone()),
                         Message::SshHostSelected,
                     )
+                    .style(move |theme, status| connection_pick_list_style(theme, status, locked))
                     .width(Fill),
                 ));
             }
         }
         let identity = row![
-            connection_input(
+            controls.input(
                 locale.text(TextKey::Name),
                 &draft.name,
                 ConnectionField::Name,
                 requirements.name,
             ),
-            connection_input(
+            controls.input(
                 locale.text(TextKey::SshHostAlias),
                 &draft.host_alias,
                 ConnectionField::HostAlias,
@@ -6830,25 +6850,26 @@ impl App {
             .spacing(12)
         } else {
             row![
-                connection_input(
+                controls.input(
                     locale.text(TextKey::IpHost),
                     &draft.host,
                     ConnectionField::Host,
                     requirements.host,
                 ),
-                connection_input(
+                controls.input(
                     locale.text(TextKey::User),
                     &draft.user,
                     ConnectionField::User,
                     requirements.user,
                 ),
-                connection_input(
-                    locale.text(TextKey::Port),
-                    &draft.port,
-                    ConnectionField::Port,
-                    requirements.port,
-                )
-                .width(Length::Fixed(150.0)),
+                controls
+                    .input(
+                        locale.text(TextKey::Port),
+                        &draft.port,
+                        ConnectionField::Port,
+                        requirements.port,
+                    )
+                    .width(Length::Fixed(150.0)),
             ]
             .spacing(12)
         };
@@ -6866,6 +6887,7 @@ impl App {
                     Some(locale.choice(draft.auth, locale.auth_method(draft.auth))),
                     |auth| Message::ConnectionAuthChanged(auth.value),
                 )
+                .style(move |theme, status| connection_pick_list_style(theme, status, locked))
                 .width(Fill)
                 .into()
             };
@@ -6878,6 +6900,7 @@ impl App {
                 )),
                 |method| Message::ConnectionMethodChanged(method.value),
             )
+            .style(move |theme, status| connection_pick_list_style(theme, status, locked))
             .width(Fill)
         ]
         .spacing(5);
@@ -6935,7 +6958,7 @@ impl App {
         if draft.connection_method == ConnectionMethod::Native {
             match draft.auth {
                 AuthMethod::Password => {
-                    auth_fields = auth_fields.push(secret_input_control(
+                    auth_fields = auth_fields.push(controls.secret(
                         locale.text(TextKey::Password),
                         locale.text(if requirements.password {
                             TextKey::PasswordRequired
@@ -6945,14 +6968,13 @@ impl App {
                         &draft.password,
                         draft.preserved_secret_state(CredentialKind::Password),
                         CredentialKind::Password,
-                        locale,
                         requirements.password,
                     ));
                 }
                 AuthMethod::Key => {
                     auth_fields = auth_fields.push(
                         row![
-                            connection_file_input(
+                            controls.file(
                                 locale.text(TextKey::PrivateKeyFile),
                                 &draft.key_file,
                                 ConnectionField::KeyFile,
@@ -6960,13 +6982,12 @@ impl App {
                                 locale.text(TextKey::Browse),
                                 requirements.key_file,
                             ),
-                            secret_input_control(
+                            controls.secret(
                                 locale.text(TextKey::KeyPassphrase),
                                 locale.text(TextKey::Optional),
                                 &draft.key_passphrase,
                                 draft.preserved_secret_state(CredentialKind::KeyPassphrase),
                                 CredentialKind::KeyPassphrase,
-                                locale,
                                 false,
                             ),
                         ]
@@ -6983,7 +7004,7 @@ impl App {
             managed_fields = managed_fields.push(
                 checkbox(draft.ssh_config_managed)
                     .label(locale.text(TextKey::WriteManagedProfile))
-                    .on_toggle(Message::ManagedSshChanged),
+                    .on_toggle_maybe((!locked).then_some(Message::ManagedSshChanged)),
             );
             if draft.ssh_config_managed
                 && draft.connection_method == ConnectionMethod::Native
@@ -6992,7 +7013,7 @@ impl App {
                 managed_fields = managed_fields.push(
                     checkbox(draft.copy_key_to_ssh_dir)
                         .label(locale.text(TextKey::CopyPrivateKey))
-                        .on_toggle(Message::CopyKeyChanged),
+                        .on_toggle_maybe((!locked).then_some(Message::CopyKeyChanged)),
                 );
             }
         }
@@ -7005,10 +7026,11 @@ impl App {
                     Some(remote_base),
                     Message::RemoteBaseChanged,
                 )
+                .style(move |theme, status| connection_pick_list_style(theme, status, locked))
                 .width(Length::Fixed(120.0)),
                 text_input("projects/data", &remote_suffix)
                     .id("connection-remote-path")
-                    .on_input(Message::RemoteSuffixChanged)
+                    .on_input_maybe((!locked).then_some(Message::RemoteSuffixChanged))
                     .width(Fill),
             ]
             .spacing(8),
@@ -7035,6 +7057,7 @@ impl App {
                     &label, locale
                 )),
             )
+            .style(move |theme, status| connection_pick_list_style(theme, status, locked))
             .width(Fill),
         ]
         .spacing(5)
@@ -7049,9 +7072,10 @@ impl App {
                 row![
                     text_input(locale.text(TextKey::Mountpoint), custom_value,)
                         .id("connection-mountpoint")
-                        .on_input(Message::CustomMountpointChanged)
+                        .on_input_maybe((!locked).then_some(Message::CustomMountpointChanged))
                         .width(Fill),
-                    button(locale.text(TextKey::Browse)).on_press(Message::BrowseMountpoint),
+                    button(locale.text(TextKey::Browse))
+                        .on_press_maybe((!locked).then_some(Message::BrowseMountpoint)),
                 ]
                 .spacing(8),
             );
@@ -7096,7 +7120,7 @@ impl App {
                         Locale::English => "Mount at login",
                         Locale::Chinese => "登录时自动挂载",
                     })
-                    .on_toggle(Message::ConnectionStartupChanged)
+                    .on_toggle_maybe((!locked).then_some(Message::ConnectionStartupChanged))
                     .into()
             };
         let organization = row![
@@ -7113,7 +7137,7 @@ impl App {
                     &self.connection_tags_input,
                 )
                 .id("connection-tags")
-                .on_input(Message::ConnectionTagsChanged)
+                .on_input_maybe((!locked).then_some(Message::ConnectionTagsChanged))
                 .width(Fill),
             ),
             labeled_control(
@@ -7138,181 +7162,7 @@ impl App {
         ]
         .spacing(16)
         .max_width(900);
-        editor_shell(header, scrollable(content), &self.status)
-    }
-
-    fn read_only_connection_settings_view<'a>(
-        &'a self,
-        draft: &'a ConnectionDraft,
-        title: &'a str,
-    ) -> Element<'a, Message> {
-        let locale = self.locale();
-        let header = row![
-            text(title).size(28),
-            Space::new().width(Fill),
-            button(locale.text(TextKey::Cancel))
-                .on_press_maybe((!self.editor_saving).then_some(Message::CancelEditor)),
-            button(if self.editor_saving {
-                locale.text(TextKey::Saving)
-            } else {
-                locale.text(TextKey::Save)
-            })
-            .on_press_maybe((!self.editor_saving).then_some(Message::SaveConnectionPreferences)),
-        ]
-        .spacing(10)
-        .align_y(Center);
-        if self.editor_saving {
-            return saving_editor_shell(header, &self.status, locale);
-        }
-        let mut content = column![
-            container(text(match locale {
-                Locale::English => "The connection is mounted or busy. Connection, authentication, and mount fields remain read-only; tags and login startup can still be changed.",
-                Locale::Chinese => "此连接已挂载或正在执行操作。连接、认证和挂载字段保持只读；仍可修改标签与登录自启。",
-            }).size(14))
-                .padding(12)
-                .width(Fill)
-                .style(container::rounded_box),
-            row![
-                labeled_control(
-                    match locale {
-                        Locale::English => "Tags",
-                        Locale::Chinese => "标签",
-                    },
-                    text_input(
-                        match locale {
-                            Locale::English => "Comma-separated tags",
-                            Locale::Chinese => "用逗号分隔多个标签",
-                        },
-                        &self.connection_tags_input,
-                    )
-                    .id("connection-tags")
-                    .on_input(Message::ConnectionTagsChanged)
-                    .width(Fill),
-                ),
-                if draft.connection_method == ConnectionMethod::Interactive {
-                    labeled_control(
-                        match locale {
-                            Locale::English => "Login startup",
-                            Locale::Chinese => "登录自启",
-                        },
-                        container(text(match locale {
-                            Locale::English => "Unavailable for interactive SSH",
-                            Locale::Chinese => "交互式 SSH 不支持",
-                        }))
-                        .padding(10)
-                        .width(Fill),
-                    )
-                } else {
-                    labeled_control(
-                        match locale {
-                            Locale::English => "Login startup",
-                            Locale::Chinese => "登录自启",
-                        },
-                        toggler(draft.auto_mount_at_login)
-                            .label(match locale {
-                                Locale::English => "Mount at login",
-                                Locale::Chinese => "登录时自动挂载",
-                            })
-                            .on_toggle(Message::ConnectionStartupChanged),
-                    )
-                },
-            ]
-            .spacing(12),
-            row![
-                connection_read_only_field(
-                    locale.text(TextKey::Source),
-                    locale.connection_source(draft.source),
-                ),
-                connection_read_only_field(locale.text(TextKey::Name), &draft.name),
-            ]
-            .spacing(12),
-            row![
-                connection_read_only_field(locale.text(TextKey::SshHostAlias), &draft.host_alias,),
-                connection_read_only_field(locale.text(TextKey::IpHost), &draft.host),
-            ]
-            .spacing(12),
-            row![
-                connection_read_only_field(locale.text(TextKey::User), &draft.user),
-                connection_read_only_field(locale.text(TextKey::Port), &draft.port),
-            ]
-            .spacing(12),
-            row![
-                connection_read_only_field(
-                    locale.text(TextKey::Transport),
-                    locale.connection_method(draft.connection_method),
-                ),
-                connection_read_only_field(
-                    locale.text(TextKey::Authentication),
-                    locale.auth_method(draft.auth),
-                ),
-            ]
-            .spacing(12),
-        ]
-        .spacing(16)
-        .max_width(900);
-        if matches!(
-            draft.source,
-            ConnectionSource::SshConfig | ConnectionSource::SshConfigBatch
-        ) {
-            content = content.push(connection_read_only_field(
-                locale.text(TextKey::SshConfigFile),
-                &draft.ssh_config_path,
-            ));
-        }
-        if draft.auth == AuthMethod::Key {
-            content = content.push(
-                row![
-                    connection_read_only_field(
-                        locale.text(TextKey::PrivateKeyFile),
-                        &draft.key_file,
-                    ),
-                    connection_read_only_field(
-                        locale.text(TextKey::KeyPassphrase),
-                        connection_secret_state_label(
-                            locale,
-                            draft.preserved_secret_state(CredentialKind::KeyPassphrase),
-                        ),
-                    ),
-                ]
-                .spacing(12),
-            );
-        } else {
-            content = content.push(connection_read_only_field(
-                locale.text(TextKey::Password),
-                connection_secret_state_label(
-                    locale,
-                    draft.preserved_secret_state(CredentialKind::Password),
-                ),
-            ));
-        }
-        content = content
-            .push(
-                row![
-                    connection_read_only_field(
-                        locale.text(TextKey::WriteManagedProfile),
-                        localized_yes_no(locale, draft.ssh_config_managed),
-                    ),
-                    connection_read_only_field(
-                        locale.text(TextKey::CopyPrivateKey),
-                        localized_yes_no(locale, draft.copy_key_to_ssh_dir),
-                    ),
-                ]
-                .spacing(12),
-            )
-            .push(
-                row![
-                    connection_read_only_field(
-                        locale.text(TextKey::RemotePath),
-                        &draft.remote_path,
-                    ),
-                    connection_read_only_field(
-                        locale.text(TextKey::Mountpoint),
-                        display_draft_mountpoint(draft, locale),
-                    ),
-                ]
-                .spacing(12),
-            );
-        editor_shell(header, scrollable(content), &self.status)
+        editor_shell(header, scrollable(controls.freeze(content)), &self.status)
     }
 
     fn settings_view(&self) -> Element<'_, Message> {
@@ -7458,6 +7308,16 @@ impl App {
                 ),
             ]
             .spacing(12),
+            labeled_control(
+                match locale {
+                    Locale::English => "Custom accent (#RRGGBB; blank uses the preset)",
+                    Locale::Chinese => "自定义强调色（#RRGGBB，留空使用预设）",
+                },
+                text_input("#7A8B99", &draft.custom_accent_color)
+                    .id("settings-custom-accent")
+                    .on_input(Message::CustomAccentColorChanged)
+                    .width(Fill),
+            ),
             text(match locale {
                 Locale::English => {
                     "Theme, accent, and text size preview immediately; Save makes them persistent. Follow system is detected when the app starts."
@@ -7663,6 +7523,17 @@ impl App {
         ]
         .spacing(6)
         .max_width(640);
+        if cfg!(windows) {
+            dependency_section = dependency_section.push(
+                text(format!(
+                    "{}\n{}\nWinFsp {}",
+                    winfsp::ATTRIBUTION,
+                    winfsp::PROJECT_URL,
+                    winfsp::VERSION
+                ))
+                .size(12),
+            );
+        }
         if self.dependency_checking {
             dependency_section = dependency_section.push(text(match locale {
                 Locale::English => "Checking dependencies...",
@@ -8233,7 +8104,7 @@ fn inode_progress_view(
     };
     let content: Element<'static, Message> = stack![
         quota_progress_layers(
-            inode.percent as f32,
+            quota_usage_percent(inode.used, inode.total),
             inode.soft_limit_percent(),
             quota_animation_phase,
         ),
@@ -8281,17 +8152,20 @@ fn quota_progress_layers(
                 progress_bar(0.0..=100.0, 100.0)
                     .girth(Length::Fixed(22.0))
                     .length(Fill),
-                container(text("✦").size(11).color(Color::WHITE.scale_alpha(
-                    0.18 + 0.42
-                        * (0.5 + 0.5 * (quota_animation_phase * std::f32::consts::TAU).sin()),
-                )))
+                container(text("✦").size(11).style(move |theme: &Theme| text::Style {
+                    color: Some(theme.extended_palette().primary.base.text.scale_alpha(
+                        0.18 + 0.42
+                            * (0.5 + 0.5 * (quota_animation_phase * std::f32::consts::TAU).sin()),
+                    )),
+                }))
                 .width(Fill)
                 .height(Length::Fixed(22.0))
                 .center_x(Fill)
                 .center_y(Length::Fixed(22.0)),
             ]
             .width(Length::FillPortion(middle))
-            .height(Length::Fixed(22.0)),
+            .height(Length::Fixed(22.0))
+            .clip(true),
             Space::new().width(Length::FillPortion(right)),
         ]
         .width(Fill)
@@ -8342,6 +8216,13 @@ fn quota_exceeded_segment(percentage: f32, soft_percent: Option<f32>) -> Option<
         .map(|soft| (soft, percentage))
 }
 
+fn quota_usage_percent(used: u64, total: u64) -> f32 {
+    if total == 0 {
+        return 0.0;
+    }
+    (used as f64 * 100.0 / total as f64).clamp(0.0, 100.0) as f32
+}
+
 fn capacity_progress_state(
     capacity: Option<&CapacityInfo>,
     checking: bool,
@@ -8349,7 +8230,7 @@ fn capacity_progress_state(
 ) -> (f32, String) {
     if let Some(capacity) = capacity {
         (
-            capacity.percent as f32,
+            quota_usage_percent(capacity.used, capacity.total),
             match locale {
                 Locale::English => format!(
                     "Capacity: {} / {} used ({}%)",
@@ -8849,21 +8730,156 @@ fn moved_connection_order(
     Some(order)
 }
 
-fn connection_input<'a>(
-    label: &'a str,
-    value: &'a str,
-    field: ConnectionField,
-    required: bool,
-) -> iced::widget::Column<'a, Message> {
-    column![
-        connection_field_label(label, required),
-        text_input(connection_input_placeholder(field), value)
-            .id(connection_input_id(field))
-            .on_input(move |value| Message::ConnectionFieldChanged(field, value))
-            .width(Fill),
-    ]
-    .spacing(5)
-    .width(Fill)
+#[derive(Clone, Copy)]
+struct ConnectionEditorControls {
+    locale: Locale,
+    locked: bool,
+}
+
+impl ConnectionEditorControls {
+    fn freeze<'a>(&self, content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+        let content = content.into();
+        if self.locked {
+            tooltip(
+                read_only::freeze(content),
+                text(connection_settings_locked_help(self.locale)).size(13),
+                tooltip::Position::FollowCursor,
+            )
+            .style(container::rounded_box)
+            .into()
+        } else {
+            content
+        }
+    }
+    fn input<'a>(
+        &self,
+        label: &'a str,
+        value: &'a str,
+        field: ConnectionField,
+        required: bool,
+    ) -> iced::widget::Column<'a, Message> {
+        column![
+            connection_field_label(label, required),
+            text_input(connection_input_placeholder(field), value)
+                .id(connection_input_id(field))
+                .on_input_maybe(
+                    (!self.locked)
+                        .then_some(move |value| Message::ConnectionFieldChanged(field, value))
+                )
+                .width(Fill),
+        ]
+        .spacing(5)
+        .width(Fill)
+    }
+
+    fn secret<'a>(
+        &self,
+        label: &'a str,
+        placeholder: &'a str,
+        value: &'a str,
+        state: PreservedSecretState,
+        kind: CredentialKind,
+        required: bool,
+    ) -> iced::widget::Column<'a, Message> {
+        let locale = self.locale;
+        let input = text_input(placeholder, value)
+            .id(match kind {
+                CredentialKind::Password => "connection-password",
+                CredentialKind::KeyPassphrase => "connection-key-passphrase",
+            })
+            .secure(true)
+            .on_input_maybe((!self.locked).then_some(move |value| match kind {
+                CredentialKind::Password => Message::PasswordChanged(SecretInput(value)),
+                CredentialKind::KeyPassphrase => Message::KeyPassphraseChanged(SecretInput(value)),
+            }))
+            .width(Fill);
+        let mut control = column![connection_field_label(label, required), input]
+            .spacing(5)
+            .width(Fill);
+        if state != PreservedSecretState::Absent {
+            let state_text = match (locale, state) {
+                (Locale::English, _) if required => {
+                    "The connection details changed. Enter the password again for this connection."
+                }
+                (Locale::Chinese, _) if required => "连接信息已更改，请重新输入此连接的密码。",
+                (Locale::English, _) if kind == CredentialKind::KeyPassphrase => {
+                    "A passphrase is stored. Leaving this blank keeps it only if the connection and private key are unchanged; otherwise enter it again."
+                }
+                (Locale::Chinese, _) if kind == CredentialKind::KeyPassphrase => {
+                    "已保存密钥口令。连接和私钥未更改时，留空会保留；否则请重新输入。"
+                }
+                (Locale::English, PreservedSecretState::System) => {
+                    "Stored in the system credential store. Leave blank to keep it, or type to replace it."
+                }
+                (Locale::Chinese, PreservedSecretState::System) => {
+                    "已存入系统凭据库。留空会保留，输入新值会替换。"
+                }
+                (Locale::English, PreservedSecretState::Obscured) => {
+                    "Stored with rclone obscure. Leave blank to keep it, or type to replace it."
+                }
+                (Locale::Chinese, PreservedSecretState::Obscured) => {
+                    "已使用 rclone obscure 保存。留空会保留，输入新值会替换。"
+                }
+                (_, PreservedSecretState::Absent) => unreachable!(),
+            };
+            control = control.push(
+                row![
+                    text(state_text).size(12),
+                    button(match locale {
+                        Locale::English => "Clear stored value",
+                        Locale::Chinese => "清除已存值",
+                    })
+                    .on_press_maybe((!self.locked).then_some(Message::ClearSecret(kind))),
+                ]
+                .spacing(8)
+                .align_y(Center),
+            );
+        }
+        control
+    }
+
+    fn file<'a>(
+        &self,
+        label: &'a str,
+        value: &'a str,
+        field: ConnectionField,
+        browse: Message,
+        browse_label: &'a str,
+        required: bool,
+    ) -> iced::widget::Column<'a, Message> {
+        column![
+            connection_field_label(label, required),
+            row![
+                text_input(connection_input_placeholder(field), value)
+                    .id(connection_input_id(field))
+                    .on_input_maybe(
+                        (!self.locked)
+                            .then_some(move |value| Message::ConnectionFieldChanged(field, value))
+                    )
+                    .width(Fill),
+                button(browse_label).on_press_maybe((!self.locked).then_some(browse)),
+            ]
+            .spacing(8),
+        ]
+        .spacing(5)
+        .width(Fill)
+    }
+}
+
+fn connection_pick_list_style(
+    theme: &Theme,
+    status: pick_list::Status,
+    locked: bool,
+) -> pick_list::Style {
+    let mut style = pick_list::default(theme, status);
+    if locked {
+        let palette = theme.extended_palette();
+        style.background = palette.background.weak.color.into();
+        style.text_color = palette.background.strong.color;
+        style.handle_color = palette.background.strong.color;
+        style.border.color = palette.background.strong.color;
+    }
+    style
 }
 
 fn connection_input_id(field: ConnectionField) -> &'static str {
@@ -8897,94 +8913,6 @@ fn connection_read_only_field<'a>(
     value: &'a str,
 ) -> iced::widget::Column<'a, Message> {
     labeled_control(label, container(text(value)).padding(10).width(Fill))
-}
-
-fn secret_input_control<'a>(
-    label: &'a str,
-    placeholder: &'a str,
-    value: &'a str,
-    state: PreservedSecretState,
-    kind: CredentialKind,
-    locale: Locale,
-    required: bool,
-) -> iced::widget::Column<'a, Message> {
-    let input = text_input(placeholder, value)
-        .id(match kind {
-            CredentialKind::Password => "connection-password",
-            CredentialKind::KeyPassphrase => "connection-key-passphrase",
-        })
-        .secure(true)
-        .on_input(move |value| match kind {
-            CredentialKind::Password => Message::PasswordChanged(SecretInput(value)),
-            CredentialKind::KeyPassphrase => Message::KeyPassphraseChanged(SecretInput(value)),
-        })
-        .width(Fill);
-    let mut control = column![connection_field_label(label, required), input]
-        .spacing(5)
-        .width(Fill);
-    if state != PreservedSecretState::Absent {
-        let state_text = match (locale, state) {
-            (Locale::English, _) if required => {
-                "The connection details changed. Enter the password again for this connection."
-            }
-            (Locale::Chinese, _) if required => "连接信息已更改，请重新输入此连接的密码。",
-            (Locale::English, _) if kind == CredentialKind::KeyPassphrase => {
-                "A passphrase is stored. Leaving this blank keeps it only if the connection and private key are unchanged; otherwise enter it again."
-            }
-            (Locale::Chinese, _) if kind == CredentialKind::KeyPassphrase => {
-                "已保存密钥口令。连接和私钥未更改时，留空会保留；否则请重新输入。"
-            }
-            (Locale::English, PreservedSecretState::System) => {
-                "Stored in the system credential store. Leave blank to keep it, or type to replace it."
-            }
-            (Locale::Chinese, PreservedSecretState::System) => {
-                "已存入系统凭据库。留空会保留，输入新值会替换。"
-            }
-            (Locale::English, PreservedSecretState::Obscured) => {
-                "Stored with rclone obscure. Leave blank to keep it, or type to replace it."
-            }
-            (Locale::Chinese, PreservedSecretState::Obscured) => {
-                "已使用 rclone obscure 保存。留空会保留，输入新值会替换。"
-            }
-            (_, PreservedSecretState::Absent) => unreachable!(),
-        };
-        control = control.push(
-            row![
-                text(state_text).size(12),
-                button(match locale {
-                    Locale::English => "Clear stored value",
-                    Locale::Chinese => "清除已存值",
-                })
-                .on_press(Message::ClearSecret(kind)),
-            ]
-            .spacing(8)
-            .align_y(Center),
-        );
-    }
-    control
-}
-
-fn connection_file_input<'a>(
-    label: &'a str,
-    value: &'a str,
-    field: ConnectionField,
-    browse: Message,
-    browse_label: &'a str,
-    required: bool,
-) -> iced::widget::Column<'a, Message> {
-    column![
-        connection_field_label(label, required),
-        row![
-            text_input(connection_input_placeholder(field), value)
-                .id(connection_input_id(field))
-                .on_input(move |value| Message::ConnectionFieldChanged(field, value))
-                .width(Fill),
-            button(browse_label).on_press(browse),
-        ]
-        .spacing(8),
-    ]
-    .spacing(5)
-    .width(Fill)
 }
 
 fn connection_field_label<'a>(label: &'a str, required: bool) -> iced::widget::Row<'a, Message> {
@@ -9618,12 +9546,8 @@ fn interactive_auth_help(locale: Locale) -> &'static str {
 
 fn connection_settings_locked_help(locale: Locale) -> &'static str {
     match locale {
-        Locale::English => {
-            "This connection is mounted or busy. Settings are read-only; unmount it to make changes. Changes take effect on the next mount."
-        }
-        Locale::Chinese => {
-            "此连接已挂载或正在执行操作。当前设置为只读；请先卸载再修改，变更会在下次挂载时生效。"
-        }
+        Locale::English => "Read-only while mounted. Unmount before editing.",
+        Locale::Chinese => "挂载状态只读，如需编辑请先取消挂载。",
     }
 }
 
@@ -9857,6 +9781,19 @@ fn effective_appearance(
     })
 }
 
+fn parse_accent_color(value: &str) -> Option<Color> {
+    let digits = value.trim().strip_prefix('#')?;
+    if digits.len() != 6 || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let rgb = u32::from_str_radix(digits, 16).ok()?;
+    Some(Color::from_rgb8(
+        (rgb >> 16) as u8,
+        (rgb >> 8) as u8,
+        rgb as u8,
+    ))
+}
+
 fn application_theme(mode: AppearanceMode, accent: AccentColor, system_dark: bool) -> Theme {
     let dark = match mode {
         AppearanceMode::System => system_dark,
@@ -9875,37 +9812,6 @@ fn application_theme(mode: AppearanceMode, accent: AccentColor, system_dark: boo
         (AccentColor::Purple, true) => Color::from_rgb8(187, 134, 252),
     };
     Theme::custom("SSH MountMate", palette)
-}
-
-fn localized_yes_no(locale: Locale, value: bool) -> &'static str {
-    match (locale, value) {
-        (Locale::English, true) => "Yes",
-        (Locale::English, false) => "No",
-        (Locale::Chinese, true) => "是",
-        (Locale::Chinese, false) => "否",
-    }
-}
-
-fn connection_secret_state_label(locale: Locale, state: PreservedSecretState) -> &'static str {
-    match (locale, state) {
-        (Locale::English, PreservedSecretState::System) => "Stored in system credentials",
-        (Locale::English, PreservedSecretState::Obscured) => "Stored with rclone obscure",
-        (Locale::English, PreservedSecretState::Absent) => "Not stored",
-        (Locale::Chinese, PreservedSecretState::System) => "已存入系统凭据库",
-        (Locale::Chinese, PreservedSecretState::Obscured) => "已使用 rclone obscure 保存",
-        (Locale::Chinese, PreservedSecretState::Absent) => "未保存",
-    }
-}
-
-fn display_draft_mountpoint(draft: &ConnectionDraft, locale: Locale) -> &str {
-    if draft.mountpoint.is_empty()
-        || draft.mountpoint == HOME_MOUNTPOINT_VALUE
-        || draft.mountpoint.eq_ignore_ascii_case("auto")
-    {
-        locale.text(TextKey::AutoMountpoint)
-    } else {
-        &draft.mountpoint
-    }
 }
 
 fn openssh_command_preview(config_path: &str, host_alias: &str) -> String {
@@ -11210,26 +11116,6 @@ fn open_path(path: &Path, locale: Locale) -> Result<(), String> {
     Ok(())
 }
 
-fn open_external_url(url: &str) -> Result<(), String> {
-    let mut command = if cfg!(windows) {
-        let mut command = Command::new("explorer.exe");
-        command.arg(url);
-        command
-    } else if cfg!(target_os = "macos") {
-        let mut command = Command::new("open");
-        command.arg(url);
-        command
-    } else {
-        let mut command = Command::new("xdg-open");
-        command.arg(url);
-        command
-    };
-    command
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| format!("could not open {url}: {error}"))
-}
-
 #[cfg(test)]
 mod localization_tests {
     use super::*;
@@ -11560,40 +11446,6 @@ mod localization_tests {
     }
 
     #[test]
-    fn mounted_connection_settings_copy_is_read_only_and_never_reveals_secrets() {
-        assert_eq!(Locale::English.text(TextKey::Edit), "Settings");
-        assert_eq!(Locale::Chinese.text(TextKey::Edit), "设置");
-        assert!(connection_settings_locked_help(Locale::English).contains("read-only"));
-        assert!(connection_settings_locked_help(Locale::Chinese).contains("只读"));
-        assert_eq!(
-            connection_secret_state_label(Locale::English, PreservedSecretState::System),
-            "Stored in system credentials"
-        );
-        assert_eq!(
-            connection_secret_state_label(Locale::Chinese, PreservedSecretState::Obscured),
-            "已使用 rclone obscure 保存"
-        );
-        assert_eq!(localized_yes_no(Locale::English, true), "Yes");
-        assert_eq!(localized_yes_no(Locale::Chinese, false), "否");
-    }
-
-    #[test]
-    fn read_only_settings_use_the_same_mountpoint_display_rules_as_cards() {
-        let mut draft = ConnectionDraft::default();
-        assert_eq!(
-            display_draft_mountpoint(&draft, Locale::English),
-            Locale::English.text(TextKey::AutoMountpoint)
-        );
-        draft.mountpoint = HOME_MOUNTPOINT_VALUE.into();
-        assert_eq!(
-            display_draft_mountpoint(&draft, Locale::Chinese),
-            Locale::Chinese.text(TextKey::AutoMountpoint)
-        );
-        draft.mountpoint = "Z:".into();
-        assert_eq!(display_draft_mountpoint(&draft, Locale::English), "Z:");
-    }
-
-    #[test]
     fn openssh_command_preview_quotes_unsafe_arguments_without_interpreting_them() {
         assert_eq!(
             openssh_command_preview("C:\\Users\\A B\\.ssh\\config", "host alias"),
@@ -11780,6 +11632,32 @@ mod localization_tests {
         assert_eq!(quota_exceeded_segment(30.0, Some(30.0)), None);
         assert_eq!(quota_exceeded_segment(20.0, Some(30.0)), None);
         assert_eq!(quota_exceeded_segment(40.0, None), None);
+    }
+
+    #[test]
+    fn quota_overage_uses_actual_usage_instead_of_rounded_label() {
+        for (used, exceeded) in [(305, false), (306, false), (307, true)] {
+            let capacity = mountmate_core::capacity::parse_lustre_quota(&format!(
+                "/lustre {used} 306 1000 - {used} 306 1000 -\n"
+            ))
+            .unwrap();
+            let (percentage, _) = capacity_progress_state(Some(&capacity), false, Locale::English);
+            assert_eq!(
+                quota_exceeded_segment(percentage, capacity.soft_limit_percent()).is_some(),
+                exceeded
+            );
+            let inode = capacity.inode.unwrap();
+            assert_eq!(
+                quota_exceeded_segment(
+                    quota_usage_percent(inode.used, inode.total),
+                    inode.soft_limit_percent(),
+                )
+                .is_some(),
+                exceeded
+            );
+        }
+        assert_eq!(quota_usage_percent(1, 0), 0.0);
+        assert_eq!(quota_usage_percent(101, 100), 100.0);
     }
 
     #[test]
@@ -12269,6 +12147,43 @@ mod localization_tests {
 
         assert_eq!(settings.cache_root, paths.cache_dir);
         assert_eq!(draft.build(&settings, Locale::English), Ok(settings));
+    }
+
+    #[test]
+    fn custom_accent_round_trips_and_invalid_input_does_not_save() {
+        let original = Settings {
+            cache_root: PathBuf::from("cache"),
+            ..Settings::default()
+        };
+        let mut draft = SettingsDraft::from_settings(&original);
+        draft.custom_accent_color = " #7a8b99 ".into();
+        let saved = draft.build(&original, Locale::English).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: temp.path().join("config"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            data_dir: temp.path().join("data"),
+        };
+        storage::save_settings(&paths, &saved).unwrap();
+        let reloaded = storage::load_settings(&paths).unwrap();
+        assert_eq!(reloaded.custom_accent_color.as_deref(), Some("#7A8B99"));
+        assert_eq!(
+            parse_accent_color(&draft.custom_accent_color),
+            Some(Color::from_rgb8(122, 139, 153))
+        );
+        for invalid in ["#12", "#GGGGGG", "#１２３", "123456"] {
+            draft.custom_accent_color = invalid.into();
+            assert!(draft.build(&original, Locale::English).is_err());
+        }
+        draft.custom_accent_color.clear();
+        assert_eq!(
+            draft
+                .build(&original, Locale::English)
+                .unwrap()
+                .custom_accent_color,
+            None
+        );
     }
 
     #[test]

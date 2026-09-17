@@ -131,6 +131,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: 1.97.0
+      - name: Embed pinned official WinFsp installer (Windows only)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/stage-winfsp.ps1
       - name: Linux GUI dependencies
         if: runner.os == 'Linux'
         shell: bash

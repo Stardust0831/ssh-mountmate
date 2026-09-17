@@ -168,6 +168,10 @@ jobs:
           fi
           sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 update
           sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=5 install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libgl1-mesa-dri libgtk-3-dev libayatana-appindicator3-dev libfuse-dev zip xvfb xdotool x11-utils openbox xterm dbus-x11 dunst haskell-gtk-sni-tray-utils weston fuse3 jq kmod openssh-client
+      - name: Embed pinned official WinFsp installer (Windows only)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/stage-winfsp.ps1
       - name: Install verified FUSE-T for macOS mount integration
         if: runner.os == 'macOS'
         shell: bash

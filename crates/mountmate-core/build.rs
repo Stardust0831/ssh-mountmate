@@ -21,6 +21,30 @@ fn main() {
     );
     println!("cargo:rustc-env=SSH_MOUNTMATE_EMBEDDED_RCLONE_SHA256={rclone_digest}");
     println!("cargo:rustc-env=SSH_MOUNTMATE_EMBEDDED_PLINK_SHA256={plink_digest}");
+    println!("cargo:rerun-if-changed=../../distribution/winfsp.json");
+    let pin: serde_json::Value =
+        serde_json::from_str(include_str!("../../distribution/winfsp.json"))
+            .expect("valid WinFsp pin");
+    let version = pin["version"].as_str().expect("WinFsp version");
+    let digest = pin["sha256"].as_str().expect("WinFsp digest");
+    println!("cargo:rustc-env=SSH_MOUNTMATE_WINFSP_VERSION={version}");
+    println!("cargo:rustc-env=SSH_MOUNTMATE_WINFSP_SHA256={digest}");
+    assert!(
+        env::var_os("SSH_MOUNTMATE_EMBED_WINFSP_PATH").is_none()
+            || env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows"),
+        "WinFsp may only be embedded in Windows builds"
+    );
+    let embedded_digest = stage_payload(
+        "SSH_MOUNTMATE_EMBED_WINFSP_PATH",
+        "SSH_MOUNTMATE_EMBED_WINFSP_SHA256",
+        "embedded-winfsp.msi",
+        "SSH_MOUNTMATE_EMBEDDED_WINFSP_PATH",
+        "WinFsp",
+    );
+    assert!(
+        embedded_digest.is_empty() || embedded_digest == digest,
+        "WinFsp must match the release pin"
+    );
 }
 
 fn stage_payload(

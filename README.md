@@ -37,9 +37,11 @@ Windows:
 - WinFsp
 - OpenSSH Client
 
-Copyable Windows dependency commands:
+Windows release binaries (x64 and ARM64) embed the unmodified official WinFsp **2.1.25156** installer, pinned by SHA-256. Linux and macOS binaries do not include it. When the component is missing, a prompt explains that it lets remote folders appear as Windows drives. Choose **Install component** to install the bundled copy without another download, or **Later** to postpone. Windows requests administrator approval; this is normally a one-time setup. After successful installation, a pending mount continues automatically. If Windows requires a restart, the app asks you to restart before mounting.
 
-When WinFsp is missing, the app offers to install `WinFsp.WinFsp` from the winget source. Installation starts after you accept the prompt and may require Windows administrator approval. If winget is unavailable or fails, the app opens https://winfsp.dev/rel/ for manual installation. You can also install it yourself:
+WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos — https://github.com/winfsp/winfsp. See [Third-Party Notices](THIRD_PARTY_NOTICES.md) for the license.
+
+For source builds without the bundled installer, install WinFsp manually. Optional Windows dependency commands:
 
 ```powershell
 winget install --id WinFsp.WinFsp -e
