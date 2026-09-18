@@ -6578,7 +6578,7 @@ impl App {
         };
         let refresh_button = tooltip(
             button(locale.text(TextKey::RefreshNow))
-                .on_press_maybe((!self.transfer_refreshing).then_some(Message::TransferTick)),
+                .on_press(Message::TransferTick),
             text(refresh_help).size(12),
             tooltip::Position::FollowCursor,
         )
@@ -11662,6 +11662,13 @@ mod localization_tests {
             capacity_soft_limit_help(Some(&lustre_capacity), Locale::Chinese),
             Some("软配额：30.0 MiB（30%）\n已超过软配额".into())
         );
+    }
+
+    #[test]
+    fn byte_labels_use_binary_suffixes_without_changing_scaling() {
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(format_bytes(1024_u64.pow(4)), "1.0 TiB");
     }
 
     #[test]
