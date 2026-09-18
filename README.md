@@ -391,11 +391,13 @@ the app tries the filesystem capacity reported by the local mountpoint, then `rc
 finally a non-interactive remote `df -Pk` query.
 
 When Lustre project quota data is available, the hard block limit (`blimit`) is the displayed total
-and the capacity percentage is calculated against it. The block soft limit (`bquota`) is shown as a
-warning marker and in the card text; reaching or passing it changes the bar to the warning color.
-The soft limit is used for display and warning purposes, so exceeding it does not make the app
-treat the hard capacity as full. Whether writes continue after the soft limit depends on Lustre's
-grace and enforcement policy.
+and the capacity percentage is calculated against it. A lower block soft limit (`bquota`) gets a
+thin neutral divider. When usage passes it, only the over-limit segment receives a sparse, soft
+breathing-dot overlay; the selected accent color remains unchanged. Equal soft and hard limits do
+not add a divider. The soft limit is used for display and warning purposes, so exceeding it does
+not make the app treat the hard capacity as full. Whether writes continue after the soft limit
+depends on Lustre's grace and enforcement policy. Capacity labels use `KiB`, `MiB`, `GiB`, and
+`TiB` suffixes while retaining the existing scaling.
 
 Interactive connections reuse their existing verified shared SSH session for the Lustre and `df`
 queries. Other supported profiles need a working non-interactive system SSH login; native SFTP's

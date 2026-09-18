@@ -6573,12 +6573,13 @@ impl App {
             locale.text(TextKey::AllCloudSynced).into()
         };
         let refresh_help = match locale {
-            Locale::English => "Transfer status refreshes automatically every second. Use this button to refresh immediately.",
+            Locale::English => {
+                "Transfer status refreshes automatically every second. Use this button to refresh immediately."
+            }
             Locale::Chinese => "传输状态每秒自动刷新；此按钮用于立即刷新。",
         };
         let refresh_button = tooltip(
-            button(locale.text(TextKey::RefreshNow))
-                .on_press(Message::TransferTick),
+            button(locale.text(TextKey::RefreshNow)).on_press(Message::TransferTick),
             text(refresh_help).size(12),
             tooltip::Position::FollowCursor,
         )
@@ -8222,10 +8223,17 @@ fn quota_overage_dots(phase: f32) -> Element<'static, Message> {
     ];
     let dot = |offset: f32| {
         let pulse = (tau * (phase + offset)).sin().max(0.0).powi(3);
-        container(text("•").size(8).style(move |theme: &Theme| text::Style {
-            color: Some(theme.extended_palette().primary.base.text.scale_alpha(
-                0.04 + 0.18 * pulse,
-            )),
+        container(text("•").size(8).style(move |theme: &Theme| {
+            text::Style {
+                color: Some(
+                    theme
+                        .extended_palette()
+                        .primary
+                        .base
+                        .text
+                        .scale_alpha(0.04 + 0.18 * pulse),
+                ),
+            }
         }))
         .width(Length::FillPortion(1))
         .height(Length::Fixed(22.0))
