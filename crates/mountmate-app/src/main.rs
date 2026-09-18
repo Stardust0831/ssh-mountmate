@@ -657,7 +657,6 @@ struct App {
     capacity_errors: HashSet<String>,
     capacity_refreshing: bool,
     capacity_refresh_pending: bool,
-    quota_animation_phase: f32,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1389,7 +1388,6 @@ enum Message {
     #[cfg(windows)]
     StartupDependenciesChecked(Result<DependencyStatus, String>),
     CapacityTick,
-    QuotaAnimationTick,
     CapacitiesLoaded(Vec<(String, Result<Option<CapacityInfo>, String>)>),
     LanguageChanged(Language),
     AppearanceModeChanged(AppearanceMode),
@@ -1586,20 +1584,6 @@ impl App {
                 .push(iced::time::every(Duration::from_secs(1)).map(|_| Message::TransferTick));
             subscriptions
                 .push(iced::time::every(Duration::from_secs(30)).map(|_| Message::CapacityTick));
-        }
-        if self.main_window_ready
-            && self.screen == Screen::Connections
-            && self.capacities.values().any(|capacity| {
-                capacity.soft_limit_exceeded()
-                    || capacity
-                        .inode
-                        .as_ref()
-                        .is_some_and(InodeInfo::soft_limit_exceeded)
-            })
-        {
-            subscriptions.push(
-                iced::time::every(Duration::from_millis(700)).map(|_| Message::QuotaAnimationTick),
-            );
         }
         if self.update_downloading {
             subscriptions.push(
@@ -1814,7 +1798,6 @@ impl App {
             capacity_errors: HashSet::new(),
             capacity_refreshing: false,
             capacity_refresh_pending: false,
-            quota_animation_phase: 0.0,
         };
         let mut tasks = vec![
             open_window.map(Message::MainWindowOpened),
@@ -1860,9 +1843,6 @@ impl App {
         let locale = self.locale();
         match message {
             Message::UpdateProgressTick => {}
-            Message::QuotaAnimationTick => {
-                self.quota_animation_phase = (self.quota_animation_phase + 0.11) % 1.0;
-            }
             Message::FocusEditorField { window, backwards } => {
                 if window == self.main_window
                     && !self.editor_saving
@@ -6449,7 +6429,6 @@ impl App {
                         can_move_up: can_move_connection(&self.servers, &server.id, -1),
                         can_move_down: can_move_connection(&self.servers, &server.id, 1),
                         connection_list_saving: self.connection_list_saving,
-                        quota_animation_phase: self.quota_animation_phase,
                     },
                     locale,
                 ));
@@ -8054,21 +8033,18 @@ struct ConnectionCardState<'a> {
     can_move_up: bool,
     can_move_down: bool,
     connection_list_saving: bool,
-    quota_animation_phase: f32,
 }
 
 fn capacity_progress_view(
     capacity: Option<&CapacityInfo>,
     checking: bool,
     locale: Locale,
-    quota_animation_phase: f32,
 ) -> Element<'static, Message> {
     let (percentage, label) = capacity_progress_state(capacity, checking, locale);
     let content: Element<'static, Message> = stack![
         quota_progress_layers(
             percentage,
             capacity.and_then(CapacityInfo::soft_limit_percent),
-            quota_animation_phase,
         ),
         container(text(label).size(12))
             .width(Fill)
@@ -8094,11 +8070,7 @@ fn capacity_progress_view(
     }
 }
 
-fn inode_progress_view(
-    inode: &InodeInfo,
-    locale: Locale,
-    quota_animation_phase: f32,
-) -> Element<'static, Message> {
+fn inode_progress_view(inode: &InodeInfo, locale: Locale) -> Element<'static, Message> {
     let label = match locale {
         Locale::English => format!(
             "Inodes: {} / {} used ({}%)",
@@ -8113,7 +8085,6 @@ fn inode_progress_view(
         quota_progress_layers(
             quota_usage_percent(inode.used, inode.total),
             inode.soft_limit_percent(),
-            quota_animation_phase,
         ),
         container(text(label).size(12))
             .width(Fill)
@@ -8139,36 +8110,11 @@ fn inode_progress_view(
     }
 }
 
-fn quota_progress_layers(
-    percentage: f32,
-    soft_percent: Option<f32>,
-    quota_animation_phase: f32,
-) -> Element<'static, Message> {
+fn quota_progress_layers(percentage: f32, soft_percent: Option<f32>) -> Element<'static, Message> {
     let percentage = percentage.clamp(0.0, 100.0);
     let soft_percent = soft_percent
         .map(|percent| percent.clamp(0.0, 100.0))
         .filter(|percent| *percent < 100.0);
-    let exceeded_segment = quota_exceeded_segment(percentage, soft_percent).map(|(soft, _)| {
-        let start = (soft * 100.0).round() as u16;
-        let end = (percentage * 100.0).round() as u16;
-        let middle = end.saturating_sub(start).max(1);
-        let right = 10_000u16.saturating_sub(end).max(1);
-        row![
-            Space::new().width(Length::FillPortion(start.max(1))),
-            stack![
-                progress_bar(0.0..=100.0, 100.0)
-                    .girth(Length::Fixed(22.0))
-                    .length(Fill),
-                quota_overage_dots(quota_animation_phase),
-            ]
-            .width(Length::FillPortion(middle))
-            .height(Length::Fixed(22.0))
-            .clip(true),
-            Space::new().width(Length::FillPortion(right)),
-        ]
-        .width(Fill)
-        .height(Length::Fixed(22.0))
-    });
     let soft_marker = soft_percent.map(|percent| {
         let left = (percent * 100.0).round() as u16;
         let right = 10_000u16.saturating_sub(left);
@@ -8198,68 +8144,11 @@ fn quota_progress_layers(
     });
     stack![
         progress_bar(0.0..=100.0, percentage).girth(Length::Fixed(22.0)),
-        exceeded_segment,
         soft_marker,
     ]
     .width(Fill)
     .height(Length::Fixed(22.0))
     .into()
-}
-
-fn quota_overage_dots(phase: f32) -> Element<'static, Message> {
-    let tau = std::f32::consts::TAU;
-    let phase = phase.rem_euclid(1.0);
-    let mut positions = [
-        0.17 + 0.07 * (tau * (phase + 0.03)).sin(),
-        0.51 + 0.10 * (tau * (phase + 0.39)).sin(),
-        0.82 + 0.06 * (tau * (phase + 0.71)).sin(),
-    ];
-    positions.sort_by(|left, right| left.total_cmp(right));
-    let portions = [
-        (positions[0].clamp(0.04, 0.94) * 1000.0) as u16,
-        ((positions[1] - positions[0]).clamp(0.04, 0.94) * 1000.0) as u16,
-        ((positions[2] - positions[1]).clamp(0.04, 0.94) * 1000.0) as u16,
-        ((1.0 - positions[2]).clamp(0.04, 0.94) * 1000.0) as u16,
-    ];
-    let dot = |offset: f32| {
-        let pulse = (tau * (phase + offset)).sin().max(0.0).powi(3);
-        container(text("•").size(8).style(move |theme: &Theme| {
-            text::Style {
-                color: Some(
-                    theme
-                        .extended_palette()
-                        .primary
-                        .base
-                        .text
-                        .scale_alpha(0.04 + 0.18 * pulse),
-                ),
-            }
-        }))
-        .width(Length::FillPortion(1))
-        .height(Length::Fixed(22.0))
-        .center_x(Fill)
-        .center_y(Length::Fixed(22.0))
-    };
-    row![
-        Space::new().width(Length::FillPortion(portions[0].max(1))),
-        dot(0.00),
-        Space::new().width(Length::FillPortion(portions[1].max(1))),
-        dot(0.34),
-        Space::new().width(Length::FillPortion(portions[2].max(1))),
-        dot(0.67),
-        Space::new().width(Length::FillPortion(portions[3].max(1))),
-    ]
-    .width(Fill)
-    .height(Length::Fixed(22.0))
-    .into()
-}
-
-fn quota_exceeded_segment(percentage: f32, soft_percent: Option<f32>) -> Option<(f32, f32)> {
-    let percentage = percentage.clamp(0.0, 100.0);
-    let soft_percent = soft_percent.map(|percent| percent.clamp(0.0, 100.0));
-    soft_percent
-        .filter(|soft| *soft < 100.0 && percentage > *soft)
-        .map(|soft| (soft, percentage))
 }
 
 fn quota_usage_percent(used: u64, total: u64) -> f32 {
@@ -8376,7 +8265,6 @@ fn connection_card<'a>(
         can_move_up,
         can_move_down,
         connection_list_saving,
-        quota_animation_phase,
     } = state;
     let id = server.id.clone();
     let host = format!("{}@{}:{}", server.user, server.host, server.port);
@@ -8462,14 +8350,9 @@ fn connection_card<'a>(
     .spacing(4)
     .width(Fill);
     if status == MountStatus::Mounted {
-        details = details.push(capacity_progress_view(
-            capacity,
-            capacity_checking,
-            locale,
-            quota_animation_phase,
-        ));
+        details = details.push(capacity_progress_view(capacity, capacity_checking, locale));
         if let Some(inode) = capacity.and_then(|capacity| capacity.inode.as_ref()) {
-            details = details.push(inode_progress_view(inode, locale, quota_animation_phase));
+            details = details.push(inode_progress_view(inode, locale));
         }
         if transfer_unavailable {
             details = details.push(text(locale.text(TextKey::TransferStateUnavailable)).size(13));
@@ -11680,34 +11563,15 @@ mod localization_tests {
     }
 
     #[test]
-    fn quota_progress_marks_only_the_range_after_the_soft_limit() {
-        assert_eq!(quota_exceeded_segment(40.0, Some(30.0)), Some((30.0, 40.0)));
-        assert_eq!(quota_exceeded_segment(30.0, Some(30.0)), None);
-        assert_eq!(quota_exceeded_segment(20.0, Some(30.0)), None);
-        assert_eq!(quota_exceeded_segment(40.0, None), None);
-    }
-
-    #[test]
-    fn quota_overage_uses_actual_usage_instead_of_rounded_label() {
+    fn soft_quota_status_uses_actual_usage_instead_of_rounded_label() {
         for (used, exceeded) in [(305, false), (306, false), (307, true)] {
             let capacity = mountmate_core::capacity::parse_lustre_quota(&format!(
                 "/lustre {used} 306 1000 - {used} 306 1000 -\n"
             ))
             .unwrap();
-            let (percentage, _) = capacity_progress_state(Some(&capacity), false, Locale::English);
-            assert_eq!(
-                quota_exceeded_segment(percentage, capacity.soft_limit_percent()).is_some(),
-                exceeded
-            );
+            assert_eq!(capacity.soft_limit_exceeded(), exceeded);
             let inode = capacity.inode.unwrap();
-            assert_eq!(
-                quota_exceeded_segment(
-                    quota_usage_percent(inode.used, inode.total),
-                    inode.soft_limit_percent(),
-                )
-                .is_some(),
-                exceeded
-            );
+            assert_eq!(inode.soft_limit_exceeded(), exceeded);
         }
         assert_eq!(quota_usage_percent(1, 0), 0.0);
         assert_eq!(quota_usage_percent(101, 100), 100.0);
