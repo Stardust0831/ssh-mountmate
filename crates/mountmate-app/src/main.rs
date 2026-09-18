@@ -1861,7 +1861,7 @@ impl App {
         match message {
             Message::UpdateProgressTick => {}
             Message::QuotaAnimationTick => {
-                self.quota_animation_phase = (self.quota_animation_phase + 0.18) % 1.0;
+                self.quota_animation_phase = (self.quota_animation_phase + 0.11) % 1.0;
             }
             Message::FocusEditorField { window, backwards } => {
                 if window == self.main_window
@@ -6572,15 +6572,21 @@ impl App {
         } else {
             locale.text(TextKey::AllCloudSynced).into()
         };
+        let refresh_help = match locale {
+            Locale::English => "Transfer status refreshes automatically every second. Use this button to refresh immediately.",
+            Locale::Chinese => "传输状态每秒自动刷新；此按钮用于立即刷新。",
+        };
+        let refresh_button = tooltip(
+            button(locale.text(TextKey::RefreshNow))
+                .on_press_maybe((!self.transfer_refreshing).then_some(Message::TransferTick)),
+            text(refresh_help).size(12),
+            tooltip::Position::FollowCursor,
+        )
+        .style(container::rounded_box);
         let header = row![
             text(locale.text(TextKey::TransferCenter)).size(28),
             Space::new().width(Fill),
-            button(if self.transfer_refreshing {
-                locale.text(TextKey::Refreshing)
-            } else {
-                locale.text(TextKey::RefreshNow)
-            })
-            .on_press_maybe((!self.transfer_refreshing).then_some(Message::TransferTick)),
+            refresh_button,
             button(locale.text(TextKey::Back)).on_press(Message::CloseTransfers),
         ]
         .spacing(10)
@@ -8152,16 +8158,7 @@ fn quota_progress_layers(
                 progress_bar(0.0..=100.0, 100.0)
                     .girth(Length::Fixed(22.0))
                     .length(Fill),
-                container(text("✦").size(11).style(move |theme: &Theme| text::Style {
-                    color: Some(theme.extended_palette().primary.base.text.scale_alpha(
-                        0.18 + 0.42
-                            * (0.5 + 0.5 * (quota_animation_phase * std::f32::consts::TAU).sin()),
-                    )),
-                }))
-                .width(Fill)
-                .height(Length::Fixed(22.0))
-                .center_x(Fill)
-                .center_y(Length::Fixed(22.0)),
+                quota_overage_dots(quota_animation_phase),
             ]
             .width(Length::FillPortion(middle))
             .height(Length::Fixed(22.0))
@@ -8202,6 +8199,47 @@ fn quota_progress_layers(
         progress_bar(0.0..=100.0, percentage).girth(Length::Fixed(22.0)),
         exceeded_segment,
         soft_marker,
+    ]
+    .width(Fill)
+    .height(Length::Fixed(22.0))
+    .into()
+}
+
+fn quota_overage_dots(phase: f32) -> Element<'static, Message> {
+    let tau = std::f32::consts::TAU;
+    let phase = phase.rem_euclid(1.0);
+    let mut positions = [
+        0.17 + 0.07 * (tau * (phase + 0.03)).sin(),
+        0.51 + 0.10 * (tau * (phase + 0.39)).sin(),
+        0.82 + 0.06 * (tau * (phase + 0.71)).sin(),
+    ];
+    positions.sort_by(|left, right| left.total_cmp(right));
+    let portions = [
+        (positions[0].clamp(0.04, 0.94) * 1000.0) as u16,
+        ((positions[1] - positions[0]).clamp(0.04, 0.94) * 1000.0) as u16,
+        ((positions[2] - positions[1]).clamp(0.04, 0.94) * 1000.0) as u16,
+        ((1.0 - positions[2]).clamp(0.04, 0.94) * 1000.0) as u16,
+    ];
+    let dot = |offset: f32| {
+        let pulse = (tau * (phase + offset)).sin().max(0.0).powi(3);
+        container(text("•").size(8).style(move |theme: &Theme| text::Style {
+            color: Some(theme.extended_palette().primary.base.text.scale_alpha(
+                0.04 + 0.18 * pulse,
+            )),
+        }))
+        .width(Length::FillPortion(1))
+        .height(Length::Fixed(22.0))
+        .center_x(Fill)
+        .center_y(Length::Fixed(22.0))
+    };
+    row![
+        Space::new().width(Length::FillPortion(portions[0].max(1))),
+        dot(0.00),
+        Space::new().width(Length::FillPortion(portions[1].max(1))),
+        dot(0.34),
+        Space::new().width(Length::FillPortion(portions[2].max(1))),
+        dot(0.67),
+        Space::new().width(Length::FillPortion(portions[3].max(1))),
     ]
     .width(Fill)
     .height(Length::Fixed(22.0))
@@ -10750,7 +10788,7 @@ fn global_progress_state(totals: &TransferTotals, out_of_space: bool) -> GlobalP
 }
 
 fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
     let mut unit = 0;
     while value >= 1024.0 && unit < UNITS.len() - 1 {
@@ -11589,7 +11627,7 @@ mod localization_tests {
         };
         assert_eq!(
             capacity_progress_state(Some(&capacity), false, Locale::English),
-            (25.0, "Capacity: 256.0 KB / 1.0 MB used (25%)".into())
+            (25.0, "Capacity: 256.0 KiB / 1.0 MiB used (25%)".into())
         );
         assert_eq!(
             capacity_progress_state(None, true, Locale::Chinese),
@@ -11610,19 +11648,19 @@ mod localization_tests {
         };
         assert_eq!(
             capacity_progress_state(Some(&lustre_capacity), false, Locale::English),
-            (40.0, "Capacity: 40.0 MB / 100.0 MB used (40%)".into())
+            (40.0, "Capacity: 40.0 MiB / 100.0 MiB used (40%)".into())
         );
         assert_eq!(
             capacity_progress_state(Some(&lustre_capacity), false, Locale::Chinese),
-            (40.0, "容量：已用 40.0 MB / 100.0 MB（40%）".into())
+            (40.0, "容量：已用 40.0 MiB / 100.0 MiB（40%）".into())
         );
         assert_eq!(
             capacity_soft_limit_help(Some(&lustre_capacity), Locale::English),
-            Some("Soft limit: 30.0 MB (30%)\nSoft limit exceeded".into())
+            Some("Soft limit: 30.0 MiB (30%)\nSoft limit exceeded".into())
         );
         assert_eq!(
             capacity_soft_limit_help(Some(&lustre_capacity), Locale::Chinese),
-            Some("软配额：30.0 MB（30%）\n已超过软配额".into())
+            Some("软配额：30.0 MiB（30%）\n已超过软配额".into())
         );
     }
 
