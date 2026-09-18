@@ -106,7 +106,7 @@ try {
 
   $gui = Start-Process -FilePath $binary -PassThru `
     -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-  $commandState = Join-Path $env:LOCALAPPDATA 'rsshmount/State/app-command.json'
+  $commandState = Join-Path $env:LOCALAPPDATA 'ssh-mountmate/state/app-command.json'
   Wait-Until { (Test-Path $commandState -PathType Leaf) -and ((Get-Item $commandState).Length -gt 0) }
   Wait-Until { [SSHMountMateWindowTest]::FindMainWindow($gui.Id) -ne [IntPtr]::Zero }
   $initialWindow = [SSHMountMateWindowTest]::FindMainWindow($gui.Id)

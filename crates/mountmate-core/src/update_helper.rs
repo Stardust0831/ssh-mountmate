@@ -485,7 +485,10 @@ fn validate_plan_fields(plan: &UpdateHelperPlan) -> Result<(), UpdateHelperError
         .iter()
         .map(String::len)
         .sum::<usize>();
-    if !valid_sha256(&plan.token_sha256)
+    if plan.prepared.installed_name.as_deref().is_some_and(|name| {
+        !crate::update_install::valid_versioned_executable_name(name)
+            || plan.layout.kind != crate::update_install::InstallKind::StandaloneExecutable
+    }) || !valid_sha256(&plan.token_sha256)
         || !valid_sha256(&plan.parent.executable_sha256)
         || !valid_sha256(&plan.prepared.executable_sha256)
         || !valid_sha256(&plan.prepared.tree_sha256)
@@ -847,7 +850,7 @@ fn rollback_and_relaunch(
     })?;
     let _ = remove_path_entry_if_present(&applied.failed_payload);
     launcher
-        .launch(&applied.executable, &plan.relaunch_arguments)
+        .launch(&applied.previous_executable, &plan.relaunch_arguments)
         .map_err(|error| UpdateHelperError::RestoredRelaunchFailed(error.to_string()))?;
     Err(UpdateHelperError::UpdateRolledBack(update_error))
 }
@@ -1012,6 +1015,7 @@ mod tests {
             "c".repeat(32)
         ));
         PreparedPayload {
+            installed_name: None,
             executable: replace_path.clone(),
             replace_path,
             executable_sha256: "b".repeat(64),
@@ -1052,6 +1056,7 @@ mod tests {
         let transaction = crate::update_install::plan_transaction_paths(&layout).unwrap();
         create_test_executable(&transaction.prepared, b"new executable");
         let prepared = PreparedPayload {
+            installed_name: None,
             replace_path: transaction.prepared.clone(),
             executable: transaction.prepared.clone(),
             executable_sha256: file_sha256(&transaction.prepared).unwrap(),

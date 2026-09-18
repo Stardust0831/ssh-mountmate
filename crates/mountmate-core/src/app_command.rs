@@ -145,7 +145,7 @@ impl Drop for InstanceLock {
 }
 
 #[cfg(windows)]
-fn windows_mutex_name(path: &Path) -> Result<Vec<u16>, AppCommandError> {
+pub(crate) fn windows_mutex_name(path: &Path) -> Result<Vec<u16>, AppCommandError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let canonical_parent = fs::canonicalize(parent)?;
     let identity = canonical_parent

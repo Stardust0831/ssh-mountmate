@@ -1,6 +1,6 @@
 use std::fmt;
 
-use mountmate_core::connection::{ConnectionSource, ImportAction, ImportStatus};
+use mountmate_core::connection::{BatchImportSource, ConnectionSource, ImportAction, ImportStatus};
 use mountmate_core::rc::RefreshResult;
 use mountmate_core::{
     AccentColor, AppearanceMode, AuthMethod, ConnectionMethod, CredentialStorage, FontScale,
@@ -63,12 +63,21 @@ impl Locale {
         match (self, value) {
             (Self::English, ConnectionSource::Manual) => "Manual",
             (Self::English, ConnectionSource::SshConfig) => "SSH config",
-            (Self::English, ConnectionSource::SshConfigBatch) => "SSH config (batch)",
+            (Self::English, ConnectionSource::SshConfigBatch) => "Batch import",
             (Self::English, ConnectionSource::SaiCluster) => "SAI cluster",
             (Self::Chinese, ConnectionSource::Manual) => "手动配置",
             (Self::Chinese, ConnectionSource::SshConfig) => "SSH 配置",
-            (Self::Chinese, ConnectionSource::SshConfigBatch) => "SSH 配置（批量）",
+            (Self::Chinese, ConnectionSource::SshConfigBatch) => "批量导入",
             (Self::Chinese, ConnectionSource::SaiCluster) => "SAI 集群",
+        }
+    }
+
+    pub(crate) fn batch_import_source(self, value: BatchImportSource) -> &'static str {
+        match (self, value) {
+            (Self::English, BatchImportSource::SshConfig) => "SSH config file",
+            (Self::English, BatchImportSource::SshMountMateConfig) => "SSH MountMate config file",
+            (Self::Chinese, BatchImportSource::SshConfig) => "SSH 配置文件",
+            (Self::Chinese, BatchImportSource::SshMountMateConfig) => "SSH MountMate 配置文件",
         }
     }
 
@@ -487,7 +496,7 @@ fn english(key: TextKey) -> &'static str {
     match key {
         TextKey::AddConnection => "Add connection",
         TextKey::AllCloudSynced => "All mounted connections are cloud synced",
-        TextKey::Authentication => "Authentication",
+        TextKey::Authentication => "Credential type",
         TextKey::AutoMountpoint => "Auto",
         TextKey::Back => "Back",
         TextKey::Browse => "Browse",
@@ -518,12 +527,12 @@ fn english(key: TextKey) -> &'static str {
         TextKey::FileTransfer => "File transfer",
         TextKey::HideDetails => "Hide details",
         TextKey::Import => "Import",
-        TextKey::ImportSshConfig => "Import SSH config",
+        TextKey::ImportSshConfig => "Batch import",
         TextKey::IpHost => "IP / Host",
         TextKey::KeyPassphrase => "Key passphrase",
         TextKey::Language => "Language",
         TextKey::Load => "Load",
-        TextKey::LoadSshBeforeImport => "Load an SSH config before importing",
+        TextKey::LoadSshBeforeImport => "Load a configuration file before importing",
         TextKey::Loading => "Loading...",
         TextKey::LoadingLog => "Loading log...",
         TextKey::LoadingMountStatus => "Loading mount status...",
@@ -576,7 +585,7 @@ fn english(key: TextKey) -> &'static str {
         TextKey::SelectCacheDirectory => "Select cache directory",
         TextKey::SelectPrivateKey => "Select private key",
         TextKey::SelectSshConfig => "Select SSH config",
-        TextKey::SelectSshHost => "Select at least one SSH Host to import or overwrite",
+        TextKey::SelectSshHost => "Select at least one connection to import or overwrite",
         TextKey::Settings => "Settings",
         TextKey::SettingsSaved => "Settings saved",
         TextKey::SettingsUnavailable => "Settings unavailable",
@@ -606,7 +615,7 @@ fn english(key: TextKey) -> &'static str {
         TextKey::RetryTerminal => "Retry",
         TextKey::HideTerminal => "Hide",
         TextKey::EndInteractiveSession => "End session",
-        TextKey::Transport => "Transport",
+        TextKey::Transport => "Authentication method",
         TextKey::Unmount => "Unmount",
         TextKey::UnmountAll => "Unmount all",
         TextKey::UnmountBeforeRemove => "Unmount the connection before removing it",
@@ -623,7 +632,7 @@ fn chinese(key: TextKey) -> &'static str {
     match key {
         TextKey::AddConnection => "添加连接",
         TextKey::AllCloudSynced => "所有已挂载连接均已同步到云端",
-        TextKey::Authentication => "身份验证",
+        TextKey::Authentication => "凭据类型",
         TextKey::AutoMountpoint => "自动",
         TextKey::Back => "返回",
         TextKey::Browse => "浏览",
@@ -652,12 +661,12 @@ fn chinese(key: TextKey) -> &'static str {
         TextKey::FileTransfer => "文件传输",
         TextKey::HideDetails => "收起详情",
         TextKey::Import => "导入",
-        TextKey::ImportSshConfig => "导入 SSH 配置",
+        TextKey::ImportSshConfig => "批量导入",
         TextKey::IpHost => "IP / 主机名",
         TextKey::KeyPassphrase => "私钥密码",
         TextKey::Language => "语言",
         TextKey::Load => "加载",
-        TextKey::LoadSshBeforeImport => "请先加载 SSH 配置再导入",
+        TextKey::LoadSshBeforeImport => "请先加载配置文件再导入",
         TextKey::Loading => "正在加载...",
         TextKey::LoadingLog => "正在加载日志...",
         TextKey::LoadingMountStatus => "正在加载挂载状态...",
@@ -708,7 +717,7 @@ fn chinese(key: TextKey) -> &'static str {
         TextKey::SelectCacheDirectory => "选择缓存目录",
         TextKey::SelectPrivateKey => "选择私钥",
         TextKey::SelectSshConfig => "选择 SSH 配置文件",
-        TextKey::SelectSshHost => "请至少选择一个要导入或覆盖的 SSH Host",
+        TextKey::SelectSshHost => "请至少选择一个要导入或覆盖的连接",
         TextKey::Settings => "设置",
         TextKey::SettingsSaved => "设置已保存",
         TextKey::SettingsUnavailable => "设置不可用",
@@ -738,7 +747,7 @@ fn chinese(key: TextKey) -> &'static str {
         TextKey::RetryTerminal => "重试",
         TextKey::HideTerminal => "隐藏",
         TextKey::EndInteractiveSession => "结束会话",
-        TextKey::Transport => "传输方式",
+        TextKey::Transport => "认证方式",
         TextKey::Unmount => "卸载",
         TextKey::UnmountAll => "全部卸载",
         TextKey::UnmountBeforeRemove => "请先卸载连接再删除",

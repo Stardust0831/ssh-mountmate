@@ -1,7 +1,10 @@
 pub mod app_command;
+pub mod application_data;
 pub mod capacity;
+pub mod config_transfer;
 pub mod connection;
 pub mod credential;
+pub mod data_migration;
 pub mod dependency;
 pub mod interactive_ssh;
 pub mod model;
@@ -17,6 +20,7 @@ pub mod service;
 pub mod ssh;
 pub mod storage;
 pub mod transfer;
+pub mod uninstall;
 pub mod update;
 pub mod update_helper;
 pub mod update_install;

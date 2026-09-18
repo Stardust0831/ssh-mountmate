@@ -9,7 +9,7 @@ It uses rclone for the actual mount operation and provides a small GUI around th
 ## What It Does
 
 - Mount a Linux server directory on Windows, macOS, or Linux.
-- Import hosts from your existing OpenSSH config and use them as editable defaults.
+- Import hosts from your existing OpenSSH config, using OpenSSH by default and keeping source-derived fields read-only.
 - Batch import all concrete hosts from a selected SSH config file.
 - Start from an SAI cluster preset and write app-managed SSH config entries.
 - Add connections manually with host, username, port, password, key file, and key passphrase.
@@ -25,6 +25,32 @@ It uses rclone for the actual mount operation and provides a small GUI around th
 - Verify remote directory contents on refresh and expose refresh/transfer actions from connection-card context menus.
 - Mount or unmount all saved connections from the main window.
 - Build native Rust packages for Windows, macOS, and Linux on x64 and arm64 with GitHub Actions.
+
+## Configuration backup and Windows uninstall
+
+Settings can export connections as JSON and open the batch import preview for either an SSH config
+or an SSH MountMate export. Exports include connection names, hosts, users, paths, tags and
+connection methods, but exclude passwords, key passphrases, credential references and private key
+contents. Imports require reviewing duplicates, cannot overwrite mounted or busy connections,
+and do not enable login mounts. Restore credentials and check local paths when moving computers.
+
+Windows stores application data under `%LOCALAPPDATA%\ssh-mountmate`, with `config`, `cache`
+and `state` subdirectories. Existing profiles in `%APPDATA%\rsshmount` and
+`%LOCALAPPDATA%\rsshmount`, plus early `SSHMountMate\bin` dependencies, migrate on startup.
+Active old mounts or update transactions defer migration until they finish and the app restarts.
+Conflicting files are retained and reported instead of overwritten.
+
+The Windows uninstall action in Settings closes the app after confirmation, removes its executable,
+application and legacy data directories, saved credentials, logs, caches, update helpers, downloads,
+extracted payloads and recognized update transaction files beside the executable. It also removes
+login startup, Explorer menus, notification registration and generated SSH profiles. For a custom
+cache root, only subdirectories belonging to current connections are removed. External SSH config
+files and private keys, JSON exports outside application directories, and shared WinFsp remain.
+Export connections, finish uploads and unmount first; unuploaded cache contents are deleted.
+
+Windows releases also provide versioned single files, such as `SSHMountMate-v0.6.9-amd64.exe`.
+ZIPs retain `SSHMountMate.exe` for older updaters. Subsequent updates started from this version
+install as `SSHMountMate-v<version>.exe`.
 
 ## Requirements
 
@@ -247,13 +273,13 @@ SSH MountMate can read your OpenSSH config and list concrete `Host` entries. Sel
 - port
 - key file
 
-After import, the connection is saved as an editable profile. Native SFTP uses the saved host, username, port, and authentication settings. Older alias-only profiles still resolve missing defaults from the source SSH config.
+After import, the connection defaults to OpenSSH. The display name stays editable; source-derived fields and mount settings retain the regular form layout but are read-only. The source file and Host selectors remain available.
 
-For `OpenSSH`, an imported connection uses `ssh -o BatchMode=yes -F <config> <alias>`. The displayed host, user, port, and key are an import snapshot; they do not override the live config. Keep the source config available. Its `Include`, `Match`, proxy, agent, certificate, and host-key settings remain in effect. Edit that config to change how the alias connects, or select Native SFTP to use the saved editable fields.
+For `OpenSSH`, an imported connection uses `ssh -o BatchMode=yes -F <config> <alias>`. The displayed host, user, port, and key are an import snapshot; they do not override the live config. Keep the source config available. Its `Include`, `Match`, proxy, agent, certificate, and host-key settings remain in effect. Edit that config to change how the alias connects, or change the source to Manual to edit saved fields and choose another authentication method.
 
 Interactive shared SSH uses the saved host, username, and port. On macOS/Linux it also retains the alias and config for OpenSSH options; Windows uses Plink's supported direct-connection settings.
 
-Batch import uses the selected config file and resolves each host with OpenSSH's `ssh -F <config> -G <host>` behavior. This keeps OpenSSH include/default handling while still saving normal editable SSH MountMate connections.
+Batch import uses the selected config file and resolves each host with OpenSSH's `ssh -F <config> -G <host>` behavior. This keeps OpenSSH include/default handling while saving connections that continue to use that source config.
 
 During batch import, duplicate entries are marked in the preview and skipped:
 

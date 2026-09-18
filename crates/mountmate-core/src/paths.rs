@@ -16,18 +16,16 @@ impl AppPaths {
         let home = home_dir();
         #[cfg(target_os = "windows")]
         {
-            let roaming = env::var_os("APPDATA")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join("AppData/Roaming"));
             let local = env::var_os("LOCALAPPDATA")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home.join("AppData/Local"));
-            return Self {
-                config_dir: roaming.join(LEGACY_APP_ID),
-                cache_dir: local.join(LEGACY_APP_ID).join("Cache"),
-                state_dir: local.join(LEGACY_APP_ID).join("State"),
-                data_dir: local.join("ssh-mountmate"),
-            };
+            let data_dir = local.join("ssh-mountmate");
+            Self {
+                config_dir: data_dir.join("config"),
+                cache_dir: data_dir.join("cache"),
+                state_dir: data_dir.join("state"),
+                data_dir,
+            }
         }
         #[cfg(target_os = "macos")]
         {
@@ -49,6 +47,23 @@ impl AppPaths {
                 data_dir: env_path("XDG_DATA_HOME", home.join(".local/share"))
                     .join("ssh-mountmate"),
             }
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn legacy_windows() -> Self {
+        let home = home_dir();
+        let local = env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join("AppData/Local"));
+        let roaming = env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join("AppData/Roaming"));
+        Self {
+            config_dir: roaming.join(LEGACY_APP_ID),
+            cache_dir: local.join(LEGACY_APP_ID).join("Cache"),
+            state_dir: local.join(LEGACY_APP_ID).join("State"),
+            data_dir: local.join("ssh-mountmate"),
         }
     }
 
@@ -150,6 +165,31 @@ impl AppPaths {
             .then_some(legacy)
             .into_iter()
             .collect()
+    }
+
+    /// Directories used by pre-0.6 Windows builds. They are returned only for
+    /// migration and explicit uninstall cleanup; normal runtime paths never
+    /// create them.
+    pub fn legacy_application_directories(&self) -> Vec<PathBuf> {
+        #[cfg(target_os = "windows")]
+        {
+            let home = home_dir();
+            let local = env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join("AppData/Local"));
+            let roaming = env::var_os("APPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join("AppData/Roaming"));
+            vec![
+                local.join(LEGACY_APP_ID),
+                roaming.join(LEGACY_APP_ID),
+                local.join("SSHMountMate"),
+            ]
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Vec::new()
+        }
     }
 }
 

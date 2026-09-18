@@ -103,7 +103,7 @@ try {
   if ($actualWinFspSha256 -ne $winFspSha256) {
     throw "WinFsp MSI SHA-256 mismatch: $actualWinFspSha256"
   }
-  $winFspLog = Join-Path $env:LOCALAPPDATA 'rsshmount/State/winfsp-install.log'
+  $winFspLog = Join-Path $env:LOCALAPPDATA 'ssh-mountmate/state/winfsp-install.log'
   Invoke-SSHMountMate @('--install-winfsp') -TimeoutMs 180000 | Write-Host
   Get-Service 'WinFsp.Launcher' -ErrorAction Stop | Out-Null
 
@@ -163,7 +163,7 @@ try {
   if (-not $drive) { throw 'No free drive letter is available for the mount test' }
   $mountpoint = "${drive}:"
 
-  $configDir = Join-Path $env:APPDATA 'rsshmount'
+  $configDir = Join-Path $env:LOCALAPPDATA 'ssh-mountmate/config'
   New-Item -ItemType Directory -Force $configDir | Out-Null
   $passwordObscured = (& $rclone obscure 'test-only-password').Trim()
   if ($LASTEXITCODE -ne 0 -or -not $passwordObscured) { throw 'rclone obscure failed' }
@@ -225,7 +225,7 @@ try {
     throw 'A queued write was reported as remotely complete'
   }
   $env:SSH_MOUNTMATE_ACTIVE_PACKAGE_ROOT = $packageRoot
-  $env:SSH_MOUNTMATE_ACTIVE_STATE_FILE = Join-Path $env:LOCALAPPDATA 'rsshmount/State/local-sftp.json'
+  $env:SSH_MOUNTMATE_ACTIVE_STATE_FILE = Join-Path $env:LOCALAPPDATA 'ssh-mountmate/state/local-sftp.json'
   & cargo test --package mountmate-core --test packaged_update --all-features `
     packaged_update_preserves_real_active_mount -- `
     --ignored --exact --test-threads=1
@@ -251,7 +251,7 @@ try {
   $mounted = $false
   $mountedId = $null
   Wait-Until { -not (Test-Path "${mountpoint}\") }
-  $state = Join-Path $env:LOCALAPPDATA 'rsshmount/State/local-sftp.json'
+  $state = Join-Path $env:LOCALAPPDATA 'ssh-mountmate/state/local-sftp.json'
   if (Test-Path $state) { throw 'Mount state remained after unmount' }
 
   Write-Host '[windows-mount-e2e] establishing verified Plink connection sharing'
@@ -350,7 +350,7 @@ try {
       Write-Host '--- SFTP server log ---'
       Get-Content $serverLog -Tail 100
     }
-    $stateDir = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'rsshmount/State' } else { '' }
+    $stateDir = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'ssh-mountmate/state' } else { '' }
     if ($stateDir -and (Test-Path $stateDir)) {
       Write-Host '--- SSH MountMate logs ---'
       Get-ChildItem $stateDir -Filter '*.log' | ForEach-Object { Get-Content $_ -Tail 100 }

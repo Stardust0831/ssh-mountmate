@@ -19,6 +19,26 @@ pub enum ConnectionSource {
     SaiCluster,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BatchImportSource {
+    #[default]
+    SshConfig,
+    SshMountMateConfig,
+}
+
+impl BatchImportSource {
+    pub const ALL: [Self; 2] = [Self::SshConfig, Self::SshMountMateConfig];
+}
+
+impl fmt::Display for BatchImportSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::SshConfig => "SSH config file",
+            Self::SshMountMateConfig => "SSH MountMate config file",
+        })
+    }
+}
+
 impl ConnectionSource {
     pub const ALL: [Self; 4] = [
         Self::Manual,
@@ -51,7 +71,7 @@ impl fmt::Display for ConnectionSource {
         formatter.write_str(match self {
             Self::Manual => "Manual",
             Self::SshConfig => "SSH config",
-            Self::SshConfigBatch => "SSH config (batch)",
+            Self::SshConfigBatch => "Batch import",
             Self::SaiCluster => "SAI cluster",
         })
     }
@@ -61,6 +81,7 @@ impl fmt::Display for ConnectionSource {
 pub struct ConnectionDraft {
     pub editing_id: Option<String>,
     pub source: ConnectionSource,
+    pub batch_import_source: BatchImportSource,
     pub name: String,
     pub folder: String,
     pub tags: Vec<String>,
@@ -127,6 +148,7 @@ impl Default for ConnectionDraft {
         Self {
             editing_id: None,
             source: ConnectionSource::Manual,
+            batch_import_source: BatchImportSource::SshConfig,
             name: String::new(),
             folder: String::new(),
             tags: Vec::new(),
@@ -220,6 +242,7 @@ impl ConnectionDraft {
         Self {
             editing_id: Some(server.id.clone()),
             source: ConnectionSource::from_server(server),
+            batch_import_source: BatchImportSource::SshConfig,
             name: server.name.clone(),
             folder: server.folder.clone(),
             tags: server.tags.clone(),
@@ -826,6 +849,7 @@ impl SshImportItem {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SshImportPlan {
     pub items: Vec<SshImportItem>,
+    pub full_connections: bool,
 }
 
 impl SshImportPlan {
@@ -857,7 +881,13 @@ impl SshImportPlan {
                     else {
                         return Err(DraftError::InvalidImportPlan);
                     };
-                    selected.push(merge_imported_connection(existing, server));
+                    if self.full_connections {
+                        let mut restored = server.clone();
+                        restored.id = existing.id.clone();
+                        selected.push(restored);
+                    } else {
+                        selected.push(merge_imported_connection(existing, server));
+                    }
                 }
                 _ => return Err(DraftError::InvalidImportAction(item.host_alias.clone())),
             }
@@ -914,7 +944,54 @@ pub fn plan_ssh_imports(
             known.push(server);
         }
     }
-    SshImportPlan { items }
+    SshImportPlan {
+        items,
+        full_connections: false,
+    }
+}
+
+/// Build the same reviewable import plan for an SSH MountMate JSON export.
+/// The JSON format already carries the display name, so the host alias is used
+/// only as the stable row label and is never treated as a secret.
+pub fn plan_server_imports(
+    imports: Vec<ServerConfig>,
+    existing: &[ServerConfig],
+    protected_ids: &std::collections::HashSet<String>,
+) -> SshImportPlan {
+    let mut known = existing.to_vec();
+    let mut items = Vec::new();
+    for mut server in imports {
+        let matched = known
+            .iter()
+            .find(|old| same_connection_target(old, &server));
+        let status = if matched.is_some() {
+            ImportStatus::SameTarget
+        } else {
+            ImportStatus::New
+        };
+        let existing_match = matched.filter(|old| existing.iter().any(|e| e.id == old.id));
+        let protected = existing_match.is_some_and(|old| protected_ids.contains(&old.id));
+        let matched_id = existing_match.map(|old| old.id.clone());
+        let matched_name = existing_match.map(|old| old.display_name().to_owned());
+        server.id = unique_id(&sanitize_id(server.display_name()), &known);
+        items.push(SshImportItem {
+            host_alias: server.display_name().to_owned(),
+            status,
+            reason: import_reason(status, protected).into(),
+            server: Some(server.clone()),
+            can_overwrite: matched_id.is_some() && !protected,
+            overwrite_protected: protected,
+            matched_id,
+            matched_name,
+        });
+        if status == ImportStatus::New {
+            known.push(server);
+        }
+    }
+    SshImportPlan {
+        items,
+        full_connections: true,
+    }
 }
 
 fn import_duplicate<'a>(

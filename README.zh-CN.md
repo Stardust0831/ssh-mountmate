@@ -9,8 +9,8 @@ SSH MountMate 是一个跨平台桌面程序，用来通过 SSH/SFTP 把 Linux �
 ## 功能
 
 - 在 Windows、macOS、Linux 上挂载 Linux 服务器目录。
-- 从已有 OpenSSH config 导入 Host，并作为可编辑默认值。
-- 从指定 SSH config 文件中批量导入全部具体 Host。
+- 从已有 OpenSSH config 导入 Host，默认使用系统 OpenSSH；名称可以编辑，其余连接字段显示配置解析结果并保持只读。
+- 通过“批量导入”读取 SSH 配置文件或 SSH MountMate JSON 配置，预览后导入或覆盖连接。
 - 通过 SAI 集群预设创建配置，并写入应用托管的 SSH config。
 - 手动添加连接，支持主机、用户名、端口、密码、密钥文件和密钥短语。
 - 可选把选中的密钥复制到 `~/.ssh`，并写入复制后的 `IdentityFile` 路径。
@@ -25,6 +25,25 @@ SSH MountMate 是一个跨平台桌面程序，用来通过 SSH/SFTP 把 Linux �
 - 刷新时核验远端目录，并在连接卡片右键菜单提供刷新和传输操作。
 - 在主窗口中批量挂载或批量取消挂载全部已保存连接。
 - 通过 GitHub Actions 为 Windows、macOS、Linux 构建 x64 和 arm64 原生 Rust 包。
+
+## 配置备份与 Windows 卸载
+
+设置中可以导出和导入 JSON 连接配置。导出包含名称、主机、端口、用户名、路径、标签和认证方式等连接信息，
+不包含密码、私钥口令、凭据库引用或私钥内容。导入先进入“批量导入”预览，支持跳过重复连接或明确覆盖，
+已挂载和正在操作的连接不能覆盖。导入不会自动启用开机挂载；在另一台电脑使用时，需要重新提供凭据并检查本地路径。
+
+Windows 应用数据统一保存在 `%LOCALAPPDATA%\ssh-mountmate`，其中 `config`、`cache`、`state` 分别保存配置、缓存和运行状态。
+旧版 `%APPDATA%\rsshmount`、`%LOCALAPPDATA%\rsshmount` 中的配置、缓存和状态，以及早期 `SSHMountMate\bin` 依赖会迁入新目录。
+旧挂载或更新仍在运行时，会暂时沿用旧配置，待取消挂载并重启后再迁移。迁移遇到冲突会保留数据并提示处理，不覆盖原文件。
+
+设置里的“卸载 SSH MountMate”会在确认后退出程序，并清理程序本体、应用目录及旧目录、缓存、日志、更新 helper、
+下载和解压文件，以及当前程序旁可识别的更新备份与恢复文件。同时移除应用保存的凭据、开机启动、资源管理器菜单、
+通知注册和应用生成的 SSH 配置。自定义缓存目录只清理当前连接对应的子目录。
+外部 SSH 配置、私钥、保存在应用目录之外的导出 JSON 和系统共享的 WinFsp 会保留。
+卸载前请先导出配置、完成上传并取消所有挂载；缓存中尚未上传的内容会随卸载删除。
+
+Windows Release 同时提供带版本号的单文件，例如 `SSHMountMate-v0.6.9-amd64.exe`。
+兼容旧更新器的 ZIP 内仍使用 `SSHMountMate.exe`；从本版发起的后续自动更新会使用 `SSHMountMate-v版本号.exe`。
 
 ## 运行依赖
 
@@ -235,13 +254,13 @@ SSH MountMate 会读取 OpenSSH config 中具体的 `Host` 条目。选择后会
 - 端口
 - 密钥文件
 
-导入后，连接会保存为可编辑的配置。原生 SFTP 使用已保存的主机、用户名、端口和认证设置。旧版仅保存 Host 别名的配置，仍会从源 SSH config 解析缺少的默认值。
+导入后默认使用 OpenSSH。名称仍可编辑，其余连接字段和挂载设置保留原有表单布局并置灰只读，源文件和 Host 选择器仍可使用。
 
-选择 `OpenSSH` 时，导入连接使用 `ssh -o BatchMode=yes -F <config> <alias>`。界面中的主机、用户名、端口和密钥只是导入快照，不会覆盖当前 config。请保留源 config；其中的 `Include`、`Match`、代理、证书和主机密钥校验设置继续生效。要改变别名的连接行为，请修改该 config；若要使用软件中保存的可编辑字段，请选择原生 SFTP。
+选择 `OpenSSH` 时，导入连接使用 `ssh -o BatchMode=yes -F <config> <alias>`。界面中的主机、用户名、端口和密钥只是导入快照，不会覆盖当前 config。请保留源 config；其中的 `Include`、`Match`、代理、证书和主机密钥校验设置继续生效。要改变别名的连接行为，请修改该 config；若要编辑软件中的字段或切换认证方式，请将来源改为手动。
 
 交互式共享 SSH 使用已保存的主机、用户名和端口。macOS/Linux 还会保留别名与 config 以读取 OpenSSH 选项；Windows 则使用 Plink 支持的直连配置。
 
-批量导入会使用用户选择的 config 文件，并通过 OpenSSH 的 `ssh -F <config> -G <host>` 行为解析每个 Host。这样可以复用 OpenSSH 的 Include 和默认值处理，同时仍然保存为普通可编辑的 SSH MountMate 连接。
+批量导入会使用用户选择的 config 文件，并通过 OpenSSH 的 `ssh -F <config> -G <host>` 行为解析每个 Host。这样可以复用 OpenSSH 的 Include 和默认值处理，并保存继续使用源配置的 SSH MountMate 连接。
 
 批量导入时，重复项会在预览中标记并跳过：
 

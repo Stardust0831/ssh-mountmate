@@ -97,8 +97,11 @@ pub fn prepare_update_install(
     safe_extract_zip(&archive, &extracted)?;
     let payload = locate_update_payload(&extracted, layout.kind, std::env::consts::OS)?;
     let transaction = plan_transaction_paths(&layout)?;
-    let prepared =
+    let mut prepared =
         prepare_directory_payload(&layout, &payload, &transaction, std::env::consts::OS)?;
+    if cfg!(windows) && layout.kind == InstallKind::StandaloneExecutable {
+        prepared.installed_name = Some(format!("SSHMountMate-v{}.exe", asset.version()));
+    }
     let authorization = match write_update_plan(
         &paths.update_state_dir(),
         parent,
@@ -165,6 +168,7 @@ mod tests {
                 token: "test-only-token".into(),
             },
             prepared: PreparedPayload {
+                installed_name: None,
                 replace_path: staged.clone(),
                 executable: staged.clone(),
                 executable_sha256: "a".repeat(64),
@@ -191,6 +195,7 @@ mod tests {
         fs::write(&owned, b"owned").unwrap();
         fs::write(&unrelated, b"keep").unwrap();
         let prepared = PreparedPayload {
+            installed_name: None,
             replace_path: unrelated.clone(),
             executable: unrelated.clone(),
             executable_sha256: "a".repeat(64),

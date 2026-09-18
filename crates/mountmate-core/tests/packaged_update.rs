@@ -7,6 +7,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(not(windows))]
 use mountmate_core::LEGACY_APP_ID;
 use mountmate_core::MountState;
 use mountmate_core::model::Settings;
@@ -606,9 +607,9 @@ impl TestEnvironment {
                 (OsString::from("LOCALAPPDATA"), local.as_os_str().to_owned()),
             ]);
             AppPaths {
-                config_dir: roaming.join(LEGACY_APP_ID),
-                cache_dir: local.join(LEGACY_APP_ID).join("Cache"),
-                state_dir: local.join(LEGACY_APP_ID).join("State"),
+                config_dir: local.join("ssh-mountmate/config"),
+                cache_dir: local.join("ssh-mountmate/cache"),
+                state_dir: local.join("ssh-mountmate/state"),
                 data_dir: local.join("ssh-mountmate"),
             }
         };

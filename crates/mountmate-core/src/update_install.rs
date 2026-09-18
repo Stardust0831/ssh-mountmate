@@ -45,6 +45,9 @@ pub struct TransactionPaths {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreparedPayload {
+    /// Optional release-version filename for Windows onefile updates.
+    #[serde(default)]
+    pub installed_name: Option<String>,
     pub replace_path: PathBuf,
     pub executable: PathBuf,
     pub executable_sha256: String,
@@ -53,6 +56,8 @@ pub struct PreparedPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppliedUpdate {
+    pub previous_target: PathBuf,
+    pub previous_executable: PathBuf,
     pub executable: PathBuf,
     pub target: PathBuf,
     pub failed_payload: PathBuf,
@@ -476,6 +481,7 @@ pub fn prepare_directory_payload(
             let tree_sha256 = prepared_tree_sha256(&transaction.prepared)
                 .map_err(PreparePayloadError::Verification)?;
             Ok(PreparedPayload {
+                installed_name: None,
                 replace_path: transaction.prepared.clone(),
                 executable: transaction.prepared.clone(),
                 executable_sha256,
@@ -508,6 +514,7 @@ pub fn prepare_directory_payload(
                 let tree_sha256 = prepared_tree_sha256(&transaction.prepared)
                     .map_err(PreparePayloadError::Verification)?;
                 Ok(PreparedPayload {
+                    installed_name: None,
                     replace_path: transaction.prepared.clone(),
                     executable: verified.executable,
                     executable_sha256,
@@ -550,6 +557,21 @@ fn apply_prepared_update_for(
     {
         return Err(ApplyUpdateError::InvalidTransaction);
     }
+    if let Some(name) = &prepared.installed_name {
+        if os != "windows"
+            || layout.kind != InstallKind::StandaloneExecutable
+            || !valid_versioned_executable_name(name)
+        {
+            return Err(ApplyUpdateError::InvalidTransaction);
+        }
+        let destination = layout.replace_path.with_file_name(name);
+        if destination != layout.replace_path
+            && path_entry_exists(&destination)
+                .map_err(|e| ApplyUpdateError::Verification(e.to_string()))?
+        {
+            return Err(ApplyUpdateError::InstallationChanged);
+        }
+    }
     validate_prepared_payload(layout.kind, prepared, os)?;
 
     let current = detect_install_layout_for(&layout.executable, os, temporary_directory)?;
@@ -574,7 +596,9 @@ fn apply_prepared_update_for(
         &transaction.backup,
         || rename_no_replace(&prepared.replace_path, &layout.replace_path),
     )?;
-    let applied = AppliedUpdate {
+    let mut applied = AppliedUpdate {
+        previous_target: layout.replace_path.clone(),
+        previous_executable: layout.executable.clone(),
         executable: installed_executable,
         target: layout.replace_path.clone(),
         failed_payload: transaction.prepared.clone(),
@@ -593,6 +617,20 @@ fn apply_prepared_update_for(
         rollback_applied_update(&applied)?;
         return Err(ApplyUpdateError::InstallationChanged);
     }
+    if let Some(name) = &prepared.installed_name {
+        let destination = layout.replace_path.with_file_name(name);
+        if destination != applied.target {
+            if let Err(source) = rename_no_replace(&applied.target, &destination) {
+                rollback_applied_update(&applied)?;
+                return Err(ApplyUpdateError::Io {
+                    path: destination,
+                    source,
+                });
+            }
+            applied.target = destination.clone();
+            applied.executable = destination;
+        }
+    }
     Ok(applied)
 }
 
@@ -603,7 +641,7 @@ pub fn rollback_applied_update(applied: &AppliedUpdate) -> Result<(), ApplyUpdat
             source,
         }
     })?;
-    match rename_no_replace(&applied.backup, &applied.target) {
+    match rename_no_replace(&applied.backup, &applied.previous_target) {
         Ok(()) => Ok(()),
         Err(restore_error) => match rename_no_replace(&applied.failed_payload, &applied.target) {
             Ok(()) => Err(ApplyUpdateError::RollbackRestoreFailed {
@@ -625,6 +663,14 @@ pub fn commit_applied_update(applied: &AppliedUpdate) -> Result<(), ApplyUpdateE
         path: applied.backup.clone(),
         source,
     })
+}
+
+pub fn valid_versioned_executable_name(name: &str) -> bool {
+    name.strip_prefix("SSHMountMate-v")
+        .and_then(|s| s.strip_suffix(".exe"))
+        .is_some_and(|version| {
+            semver::Version::parse(version).is_ok() && !version.contains(['/', '\\', ':'])
+        })
 }
 
 fn transaction_file_name(
@@ -1437,6 +1483,49 @@ mod tests {
         .unwrap();
         fs::write(root.join("Contents/Info.plist"), b"<?xml version=\"1.0\"?>").unwrap();
         executable
+    }
+
+    #[test]
+    fn versioned_windows_install_rolls_back_to_original_filename() {
+        let temp = tempdir().unwrap();
+        let executable = temp.path().join("SSHMountMate-v0.6.8.exe");
+        fs::write(&executable, b"old executable").unwrap();
+        let layout =
+            detect_install_layout_for(&executable, "windows", &temp.path().join("unused-temp"))
+                .unwrap();
+        let payload_root = temp.path().join("download");
+        fs::create_dir(&payload_root).unwrap();
+        fs::write(payload_root.join("SSHMountMate.exe"), b"new executable").unwrap();
+        let payload = locate_standalone_payload(&payload_root, "windows").unwrap();
+        let transaction = plan_transaction_paths(&layout).unwrap();
+        let mut prepared =
+            prepare_directory_payload(&layout, &payload, &transaction, "windows").unwrap();
+        prepared.installed_name = Some("SSHMountMate-v0.6.9.exe".into());
+        let applied = apply_prepared_update_for(
+            &layout,
+            &prepared,
+            &transaction,
+            "windows",
+            &temp.path().join("unused-temp"),
+        )
+        .unwrap();
+        assert!(!executable.exists());
+        assert_eq!(fs::read(&applied.executable).unwrap(), b"new executable");
+        rollback_applied_update(&applied).unwrap();
+        assert_eq!(fs::read(executable).unwrap(), b"old executable");
+        assert!(!applied.executable.exists());
+    }
+
+    #[test]
+    fn versioned_filenames_cannot_escape_install_directory() {
+        assert!(valid_versioned_executable_name("SSHMountMate-v0.6.9.exe"));
+        for name in [
+            "../SSHMountMate-v0.6.9.exe",
+            "SSHMountMate-v../../bad.exe",
+            "SSHMountMate-v0.6.9.exe:stream",
+        ] {
+            assert!(!valid_versioned_executable_name(name));
+        }
     }
 
     #[test]

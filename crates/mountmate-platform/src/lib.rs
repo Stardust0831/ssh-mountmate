@@ -50,6 +50,34 @@ pub trait PlatformIntegration: Send + Sync {
     fn set_login_startup(&self, executable: &Path, enabled: bool) -> Result<(), PlatformError>;
 }
 
+/// Remove registrations belonging to this application, retaining shared drivers.
+pub fn remove_application_integration(executable: &Path) -> Result<(), PlatformError> {
+    Platform.set_login_startup(executable, false)?;
+    Platform.unregister_file_manager_menu()?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let key: Vec<u16> = std::ffi::OsStr::new(&format!(
+            r"Software\Classes\AppUserModelId\{NOTIFICATION_APP_ID}"
+        ))
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+        let code = unsafe {
+            windows_sys::Win32::System::Registry::RegDeleteTreeW(
+                windows_sys::Win32::System::Registry::HKEY_CURRENT_USER,
+                key.as_ptr(),
+            )
+        };
+        if code != 0 && code != 2 {
+            return Err(PlatformError::Failed(
+                std::io::Error::from_raw_os_error(code as i32).to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub struct Platform;
 
 /// Stable desktop identity shared by launchers, windows, and notifications.
@@ -61,7 +89,21 @@ pub fn ensure_application_identity(executable: &Path) -> Result<(), PlatformErro
     install_linux_application_identity(&linux_data_home()?, executable)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+pub fn ensure_application_identity(executable: &Path) -> Result<(), PlatformError> {
+    // A versioned update changes the executable path. Refresh a previously
+    // enabled Explorer menu without enabling it for users who never opted in.
+    if EXPLORER_MENU_ENTRIES.iter().any(|entry| {
+        windows_registry::CURRENT_USER
+            .open(format!(r"Software\Classes\{}", entry.key))
+            .is_ok()
+    }) {
+        register_file_manager_menu(executable)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 pub fn ensure_application_identity(_executable: &Path) -> Result<(), PlatformError> {
     Ok(())
 }

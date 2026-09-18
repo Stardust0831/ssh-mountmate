@@ -376,6 +376,60 @@ fn restrict_path(
         })
 }
 
+/// Remove generated SSH profiles and their dedicated Include, preserving the
+/// user's SSH config, imported configs and private keys.
+pub fn remove_managed_ssh_integration() -> Result<(), String> {
+    let config = default_ssh_config_path();
+    remove_managed_ssh_integration_at(&config)
+}
+
+fn remove_managed_ssh_integration_at(config: &Path) -> Result<(), String> {
+    let ssh_dir = config.parent().ok_or("Missing SSH directory")?;
+    let managed = ssh_dir.join("ssh-mountmate.d");
+    let mut keep_include = false;
+    if managed.exists() {
+        crate::application_data::validate_removal_tree(&managed)?;
+        // A profile may have been removed from servers.json. Only delete files
+        // carrying the exact header written by this application.
+        for entry in fs::read_dir(&managed).map_err(|e| e.to_string())? {
+            let path = entry.map_err(|e| e.to_string())?.path();
+            if path.extension().is_some_and(|e| e == "conf")
+                && fs::read_to_string(&path)
+                    .map_err(|e| e.to_string())?
+                    .starts_with("# Managed by SSH MountMate.\n")
+            {
+                fs::remove_file(&path).map_err(|e| e.to_string())?;
+            }
+        }
+        keep_include = fs::read_dir(&managed)
+            .map_err(|e| e.to_string())?
+            .next()
+            .is_some();
+        if !keep_include {
+            fs::remove_dir(&managed).map_err(|e| e.to_string())?;
+        }
+    }
+    if !keep_include && config.exists() {
+        let original = fs::read_to_string(config).map_err(|e| e.to_string())?;
+        let cleaned: String = original
+            .split_inclusive('\n')
+            .filter(|line| {
+                !parse_ssh_directive(line).is_some_and(|(key, args)| {
+                    key.eq_ignore_ascii_case("include") && args == ["~/.ssh/ssh-mountmate.d/*.conf"]
+                })
+            })
+            .collect();
+        if original != cleaned {
+            atomic_write(config, cleaned.as_bytes()).map_err(|e| e.to_string())?;
+        }
+    }
+    match fs::remove_file(ssh_dir.join("ssh-mountmate.lock")) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 fn ensure_managed_include(
     ssh_dir: &Path,
     permissions: &dyn SshPermissionControl,
@@ -943,6 +997,37 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn uninstall_preserves_user_ssh_files_and_removes_only_generated_profiles() {
+        let temp = tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let managed = root.join("ssh-mountmate.d");
+        fs::create_dir(&managed).unwrap();
+        let config = root.join("config");
+        let user_config = "Host work\n    HostName example.org\n";
+        let original = format!("Include ~/.ssh/ssh-mountmate.d/*.conf\n{user_config}");
+        fs::write(&config, &original).unwrap();
+        fs::write(root.join("private-key"), b"keep key").unwrap();
+        fs::write(
+            managed.join("generated.conf"),
+            "# Managed by SSH MountMate.\nHost generated\n",
+        )
+        .unwrap();
+        fs::write(managed.join("user.conf"), "Host personal\n").unwrap();
+        remove_managed_ssh_integration_at(&config).unwrap();
+        assert!(!managed.join("generated.conf").exists());
+        assert_eq!(fs::read_to_string(&config).unwrap(), original);
+        assert_eq!(
+            fs::read_to_string(managed.join("user.conf")).unwrap(),
+            "Host personal\n"
+        );
+        fs::remove_file(managed.join("user.conf")).unwrap();
+        remove_managed_ssh_integration_at(&config).unwrap();
+        assert!(!managed.exists());
+        assert_eq!(fs::read_to_string(config).unwrap(), user_config);
+        assert_eq!(fs::read(root.join("private-key")).unwrap(), b"keep key");
+    }
 
     const TEST_HOST_KEY: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";

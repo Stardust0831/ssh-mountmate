@@ -413,6 +413,8 @@ jobs:
           cargo build --release --package ssh-mountmate
           if ($LASTEXITCODE -ne 0) { throw "onefile build failed" }
           New-Item -ItemType Directory -Force target/onefile, release | Out-Null
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
+          Copy-Item target/release/SSHMountMate.exe "release/SSHMountMate-v$version-${{ matrix.rclone_arch }}.exe"
           Copy-Item target/release/SSHMountMate.exe target/onefile/SSHMountMate.exe
           Compress-Archive -Path target/onefile/SSHMountMate.exe -DestinationPath "release/${{ matrix.asset }}.zip"
           $test = Join-Path $env:RUNNER_TEMP onefile-release-smoke
@@ -537,7 +539,9 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.asset }}
-          path: release/${{ matrix.asset }}.zip
+          path: |
+            release/${{ matrix.asset }}.zip
+            release/SSHMountMate-v*.exe
           if-no-files-found: error
 
   release-set:
@@ -569,7 +573,7 @@ jobs:
             test -s "release-assets/${asset}"
           done
           test "$(find release-assets -maxdepth 1 -name 'SSHMountMate-*.zip' | wc -l)" -eq 6
-          (cd release-assets && sha256sum SSHMountMate-*.zip > SHA256SUMS.txt)
+          (cd release-assets && sha256sum SSHMountMate-*.zip SSHMountMate-v*.exe > SHA256SUMS.txt)
           (cd release-assets && sha256sum --check SHA256SUMS.txt)
 
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88

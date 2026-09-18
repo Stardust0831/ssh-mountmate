@@ -28,9 +28,8 @@ use crate::runtime::{
     SystemProcessControl,
 };
 use crate::ssh::{
-    KnownHostsManager, RequestedTransport, ResolvedSshConfig, SshError, SshTransport,
-    choose_transport, known_hosts_marker, list_ssh_config_hosts, resolve_ssh_config,
-    select_known_hosts_for_marker,
+    KnownHostsManager, ResolvedSshConfig, SshError, known_hosts_marker, list_ssh_config_hosts,
+    resolve_ssh_config, select_known_hosts_for_marker,
 };
 use crate::storage::{StorageError, read_json};
 use crate::transfer::TransferSnapshot;
@@ -547,7 +546,7 @@ fn imported_ssh_server(
     host_alias: &str,
     config_path: &Path,
     resolved: &ResolvedSshConfig,
-    windows: bool,
+    _windows: bool,
 ) -> Result<ServerConfig, String> {
     let host = resolved.first("hostname", host_alias).trim();
     let user = resolved.first("user", "").trim();
@@ -556,10 +555,10 @@ fn imported_ssh_server(
     if host.is_empty() || user.is_empty() {
         return Err("missing HostName or User".into());
     }
-    let connection_method = match choose_transport(RequestedTransport::Auto, resolved, windows) {
-        SshTransport::Native => ConnectionMethod::Native,
-        SshTransport::Openssh => ConnectionMethod::Openssh,
-    };
+    // An imported SSH config is authoritative. OpenSSH is the only transport
+    // that preserves Include, Match, ProxyJump, agent and certificate rules.
+    // Users can still choose another method explicitly after import.
+    let connection_method = ConnectionMethod::Openssh;
     Ok(ServerConfig {
         name: host_alias.into(),
         mode: "ssh_config".into(),
@@ -610,7 +609,7 @@ fn fallback_known_hosts(
     select_known_hosts_for_marker(None, Some(&source), default, &marker)
 }
 
-fn expand_home_path(path: &Path) -> PathBuf {
+pub(crate) fn expand_home_path(path: &Path) -> PathBuf {
     let value = path.as_os_str().to_string_lossy();
     if (value == "~" || value.starts_with("~/") || value.starts_with("~\\"))
         && let Some(directories) = directories::BaseDirs::new()
@@ -685,7 +684,7 @@ mod tests {
         assert_eq!(server.host, "login.example");
         assert_eq!(server.user, "alice");
         assert_eq!(server.port, "2202");
-        assert_eq!(server.connection_method, ConnectionMethod::Native);
+        assert_eq!(server.connection_method, ConnectionMethod::Openssh);
         assert_eq!(server.ssh_config_path, "/tmp/custom ssh config");
         assert!(server.key_file.is_empty());
     }
@@ -894,6 +893,7 @@ mod tests {
         let mut imported = imported_ssh_server("cluster", &source_config, &original, true).unwrap();
         imported.id = "edited-connection".into();
         let mut draft = ConnectionDraft::from_server(&imported);
+        draft.connection_method = ConnectionMethod::Native;
         draft.host = "edited.example".into();
         draft.user = "edited-user".into();
         draft.port = "2303".into();

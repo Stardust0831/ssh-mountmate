@@ -24,8 +24,9 @@ use mountmate_core::app_command::{
     same_instance_build, send_command_retry,
 };
 use mountmate_core::capacity::{CapacityInfo, InodeInfo};
+use mountmate_core::config_transfer::{plan_connection_import, write_connection_export};
 use mountmate_core::connection::{
-    ConnectionDraft, ConnectionSource, DraftError, ImportAction, ImportStatus,
+    BatchImportSource, ConnectionDraft, ConnectionSource, DraftError, ImportAction, ImportStatus,
     PreservedSecretState, SecretAction, SshImportPlan,
 };
 use mountmate_core::credential::{
@@ -116,6 +117,17 @@ use tray::{TrayAction, TrayController, TrayError};
 fn main() {
     if let Err(error) = run() {
         eprintln!("{error}");
+        #[cfg(windows)]
+        if std::env::args()
+            .nth(1)
+            .is_none_or(|arg| matches!(arg.as_str(), "--show-main" | "--show-transfers"))
+        {
+            rfd::MessageDialog::new()
+                .set_title(APP_NAME)
+                .set_description(&error)
+                .set_level(rfd::MessageLevel::Error)
+                .show();
+        }
         std::process::exit(1);
     }
 }
@@ -247,6 +259,8 @@ fn run() -> Result<(), String> {
     }
 
     let paths = AppPaths::discover();
+    #[cfg(windows)]
+    let (paths, _migration_guard) = prepare_windows_profile(paths, &action)?;
     let instance_lock = match InstanceLock::try_acquire(&paths.app_instance_lock()) {
         Ok(lock) => Arc::new(lock),
         Err(AppCommandError::AlreadyRunning) => {
@@ -369,6 +383,48 @@ fn run() -> Result<(), String> {
         }
         _ => unreachable!(),
     }
+}
+
+#[cfg(windows)]
+fn prepare_windows_profile(
+    paths: AppPaths,
+    action: &LaunchAction,
+) -> Result<(AppPaths, Option<InstanceLock>), String> {
+    let legacy = AppPaths::legacy_windows();
+    // The old update helper still owns its health marker and state directory.
+    // Complete that transaction before moving the profile on a normal launch.
+    if matches!(action, LaunchAction::Gui {update_health: Some(health), ..}
+        if health.marker_path.parent() == Some(legacy.update_state_dir().as_path()))
+    {
+        return Ok((legacy, None));
+    }
+    if !legacy.config_dir.exists()
+        && !legacy.cache_dir.exists()
+        && !legacy.state_dir.exists()
+        && !legacy.legacy_managed_bin_dirs().iter().any(|p| p.exists())
+    {
+        return Ok((paths, None));
+    }
+    // Keep the old profile usable while a previous GUI, detached mount, or
+    // update helper is active. Users must still be able to unmount through the
+    // new GUI; migration will run on a later startup after those processes exit.
+    if running_instance(&legacy.app_command_state()).is_ok()
+        || mountmate_core::application_data::profile_has_processes(&legacy)?
+    {
+        return Ok((legacy, None));
+    }
+    let guard = InstanceLock::try_acquire(&legacy.app_instance_lock()).map_err(|e| {
+        format!("Please exit the old SSH MountMate before migrating. 请先退出旧版再迁移：{e}")
+    })?;
+    let _new_guard =
+        InstanceLock::try_acquire(&paths.app_instance_lock()).map_err(|e| e.to_string())?;
+    mountmate_core::application_data::ensure_no_profile_processes(&legacy)?;
+    mountmate_core::data_migration::migrate_windows_data(&legacy, &paths).map_err(|e| {
+        format!(
+            "Profile migration stopped; data retained. Close the app and retry after resolving the conflict. 配置迁移已停止，数据已保留，请处理冲突后重试：{e}"
+        )
+    })?;
+    Ok((paths, Some(guard)))
 }
 
 #[derive(Clone)]
@@ -577,6 +633,8 @@ struct App {
     pending_commands: VecDeque<AppCommand>,
     settings: Settings,
     startup_integration_lock: Arc<Mutex<()>>,
+    integration_jobs: usize,
+    export_pending: bool,
     startup_notice: Option<String>,
     system_locale: Locale,
     system_theme_dark: bool,
@@ -635,6 +693,7 @@ struct App {
     terminal_error: Option<(String, String)>,
     custom_setting: Option<CustomSettingDraft>,
     editor_saving: bool,
+    maintenance_pending: bool,
     ssh_import_loading: bool,
     ssh_import_plan: Option<SshImportPlan>,
     ssh_import_actions: Vec<ImportAction>,
@@ -1322,6 +1381,7 @@ enum Message {
     CloseLog,
     CancelEditor,
     ConnectionSourceChanged(ConnectionSource),
+    BatchImportSourceChanged(BatchImportSource),
     ConnectionFieldChanged(ConnectionField, String),
     ConnectionTagsChanged(String),
     RemoteBaseChanged(String),
@@ -1347,9 +1407,12 @@ enum Message {
     LoadSshConfig,
     BrowseSshConfig,
     SshConfigPicked(Option<PathBuf>),
+    BrowseBatchImport,
+    BatchImportPicked(Option<PathBuf>),
     BrowsePrivateKey,
     PrivateKeyPicked(Option<PathBuf>),
     SshImportLoaded {
+        batch_source: BatchImportSource,
         config_path: PathBuf,
         result: Result<SshImportPlan, String>,
     },
@@ -1398,6 +1461,12 @@ enum Message {
     UnregisterFileManagerMenu,
     FileManagerMenuFinished(Result<bool, String>),
     SaveSettings,
+    ExportConnections,
+    ImportConnections,
+    ConnectionsExported(Result<bool, String>),
+    UninstallApplication,
+    UninstallDecision(bool),
+    UninstallFinished(Result<String, String>),
     SettingsSaved(Result<SettingsMutation, String>),
     StartupReconciled(Result<(), String>),
     Mount(String),
@@ -1436,11 +1505,37 @@ struct ServerMutation {
     warning: Option<String>,
 }
 
+fn source_config_mutation(message: &Message) -> bool {
+    matches!(message,
+        Message::ConnectionFieldChanged(field, _) if !matches!(field, ConnectionField::Name | ConnectionField::SshConfigPath))
+        || matches!(
+            message,
+            Message::ConnectionTagsChanged(_)
+                | Message::RemoteBaseChanged(_)
+                | Message::RemoteSuffixChanged(_)
+                | Message::MountpointChoiceChanged(_)
+                | Message::CustomMountpointChanged(_)
+                | Message::BrowseMountpoint
+                | Message::MountpointPicked(_)
+                | Message::ConnectionAuthChanged(_)
+                | Message::ConnectionMethodChanged(_)
+                | Message::PasswordChanged(_)
+                | Message::KeyPassphraseChanged(_)
+                | Message::ClearSecret(_)
+                | Message::ManagedSshChanged(_)
+                | Message::CopyKeyChanged(_)
+                | Message::ConnectionStartupChanged(_)
+                | Message::BrowsePrivateKey
+                | Message::PrivateKeyPicked(_)
+        )
+}
+
 fn is_editor_mutation(message: &Message) -> bool {
     matches!(
         message,
         Message::CancelEditor
             | Message::ConnectionSourceChanged(_)
+            | Message::BatchImportSourceChanged(_)
             | Message::ConnectionFieldChanged(_, _)
             | Message::ConnectionTagsChanged(_)
             | Message::RemoteBaseChanged(_)
@@ -1460,6 +1555,8 @@ fn is_editor_mutation(message: &Message) -> bool {
             | Message::LoadSshConfig
             | Message::BrowseSshConfig
             | Message::SshConfigPicked(_)
+            | Message::BrowseBatchImport
+            | Message::BatchImportPicked(_)
             | Message::BrowsePrivateKey
             | Message::PrivateKeyPicked(_)
             | Message::SshHostSelected(_)
@@ -1487,6 +1584,8 @@ fn is_editor_mutation(message: &Message) -> bool {
             | Message::SettingsConnectionStartupChanged(_, _)
             | Message::ToggleSettingsConnectionPreferences
             | Message::OpenBatchManagement
+            | Message::ImportConnections
+            | Message::UninstallApplication
     )
 }
 
@@ -1718,6 +1817,8 @@ impl App {
             pending_commands: VecDeque::new(),
             settings,
             startup_integration_lock: Arc::new(Mutex::new(())),
+            integration_jobs: 1,
+            export_pending: false,
             startup_notice,
             system_locale,
             system_theme_dark,
@@ -1776,6 +1877,7 @@ impl App {
             terminal_error: None,
             custom_setting: None,
             editor_saving: false,
+            maintenance_pending: false,
             ssh_import_loading: false,
             ssh_import_plan: None,
             ssh_import_actions: Vec::new(),
@@ -1806,6 +1908,13 @@ impl App {
         if screen == Screen::TransferCenter {
             tasks.push(app.transfer_task());
         }
+        #[cfg(windows)]
+        if app.paths.config_dir == AppPaths::legacy_windows().config_dir {
+            app.status = match app.locale() {
+                Locale::English => "Using the previous data directory while mounts or an update are active. Unmount and restart to move data into the single ssh-mountmate folder.",
+                Locale::Chinese => "当前挂载或更新仍使用旧数据目录。取消挂载并重启后，会迁入统一的 ssh-mountmate 文件夹。",
+            }.into();
+        }
         if app.settings.auto_check_updates {
             app.update_checking = true;
             tasks.push(app.check_update_task(false));
@@ -1821,6 +1930,14 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        if self.maintenance_pending
+            && !matches!(
+                message,
+                Message::UninstallDecision(_) | Message::UninstallFinished(_)
+            )
+        {
+            return Task::none();
+        }
         if self.editor_saving && is_editor_mutation(&message) {
             return Task::none();
         }
@@ -1831,6 +1948,14 @@ impl App {
             .is_some_and(|id| !self.can_modify(id))
             && is_editor_mutation(&message)
             && !matches!(message, Message::CancelEditor)
+        {
+            return Task::none();
+        }
+        if self
+            .connection_draft
+            .as_ref()
+            .is_some_and(|d| d.source == ConnectionSource::SshConfig)
+            && source_config_mutation(&message)
         {
             return Task::none();
         }
@@ -2973,6 +3098,16 @@ impl App {
             Message::ConnectionSourceChanged(source) => {
                 if let Some(draft) = &mut self.connection_draft {
                     draft.source = source;
+                    if matches!(
+                        source,
+                        ConnectionSource::SshConfig | ConnectionSource::SshConfigBatch
+                    ) {
+                        if draft.batch_import_source != BatchImportSource::SshConfig {
+                            draft.ssh_config_path.clear();
+                        }
+                        draft.batch_import_source = BatchImportSource::SshConfig;
+                        draft.connection_method = ConnectionMethod::Openssh;
+                    }
                     draft.apply_source_defaults();
                     if matches!(
                         source,
@@ -2985,6 +3120,21 @@ impl App {
                     }
                     self.ssh_import_plan = None;
                     self.ssh_import_actions.clear();
+                }
+            }
+            Message::BatchImportSourceChanged(source) => {
+                if let Some(draft) = &mut self.connection_draft {
+                    draft.batch_import_source = source;
+                    self.ssh_import_plan = None;
+                    self.ssh_import_actions.clear();
+                    draft.ssh_config_path = if source == BatchImportSource::SshConfig {
+                        default_ssh_config_path().display().to_string()
+                    } else {
+                        String::new()
+                    };
+                    if source == BatchImportSource::SshConfig {
+                        return self.load_ssh_config();
+                    }
                 }
             }
             Message::ConnectionFieldChanged(field, value) => {
@@ -3176,6 +3326,31 @@ impl App {
                 }
             }
             Message::SshConfigPicked(None) => {}
+            Message::BrowseBatchImport => {
+                let title = match locale {
+                    Locale::English => "Select configuration to import",
+                    Locale::Chinese => "选择要导入的配置文件",
+                };
+                return Task::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new()
+                            .set_title(title)
+                            .pick_file()
+                            .await
+                            .map(|file| file.path().to_owned())
+                    },
+                    Message::BatchImportPicked,
+                );
+            }
+            Message::BatchImportPicked(Some(path)) => {
+                if let Some(draft) = &mut self.connection_draft {
+                    draft.ssh_config_path = path.display().to_string();
+                    self.ssh_import_plan = None;
+                    self.ssh_import_actions.clear();
+                    return self.load_ssh_config();
+                }
+            }
+            Message::BatchImportPicked(None) => {}
             Message::BrowsePrivateKey => {
                 let title = locale.text(TextKey::SelectPrivateKey);
                 return Task::perform(
@@ -3196,6 +3371,7 @@ impl App {
             }
             Message::PrivateKeyPicked(None) => {}
             Message::SshImportLoaded {
+                batch_source,
                 config_path,
                 result,
             } => {
@@ -3207,7 +3383,8 @@ impl App {
                     matches!(
                         draft.source,
                         ConnectionSource::SshConfig | ConnectionSource::SshConfigBatch
-                    ) && Path::new(draft.ssh_config_path.trim()) == config_path
+                    ) && draft.batch_import_source == batch_source
+                        && Path::new(draft.ssh_config_path.trim()) == config_path
                         && draft
                             .editing_id
                             .as_deref()
@@ -3609,12 +3786,100 @@ impl App {
             }
             Message::RegisterFileManagerMenu => return self.file_manager_menu_task(true),
             Message::UnregisterFileManagerMenu => return self.file_manager_menu_task(false),
-            Message::FileManagerMenuFinished(result) => match result {
-                Ok(true) => self.status = locale.text(TextKey::FileManagerMenuRegistered).into(),
-                Ok(false) => self.status = locale.text(TextKey::FileManagerMenuRemoved).into(),
-                Err(error) => self.status = error,
-            },
+            Message::FileManagerMenuFinished(result) => {
+                self.integration_jobs = self.integration_jobs.saturating_sub(1);
+                self.status = match result {
+                    Ok(true) => locale.text(TextKey::FileManagerMenuRegistered).into(),
+                    Ok(false) => locale.text(TextKey::FileManagerMenuRemoved).into(),
+                    Err(error) => error,
+                };
+            }
             Message::SaveSettings => return self.save_settings(),
+            Message::ExportConnections => {
+                if self.export_pending {
+                    return Task::none();
+                }
+                self.export_pending = true;
+                let servers = self.servers.clone();
+                let paths = self.paths.clone();
+                let title = match locale {
+                    Locale::English => "Export connections",
+                    Locale::Chinese => "导出连接配置",
+                };
+                return Task::perform(
+                    async move {
+                        let Some(file) = rfd::AsyncFileDialog::new()
+                            .set_title(title)
+                            .add_filter("SSH MountMate JSON", &["json"])
+                            .set_file_name("ssh-mountmate-connections.json")
+                            .save_file()
+                            .await
+                        else {
+                            return Ok(false);
+                        };
+                        let path = file.path().to_owned();
+                        let mut owned_roots = paths.legacy_application_directories();
+                        owned_roots.extend([
+                            paths.data_dir.clone(),
+                            paths.config_dir.clone(),
+                            paths.cache_dir.clone(),
+                            paths.state_dir.clone(),
+                        ]);
+                        if owned_roots.iter().any(|root| path.starts_with(root)) {
+                            return Err("Save the export outside application data so uninstall will preserve it. 请将导出文件保存在应用目录之外。".into());
+                        }
+                        tokio::task::spawn_blocking(move || {
+                            write_connection_export(&path, &servers).map(|_| true)
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?
+                    },
+                    Message::ConnectionsExported,
+                );
+            }
+            Message::ConnectionsExported(result) => {
+                self.export_pending = false;
+                self.status = match result {
+                    Ok(true) => match locale {
+                        Locale::English => {
+                            "Connections exported without passwords or private key contents."
+                        }
+                        Locale::Chinese => "连接配置已导出，不包含密码和私钥内容。",
+                    }
+                    .into(),
+                    Ok(false) => match locale {
+                        Locale::English => "Export cancelled",
+                        Locale::Chinese => "已取消导出",
+                    }
+                    .into(),
+                    Err(error) => error,
+                };
+            }
+            Message::ImportConnections => {
+                if self.editor_saving || self.connection_list_saving {
+                    return Task::none();
+                }
+                let mut draft = ConnectionDraft::default();
+                draft.source = ConnectionSource::SshConfigBatch;
+                draft.batch_import_source = BatchImportSource::SshMountMateConfig;
+                self.connection_draft = Some(draft);
+                self.ssh_import_plan = None;
+                self.ssh_import_actions.clear();
+                self.invalidate_mountpoint_preflight();
+                self.screen = Screen::ConnectionEditor;
+            }
+            Message::UninstallApplication => return self.confirm_uninstall(),
+            Message::UninstallDecision(false) => {
+                self.maintenance_pending = false;
+            }
+            Message::UninstallDecision(true) => return self.uninstall_application(),
+            Message::UninstallFinished(result) => match result {
+                Ok(_) => return iced::exit(),
+                Err(error) => {
+                    self.maintenance_pending = false;
+                    self.status = error;
+                }
+            },
             Message::SettingsSaved(result) => {
                 self.editor_saving = false;
                 match result {
@@ -3631,6 +3896,7 @@ impl App {
                 }
             }
             Message::StartupReconciled(result) => {
+                self.integration_jobs = self.integration_jobs.saturating_sub(1);
                 if let Err(error) = result {
                     diagnostic_trace(&format!("login startup reconciliation failed: {error}"));
                     self.status = match locale {
@@ -4528,6 +4794,7 @@ impl App {
             .map(|server| server.id.clone())
             .collect();
         let service = self.service.clone();
+        let batch_source = draft.batch_import_source;
         let result_path = config_path.clone();
         self.ssh_import_loading = true;
         self.status = self
@@ -4536,14 +4803,19 @@ impl App {
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    service
-                        .ssh_import_plan(&config_path, &existing, &protected)
-                        .map_err(|error| error.to_string())
+                    if batch_source == BatchImportSource::SshMountMateConfig {
+                        plan_connection_import(&config_path, &existing, &protected)
+                    } else {
+                        service
+                            .ssh_import_plan(&config_path, &existing, &protected)
+                            .map_err(|error| error.to_string())
+                    }
                 })
                 .await
                 .unwrap_or_else(|error| Err(error.to_string()))
             },
             move |result| Message::SshImportLoaded {
+                batch_source,
                 config_path: result_path.clone(),
                 result,
             },
@@ -4566,6 +4838,13 @@ impl App {
                 return Task::none();
             }
         };
+        if updates
+            .iter()
+            .any(|s| self.servers.iter().any(|old| old.id == s.id) && !self.can_modify(&s.id))
+        {
+            self.status = connection_settings_locked_help(self.locale()).into();
+            return Task::none();
+        }
         self.editor_saving = true;
         self.status = self.locale().saving_connections(updates.len());
         let paths = self.paths.clone();
@@ -4760,6 +5039,7 @@ impl App {
     }
 
     fn file_manager_menu_task(&mut self, register: bool) -> Task<Message> {
+        self.integration_jobs += 1;
         self.status = self
             .locale()
             .text(if register {
@@ -4768,9 +5048,11 @@ impl App {
                 TextKey::RemovingFileManagerMenu
             })
             .into();
+        let integration = self.startup_integration_lock.clone();
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
+                    let _guard = integration.lock().map_err(|e| e.to_string())?;
                     if register {
                         let executable = std::env::current_exe().map_err(|error| {
                             format!("Could not locate the current executable: {error}")
@@ -4790,6 +5072,103 @@ impl App {
                 .unwrap_or_else(|error| Err(error.to_string()))
             },
             Message::FileManagerMenuFinished,
+        )
+    }
+
+    fn uninstall_available(&self) -> bool {
+        cfg!(windows)
+            && self.integration_jobs == 0
+            && !self.export_pending
+            && !self.editor_saving
+            && !self.connection_list_saving
+            && self.busy.is_empty()
+            && !self.update_downloading
+            && !self.update_checking
+            && self.prepared_update.is_none()
+            && !self.win_fsp_install_pending
+            && !self.dependency_checking
+            && !self.capacity_refreshing
+            && !self.transfer_refreshing
+            && !self.ssh_import_loading
+            && self.interactive_terminals.is_empty()
+            && self.servers.iter().all(|s| self.can_modify(&s.id))
+    }
+
+    fn confirm_uninstall(&mut self) -> Task<Message> {
+        if !self.uninstall_available() {
+            self.status = match self.locale() {
+                Locale::English => "Finish operations, unmount all connections and end SSH sessions before uninstalling.",
+                Locale::Chinese => "请先完成当前操作、取消所有挂载并结束 SSH 会话，再卸载软件。",
+            }.into();
+            return Task::none();
+        }
+        self.maintenance_pending = true;
+        let description = match self.locale() {
+            Locale::English => {
+                "Uninstall SSH MountMate and delete its connections, settings, saved credentials, logs, mount caches and update files, including old backups and the running executable?\n\nExport connections in Settings first if you want to restore them later. Local cache files that have not uploaded will be lost. External SSH config files and private keys, exported JSON files and the shared WinFsp component are retained.\n\nThe app will close to finish removal."
+            }
+            Locale::Chinese => {
+                "卸载 SSH MountMate，并删除连接、设置、已存凭据、日志、挂载缓存、更新文件、旧备份和当前程序本体？\n\n如需日后恢复连接，请先取消并在设置中导出配置。缓存中尚未上传的文件也会被删除。外部 SSH 配置与私钥、自行导出的 JSON，以及系统共享组件 WinFsp 将保留。\n\n程序会退出以完成清理。"
+            }
+        };
+        Task::perform(
+            async move {
+                rfd::AsyncMessageDialog::new()
+                    .set_title(APP_NAME)
+                    .set_level(rfd::MessageLevel::Warning)
+                    .set_description(description)
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show()
+                    .await
+                    == rfd::MessageDialogResult::Yes
+            },
+            Message::UninstallDecision,
+        )
+    }
+
+    fn uninstall_application(&mut self) -> Task<Message> {
+        if !self.maintenance_pending || !self.uninstall_available() {
+            self.maintenance_pending = false;
+            return Task::none();
+        }
+        let paths = self.paths.clone();
+        let servers = self.servers.clone();
+        let settings = self.settings.clone();
+        let integration = self.startup_integration_lock.clone();
+        self.status = match self.locale() {
+            Locale::English => "Preparing uninstall…",
+            Locale::Chinese => "正在准备卸载…",
+        }
+        .into();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    use mountmate_core::application_data::{
+                        ensure_no_profile_processes, uninstall_inventory,
+                    };
+                    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+                    ensure_no_profile_processes(&paths)?;
+                    #[cfg(windows)]
+                    ensure_no_profile_processes(&AppPaths::legacy_windows())?;
+                    let targets = uninstall_inventory(&paths, &executable, &servers, &settings)?;
+                    let _guard = integration.lock().map_err(|e| e.to_string())?;
+                    mountmate_platform::remove_application_integration(&executable)
+                        .map_err(|e| e.to_string())?;
+                    for server in &servers {
+                        delete_server_credentials(server, &SystemCredentialStore)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    #[cfg(windows)]
+                    mountmate_core::credential::delete_all_application_credentials()
+                        .map_err(|e| e.to_string())?;
+                    mountmate_core::ssh::remove_managed_ssh_integration()?;
+                    mountmate_core::uninstall::launch_cleanup(&targets)?;
+                    Ok(String::new())
+                })
+                .await
+                .map_err(|e| e.to_string())?
+            },
+            Message::UninstallFinished,
         )
     }
 
@@ -6704,13 +7083,25 @@ impl App {
             ssh_config_controls = ssh_config_controls.push(
                 row![
                     controls.input(
-                        locale.text(TextKey::SshConfigFile),
+                        if draft.batch_import_source == BatchImportSource::SshMountMateConfig {
+                            match locale {
+                                Locale::English => "SSH MountMate config file",
+                                Locale::Chinese => "SSH MountMate 配置文件",
+                            }
+                        } else {
+                            locale.text(TextKey::SshConfigFile)
+                        },
                         &draft.ssh_config_path,
                         ConnectionField::SshConfigPath,
                         requirements.ssh_config_path,
                     ),
-                    button(locale.text(TextKey::Browse))
-                        .on_press_maybe((!locked).then_some(Message::BrowseSshConfig)),
+                    button(locale.text(TextKey::Browse)).on_press_maybe((!locked).then_some(
+                        if draft.source == ConnectionSource::SshConfigBatch {
+                            Message::BrowseBatchImport
+                        } else {
+                            Message::BrowseSshConfig
+                        }
+                    )),
                     button(if self.ssh_import_loading {
                         locale.text(TextKey::Loading)
                     } else {
@@ -6726,6 +7117,21 @@ impl App {
             );
         }
         if draft.source == ConnectionSource::SshConfigBatch {
+            let import_source = labeled_control(
+                match locale {
+                    Locale::English => "Import from",
+                    Locale::Chinese => "导入来源",
+                },
+                pick_list(
+                    localized_choices(BatchImportSource::ALL, locale, Locale::batch_import_source),
+                    Some(locale.choice(
+                        draft.batch_import_source,
+                        locale.batch_import_source(draft.batch_import_source),
+                    )),
+                    |source| Message::BatchImportSourceChanged(source.value),
+                )
+                .width(Fill),
+            );
             let mut items = column![].spacing(8);
             if let Some(plan) = &self.ssh_import_plan {
                 for (index, item) in plan.items.iter().enumerate() {
@@ -6755,7 +7161,12 @@ impl App {
                         .map(|server| format!("{}@{}:{}", server.user, server.host, server.port))
                         .unwrap_or_else(|| reason.clone());
                     let mut details = column![
-                        text(&item.host_alias).size(17),
+                        text(
+                            item.server
+                                .as_ref()
+                                .map_or(item.host_alias.as_str(), |server| server.display_name())
+                        )
+                        .size(17),
                         text(target).size(13),
                         text(locale.import_status(item.status)).size(12),
                     ]
@@ -6782,7 +7193,7 @@ impl App {
                     );
                 }
             }
-            let content = column![source, ssh_config_controls, items]
+            let content = column![source, import_source, ssh_config_controls, items]
                 .spacing(16)
                 .max_width(900);
             return editor_shell(header, scrollable(controls.freeze(content)), &self.status);
@@ -6809,58 +7220,50 @@ impl App {
                 ));
             }
         }
+        let source_locked = draft.source == ConnectionSource::SshConfig;
+        let mounted_controls = controls;
+        let locked = locked || source_locked;
+        let controls = ConnectionEditorControls { locale, locked };
         let identity = row![
-            controls.input(
+            mounted_controls.input(
                 locale.text(TextKey::Name),
                 &draft.name,
                 ConnectionField::Name,
-                requirements.name,
+                requirements.name
             ),
             controls.input(
                 locale.text(TextKey::SshHostAlias),
                 &draft.host_alias,
                 ConnectionField::HostAlias,
-                requirements.host_alias,
+                requirements.host_alias
             ),
         ]
         .spacing(12);
-        let ssh_config_authoritative = draft.source == ConnectionSource::SshConfig
-            && draft.connection_method == ConnectionMethod::Openssh;
-        let target = if ssh_config_authoritative {
-            row![
-                connection_read_only_field(locale.text(TextKey::IpHost), &draft.host),
-                connection_read_only_field(locale.text(TextKey::User), &draft.user),
-                connection_read_only_field(locale.text(TextKey::Port), &draft.port)
-                    .width(Length::Fixed(150.0)),
-            ]
-            .spacing(12)
-        } else {
-            row![
-                controls.input(
-                    locale.text(TextKey::IpHost),
-                    &draft.host,
-                    ConnectionField::Host,
-                    requirements.host,
-                ),
-                controls.input(
-                    locale.text(TextKey::User),
-                    &draft.user,
-                    ConnectionField::User,
-                    requirements.user,
-                ),
-                controls
-                    .input(
-                        locale.text(TextKey::Port),
-                        &draft.port,
-                        ConnectionField::Port,
-                        requirements.port,
-                    )
-                    .width(Length::Fixed(150.0)),
-            ]
-            .spacing(12)
-        };
+        let target = row![
+            controls.input(
+                locale.text(TextKey::IpHost),
+                &draft.host,
+                ConnectionField::Host,
+                requirements.host
+            ),
+            controls.input(
+                locale.text(TextKey::User),
+                &draft.user,
+                ConnectionField::User,
+                requirements.user
+            ),
+            controls
+                .input(
+                    locale.text(TextKey::Port),
+                    &draft.port,
+                    ConnectionField::Port,
+                    requirements.port
+                )
+                .width(Length::Fixed(150.0)),
+        ]
+        .spacing(12);
         let authentication: Element<'_, Message> =
-            if draft.connection_method != ConnectionMethod::Native {
+            if draft.connection_method != ConnectionMethod::Native && !source_locked {
                 let label = if draft.connection_method == ConnectionMethod::Interactive {
                     interactive_auth_help(locale)
                 } else {
@@ -6877,6 +7280,20 @@ impl App {
                 .width(Fill)
                 .into()
             };
+        let authentication = if source_locked {
+            let label = match locale {
+                Locale::English => "From SSH config",
+                Locale::Chinese => "由 SSH 配置决定",
+            };
+            pick_list(vec![label], Some(label), |_| {
+                Message::ConnectionAuthChanged(AuthMethod::Key)
+            })
+            .style(move |theme, status| connection_pick_list_style(theme, status, true))
+            .width(Fill)
+            .into()
+        } else {
+            authentication
+        };
         let transport_choice = column![
             pick_list(
                 localized_choices(ConnectionMethod::ALL, locale, Locale::connection_method),
@@ -6900,48 +7317,15 @@ impl App {
         ]
         .spacing(12);
 
-        if ssh_config_authoritative {
-            ssh_config_controls = ssh_config_controls.push(
-                container(
-                    column![
-                        text(match locale {
-                            Locale::English => "OpenSSH source of truth",
-                            Locale::Chinese => "OpenSSH 权威来源",
-                        })
-                        .size(16),
-                        text(format!(
-                            "{}: {}",
-                            locale.text(TextKey::SshConfigFile),
-                            draft.ssh_config_path
-                        ))
-                        .size(13),
-                        text(format!(
-                            "{}: {}",
-                            locale.text(TextKey::SshHostAlias),
-                            draft.host_alias
-                        ))
-                        .size(13),
-                        text(openssh_command_preview(
-                            &draft.ssh_config_path,
-                            &draft.host_alias
-                        ))
-                        .size(13),
-                        text(match locale {
-                            Locale::English => "The visible resolved fields are only an import snapshot. The actual OpenSSH command remains authoritative and may apply Include, Match, ProxyJump, ProxyCommand, agent, certificate, and token expansion rules not shown here.",
-                            Locale::Chinese => "可见的解析字段只是导入快照。实际 OpenSSH 命令仍是权威来源，并可能应用此处未显示的 Include、Match、ProxyJump、ProxyCommand、代理、证书和令牌展开规则。",
-                        })
-                        .size(12),
-                    ]
-                    .spacing(5),
-                )
-                .padding(10)
-                .width(Fill)
-                .style(container::rounded_box),
-            );
+        if source_locked {
+            ssh_config_controls = ssh_config_controls.push(text(match locale {
+                Locale::English => "Connection fields are read from SSH config. Edit that file and reload to change them; OpenSSH resolves it again when connecting.",
+                Locale::Chinese => "连接字段来自 SSH 配置，修改源文件后重新读取即可更新；连接时由 OpenSSH 读取配置。",
+            }).size(13));
         }
 
         let mut auth_fields = column![].spacing(12);
-        if draft.connection_method == ConnectionMethod::Native {
+        if draft.connection_method == ConnectionMethod::Native || source_locked {
             match draft.auth {
                 AuthMethod::Password => {
                     auth_fields = auth_fields.push(controls.secret(
@@ -7135,10 +7519,7 @@ impl App {
             ),
         ]
         .spacing(12);
-        let content = column![
-            source,
-            ssh_config_controls,
-            identity,
+        let details = column![
             target,
             transport,
             auth_fields,
@@ -7146,9 +7527,28 @@ impl App {
             organization,
             paths
         ]
-        .spacing(16)
-        .max_width(900);
-        editor_shell(header, scrollable(controls.freeze(content)), &self.status)
+        .spacing(16);
+        let details: Element<'_, Message> = if source_locked {
+            tooltip(
+                read_only::freeze(details.into()),
+                text(match locale {
+                    Locale::English => "Read from SSH config; edit the source file and reload.",
+                    Locale::Chinese => "来自 SSH 配置；请修改源文件后重新读取。",
+                }),
+                tooltip::Position::FollowCursor,
+            )
+            .into()
+        } else {
+            details.into()
+        };
+        let content = column![source, ssh_config_controls, identity, details]
+            .spacing(16)
+            .max_width(900);
+        editor_shell(
+            header,
+            scrollable(mounted_controls.freeze(content)),
+            &self.status,
+        )
     }
 
     fn settings_view(&self) -> Element<'_, Message> {
@@ -7650,6 +8050,22 @@ impl App {
                 .filter(|_| !self.update_downloading),
         );
         update_section = update_section.push(row![check, install].spacing(10));
+        let mut maintenance = column![
+            text(match locale {Locale::English => "Connections and application data", Locale::Chinese => "连接配置与应用数据"}).size(20),
+            text(match locale {Locale::English => "Export connection details as JSON. Passwords and private key contents are not included. Import previews each connection; automatic mounts stay off until enabled.", Locale::Chinese => "将连接信息导出为 JSON，不包含密码和私钥内容。导入时可逐条预览，自动挂载需重新启用。"}).size(13),
+            row![button(match locale {Locale::English => "Export connections", Locale::Chinese => "导出连接配置"}).on_press(Message::ExportConnections),
+                button(match locale {Locale::English => "Import connections", Locale::Chinese => "导入连接配置"}).on_press(Message::ImportConnections)].spacing(10),
+        ].spacing(8).max_width(640);
+        if cfg!(windows) {
+            maintenance = maintenance.push(
+                button(match locale {
+                    Locale::English => "Uninstall SSH MountMate",
+                    Locale::Chinese => "卸载 SSH MountMate",
+                })
+                .style(button::danger)
+                .on_press(Message::UninstallApplication),
+            );
+        }
         let content = column![
             mount_backend,
             credential_storage,
@@ -7662,6 +8078,7 @@ impl App {
             logs,
             dependency_section,
             update_section,
+            maintenance,
             tray_capability,
             file_manager
         ]
@@ -8837,13 +9254,6 @@ fn connection_input_placeholder(field: ConnectionField) -> &'static str {
     }
 }
 
-fn connection_read_only_field<'a>(
-    label: &'a str,
-    value: &'a str,
-) -> iced::widget::Column<'a, Message> {
-    labeled_control(label, container(text(value)).padding(10).width(Fill))
-}
-
 fn connection_field_label<'a>(label: &'a str, required: bool) -> iced::widget::Row<'a, Message> {
     let mut content = row![text(label).size(13)].spacing(3).align_y(Center);
     if required {
@@ -9741,26 +10151,6 @@ fn application_theme(mode: AppearanceMode, accent: AccentColor, system_dark: boo
         (AccentColor::Purple, true) => Color::from_rgb8(187, 134, 252),
     };
     Theme::custom("SSH MountMate", palette)
-}
-
-fn openssh_command_preview(config_path: &str, host_alias: &str) -> String {
-    format!(
-        "ssh -o BatchMode=yes -F {} {}",
-        quote_command_preview_argument(config_path),
-        quote_command_preview_argument(host_alias)
-    )
-}
-
-fn quote_command_preview_argument(value: &str) -> String {
-    if !value.is_empty()
-        && value
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "-._/:\\".contains(character))
-    {
-        value.into()
-    } else {
-        format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\""))
-    }
 }
 
 fn localize_service_error(locale: Locale, error: &ServiceError) -> String {
@@ -11375,18 +11765,6 @@ mod localization_tests {
     }
 
     #[test]
-    fn openssh_command_preview_quotes_unsafe_arguments_without_interpreting_them() {
-        assert_eq!(
-            openssh_command_preview("C:\\Users\\A B\\.ssh\\config", "host alias"),
-            "ssh -o BatchMode=yes -F \"C:\\\\Users\\\\A B\\\\.ssh\\\\config\" \"host alias\""
-        );
-        assert_eq!(
-            openssh_command_preview("C:\\Users\\me\\.ssh\\config", "host-a"),
-            "ssh -o BatchMode=yes -F C:\\Users\\me\\.ssh\\config host-a"
-        );
-    }
-
-    #[test]
     fn mount_status_messages_use_the_display_name_not_the_internal_id() {
         let server = ServerConfig {
             id: "NAS".into(),
@@ -12306,6 +12684,7 @@ mod localization_tests {
             "save failed".into()
         ))));
         assert!(!is_editor_mutation(&Message::SshImportLoaded {
+            batch_source: BatchImportSource::SshConfig,
             config_path: PathBuf::from("config"),
             result: Err("load failed".into()),
         }));
