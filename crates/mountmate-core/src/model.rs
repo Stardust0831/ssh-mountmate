@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const SETTINGS_SCHEMA_VERSION: u32 = 14;
-pub const DEFAULT_VFS_UPLOAD_TRANSFERS: u16 = 4;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 15;
+pub const DEFAULT_VFS_UPLOAD_TRANSFERS: u16 = 12;
 pub const MIN_VFS_UPLOAD_TRANSFERS: u16 = 1;
 pub const MAX_VFS_UPLOAD_TRANSFERS: u16 = 32;
 pub const MAX_CONNECTION_TAGS: usize = 8;
@@ -100,6 +100,7 @@ pub enum AccentColor {
     Green,
     Amber,
     Purple,
+    Custom,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,7 +127,13 @@ impl FontScale {
 }
 
 impl AccentColor {
-    pub const ALL: [Self; 4] = [Self::Blue, Self::Green, Self::Amber, Self::Purple];
+    pub const ALL: [Self; 5] = [
+        Self::Blue,
+        Self::Green,
+        Self::Amber,
+        Self::Purple,
+        Self::Custom,
+    ];
 }
 
 impl AuthMethod {
@@ -589,6 +596,18 @@ impl Settings {
         {
             self.vfs_write_back = default_write_back();
         }
+        if version < 15 {
+            if self.vfs_upload_transfers == 4 {
+                self.vfs_upload_transfers = default_vfs_upload_transfers();
+            }
+            if self.custom_accent_color.as_deref().is_some_and(|color| {
+                color.trim().strip_prefix('#').is_some_and(|digits| {
+                    digits.len() == 6 && digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            }) {
+                self.accent_color = AccentColor::Custom;
+            }
+        }
         if !(MIN_VFS_UPLOAD_TRANSFERS..=MAX_VFS_UPLOAD_TRANSFERS)
             .contains(&self.vfs_upload_transfers)
         {
@@ -686,6 +705,46 @@ mod tests {
         }
         .migrate();
         assert_eq!(custom.vfs_write_back, "0s");
+    }
+
+    #[test]
+    fn schema_15_migrates_old_upload_default_and_custom_accent_once() {
+        let old: Settings = serde_json::from_str(
+            r##"{
+            "settings_schema_version":14,"vfs_upload_transfers":4,
+            "accent_color":"green","custom_accent_color":"#7A8B99"
+        }"##,
+        )
+        .unwrap();
+        let migrated = old.migrate();
+        assert_eq!(migrated.vfs_upload_transfers, 12);
+        assert_eq!(migrated.accent_color, AccentColor::Custom);
+        assert_eq!(migrated.custom_accent_color.as_deref(), Some("#7A8B99"));
+        let edited = Settings {
+            vfs_upload_transfers: 4,
+            accent_color: AccentColor::Purple,
+            ..migrated
+        };
+        let reloaded: Settings =
+            serde_json::from_str(&serde_json::to_string(&edited).unwrap()).unwrap();
+        assert_eq!(reloaded.migrate(), edited);
+        for uploads in [1, 8, 12, 32] {
+            let old = Settings {
+                settings_schema_version: 14,
+                vfs_upload_transfers: uploads,
+                ..Settings::default()
+            };
+            assert_eq!(old.migrate().vfs_upload_transfers, uploads);
+        }
+        for value in ["", "#invalid"] {
+            let old = Settings {
+                settings_schema_version: 14,
+                accent_color: AccentColor::Green,
+                custom_accent_color: Some(value.into()),
+                ..Settings::default()
+            };
+            assert_eq!(old.migrate().accent_color, AccentColor::Green);
+        }
     }
 
     #[test]

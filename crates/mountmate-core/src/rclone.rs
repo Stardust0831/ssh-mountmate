@@ -623,7 +623,7 @@ mod tests {
                 .windows(2)
                 .any(|item| item == ["--dir-cache-time", "5m"])
         );
-        assert!(command.windows(2).any(|item| item == ["--transfers", "4"]));
+        assert!(command.windows(2).any(|item| item == ["--transfers", "12"]));
     }
 
     #[test]

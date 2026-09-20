@@ -644,7 +644,6 @@ struct App {
     servers: Vec<ServerConfig>,
     mount_targets: Vec<ServerConfig>,
     pending_interactive_mounts: HashSet<String>,
-    expanded_mounts: HashSet<String>,
     connection_search: String,
     connection_sort: ConnectionSort,
     connection_tag_filter: Option<String>,
@@ -1269,16 +1268,14 @@ impl SettingsDraft {
         settings.appearance_mode = self.appearance_mode;
         settings.accent_color = self.accent_color;
         let custom_accent = self.custom_accent_color.trim();
-        settings.custom_accent_color = if custom_accent.is_empty() {
-            None
+        settings.custom_accent_color = if self.accent_color != AccentColor::Custom {
+            parse_accent_color(custom_accent).map(|_| custom_accent.to_ascii_uppercase())
         } else if parse_accent_color(custom_accent).is_some() {
             Some(custom_accent.to_ascii_uppercase())
         } else {
             return Err(match locale {
-                Locale::English => {
-                    "Enter an accent color as #RRGGBB, or leave it blank to use a preset.".into()
-                }
-                Locale::Chinese => "请按 #RRGGBB 格式填写强调色，或留空使用预设颜色。".into(),
+                Locale::English => "Enter a custom accent color as #RRGGBB.".into(),
+                Locale::Chinese => "请按 #RRGGBB 格式填写自定义强调色。".into(),
             });
         };
         settings.font_scale = self.font_scale;
@@ -1394,12 +1391,12 @@ enum Message {
     AddMountMapping,
     RemovePrimaryMapping,
     RemoveMountMapping(usize),
-    MappingRemoteChanged(usize, String),
+    MappingRemoteBaseChanged(usize, String),
+    MappingRemoteSuffixChanged(usize, String),
     MappingLocalChanged(usize, String),
     MappingLocalChoice(usize, String),
     MappingBrowse(usize),
     MappingPicked(String, Option<PathBuf>),
-    ToggleMountMappings(String),
     MountConnection(String, MountOperation),
     RemoteBaseChanged(String),
     RemoteSuffixChanged(String),
@@ -1545,7 +1542,8 @@ fn is_editor_mutation(message: &Message) -> bool {
         Message::AddMountMapping
             | Message::RemovePrimaryMapping
             | Message::RemoveMountMapping(_)
-            | Message::MappingRemoteChanged(_, _)
+            | Message::MappingRemoteBaseChanged(_, _)
+            | Message::MappingRemoteSuffixChanged(_, _)
             | Message::MappingLocalChanged(_, _)
             | Message::MappingLocalChoice(_, _)
             | Message::MappingBrowse(_)
@@ -1656,7 +1654,9 @@ impl App {
             || self.settings.custom_accent_color.as_deref(),
             |draft| Some(draft.custom_accent_color.as_str()),
         );
-        if let Some(color) = custom.and_then(parse_accent_color) {
+        if accent == AccentColor::Custom
+            && let Some(color) = custom.and_then(parse_accent_color)
+        {
             let mut palette = theme.palette();
             palette.primary = color;
             Theme::custom("SSH MountMate", palette)
@@ -1842,7 +1842,6 @@ impl App {
                 .flat_map(ServerConfig::mount_targets)
                 .collect(),
             pending_interactive_mounts: HashSet::new(),
-            expanded_mounts: HashSet::new(),
             servers,
             connection_search: String::new(),
             connection_sort: ConnectionSort::default(),
@@ -1958,7 +1957,8 @@ impl App {
         if let Some(draft) = &self.connection_draft {
             let row = match &message {
                 Message::RemoveMountMapping(i)
-                | Message::MappingRemoteChanged(i, _)
+                | Message::MappingRemoteBaseChanged(i, _)
+                | Message::MappingRemoteSuffixChanged(i, _)
                 | Message::MappingLocalChanged(i, _)
                 | Message::MappingLocalChoice(i, _)
                 | Message::MappingBrowse(i) => Some(*i),
@@ -3289,11 +3289,6 @@ impl App {
                     draft.folder.clear();
                 }
             }
-            Message::ToggleMountMappings(id) => {
-                if !self.expanded_mounts.remove(&id) {
-                    self.expanded_mounts.insert(id);
-                }
-            }
             Message::MountConnection(id, operation) => {
                 let ids: Vec<_> = self
                     .mount_targets
@@ -3346,13 +3341,24 @@ impl App {
                     draft.mounts.remove(index);
                 }
             }
-            Message::MappingRemoteChanged(index, value) => {
+            Message::MappingRemoteBaseChanged(index, base) => {
                 if let Some(mapping) = self
                     .connection_draft
                     .as_mut()
                     .and_then(|d| d.mounts.get_mut(index))
                 {
-                    mapping.remote_path = value;
+                    let (_, suffix) = split_remote_path(&mapping.remote_path);
+                    mapping.remote_path = compose_remote_path(&base, &suffix);
+                }
+            }
+            Message::MappingRemoteSuffixChanged(index, suffix) => {
+                if let Some(mapping) = self
+                    .connection_draft
+                    .as_mut()
+                    .and_then(|d| d.mounts.get_mut(index))
+                {
+                    let (base, _) = split_remote_path(&mapping.remote_path);
+                    mapping.remote_path = compose_remote_path(&base, &suffix);
                 }
             }
             Message::MappingLocalChanged(index, value) => {
@@ -4020,8 +4026,24 @@ impl App {
             }
             Message::AccentColorChanged(accent) => {
                 if let Some(draft) = &mut self.settings_draft {
+                    if accent == AccentColor::Custom
+                        && parse_accent_color(&draft.custom_accent_color).is_none()
+                    {
+                        let color = application_theme(
+                            draft.appearance_mode,
+                            draft.accent_color,
+                            self.system_theme_dark,
+                        )
+                        .palette()
+                        .primary;
+                        draft.custom_accent_color = format!(
+                            "#{:02X}{:02X}{:02X}",
+                            (color.r * 255.0).round() as u8,
+                            (color.g * 255.0).round() as u8,
+                            (color.b * 255.0).round() as u8
+                        );
+                    }
                     draft.accent_color = accent;
-                    draft.custom_accent_color.clear();
                 }
             }
             Message::CustomAccentColorChanged(value) => {
@@ -7127,24 +7149,13 @@ impl App {
             .iter()
             .filter(|s| self.mount_statuses.get(&s.id) == Some(&MountStatus::Mounted))
             .count();
-        let expanded = self.expanded_mounts.contains(&server.id);
         let label = match locale {
-            Locale::English => format!(
-                "{} Mount points ({mounted}/{})",
-                if expanded { "▾" } else { "▸" },
-                targets.len()
-            ),
-            Locale::Chinese => format!(
-                "{} 挂载点（已挂载 {mounted}/{}）",
-                if expanded { "▾" } else { "▸" },
-                targets.len()
-            ),
+            Locale::English => format!("Mount points ({mounted}/{})", targets.len()),
+            Locale::Chinese => format!("挂载点（已挂载 {mounted}/{}）", targets.len()),
         };
         let mut content = column![
             row![
-                button(text(label))
-                    .style(button::text)
-                    .on_press(Message::ToggleMountMappings(server.id.clone())),
+                text(label),
                 Space::new().width(Fill),
                 button(locale.text(TextKey::MountAll)).on_press_maybe(
                     targets
@@ -7163,86 +7174,82 @@ impl App {
             .align_y(Center)
         ]
         .spacing(10);
-        if expanded {
-            for target in targets {
-                let id = &target.id;
-                let status = self
-                    .mount_statuses
-                    .get(id)
-                    .copied()
-                    .unwrap_or(MountStatus::Unmounted);
-                let busy = self.busy.contains(id);
-                let waiting = self.pending_unmount_after_sync.contains(id);
-                let mut details = column![
-                    text(format!(
-                        "{} → {}",
-                        if target.remote_path.is_empty() {
-                            "~"
-                        } else {
-                            &target.remote_path
-                        },
-                        display_mountpoint(target, locale)
-                    ))
-                    .size(15),
-                    text(status_label(locale, status)).size(12),
-                ]
-                .spacing(5)
-                .width(Fill);
-                if status == MountStatus::Mounted {
-                    details = details.push(capacity_progress_view(
-                        self.capacities.get(id),
-                        self.capacity_refreshing && !self.capacity_errors.contains(id),
-                        locale,
-                    ));
-                    if let Some(inode) = self.capacities.get(id).and_then(|c| c.inode.as_ref()) {
-                        details = details.push(inode_progress_view(inode, locale));
-                    }
-                    if let Some(transfer) = self.transfers.get(id).filter(|t| transfer_is_active(t))
-                    {
-                        details = details.push(text(transfer_label(locale, transfer)).size(12));
-                    }
-                    if self.transfer_errors.contains_key(id) {
-                        details = details
-                            .push(text(locale.text(TextKey::TransferStateUnavailable)).size(12));
-                    }
+        for target in targets {
+            let id = &target.id;
+            let status = self
+                .mount_statuses
+                .get(id)
+                .copied()
+                .unwrap_or(MountStatus::Unmounted);
+            let busy = self.busy.contains(id);
+            let waiting = self.pending_unmount_after_sync.contains(id);
+            let mut details = column![
+                text(format!(
+                    "{} → {}",
+                    if target.remote_path.is_empty() {
+                        "~"
+                    } else {
+                        &target.remote_path
+                    },
+                    display_mountpoint(target, locale)
+                ))
+                .size(15),
+                text(status_label(locale, status)).size(12),
+            ]
+            .spacing(5)
+            .width(Fill);
+            if status == MountStatus::Mounted {
+                details = details.push(capacity_progress_view(
+                    self.capacities.get(id),
+                    self.capacity_refreshing && !self.capacity_errors.contains(id),
+                    locale,
+                ));
+                if let Some(inode) = self.capacities.get(id).and_then(|c| c.inode.as_ref()) {
+                    details = details.push(inode_progress_view(inode, locale));
                 }
-                if let Some(error) = self.operation_errors.get(id) {
+                if let Some(transfer) = self.transfers.get(id).filter(|t| transfer_is_active(t)) {
+                    details = details.push(text(transfer_label(locale, transfer)).size(12));
+                }
+                if self.transfer_errors.contains_key(id) {
                     details =
-                        details.push(text(mount_error_summary(locale, &error.cause)).size(12));
+                        details.push(text(locale.text(TextKey::TransferStateUnavailable)).size(12));
                 }
-                let operation = if waiting {
-                    Message::CancelPendingUnmount(id.clone())
-                } else {
-                    Message::Mount(id.clone())
-                };
-                let operation_label = if waiting {
-                    match locale {
-                        Locale::English => "Cancel pending unmount",
-                        Locale::Chinese => "取消等待卸载",
-                    }
-                } else if status == MountStatus::Mounted {
-                    locale.text(TextKey::Unmount)
-                } else {
-                    locale.text(TextKey::Mount)
-                };
-                content = content.push(
-                    container(
-                        row![
-                            details,
-                            button(operation_label).on_press_maybe((!busy).then_some(operation)),
-                            button(locale.text(TextKey::Open)).on_press_maybe(
-                                (status == MountStatus::Mounted && !busy)
-                                    .then_some(Message::Open(id.clone()))
-                            ),
-                            button(locale.text(TextKey::Logs))
-                                .on_press(Message::OpenOperationLog(id.clone())),
-                        ]
-                        .spacing(8)
-                        .align_y(Center),
-                    )
-                    .padding([8, 12]),
-                );
             }
+            if let Some(error) = self.operation_errors.get(id) {
+                details = details.push(text(mount_error_summary(locale, &error.cause)).size(12));
+            }
+            let operation = if waiting {
+                Message::CancelPendingUnmount(id.clone())
+            } else {
+                Message::Mount(id.clone())
+            };
+            let operation_label = if waiting {
+                match locale {
+                    Locale::English => "Cancel pending unmount",
+                    Locale::Chinese => "取消等待卸载",
+                }
+            } else if status == MountStatus::Mounted {
+                locale.text(TextKey::Unmount)
+            } else {
+                locale.text(TextKey::Mount)
+            };
+            content = content.push(
+                container(
+                    row![
+                        details,
+                        button(operation_label).on_press_maybe((!busy).then_some(operation)),
+                        button(locale.text(TextKey::Open)).on_press_maybe(
+                            (status == MountStatus::Mounted && !busy)
+                                .then_some(Message::Open(id.clone()))
+                        ),
+                        button(locale.text(TextKey::Logs))
+                            .on_press(Message::OpenOperationLog(id.clone())),
+                    ]
+                    .spacing(8)
+                    .align_y(Center),
+                )
+                .padding([8, 12]),
+            );
         }
         content.into()
     }
@@ -7827,31 +7834,14 @@ impl App {
             .editing_id
             .as_ref()
             .is_some_and(|id| !self.mapping_can_modify(id));
-        let (remote_base, remote_suffix) = split_remote_path(&draft.remote_path);
-        let remote_path = column![
-            text(locale.text(TextKey::RemotePath)).size(13),
-            row![
-                pick_list(
-                    vec!["$HOME".to_owned(), "/".to_owned()],
-                    Some(remote_base),
-                    Message::RemoteBaseChanged,
-                )
-                .style(move |theme, status| connection_pick_list_style(theme, status, path_locked))
-                .width(Length::Fixed(120.0)),
-                text_input("projects/data", &remote_suffix)
-                    .id("connection-remote-path")
-                    .on_input_maybe((!path_locked).then_some(Message::RemoteSuffixChanged))
-                    .width(Fill),
-            ]
-            .spacing(8),
-            text(match locale {
-                Locale::English => "Leave blank to use the selected root directory.",
-                Locale::Chinese => "留空使用左侧选中的根目录。",
-            })
-            .size(12),
-        ]
-        .spacing(5)
-        .width(Fill);
+        let remote_path = remote_path_control(
+            &draft.remote_path,
+            locale,
+            path_locked,
+            "connection-remote-path".into(),
+            Message::RemoteBaseChanged,
+            Message::RemoteSuffixChanged,
+        );
         let primary_choice = mountpoint_choice(&draft.mountpoint);
         let custom_mountpoint = primary_choice == "custom";
         let mut mountpoint = column![
@@ -7989,22 +7979,14 @@ impl App {
             } else {
                 local
             };
-            let remote = column![
-                text(locale.text(TextKey::RemotePath)).size(13),
-                text_input("/data/projects", &mapping.remote_path)
-                    .on_input_maybe(
-                        (!frozen)
-                            .then_some(move |value| Message::MappingRemoteChanged(index, value))
-                    )
-                    .width(Fill),
-                text(match locale {
-                    Locale::English => "Blank: home directory; /: server root",
-                    Locale::Chinese => "留空为用户主目录，/ 为服务器根目录",
-                })
-                .size(12),
-            ]
-            .spacing(5)
-            .width(Fill);
+            let remote = remote_path_control(
+                &mapping.remote_path,
+                locale,
+                frozen,
+                format!("mapping-{}-remote-path", mapping.id),
+                move |base| Message::MappingRemoteBaseChanged(index, base),
+                move |suffix| Message::MappingRemoteSuffixChanged(index, suffix),
+            );
             paths = paths.push(
                 controls.freeze(
                     row![
@@ -8183,6 +8165,23 @@ impl App {
         ]
         .spacing(8)
         .max_width(640);
+        let mut accent_control = column![
+            pick_list(
+                localized_choices(AccentColor::ALL, locale, Locale::accent_color),
+                Some(locale.choice(draft.accent_color, locale.accent_color(draft.accent_color))),
+                |accent| Message::AccentColorChanged(accent.value),
+            )
+            .width(Fill),
+        ]
+        .spacing(8);
+        if draft.accent_color == AccentColor::Custom {
+            accent_control = accent_control.push(
+                text_input("#RRGGBB", &draft.custom_accent_color)
+                    .id("settings-custom-accent")
+                    .on_input(Message::CustomAccentColorChanged)
+                    .width(Fill),
+            );
+        }
         let appearance = column![
             text(match locale {
                 Locale::English => "Appearance",
@@ -8214,15 +8213,7 @@ impl App {
                         Locale::English => "Accent",
                         Locale::Chinese => "强调色",
                     },
-                    pick_list(
-                        localized_choices(AccentColor::ALL, locale, Locale::accent_color),
-                        Some(locale.choice(
-                            draft.accent_color,
-                            locale.accent_color(draft.accent_color),
-                        )),
-                        |accent| Message::AccentColorChanged(accent.value),
-                    )
-                    .width(Fill),
+                    accent_control,
                 ),
                 labeled_control(
                     match locale {
@@ -8238,16 +8229,6 @@ impl App {
                 ),
             ]
             .spacing(12),
-            labeled_control(
-                match locale {
-                    Locale::English => "Custom accent (#RRGGBB; blank uses the preset)",
-                    Locale::Chinese => "自定义强调色（#RRGGBB，留空使用预设）",
-                },
-                text_input("#7A8B99", &draft.custom_accent_color)
-                    .id("settings-custom-accent")
-                    .on_input(Message::CustomAccentColorChanged)
-                    .width(Fill),
-            ),
             text(match locale {
                 Locale::English => {
                     "Theme, accent, and text size preview immediately; Save makes them persistent. Follow system is detected when the app starts."
@@ -10699,8 +10680,8 @@ fn application_theme(mode: AppearanceMode, accent: AccentColor, system_dark: boo
     };
     let mut palette = if dark { Palette::DARK } else { Palette::LIGHT };
     palette.primary = match (accent, dark) {
-        (AccentColor::Blue, false) => Color::from_rgb8(52, 103, 209),
-        (AccentColor::Blue, true) => Color::from_rgb8(110, 168, 254),
+        (AccentColor::Blue | AccentColor::Custom, false) => Color::from_rgb8(52, 103, 209),
+        (AccentColor::Blue | AccentColor::Custom, true) => Color::from_rgb8(110, 168, 254),
         (AccentColor::Green, false) => Color::from_rgb8(46, 125, 50),
         (AccentColor::Green, true) => Color::from_rgb8(102, 187, 106),
         (AccentColor::Amber, false) => Color::from_rgb8(154, 103, 0),
@@ -12013,6 +11994,42 @@ fn open_path(path: &Path, locale: Locale) -> Result<(), String> {
     Ok(())
 }
 
+fn remote_path_control<'a>(
+    value: &str,
+    locale: Locale,
+    locked: bool,
+    field_id: String,
+    on_base: impl Fn(String) -> Message + 'a,
+    on_suffix: impl Fn(String) -> Message + 'a,
+) -> Element<'a, Message> {
+    let (remote_base, remote_suffix) = split_remote_path(value);
+    column![
+        text(locale.text(TextKey::RemotePath)).size(13),
+        row![
+            pick_list(
+                vec!["$HOME".to_owned(), "/".to_owned()],
+                Some(remote_base),
+                on_base,
+            )
+            .style(move |theme, status| connection_pick_list_style(theme, status, locked))
+            .width(Length::Fixed(120.0)),
+            text_input("projects/data", &remote_suffix)
+                .id(field_id)
+                .on_input_maybe((!locked).then_some(on_suffix))
+                .width(Fill),
+        ]
+        .spacing(8),
+        text(match locale {
+            Locale::English => "Leave blank to use the selected root directory.",
+            Locale::Chinese => "留空使用左侧选中的根目录。",
+        })
+        .size(12),
+    ]
+    .spacing(5)
+    .width(Fill)
+    .into()
+}
+
 fn preflight_changed_mappings(previous: &ServerConfig, next: &ServerConfig) -> Result<(), String> {
     let previous = previous.mount_targets();
     let home = directories::BaseDirs::new()
@@ -13046,6 +13063,7 @@ mod localization_tests {
             ..Settings::default()
         };
         let mut draft = SettingsDraft::from_settings(&original);
+        draft.accent_color = AccentColor::Custom;
         draft.custom_accent_color = " #7a8b99 ".into();
         let saved = draft.build(&original, Locale::English).unwrap();
         let temp = tempfile::tempdir().unwrap();
@@ -13057,7 +13075,18 @@ mod localization_tests {
         };
         storage::save_settings(&paths, &saved).unwrap();
         let reloaded = storage::load_settings(&paths).unwrap();
+        assert_eq!(reloaded.accent_color, AccentColor::Custom);
         assert_eq!(reloaded.custom_accent_color.as_deref(), Some("#7A8B99"));
+        let mut preset = SettingsDraft::from_settings(&reloaded);
+        preset.accent_color = AccentColor::Amber;
+        let saved_preset = preset.build(&reloaded, Locale::English).unwrap().migrate();
+        assert_eq!(saved_preset.accent_color, AccentColor::Amber);
+        assert_eq!(saved_preset.custom_accent_color.as_deref(), Some("#7A8B99"));
+        preset.accent_color = AccentColor::Custom;
+        assert_eq!(
+            preset.build(&saved_preset, Locale::English).unwrap(),
+            reloaded
+        );
         assert_eq!(
             parse_accent_color(&draft.custom_accent_color),
             Some(Color::from_rgb8(122, 139, 153))
@@ -13067,6 +13096,8 @@ mod localization_tests {
             assert!(draft.build(&original, Locale::English).is_err());
         }
         draft.custom_accent_color.clear();
+        assert!(draft.build(&original, Locale::English).is_err());
+        draft.accent_color = AccentColor::Blue;
         assert_eq!(
             draft
                 .build(&original, Locale::English)

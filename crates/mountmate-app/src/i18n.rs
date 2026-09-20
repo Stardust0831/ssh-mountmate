@@ -136,10 +136,12 @@ impl Locale {
             (Self::English, AccentColor::Green) => "Green",
             (Self::English, AccentColor::Amber) => "Amber",
             (Self::English, AccentColor::Purple) => "Purple",
+            (Self::English, AccentColor::Custom) => "Custom",
             (Self::Chinese, AccentColor::Blue) => "蓝色",
             (Self::Chinese, AccentColor::Green) => "绿色",
             (Self::Chinese, AccentColor::Amber) => "琥珀色",
             (Self::Chinese, AccentColor::Purple) => "紫色",
+            (Self::Chinese, AccentColor::Custom) => "自定义",
         }
     }
 

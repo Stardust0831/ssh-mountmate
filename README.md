@@ -30,8 +30,9 @@ It uses rclone for the actual mount operation and provides a small GUI around th
 ## Multiple mount points per connection
 
 In the connection editor, use **Add mount point** to pair each remote directory with a local drive
-or folder. A connection can contain up to 64 mappings. Expand its card to mount, unmount, open,
-view logs or inspect capacity and transfers for each mapping; group actions operate on all its
+or folder. Every row offers the same `$HOME` / `/` selector and relative path input.
+A connection can contain up to 64 mappings. All mappings stay visible on its card so you can mount,
+unmount, open, view logs or inspect capacity and transfers for each mapping; group actions operate on all its
 mappings. Interactive login is shared by the mappings in that connection.
 
 While any mapping is mounted or starting, shared connection fields are read-only. Active path
@@ -43,6 +44,10 @@ JSON exports include all mappings without duplicating credentials. This version 
 its schema 2 exports require v0.6.12 or later. Login auto-mount and **Mount all** cover all mappings
 in each selected connection. CLI `--mount-id` and `--unmount-id` still target an individual mapping:
 the original uses the connection ID, and additional mappings use `<connection-id>--mount-<mapping-id>`.
+
+In Settings, **Accent → Custom** reveals a color input within the accent control. Presets hide
+the input, and switching back to Custom restores the last saved color. Existing custom colors
+are preserved on upgrade.
 
 ## Configuration backup and automatic update cleanup
 
@@ -411,7 +416,7 @@ slow local connection cannot monopolize the listener or delay normal shutdown in
 
 Mounted connection cards show rclone's real VFS upload queue. The recommended cache profile keeps rclone's upstream five-second write-back window so Explorer/Finder can finish close, rename, and metadata operations before remote upload begins. When automatic transfer display is enabled, queued or active uploads open one shared bottom-right progress window that summarizes active connections and can expand to show details. The Transfer center remains available for manually viewing all mounts together. A file is only shown as cloud-synced after rclone reports no queued or active uploads. SSH MountMate warns before unmounting or exiting while uploads remain.
 
-The simultaneous-upload setting limits how many different cached files rclone may upload at once. The default is 4, with presets for 8 and 12 and a custom range of 1 through 32. Extra files remain queued in the local cache. Rewriting the same path does not create reliable parallel revisions: rclone cancels or reschedules that path's write-back and the latest local content may overwrite another writer's remote change.
+The simultaneous-upload setting limits how many different cached files rclone may upload at once. The default is 12, with presets for 4 and 8 and a custom range of 1 through 32. Upgrading from v0.6.12 or earlier changes the previous value of 4 to 12; other valid values are preserved. Changes take effect on the next mount. Extra files remain queued in the local cache. Rewriting the same path does not create reliable parallel revisions: rclone cancels or reschedules that path's write-back and the latest local content may overwrite another writer's remote change.
 
 The transfer display keeps completed bytes in the current upload session when rclone removes a file
 from `vfs/queue`, so the overall progress denominator does not shrink as files finish. The display
