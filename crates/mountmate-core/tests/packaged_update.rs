@@ -152,9 +152,10 @@ fn run_scenario(scenario: Scenario) -> TestResult {
     // Simulate an older GUI holding a prepared update while the new GUI fixture
     // starts. It must not clean the helper before this test launches it.
     fs::create_dir_all(&environment.paths.data_dir)?;
-    let maintenance_lock =
-        File::create(environment.paths.data_dir.join("update-maintenance.lock"))?;
-    fs2::FileExt::lock_exclusive(&maintenance_lock)?;
+    let maintenance_lock = mountmate_core::storage::FileLock::acquire(
+        &environment.paths.data_dir.join("update-maintenance.lock"),
+        Duration::ZERO,
+    )?;
     let stale_archive = environment
         .paths
         .update_cache_dir()

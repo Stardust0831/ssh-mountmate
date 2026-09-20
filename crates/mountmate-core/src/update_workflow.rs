@@ -47,7 +47,7 @@ pub enum UpdateWorkflowError {
 #[derive(Debug, Clone)]
 pub struct PreparedUpdateLaunch {
     helper_executable: PathBuf,
-    _maintenance_lock: Arc<fs::File>,
+    _maintenance_lock: Arc<crate::storage::FileLock>,
     authorization: UpdateHelperAuthorization,
     prepared: PreparedPayload,
     transaction: TransactionPaths,
@@ -181,7 +181,13 @@ mod tests {
         fs::write(&plan, b"authorized update plan").unwrap();
         let prepared = PreparedUpdateLaunch {
             helper_executable: temp.path().join("must-not-launch"),
-            _maintenance_lock: Arc::new(fs::File::create(temp.path().join("lock")).unwrap()),
+            _maintenance_lock: Arc::new(
+                crate::storage::FileLock::acquire(
+                    &temp.path().join("lock"),
+                    std::time::Duration::ZERO,
+                )
+                .unwrap(),
+            ),
             authorization: UpdateHelperAuthorization {
                 plan_path: plan.clone(),
                 token: "test-only-token".into(),

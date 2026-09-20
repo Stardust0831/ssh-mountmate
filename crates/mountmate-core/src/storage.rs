@@ -757,6 +757,7 @@ pub fn restrict_private_path(_path: &Path, _directory: bool) -> io::Result<()> {
     ))
 }
 
+#[derive(Debug)]
 pub struct FileLock {
     file: File,
 }

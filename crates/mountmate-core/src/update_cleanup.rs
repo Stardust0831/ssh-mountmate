@@ -1,33 +1,35 @@
 //! Best-effort maintenance of updater-owned files, independent of helper version.
 use std::{
-    fs::{self, File, OpenOptions},
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use fs2::FileExt;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
-use crate::{application_data::validate_removal_tree, paths::AppPaths};
+use crate::{
+    application_data::validate_removal_tree,
+    paths::AppPaths,
+    storage::{FileLock, StorageError},
+};
 
 /// Shared by preparation and cleanup, including profiles using the legacy state
 /// directory. Keep the file in place: unlinking a lock creates two lock domains.
-pub(crate) fn lock_updates(paths: &AppPaths) -> Result<Arc<File>, String> {
+pub(crate) fn lock_updates(paths: &AppPaths) -> Result<Arc<FileLock>, String> {
     let path = paths.data_dir.join("update-maintenance.lock");
     crate::data_migration::validate_ancestors(&path).map_err(|e| e.to_string())?;
-    fs::create_dir_all(&paths.data_dir).map_err(|e| e.to_string())?;
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|e| e.to_string())?;
-    FileExt::try_lock_exclusive(&file).map_err(|_| {
-        "Update maintenance is in progress; retry shortly. 更新正在收尾，请稍后重试。".to_owned()
-    })?;
-    Ok(Arc::new(file))
+    // FileLock explicitly unlocks on drop. Closing only the descriptor can
+    // leave a flock alive in a concurrently forked child until its exec/exit.
+    FileLock::acquire(&path, Duration::ZERO)
+        .map(Arc::new)
+        .map_err(|error| match error {
+            StorageError::LockTimeout(_) => {
+                "Update maintenance is in progress; retry shortly. 更新正在收尾，请稍后重试。"
+                    .to_owned()
+            }
+            error => error.to_string(),
+        })
 }
 
 #[derive(Debug, Default, Clone)]
