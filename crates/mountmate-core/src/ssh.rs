@@ -36,14 +36,52 @@ pub fn known_hosts_line_matches(line: &str, marker: &str) -> bool {
     } else {
         first
     };
-    hosts.is_some_and(|hosts| hosts.split(',').any(|host| host == marker))
+    hosts.is_some_and(|hosts| {
+        hosts
+            .split(',')
+            .any(|host| known_hosts_marker_matches(host, marker))
+    })
+}
+
+/// OpenSSH accepts both `host` and `[host]:22` for the default port. Treat
+/// those spellings as the same binding when selecting or replacing trust
+/// records; otherwise an old `[host]:22` line can survive a confirmation and
+/// still make rclone reject the connection.
+pub(crate) fn known_hosts_marker_matches(value: &str, marker: &str) -> bool {
+    if value == marker {
+        return true;
+    }
+    if value.starts_with("|1|") {
+        if hashed_host_matches(value, marker) {
+            return true;
+        }
+        if !marker.starts_with('[') && !marker.contains(':') {
+            return hashed_host_matches(value, &format!("[{marker}]:22"));
+        }
+        if let Some(host) = marker.strip_suffix("]:22")
+            && host.starts_with('[')
+        {
+            return hashed_host_matches(value, &host[1..]);
+        }
+        return false;
+    }
+    if let Some(host) = marker.strip_suffix("]:22")
+        && host.starts_with('[')
+    {
+        return value == &host[1..];
+    }
+    if !marker.starts_with('[') && !marker.contains(':') {
+        value == format!("[{marker}]:22")
+    } else {
+        false
+    }
 }
 
 fn known_hosts_line_has_key_binding(line: &str, marker: &str) -> bool {
     parsed_known_hosts_binding(line).is_some_and(|patterns| match patterns {
-        ssh_key::known_hosts::HostPatterns::Patterns(hosts) => {
-            hosts.iter().any(|host| host == marker)
-        }
+        ssh_key::known_hosts::HostPatterns::Patterns(hosts) => hosts
+            .iter()
+            .any(|host| known_hosts_marker_matches(host, marker)),
         ssh_key::known_hosts::HostPatterns::HashedName { .. } => false,
     })
 }
@@ -650,9 +688,17 @@ pub fn scan_host_keys(
 ) -> Result<Vec<String>, SshError> {
     validate_host_alias(host)?;
     let port = validate_port(port)?;
+    let timeout_seconds = timeout.as_secs().clamp(1, 8).to_string();
     let mut command = Command::new(keyscan);
     command
-        .args(["-T", "8", "-p", &port, "-t", "rsa,ecdsa,ed25519"])
+        .args([
+            "-T",
+            &timeout_seconds,
+            "-p",
+            &port,
+            "-t",
+            "rsa,ecdsa,ed25519",
+        ])
         .arg(host)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -920,7 +966,7 @@ fn known_hosts_file_contains_hashed_marker(path: &Path, marker: &str) -> bool {
         content.lines().any(|line| {
             parsed_known_hosts_binding(line).is_some_and(|patterns| match patterns {
                 ssh_key::known_hosts::HostPatterns::HashedName { .. } => {
-                    hashed_host_matches(&patterns.to_string(), marker)
+                    known_hosts_marker_matches(&patterns.to_string(), marker)
                 }
                 ssh_key::known_hosts::HostPatterns::Patterns(_) => false,
             })
@@ -1152,6 +1198,18 @@ mod tests {
         );
         assert!(known_hosts_line_matches(
             &format!("@cert-authority example.com {TEST_HOST_KEY}"),
+            "example.com"
+        ));
+        assert!(known_hosts_marker_matches(
+            "example.com",
+            "[example.com]:22"
+        ));
+        assert!(known_hosts_marker_matches(
+            "[example.com]:22",
+            "example.com"
+        ));
+        assert!(!known_hosts_marker_matches(
+            "[example.com]:12022",
             "example.com"
         ));
     }

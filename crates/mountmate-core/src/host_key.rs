@@ -12,7 +12,7 @@ use wait_timeout::ChildExt;
 
 use crate::paths::AppPaths;
 use crate::ssh::{
-    SshError, concise_ssh_diagnostics, hashed_host_matches, known_hosts_marker,
+    SshError, concise_ssh_diagnostics, known_hosts_marker, known_hosts_marker_matches,
     normalize_host_key_output, quote_ssh_value, scan_host_keys, validate_host_alias, validate_port,
 };
 use crate::storage::{FileLock, atomic_write, restrict_private_path};
@@ -129,7 +129,7 @@ impl HostKeyReview {
             }
             let remaining = parts[0]
                 .split(',')
-                .filter(|pattern| *pattern != marker && !hashed_host_matches(pattern, &marker))
+                .filter(|pattern| !known_hosts_marker_matches(pattern, &marker))
                 .collect::<Vec<_>>();
             if remaining.len() == parts[0].split(',').count() {
                 updated.push(line.to_owned());
@@ -187,7 +187,7 @@ fn read_bindings(path: &Path, marker: &str) -> Result<Vec<String>, SshError> {
                 || parts[0].starts_with(['#', '@'])
                 || !parts[0]
                     .split(',')
-                    .any(|pattern| pattern == marker || hashed_host_matches(pattern, marker))
+                    .any(|pattern| known_hosts_marker_matches(pattern, marker))
             {
                 return None;
             }
@@ -448,7 +448,9 @@ mod tests {
         let old = different_key();
         fs::write(
             paths.known_hosts(),
-            format!("example.com,other.example {old}\n[example.com]:2222 {old}\n"),
+            format!(
+                "example.com,other.example {old}\n[example.com]:22 {old}\n[example.com]:2222 {old}\n"
+            ),
         )
         .unwrap();
         let review = HostKeyReview::new(

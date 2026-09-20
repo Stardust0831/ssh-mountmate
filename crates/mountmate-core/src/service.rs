@@ -30,7 +30,7 @@ use crate::runtime::{
 };
 use crate::ssh::{
     ResolvedSshConfig, SshError, known_hosts_marker, list_ssh_config_hosts, resolve_ssh_config,
-    select_known_hosts_for_marker,
+    scan_host_keys, select_known_hosts_for_marker,
 };
 use crate::storage::{StorageError, read_json};
 use crate::transfer::TransferSnapshot;
@@ -387,12 +387,7 @@ impl MountService {
         // Capacity refreshes reuse trust without performing additional probes.
         if verify_saved_key
             && let Some(trusted) = known_hosts.as_deref()
-            && let Ok(review) = self.review_host_key(
-                &server,
-                Some(trusted),
-                Path::new("ssh"),
-                Path::new("ssh-keyscan"),
-            )
+            && let Some(review) = self.review_saved_host_key(&server, trusted)?
             && !review.includes_trusted_key()
         {
             return Err(ServiceError::HostKeyConfirmation(Box::new(review)));
@@ -535,6 +530,34 @@ impl MountService {
             keys,
             source,
         )?)
+    }
+
+    /// A saved trust record is checked with a short, keyscan-only probe. A
+    /// failed probe is deliberately ignored here: rclone will perform the
+    /// authoritative SSH handshake, and the full fallback probe remains
+    /// available for first use and an actual mismatch. This avoids adding the
+    /// slow handshake fallback to every normal mount.
+    fn review_saved_host_key(
+        &self,
+        server: &ServerConfig,
+        source: &Path,
+    ) -> Result<Option<HostKeyReview>, ServiceError> {
+        let keys = match scan_host_keys(
+            Path::new("ssh-keyscan"),
+            &server.host,
+            &server.port,
+            Duration::from_secs(2),
+        ) {
+            Ok(keys) => keys,
+            Err(_) => return Ok(None),
+        };
+        Ok(Some(HostKeyReview::new(
+            &self.paths,
+            &server.host,
+            &server.port,
+            keys,
+            Some(source),
+        )?))
     }
 
     pub fn confirm_host_key(&self, review: &HostKeyReview) -> Result<(), ServiceError> {
