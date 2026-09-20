@@ -13,6 +13,8 @@ server_user="mountmate"
 server_password="test-only-password"
 remote_root="${test_root}/remote"
 mountpoint="${test_root}/mount"
+secondary_mount="${test_root}/mount-projects"
+secondary_id="local-sftp--mount-0123456789abcdef0123456789abcdef"
 server_pid=""
 
 allocate_loopback_port() {
@@ -74,11 +76,17 @@ cleanup() {
     fi
   fi
   if [[ -x "${binary}" ]]; then
-    "${binary}" --unmount-id local-sftp >/dev/null 2>&1 || true
+    "${binary}" --unmount-all >/dev/null 2>&1 || true
   fi
-  if mountpoint -q "${mountpoint}"; then
-    fusermount3 -u "${mountpoint}" 2>/dev/null || sudo umount "${mountpoint}" 2>/dev/null || true
-  fi
+  for local_mount in "${secondary_mount}" "${mountpoint}"; do
+    if mountpoint -q "${local_mount}"; then
+      fusermount3 -u "${local_mount}" 2>/dev/null || sudo umount "${local_mount}" 2>/dev/null || true
+    fi
+    if mountpoint -q "${local_mount}"; then
+      echo "Leaving fixture in place because a mount is still active: ${local_mount}" >&2
+      return
+    fi
+  done
   if [[ -n "${server_pid}" ]]; then
     kill "${server_pid}" 2>/dev/null || true
     wait "${server_pid}" 2>/dev/null || true
@@ -128,6 +136,7 @@ jq -n \
   --arg port "${port}" \
   --arg password "${password_obscured}" \
   --arg mountpoint "${mountpoint}" \
+  --arg secondary_mount "${secondary_mount}" \
   '[{
     id: "local-sftp",
     name: "Local SFTP",
@@ -141,6 +150,7 @@ jq -n \
     connection_method: "native",
     remote_path: "",
     mountpoint: $mountpoint,
+    mounts: [{id: "0123456789abcdef0123456789abcdef", remote_path: "projects", mountpoint: $secondary_mount}],
     cache_mode: "full"
   }]' >"${config_dir}/servers.json"
 jq -n '{
@@ -154,7 +164,15 @@ jq -n '{
   language: "en"
 }' >"${config_dir}/settings.json"
 
-"${binary}" --mount-id local-sftp
+mkdir -p "${remote_root}/projects"
+printf '%s' 'secondary remote content' >"${remote_root}/projects/secondary.txt"
+"${binary}" --mount-all
+mountpoint -q "${secondary_mount}"
+test "$(cat "${secondary_mount}/secondary.txt")" = 'secondary remote content'
+secondary_state="${XDG_STATE_HOME}/rsshmount/${secondary_id}.json"
+secondary_pid="$(jq -r .pid "${secondary_state}")"
+"${binary}" --refresh-path "${secondary_mount}" >"${test_root}/secondary-refresh"
+grep -F 'Remote verified:' "${test_root}/secondary-refresh"
 mountpoint -q "${mountpoint}"
 test "$(cat "${mountpoint}/initial.txt")" = 'initial remote content'
 
@@ -179,6 +197,17 @@ export SSH_MOUNTMATE_ACTIVE_STATE_FILE="${XDG_STATE_HOME}/rsshmount/local-sftp.j
 cargo test --package mountmate-core --test packaged_update --all-features \
   packaged_update_preserves_real_active_mount -- \
   --ignored --exact --test-threads=1
+
+test "$(jq -r .pid "${secondary_state}")" = "${secondary_pid}"
+kill -0 "${secondary_pid}"
+test "$(cat "${secondary_mount}/secondary.txt")" = 'secondary remote content'
+"${binary}" --unmount-id "${secondary_id}"
+if mountpoint -q "${secondary_mount}"; then
+  echo 'secondary mapping remained active after unmount' >&2
+  exit 1
+fi
+mountpoint -q "${mountpoint}"
+test "$(cat "${mountpoint}/initial.txt")" = 'initial remote content'
 
 # Keep the upload queued throughout package copying and verification, including
 # on slower ARM64 runners. Release it explicitly only after the update test has

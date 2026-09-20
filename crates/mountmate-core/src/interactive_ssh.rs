@@ -223,7 +223,7 @@ impl InteractiveSshSession {
 
     fn openssh(paths: &AppPaths, server: &ServerConfig) -> Result<Self, InteractiveSshError> {
         let ssh = find_system_executable("ssh").ok_or(InteractiveSshError::OpenSshMissing)?;
-        let id_hash = format!("{:x}", Sha256::digest(server.id.as_bytes()));
+        let id_hash = format!("{:x}", Sha256::digest(server.connection_id().as_bytes()));
         let control_dir = control_directory(paths, &id_hash);
         #[cfg(unix)]
         ensure_control_directory(&control_dir)?;

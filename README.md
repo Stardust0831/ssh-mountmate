@@ -9,6 +9,7 @@ It uses rclone for the actual mount operation and provides a small GUI around th
 ## What It Does
 
 - Mount a Linux server directory on Windows, macOS, or Linux.
+- Share one connection and authentication across multiple remote-to-local directory mappings.
 - Import hosts from your existing OpenSSH config, using OpenSSH by default and keeping source-derived fields read-only.
 - Batch import all concrete hosts from a selected SSH config file.
 - Start from an SAI cluster preset and write app-managed SSH config entries.
@@ -25,6 +26,23 @@ It uses rclone for the actual mount operation and provides a small GUI around th
 - Verify remote directory contents on refresh and expose refresh/transfer actions from connection-card context menus.
 - Mount or unmount all saved connections from the main window.
 - Build native Rust packages for Windows, macOS, and Linux on x64 and arm64 with GitHub Actions.
+
+## Multiple mount points per connection
+
+In the connection editor, use **Add mount point** to pair each remote directory with a local drive
+or folder. A connection can contain up to 64 mappings. Expand its card to mount, unmount, open,
+view logs or inspect capacity and transfers for each mapping; group actions operate on all its
+mappings. Interactive login is shared by the mappings in that connection.
+
+While any mapping is mounted or starting, shared connection fields are read-only. Active path
+rows are also read-only, while idle rows can still be edited or removed and new rows added.
+SSH config imports keep their source-derived connection fields read-only and allow path mappings
+to be edited. Existing single-mount profiles keep their original mount IDs and caches.
+
+JSON exports include all mappings without duplicating credentials. This version reads old exports;
+its schema 2 exports require v0.6.12 or later. Login auto-mount and **Mount all** cover all mappings
+in each selected connection. CLI `--mount-id` and `--unmount-id` still target an individual mapping:
+the original uses the connection ID, and additional mappings use `<connection-id>--mount-<mapping-id>`.
 
 ## Configuration backup and automatic update cleanup
 
@@ -278,7 +296,7 @@ SSH MountMate can read your OpenSSH config and list concrete `Host` entries. Sel
 - port
 - key file
 
-After import, the connection defaults to OpenSSH. The display name stays editable; source-derived fields and mount settings retain the regular form layout but are read-only. The source file and Host selectors remain available.
+After import, the connection defaults to OpenSSH. The display name stays editable; source-derived connection fields retain the regular form layout but are read-only; directory mappings remain editable. The source file and Host selectors remain available.
 
 For `OpenSSH`, an imported connection uses `ssh -o BatchMode=yes -F <config> <alias>`. The displayed host, user, port, and key are an import snapshot; they do not override the live config. Keep the source config available. Its `Include`, `Match`, proxy, agent, certificate, and host-key settings remain in effect. Edit that config to change how the alias connects, or change the source to Manual to edit saved fields and choose another authentication method.
 

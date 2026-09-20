@@ -157,9 +157,13 @@ try {
     throw 'Failed to start the SFTP server on an available loopback port'
   }
 
-  $drive = @('R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z') |
+  $drives = @('R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z') |
     Where-Object { -not (Test-Path "${_}:\") } |
-    Select-Object -First 1
+    Select-Object -First 2
+  if ($drives.Count -ne 2) { throw 'Two free drive letters are required' }
+  $drive = $drives[0]
+  $secondaryMount = "$($drives[1]):"
+  $secondaryId = 'local-sftp--mount-0123456789abcdef0123456789abcdef'
   if (-not $drive) { throw 'No free drive letter is available for the mount test' }
   $mountpoint = "${drive}:"
 
@@ -181,6 +185,7 @@ try {
       connection_method = 'native'
       remote_path = ''
       mountpoint = $mountpoint
+      mounts = @(@{ id = '0123456789abcdef0123456789abcdef'; remote_path = 'projects'; mountpoint = $secondaryMount })
       cache_mode = 'full'
     }
   )
@@ -198,13 +203,23 @@ try {
   } | ConvertTo-Json | Set-Content (Join-Path $configDir 'settings.json')
 
   Write-Host '[windows-mount-e2e] mounting drive'
-  Invoke-SSHMountMate -Arguments @('--mount-id', 'local-sftp') -NoCapture | Out-Null
+  New-Item -ItemType Directory -Force (Join-Path $remoteRoot 'projects') | Out-Null
+  Set-Content -Path (Join-Path $remoteRoot 'projects/secondary.txt') -Value 'secondary remote content' -NoNewline
   $mounted = $true
   $mountedId = 'local-sftp'
+  Invoke-SSHMountMate -Arguments @('--mount-all') -NoCapture | Out-Null
   Wait-Until { Test-Path "${mountpoint}\initial.txt" }
   if ((Get-Content "${mountpoint}\initial.txt" -Raw) -ne 'initial remote content') {
     throw 'Mounted initial file content did not match the SFTP source'
   }
+
+  Wait-Until { Test-Path "${secondaryMount}\secondary.txt" }
+  if ((Get-Content "${secondaryMount}\secondary.txt" -Raw) -ne 'secondary remote content') { throw 'Secondary directory mapping is incorrect' }
+  $secondaryRefresh = Invoke-SSHMountMate @('--refresh-path', $secondaryMount)
+  if ($secondaryRefresh -notmatch 'Remote verified:') { throw 'Secondary mapping refresh failed' }
+  Invoke-SSHMountMate -Arguments @('--unmount-id', $secondaryId) -NoCapture | Out-Null
+  Wait-Until { -not (Test-Path "${secondaryMount}\") }
+  if (-not (Test-Path "${mountpoint}\initial.txt")) { throw 'Unmounting one mapping interrupted its sibling' }
 
   Get-ChildItem "${mountpoint}\" | Out-Null
   Set-Content -Path (Join-Path $remoteRoot 'remote-new.txt') `
@@ -326,7 +341,7 @@ try {
 } finally {
   if ($mounted) {
     try {
-      Invoke-SSHMountMate -Arguments @('--unmount-id', $mountedId) -NoCapture | Out-Null
+      Invoke-SSHMountMate -Arguments @('--unmount-all') -NoCapture | Out-Null
     } catch {
       Write-Warning "Failed to unmount $mountedId during cleanup: $($_.Exception.Message)"
     }

@@ -46,6 +46,10 @@ pub fn load_servers(paths: &AppPaths) -> Result<Vec<ServerConfig>, StorageError>
     let mut servers: Vec<ServerConfig> = read_json(&paths.servers_file())?;
     for server in &mut servers {
         server.normalize();
+        if !server.mounts.is_empty() || !server.primary_mount {
+            crate::connection::validate_mount_mappings(server, &[])
+                .map_err(StorageError::InvalidPreferenceUpdate)?;
+        }
     }
     Ok(servers)
 }
@@ -61,6 +65,8 @@ pub fn upsert_server(
 ) -> Result<Vec<ServerConfig>, StorageError> {
     let _lock = FileLock::acquire(&paths.servers_lock(), Duration::from_secs(10))?;
     let mut servers = load_servers(paths)?;
+    crate::connection::validate_mount_mappings(&server, &servers)
+        .map_err(StorageError::InvalidPreferenceUpdate)?;
     reject_duplicate_target(&servers, &server)?;
     if let Some(existing) = servers.iter_mut().find(|existing| existing.id == server.id) {
         *existing = server;
@@ -78,6 +84,8 @@ pub fn upsert_servers(
     let _lock = FileLock::acquire(&paths.servers_lock(), Duration::from_secs(10))?;
     let mut servers = load_servers(paths)?;
     for server in updates {
+        crate::connection::validate_mount_mappings(&server, &servers)
+            .map_err(StorageError::InvalidPreferenceUpdate)?;
         reject_duplicate_target(&servers, &server)?;
         if let Some(existing) = servers.iter_mut().find(|existing| existing.id == server.id) {
             *existing = server;
@@ -813,6 +821,60 @@ impl Drop for FileLock {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.file);
     }
+}
+
+/// Change path mappings without rewriting credentials or the managed SSH profile.
+/// Mounted mappings are immutable; idle rows and new mappings remain editable.
+pub fn update_mount_paths(
+    paths: &AppPaths,
+    expected: &ServerConfig,
+    remote_path: String,
+    mountpoint: String,
+    mounts: Vec<crate::model::MountMapping>,
+    primary_mount: bool,
+) -> Result<Vec<ServerConfig>, StorageError> {
+    let _lock = FileLock::acquire(&paths.servers_lock(), Duration::from_secs(10))?;
+    let mut servers = load_servers(paths)?;
+    let index = servers
+        .iter()
+        .position(|s| s.id == expected.id)
+        .ok_or_else(|| StorageError::MissingConnection(expected.id.clone()))?;
+    if servers[index] != *expected {
+        return Err(StorageError::InvalidPreferenceUpdate(
+            "Connection changed; reopen the editor / 连接已变化，请重新打开编辑页面".into(),
+        ));
+    }
+    let mut next = expected.clone();
+    next.remote_path = remote_path;
+    next.mountpoint = mountpoint;
+    next.mounts = mounts;
+    next.primary_mount = primary_mount;
+    crate::connection::validate_mount_mappings(&next, &servers)
+        .map_err(StorageError::InvalidPreferenceUpdate)?;
+    let old_targets = expected.mount_targets();
+    let new_targets = next.mount_targets();
+    let mut ids: Vec<_> = old_targets
+        .iter()
+        .chain(&new_targets)
+        .map(|s| s.id.clone())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    let _mount_locks = ids
+        .iter()
+        .map(|id| FileLock::acquire(&paths.mount_lock(id), Duration::ZERO))
+        .collect::<Result<Vec<_>, _>>()?;
+    for old in &old_targets {
+        if paths.state_file(&old.id).exists() && !new_targets.iter().any(|s| s == old) {
+            return Err(StorageError::InvalidPreferenceUpdate(
+                "Mounted paths are read-only; unmount first / 挂载状态只读，如需编辑请先取消挂载"
+                    .into(),
+            ));
+        }
+    }
+    servers[index] = next;
+    write_private_json(&paths.servers_file(), &servers)?;
+    Ok(servers)
 }
 
 #[cfg(test)]

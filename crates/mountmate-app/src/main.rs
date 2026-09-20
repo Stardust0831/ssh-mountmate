@@ -497,7 +497,11 @@ fn editor_keyboard_event(
 
 fn run_headless(paths: &AppPaths, command: AppCommand) -> Result<(), String> {
     let settings = storage::load_settings(paths).map_err(|error| error.to_string())?;
-    let servers = storage::load_servers(paths).map_err(|error| error.to_string())?;
+    let servers: Vec<_> = storage::load_servers(paths)
+        .map_err(|error| error.to_string())?
+        .iter()
+        .flat_map(ServerConfig::mount_targets)
+        .collect();
     let service = MountService::new(paths.clone(), application_root());
     match command {
         AppCommand::Mount { id } => {
@@ -638,6 +642,9 @@ struct App {
     system_locale: Locale,
     system_theme_dark: bool,
     servers: Vec<ServerConfig>,
+    mount_targets: Vec<ServerConfig>,
+    pending_interactive_mounts: HashSet<String>,
+    expanded_mounts: HashSet<String>,
     connection_search: String,
     connection_sort: ConnectionSort,
     connection_tag_filter: Option<String>,
@@ -711,7 +718,7 @@ struct App {
     dependency_status: Option<DependencyStatus>,
     dependency_checking: bool,
     win_fsp_install_pending: bool,
-    win_fsp_pending_mount: Option<String>,
+    win_fsp_pending_mounts: HashSet<String>,
     capacities: HashMap<String, CapacityInfo>,
     capacity_errors: HashSet<String>,
     capacity_refreshing: bool,
@@ -1384,6 +1391,16 @@ enum Message {
     BatchImportSourceChanged(BatchImportSource),
     ConnectionFieldChanged(ConnectionField, String),
     ConnectionTagsChanged(String),
+    AddMountMapping,
+    RemovePrimaryMapping,
+    RemoveMountMapping(usize),
+    MappingRemoteChanged(usize, String),
+    MappingLocalChanged(usize, String),
+    MappingLocalChoice(usize, String),
+    MappingBrowse(usize),
+    MappingPicked(String, Option<PathBuf>),
+    ToggleMountMappings(String),
+    MountConnection(String, MountOperation),
     RemoteBaseChanged(String),
     RemoteSuffixChanged(String),
     MountpointChoiceChanged(String),
@@ -1509,12 +1526,6 @@ fn source_config_mutation(message: &Message) -> bool {
         || matches!(
             message,
             Message::ConnectionTagsChanged(_)
-                | Message::RemoteBaseChanged(_)
-                | Message::RemoteSuffixChanged(_)
-                | Message::MountpointChoiceChanged(_)
-                | Message::CustomMountpointChanged(_)
-                | Message::BrowseMountpoint
-                | Message::MountpointPicked(_)
                 | Message::ConnectionAuthChanged(_)
                 | Message::ConnectionMethodChanged(_)
                 | Message::PasswordChanged(_)
@@ -1531,7 +1542,15 @@ fn source_config_mutation(message: &Message) -> bool {
 fn is_editor_mutation(message: &Message) -> bool {
     matches!(
         message,
-        Message::CancelEditor
+        Message::AddMountMapping
+            | Message::RemovePrimaryMapping
+            | Message::RemoveMountMapping(_)
+            | Message::MappingRemoteChanged(_, _)
+            | Message::MappingLocalChanged(_, _)
+            | Message::MappingLocalChoice(_, _)
+            | Message::MappingBrowse(_)
+            | Message::MappingPicked(_, _)
+            | Message::CancelEditor
             | Message::ConnectionSourceChanged(_)
             | Message::BatchImportSourceChanged(_)
             | Message::ConnectionFieldChanged(_, _)
@@ -1672,7 +1691,7 @@ impl App {
                 iced::time::every(Duration::from_millis(500)).map(|_| Message::InteractiveTick),
             );
         }
-        if self.servers.iter().any(|server| {
+        if self.mount_targets.iter().any(|server| {
             self.mount_statuses.get(&server.id) == Some(&MountStatus::Mounted)
                 && !self.busy.contains(&server.id)
         }) {
@@ -1818,6 +1837,12 @@ impl App {
             startup_notice,
             system_locale,
             system_theme_dark,
+            mount_targets: servers
+                .iter()
+                .flat_map(ServerConfig::mount_targets)
+                .collect(),
+            pending_interactive_mounts: HashSet::new(),
+            expanded_mounts: HashSet::new(),
             servers,
             connection_search: String::new(),
             connection_sort: ConnectionSort::default(),
@@ -1892,7 +1917,7 @@ impl App {
             dependency_status: None,
             dependency_checking: false,
             win_fsp_install_pending: false,
-            win_fsp_pending_mount: None,
+            win_fsp_pending_mounts: HashSet::new(),
             capacities: HashMap::new(),
             capacity_errors: HashSet::new(),
             capacity_refreshing: false,
@@ -1930,15 +1955,46 @@ impl App {
         if self.editor_saving && is_editor_mutation(&message) {
             return Task::none();
         }
-        if self
-            .connection_draft
-            .as_ref()
-            .and_then(|draft| draft.editing_id.as_deref())
-            .is_some_and(|id| !self.can_modify(id))
-            && is_editor_mutation(&message)
-            && !matches!(message, Message::CancelEditor)
-        {
-            return Task::none();
+        if let Some(draft) = &self.connection_draft {
+            let row = match &message {
+                Message::RemoveMountMapping(i)
+                | Message::MappingRemoteChanged(i, _)
+                | Message::MappingLocalChanged(i, _)
+                | Message::MappingLocalChoice(i, _)
+                | Message::MappingBrowse(i) => Some(*i),
+                Message::MappingPicked(id, _) => draft.mounts.iter().position(|m| &m.id == id),
+                _ => None,
+            };
+            let path_message = matches!(
+                message,
+                Message::RemovePrimaryMapping
+                    | Message::RemoteBaseChanged(_)
+                    | Message::RemoteSuffixChanged(_)
+                    | Message::MountpointChoiceChanged(_)
+                    | Message::CustomMountpointChanged(_)
+                    | Message::BrowseMountpoint
+                    | Message::MountpointPicked(_)
+            );
+            if let Some(id) = &draft.editing_id {
+                let row_id = row
+                    .and_then(|i| draft.mounts.get(i))
+                    .map(|m| format!("{}--mount-{}", id, m.id));
+                if (path_message && !self.mapping_can_modify(id))
+                    || row_id
+                        .as_ref()
+                        .is_some_and(|id| !self.mapping_can_modify(id))
+                {
+                    return Task::none();
+                }
+                if !self.can_modify(id)
+                    && is_editor_mutation(&message)
+                    && !path_message
+                    && row.is_none()
+                    && !matches!(message, Message::CancelEditor | Message::AddMountMapping)
+                {
+                    return Task::none();
+                }
+            }
         }
         if self
             .connection_draft
@@ -2006,7 +2062,20 @@ impl App {
                         ) {
                             session.resume_sent = true;
                             session.queued_mount = false;
-                            return self.start_mount_operation(id, Some(MountOperation::Mount));
+                            let ids: Vec<_> = self
+                                .pending_interactive_mounts
+                                .iter()
+                                .filter(|mount_id| {
+                                    self.mount_targets
+                                        .iter()
+                                        .any(|s| s.id == **mount_id && s.connection_id() == id)
+                                })
+                                .cloned()
+                                .collect();
+                            return Task::batch(ids.into_iter().map(|id| {
+                                self.pending_interactive_mounts.remove(&id);
+                                self.start_mount_operation(id, Some(MountOperation::Mount))
+                            }));
                         }
                     }
                     Ok(false) => {}
@@ -2142,6 +2211,11 @@ impl App {
             Message::Refresh => match storage::load_servers(&self.paths) {
                 Ok(servers) => {
                     self.servers = servers;
+                    self.mount_targets = self
+                        .servers
+                        .iter()
+                        .flat_map(ServerConfig::mount_targets)
+                        .collect();
                     self.selected_connections
                         .retain(|id| self.servers.iter().any(|server| server.id == *id));
                     self.status = locale.text(TextKey::RefreshingMountStatus).into();
@@ -2261,7 +2335,7 @@ impl App {
                                 0
                             };
                             let display_name = self
-                                .servers
+                                .mount_targets
                                 .iter()
                                 .find(|server| server.id == id)
                                 .map(|server| server.display_name().to_owned())
@@ -2620,6 +2694,11 @@ impl App {
                 Ok(servers) => {
                     self.connection_list_saving = false;
                     self.servers = servers;
+                    self.mount_targets = self
+                        .servers
+                        .iter()
+                        .flat_map(ServerConfig::mount_targets)
+                        .collect();
                     if self.connection_tag_filter.as_ref().is_some_and(|filter| {
                         !self
                             .servers
@@ -2641,7 +2720,12 @@ impl App {
                 }
             },
             Message::BatchMountSelected => {
-                let ids = selected_server_ids(&self.servers, &self.selected_connections);
+                let ids: Vec<_> = self
+                    .mount_targets
+                    .iter()
+                    .filter(|s| self.selected_connections.contains(s.connection_id()))
+                    .map(|s| s.id.clone())
+                    .collect();
                 let mut tasks = Vec::new();
                 for id in ids {
                     tasks.push(self.handle_mount_command(id, MountOperation::Mount));
@@ -2649,8 +2733,11 @@ impl App {
                 return Task::batch(tasks);
             }
             Message::BatchUnmountSelected => {
-                let ids = selected_server_ids(&self.servers, &self.selected_connections)
-                    .into_iter()
+                let ids = self
+                    .mount_targets
+                    .iter()
+                    .filter(|s| self.selected_connections.contains(s.connection_id()))
+                    .map(|s| s.id.clone())
                     .filter(|id| self.paths.state_file(id).exists())
                     .collect::<Vec<_>>();
                 let (unsafe_ids, safe_ids): (Vec<_>, Vec<_>) = ids.into_iter().partition(|id| {
@@ -2710,6 +2797,11 @@ impl App {
                 match result {
                     Ok(outcome) => {
                         self.servers = outcome.servers;
+                        self.mount_targets = self
+                            .servers
+                            .iter()
+                            .flat_map(ServerConfig::mount_targets)
+                            .collect();
                         self.status = match outcome.warning {
                             Some(warning) => warning,
                             None => match locale {
@@ -2859,6 +2951,11 @@ impl App {
                     Ok(outcome) => {
                         let terminal_task = self.reconcile_interactive_sessions(&outcome.servers);
                         self.servers = outcome.servers;
+                        self.mount_targets = self
+                            .servers
+                            .iter()
+                            .flat_map(ServerConfig::mount_targets)
+                            .collect();
                         self.selected_connections
                             .retain(|id| self.servers.iter().any(|server| server.id == *id));
                         self.status = outcome.warning.unwrap_or_else(|| match locale {
@@ -2939,6 +3036,11 @@ impl App {
                 Ok(servers) => {
                     self.connection_list_saving = false;
                     self.servers = servers;
+                    self.mount_targets = self
+                        .servers
+                        .iter()
+                        .flat_map(ServerConfig::mount_targets)
+                        .collect();
                     self.reorder_original = None;
                     self.connection_list_mode = ConnectionListMode::Browse;
                     self.status = match locale {
@@ -3185,6 +3287,121 @@ impl App {
                 if let Some(draft) = &mut self.connection_draft {
                     draft.tags = parse_tag_input(&value);
                     draft.folder.clear();
+                }
+            }
+            Message::ToggleMountMappings(id) => {
+                if !self.expanded_mounts.remove(&id) {
+                    self.expanded_mounts.insert(id);
+                }
+            }
+            Message::MountConnection(id, operation) => {
+                let ids: Vec<_> = self
+                    .mount_targets
+                    .iter()
+                    .filter(|s| s.connection_id() == id)
+                    .map(|s| s.id.clone())
+                    .collect();
+                let mut unsafe_ids = Vec::new();
+                let mut tasks = Vec::new();
+                for id in ids {
+                    if operation == MountOperation::Unmount
+                        && unmount_needs_confirmation(
+                            self.transfers.get(&id),
+                            self.transfer_errors.contains_key(&id),
+                            self.synced_polls.get(&id).copied().unwrap_or(0),
+                        )
+                        && self.mount_statuses.get(&id) == Some(&MountStatus::Mounted)
+                    {
+                        unsafe_ids.push(id);
+                    } else {
+                        tasks.push(self.handle_mount_command(id, operation));
+                    }
+                }
+                if !unsafe_ids.is_empty() {
+                    tasks.push(self.confirm_waiting_unmount(unsafe_ids));
+                }
+                return Task::batch(tasks);
+            }
+            Message::RemovePrimaryMapping => {
+                if let Some(draft) = &mut self.connection_draft
+                    && !draft.mounts.is_empty()
+                {
+                    draft.primary_mount = false;
+                }
+            }
+            Message::AddMountMapping => {
+                if let Some(draft) = &mut self.connection_draft
+                    && draft.mounts.len() + usize::from(draft.primary_mount) < 64
+                {
+                    draft
+                        .mounts
+                        .push(mountmate_core::model::MountMapping::default());
+                }
+            }
+            Message::RemoveMountMapping(index) => {
+                if let Some(draft) = &mut self.connection_draft
+                    && index < draft.mounts.len()
+                    && (draft.primary_mount || draft.mounts.len() > 1)
+                {
+                    draft.mounts.remove(index);
+                }
+            }
+            Message::MappingRemoteChanged(index, value) => {
+                if let Some(mapping) = self
+                    .connection_draft
+                    .as_mut()
+                    .and_then(|d| d.mounts.get_mut(index))
+                {
+                    mapping.remote_path = value;
+                }
+            }
+            Message::MappingLocalChanged(index, value) => {
+                if let Some(mapping) = self
+                    .connection_draft
+                    .as_mut()
+                    .and_then(|d| d.mounts.get_mut(index))
+                {
+                    mapping.mountpoint = value;
+                }
+            }
+            Message::MappingLocalChoice(index, value) => {
+                if let Some(mapping) = self
+                    .connection_draft
+                    .as_mut()
+                    .and_then(|d| d.mounts.get_mut(index))
+                {
+                    mapping.mountpoint = mountpoint_value_for_choice(&value, "");
+                }
+            }
+            Message::MappingBrowse(index) => {
+                let Some(id) = self
+                    .connection_draft
+                    .as_ref()
+                    .and_then(|d| d.mounts.get(index))
+                    .map(|m| m.id.clone())
+                else {
+                    return Task::none();
+                };
+                return Task::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new()
+                            .pick_folder()
+                            .await
+                            .map(|f| f.path().to_owned())
+                    },
+                    move |path| Message::MappingPicked(id.clone(), path),
+                );
+            }
+            Message::MappingPicked(id, path) => {
+                if let Some(path) = path
+                    && let Some(mapping) = self
+                        .connection_draft
+                        .as_mut()
+                        .and_then(|d| d.mounts.iter_mut().find(|m| m.id == id))
+                {
+                    mapping.mountpoint = suggested_mountpoint(&path, "ssh-mountmate")
+                        .display()
+                        .to_string();
                 }
             }
             Message::RemoteBaseChanged(base) => {
@@ -3490,6 +3707,11 @@ impl App {
                     Ok(outcome) => {
                         let terminal_task = self.reconcile_interactive_sessions(&outcome.servers);
                         self.servers = outcome.servers;
+                        self.mount_targets = self
+                            .servers
+                            .iter()
+                            .flat_map(ServerConfig::mount_targets)
+                            .collect();
                         self.connection_draft = None;
                         self.invalidate_mountpoint_preflight();
                         self.screen = Screen::Connections;
@@ -3901,6 +4123,11 @@ impl App {
                     Ok(outcome) => {
                         self.settings = outcome.settings;
                         self.servers = outcome.servers;
+                        self.mount_targets = self
+                            .servers
+                            .iter()
+                            .flat_map(ServerConfig::mount_targets)
+                            .collect();
                         self.settings_draft = None;
                         self.screen = Screen::Connections;
                         self.status = outcome
@@ -3940,7 +4167,7 @@ impl App {
                     );
                 }
                 self.win_fsp_install_pending = false;
-                self.win_fsp_pending_mount = None;
+                self.win_fsp_pending_mounts.clear();
                 self.status = match locale {
                     Locale::English => "Mounting component installation postponed. You can install it the next time you mount.".into(),
                     Locale::Chinese => "已暂缓安装挂载组件，下次点击挂载时可继续安装。".into(),
@@ -3948,7 +4175,7 @@ impl App {
             }
             Message::WinFspInstallFinished(result) => {
                 self.win_fsp_install_pending = false;
-                let pending_mount = self.win_fsp_pending_mount.take();
+                let pending_mounts = std::mem::take(&mut self.win_fsp_pending_mounts);
                 match result {
                     Ok(WinFspInstallOutcome::Installed) => {
                         self.status = match locale {
@@ -3958,13 +4185,13 @@ impl App {
                             Locale::Chinese => "挂载组件安装完成，可以开始挂载。".into(),
                         };
                         self.dependency_checking = true;
-                        if let Some(id) = pending_mount {
-                            return Task::batch([
-                                self.dependency_check_task(),
-                                self.start_mount_operation(id, Some(MountOperation::Mount)),
-                            ]);
-                        }
-                        return self.dependency_check_task();
+                        let mut tasks = vec![self.dependency_check_task()];
+                        tasks.extend(
+                            pending_mounts.into_iter().map(|id| {
+                                self.start_mount_operation(id, Some(MountOperation::Mount))
+                            }),
+                        );
+                        return Task::batch(tasks);
                     }
                     Ok(WinFspInstallOutcome::Cancelled) => {
                         self.status = match locale {
@@ -4113,7 +4340,9 @@ impl App {
                     } else {
                         connection_settings_locked_help(locale).into()
                     };
-                    if can_modify && mountpoint_choice(&server.mountpoint) == "custom" {
+                    if self.mapping_can_modify(&id)
+                        && mountpoint_choice(&server.mountpoint) == "custom"
+                    {
                         return self.start_mountpoint_preflight();
                     }
                     self.invalidate_mountpoint_preflight();
@@ -4202,6 +4431,11 @@ impl App {
                     Ok(outcome) => {
                         let terminal_task = self.reconcile_interactive_sessions(&outcome.servers);
                         self.servers = outcome.servers;
+                        self.mount_targets = self
+                            .servers
+                            .iter()
+                            .flat_map(ServerConfig::mount_targets)
+                            .collect();
                         self.selected_connections.retain(|selected| {
                             self.servers.iter().any(|server| server.id == *selected)
                         });
@@ -4257,14 +4491,14 @@ impl App {
             return;
         }
         let locale = self.locale();
-        let can_mount = self.servers.iter().any(|server| {
+        let can_mount = self.mount_targets.iter().any(|server| {
             !self.busy.contains(&server.id)
                 && !matches!(
                     self.mount_statuses.get(&server.id),
                     Some(MountStatus::Mounted | MountStatus::Starting)
                 )
         });
-        let can_unmount = self.servers.iter().any(|server| {
+        let can_unmount = self.mount_targets.iter().any(|server| {
             !self.busy.contains(&server.id)
                 && matches!(
                     self.mount_statuses.get(&server.id),
@@ -4310,7 +4544,7 @@ impl App {
                 let generation = self.claim_status_generation();
                 let expected_status = self.status.clone();
                 let service = self.service.clone();
-                let servers = self.servers.clone();
+                let servers = self.mount_targets.clone();
                 Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
@@ -4329,7 +4563,7 @@ impl App {
                 )
             }
             AppCommand::Refresh { id, relative_dir } => {
-                if !self.servers.iter().any(|server| server.id == id) {
+                if !self.mount_targets.iter().any(|server| server.id == id) {
                     self.status = self.locale().text(TextKey::ConnectionGone).into();
                     return Task::none();
                 }
@@ -4356,7 +4590,7 @@ impl App {
             }
             AppCommand::MountAll => {
                 let ids = self
-                    .servers
+                    .mount_targets
                     .iter()
                     .map(|server| server.id.clone())
                     .collect::<Vec<_>>();
@@ -4366,7 +4600,7 @@ impl App {
                 )
             }
             AppCommand::MountStartup => {
-                let ids = startup_servers(&self.settings, &self.servers)
+                let ids = startup_servers(&self.settings, &self.mount_targets)
                     .into_iter()
                     .map(|server| server.id)
                     .collect::<Vec<_>>();
@@ -4377,7 +4611,7 @@ impl App {
             }
             AppCommand::UnmountAll => {
                 let ids = self
-                    .servers
+                    .mount_targets
                     .iter()
                     .filter(|server| self.paths.state_file(&server.id).exists())
                     .map(|server| server.id.clone())
@@ -4492,7 +4726,7 @@ impl App {
             .filter(|snapshot| transfer_is_active(snapshot))
             .count();
         let unknown = self
-            .servers
+            .mount_targets
             .iter()
             .filter(|server| self.mount_statuses.get(&server.id) == Some(&MountStatus::Mounted))
             .filter(|server| {
@@ -4526,28 +4760,93 @@ impl App {
         )
     }
 
+    fn mapping_can_modify(&self, id: &str) -> bool {
+        mapping_is_editable(
+            self.busy.contains(id),
+            self.mount_statuses.get(id).copied(),
+            self.pending_interactive_mounts.contains(id),
+            self.mount_targets
+                .iter()
+                .find(|s| s.id == id)
+                .and_then(|s| self.interactive_terminals.get(s.connection_id()))
+                .map(|s| s.lifecycle),
+        )
+    }
+
+    fn session_can_end(&self, id: &str) -> bool {
+        self.mount_targets
+            .iter()
+            .filter(|s| s.connection_id() == id)
+            .all(|s| {
+                !self.busy.contains(&s.id)
+                    && interactive_session_can_restart_or_end(
+                        self.mount_statuses.get(&s.id).copied(),
+                    )
+            })
+    }
+
     fn can_modify(&self, id: &str) -> bool {
-        !self.busy.contains(id)
-            && self
-                .mount_statuses
-                .get(id)
-                .copied()
-                .unwrap_or(MountStatus::Unmounted)
-                == MountStatus::Unmounted
+        self.mount_targets
+            .iter()
+            .filter(|s| s.connection_id() == id)
+            .all(|s| self.mapping_can_modify(&s.id))
+            && self.mapping_can_modify(id)
     }
 
     fn save_connection(&mut self) -> Task<Message> {
         if self.editor_saving || self.connection_list_saving {
             return Task::none();
         }
-        if self.connection_draft.as_ref().is_some_and(|draft| {
-            draft
+        if let Some(draft) = &self.connection_draft
+            && let Some(previous) = draft
                 .editing_id
-                .as_deref()
-                .is_some_and(|id| !self.can_modify(id))
-        }) {
-            self.status = connection_settings_locked_help(self.locale()).into();
-            return Task::none();
+                .as_ref()
+                .and_then(|id| self.servers.iter().find(|s| &s.id == id))
+            && !self.can_modify(&previous.id)
+        {
+            let previous = previous.clone();
+            let mut next = previous.clone();
+            next.remote_path = draft.remote_path.trim().to_owned();
+            next.mountpoint = draft.mountpoint.trim().to_owned();
+            next.mounts = draft.mounts.clone();
+            next.primary_mount = draft.primary_mount;
+            next.remote_path = mountmate_core::connection::normalize_remote_path(&next.remote_path);
+            for mapping in &mut next.mounts {
+                mapping.remote_path =
+                    mountmate_core::connection::normalize_remote_path(&mapping.remote_path);
+                mapping.mountpoint = mapping.mountpoint.trim().to_owned();
+            }
+            if let Err(error) =
+                mountmate_core::connection::validate_mount_mappings(&next, &self.servers)
+            {
+                self.status = error;
+                return Task::none();
+            }
+            self.editor_saving = true;
+            let paths = self.paths.clone();
+            return Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        preflight_changed_mappings(&previous, &next)?;
+                        storage::update_mount_paths(
+                            &paths,
+                            &previous,
+                            next.remote_path,
+                            next.mountpoint,
+                            next.mounts,
+                            next.primary_mount,
+                        )
+                        .map(|servers| ServerMutation {
+                            servers,
+                            warning: None,
+                        })
+                        .map_err(|e| e.to_string())
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?
+                },
+                Message::ConnectionSaved,
+            );
         }
         if self
             .connection_draft
@@ -4559,7 +4858,8 @@ impl App {
         let Some(draft) = &self.connection_draft else {
             return Task::none();
         };
-        if mountpoint_choice(&draft.mountpoint) == "custom"
+        if draft.primary_mount
+            && mountpoint_choice(&draft.mountpoint) == "custom"
             && !self.mountpoint_preflight.allows_save()
         {
             return Task::none();
@@ -4582,7 +4882,8 @@ impl App {
             .and_then(|id| self.servers.iter().find(|server| server.id == id))
             .cloned();
         let credential_storage = self.settings.credential_storage;
-        let custom_mountpoint = (mountpoint_choice(&validated.server.mountpoint) == "custom")
+        let custom_mountpoint = (validated.server.primary_mount
+            && mountpoint_choice(&validated.server.mountpoint) == "custom")
             .then(|| validated.server.mountpoint.clone());
         Task::perform(
             async move {
@@ -4593,6 +4894,15 @@ impl App {
                             .unwrap_or_else(|| PathBuf::from("."));
                         preflight_custom_mountpoint(&mountpoint, &home)
                             .map_err(|error| error.to_string())?;
+                    }
+                    for mapping in &validated.server.mounts {
+                        if mountpoint_choice(&mapping.mountpoint) == "custom" {
+                            let home = directories::BaseDirs::new()
+                                .map(|d| d.home_dir().to_owned())
+                                .unwrap_or_default();
+                            preflight_custom_mountpoint(&mapping.mountpoint, &home)
+                                .map_err(|e| e.to_string())?;
+                        }
                     }
                     let server_id = validated.server.id.clone();
                     let password = prepare_secret_action(
@@ -5158,7 +5468,7 @@ impl App {
             return Task::none();
         }
         if !winfsp::installer_is_embedded() {
-            self.win_fsp_pending_mount = None;
+            self.win_fsp_pending_mounts.clear();
             self.status = match self.locale() {
                 Locale::English => format!(
                     "This source build does not include the Windows mounting component. Install WinFsp from {WINFSP_INSTALL_URL}, then retry mounting."
@@ -5178,7 +5488,7 @@ impl App {
                 "要将远程目录显示为资源管理器中的盘符，SSH MountMate 需要先安装 WinFsp 底层挂载组件。\n\n组件已随软件附带，无需再次下载，通常只需安装一次。Windows 会请求管理员授权。\n\n也可以选择「稍后」，下次挂载时再安装。"
             }
         }.to_owned();
-        if self.win_fsp_pending_mount.is_some() {
+        if !self.win_fsp_pending_mounts.is_empty() {
             description.push_str(match self.locale() {
                 Locale::English => {
                     "\n\nAfter installation, your pending mount will continue automatically."
@@ -5292,7 +5602,7 @@ impl App {
             .filter(|snapshot| transfer_is_active(snapshot))
             .count();
         let unknown = self
-            .servers
+            .mount_targets
             .iter()
             .filter(|server| self.mount_statuses.get(&server.id) == Some(&MountStatus::Mounted))
             .filter(|server| {
@@ -5353,7 +5663,7 @@ impl App {
 
     fn block_update_for_interactive_mounts(&mut self) -> bool {
         let names = self
-            .servers
+            .mount_targets
             .iter()
             .filter(|server| {
                 interactive_mount_blocks_update(
@@ -5398,7 +5708,7 @@ impl App {
         };
         let service = self.service.clone();
         let ids: Vec<_> = self
-            .servers
+            .mount_targets
             .iter()
             .map(|server| server.id.clone())
             .collect();
@@ -5465,7 +5775,7 @@ impl App {
             return Task::none();
         }
         let servers: Vec<_> = self
-            .servers
+            .mount_targets
             .iter()
             .filter(|server| {
                 self.mount_statuses.get(&server.id) == Some(&MountStatus::Mounted)
@@ -5531,7 +5841,7 @@ impl App {
             return Task::none();
         }
         let ids: Vec<_> = self
-            .servers
+            .mount_targets
             .iter()
             .filter(|server| {
                 self.mount_statuses.get(&server.id) == Some(&MountStatus::Mounted)
@@ -5731,7 +6041,7 @@ impl App {
 
     fn global_progress_state(&self) -> GlobalProgressState {
         let mounted = self
-            .servers
+            .mount_targets
             .iter()
             .filter(|server| self.mount_statuses.get(&server.id) == Some(&MountStatus::Mounted));
         let totals = transfer_totals(mounted.map(|server| {
@@ -5749,6 +6059,11 @@ impl App {
     }
 
     fn interactive_session_ready(&self, id: &str) -> bool {
+        let id = self
+            .mount_targets
+            .iter()
+            .find(|s| s.id == id)
+            .map_or(id, ServerConfig::connection_id);
         self.interactive_terminals
             .get(id)
             .is_some_and(|session| session.lifecycle == InteractiveTerminalLifecycle::Ready)
@@ -5761,6 +6076,8 @@ impl App {
     }
 
     fn queue_interactive_mount(&mut self, id: String, server: ServerConfig) -> Task<Message> {
+        self.pending_interactive_mounts.insert(id);
+        let id = server.connection_id().to_owned();
         if self.interactive_terminals.get(&id).is_some_and(|session| {
             matches!(
                 session.lifecycle,
@@ -5952,7 +6269,7 @@ impl App {
         let Some(id) = self.terminal_server_id.clone() else {
             return Task::none();
         };
-        if !interactive_session_can_restart_or_end(self.mount_statuses.get(&id).copied()) {
+        if !self.session_can_end(&id) {
             self.status = match self.locale() {
                 Locale::English => {
                     "Unmount this connection before ending its shared SSH session".into()
@@ -5963,6 +6280,12 @@ impl App {
         }
         let window = self.terminal_window.take();
         self.terminal_server_id = None;
+        self.pending_interactive_mounts.retain(|mount_id| {
+            !self
+                .mount_targets
+                .iter()
+                .any(|s| &s.id == mount_id && s.connection_id() == id)
+        });
         self.interactive_terminals.remove(&id);
         self.terminal_error = None;
         if let Some(window) = window {
@@ -5979,7 +6302,7 @@ impl App {
         let Some(server) = self.servers.iter().find(|server| server.id == id).cloned() else {
             return self.end_interactive_session();
         };
-        if !interactive_session_can_restart_or_end(self.mount_statuses.get(&id).copied()) {
+        if !self.session_can_end(&id) {
             self.status = match self.locale() {
                 Locale::English => {
                     "Unmount this connection before restarting its shared SSH session".into()
@@ -6006,6 +6329,15 @@ impl App {
             .collect::<HashSet<_>>();
         self.interactive_terminals
             .retain(|id, _| compatible.contains(id));
+        let next_targets: Vec<_> = next_servers
+            .iter()
+            .flat_map(ServerConfig::mount_targets)
+            .collect();
+        self.pending_interactive_mounts.retain(|id| {
+            next_targets
+                .iter()
+                .any(|s| &s.id == id && compatible.contains(s.connection_id()))
+        });
 
         let visible_is_compatible = self
             .terminal_server_id
@@ -6027,6 +6359,9 @@ impl App {
         id: String,
         requested: Option<MountOperation>,
     ) -> Task<Message> {
+        if self.editor_saving {
+            return Task::none();
+        }
         let current_status = self.mount_statuses.get(&id).copied();
         let mounted = matches!(
             current_status,
@@ -6041,10 +6376,10 @@ impl App {
             && cfg!(windows)
             && !mount_dependency_available(MountBackend::Fuse)
         {
+            self.win_fsp_pending_mounts.insert(id);
             if self.win_fsp_install_pending {
                 return Task::none();
             }
-            self.win_fsp_pending_mount = Some(id);
             let locale = self.locale();
             self.status = match locale {
                 Locale::English => {
@@ -6066,7 +6401,11 @@ impl App {
         {
             return self.confirm_waiting_unmount(vec![id]);
         }
-        let server = self.servers.iter().find(|server| server.id == id).cloned();
+        let server = self
+            .mount_targets
+            .iter()
+            .find(|server| server.id == id)
+            .cloned();
         if operation == MountOperation::Mount
             && server
                 .as_ref()
@@ -6083,7 +6422,11 @@ impl App {
             && server
                 .as_ref()
                 .is_some_and(|server| server.connection_method == ConnectionMethod::Interactive)
-            && let Some(session) = self.interactive_terminals.get_mut(&id)
+            && let Some(session) = self.interactive_terminals.get_mut(
+                server
+                    .as_ref()
+                    .map_or(id.as_str(), ServerConfig::connection_id),
+            )
         {
             session.lifecycle = InteractiveTerminalLifecycle::Ready;
             session.queued_mount = false;
@@ -6157,7 +6500,10 @@ impl App {
         let names = ids
             .iter()
             .map(|id| {
-                operation_display_name(self.servers.iter().find(|server| server.id == *id), id)
+                operation_display_name(
+                    self.mount_targets.iter().find(|server| server.id == *id),
+                    id,
+                )
             })
             .collect::<Vec<_>>()
             .join(", ");
@@ -6215,8 +6561,10 @@ impl App {
     fn open_mountpoint(&mut self, id: String) -> Task<Message> {
         let state_file = self.paths.state_file(&id);
         let locale = self.locale();
-        let display_name =
-            operation_display_name(self.servers.iter().find(|server| server.id == id), &id);
+        let display_name = operation_display_name(
+            self.mount_targets.iter().find(|server| server.id == id),
+            &id,
+        );
         self.status = locale.opening(&display_name);
         Task::perform(
             async move {
@@ -6233,7 +6581,7 @@ impl App {
     }
 
     fn open_log(&mut self, id: String) -> Task<Message> {
-        let Some(server) = self.servers.iter().find(|server| server.id == id) else {
+        let Some(server) = self.mount_targets.iter().find(|server| server.id == id) else {
             self.status = self.locale().text(TextKey::ConnectionGone).into();
             return Task::none();
         };
@@ -6300,7 +6648,7 @@ impl App {
         let locale = self.locale();
         let reordering = self.connection_list_mode == ConnectionListMode::Reorder;
         let active_transfers = self
-            .servers
+            .mount_targets
             .iter()
             .filter(|server| {
                 self.mount_statuses.get(&server.id) == Some(&MountStatus::Mounted)
@@ -6695,11 +7043,31 @@ impl App {
                 connections = connections.push(connection_card(
                     server,
                     ConnectionCardState {
-                        status: self
-                            .mount_statuses
-                            .get(&server.id)
-                            .copied()
-                            .unwrap_or(MountStatus::Unmounted),
+                        status: if server.mounts.is_empty() {
+                            self.mount_statuses
+                                .get(&server.id)
+                                .copied()
+                                .unwrap_or(MountStatus::Unmounted)
+                        } else {
+                            let statuses: Vec<_> = self
+                                .mount_targets
+                                .iter()
+                                .filter(|s| s.connection_id() == server.id)
+                                .map(|s| {
+                                    self.mount_statuses
+                                        .get(&s.id)
+                                        .copied()
+                                        .unwrap_or(MountStatus::Unmounted)
+                                })
+                                .collect();
+                            if statuses.contains(&MountStatus::Starting) {
+                                MountStatus::Starting
+                            } else if statuses.contains(&MountStatus::Mounted) {
+                                MountStatus::Mounted
+                            } else {
+                                MountStatus::Unmounted
+                            }
+                        },
                         busy: self.busy.contains(&server.id),
                         transfer: self.transfers.get(&server.id),
                         transfer_unavailable: self.transfer_errors.contains_key(&server.id),
@@ -6726,6 +7094,7 @@ impl App {
                         connection_list_saving: self.connection_list_saving,
                     },
                     locale,
+                    (!server.mounts.is_empty()).then(|| self.mount_mappings_view(server)),
                 ));
             }
         }
@@ -6747,10 +7116,141 @@ impl App {
         .into()
     }
 
+    fn mount_mappings_view<'a>(&'a self, server: &'a ServerConfig) -> Element<'a, Message> {
+        let locale = self.locale();
+        let targets: Vec<_> = self
+            .mount_targets
+            .iter()
+            .filter(|s| s.connection_id() == server.id)
+            .collect();
+        let mounted = targets
+            .iter()
+            .filter(|s| self.mount_statuses.get(&s.id) == Some(&MountStatus::Mounted))
+            .count();
+        let expanded = self.expanded_mounts.contains(&server.id);
+        let label = match locale {
+            Locale::English => format!(
+                "{} Mount points ({mounted}/{})",
+                if expanded { "▾" } else { "▸" },
+                targets.len()
+            ),
+            Locale::Chinese => format!(
+                "{} 挂载点（已挂载 {mounted}/{}）",
+                if expanded { "▾" } else { "▸" },
+                targets.len()
+            ),
+        };
+        let mut content = column![
+            row![
+                button(text(label))
+                    .style(button::text)
+                    .on_press(Message::ToggleMountMappings(server.id.clone())),
+                Space::new().width(Fill),
+                button(locale.text(TextKey::MountAll)).on_press_maybe(
+                    targets
+                        .iter()
+                        .any(|s| self.mapping_can_modify(&s.id))
+                        .then_some(Message::MountConnection(
+                            server.id.clone(),
+                            MountOperation::Mount
+                        ))
+                ),
+                button(locale.text(TextKey::UnmountAll)).on_press_maybe((mounted > 0).then_some(
+                    Message::MountConnection(server.id.clone(), MountOperation::Unmount)
+                )),
+            ]
+            .spacing(8)
+            .align_y(Center)
+        ]
+        .spacing(10);
+        if expanded {
+            for target in targets {
+                let id = &target.id;
+                let status = self
+                    .mount_statuses
+                    .get(id)
+                    .copied()
+                    .unwrap_or(MountStatus::Unmounted);
+                let busy = self.busy.contains(id);
+                let waiting = self.pending_unmount_after_sync.contains(id);
+                let mut details = column![
+                    text(format!(
+                        "{} → {}",
+                        if target.remote_path.is_empty() {
+                            "~"
+                        } else {
+                            &target.remote_path
+                        },
+                        display_mountpoint(target, locale)
+                    ))
+                    .size(15),
+                    text(status_label(locale, status)).size(12),
+                ]
+                .spacing(5)
+                .width(Fill);
+                if status == MountStatus::Mounted {
+                    details = details.push(capacity_progress_view(
+                        self.capacities.get(id),
+                        self.capacity_refreshing && !self.capacity_errors.contains(id),
+                        locale,
+                    ));
+                    if let Some(inode) = self.capacities.get(id).and_then(|c| c.inode.as_ref()) {
+                        details = details.push(inode_progress_view(inode, locale));
+                    }
+                    if let Some(transfer) = self.transfers.get(id).filter(|t| transfer_is_active(t))
+                    {
+                        details = details.push(text(transfer_label(locale, transfer)).size(12));
+                    }
+                    if self.transfer_errors.contains_key(id) {
+                        details = details
+                            .push(text(locale.text(TextKey::TransferStateUnavailable)).size(12));
+                    }
+                }
+                if let Some(error) = self.operation_errors.get(id) {
+                    details =
+                        details.push(text(mount_error_summary(locale, &error.cause)).size(12));
+                }
+                let operation = if waiting {
+                    Message::CancelPendingUnmount(id.clone())
+                } else {
+                    Message::Mount(id.clone())
+                };
+                let operation_label = if waiting {
+                    match locale {
+                        Locale::English => "Cancel pending unmount",
+                        Locale::Chinese => "取消等待卸载",
+                    }
+                } else if status == MountStatus::Mounted {
+                    locale.text(TextKey::Unmount)
+                } else {
+                    locale.text(TextKey::Mount)
+                };
+                content = content.push(
+                    container(
+                        row![
+                            details,
+                            button(operation_label).on_press_maybe((!busy).then_some(operation)),
+                            button(locale.text(TextKey::Open)).on_press_maybe(
+                                (status == MountStatus::Mounted && !busy)
+                                    .then_some(Message::Open(id.clone()))
+                            ),
+                            button(locale.text(TextKey::Logs))
+                                .on_press(Message::OpenOperationLog(id.clone())),
+                        ]
+                        .spacing(8)
+                        .align_y(Center),
+                    )
+                    .padding([8, 12]),
+                );
+            }
+        }
+        content.into()
+    }
+
     fn transfer_center_view(&self) -> Element<'_, Message> {
         let locale = self.locale();
         let mounted: Vec<_> = self
-            .servers
+            .mount_targets
             .iter()
             .filter(|server| self.mount_statuses.get(&server.id) == Some(&MountStatus::Mounted))
             .collect();
@@ -6948,7 +7448,12 @@ impl App {
             .is_some_and(|id| !self.can_modify(id));
         let controls = ConnectionEditorControls { locale, locked };
         let requirements = draft.requirements();
-        let mountpoint_allows_save = mountpoint_choice(&draft.mountpoint) != "custom"
+        let mountpoint_allows_save = !draft.primary_mount
+            || draft
+                .editing_id
+                .as_ref()
+                .is_some_and(|id| !self.mapping_can_modify(id))
+            || mountpoint_choice(&draft.mountpoint) != "custom"
             || self.mountpoint_preflight.allows_save();
         let header = row![
             text(title).size(28),
@@ -6963,8 +7468,7 @@ impl App {
                 locale.text(TextKey::Save)
             })
             .on_press_maybe(
-                (!locked && !self.editor_saving && mountpoint_allows_save)
-                    .then_some(Message::SaveConnection),
+                (!self.editor_saving && mountpoint_allows_save).then_some(Message::SaveConnection),
             ),
         ]
         .spacing(10)
@@ -7088,6 +7592,22 @@ impl App {
                     ]
                     .spacing(3)
                     .width(Fill);
+                    if let Some(server) = &item.server {
+                        for target in server.mount_targets() {
+                            details = details.push(
+                                text(format!(
+                                    "{} → {}",
+                                    if target.remote_path.is_empty() {
+                                        "~"
+                                    } else {
+                                        &target.remote_path
+                                    },
+                                    display_mountpoint(&target, locale)
+                                ))
+                                .size(12),
+                            );
+                        }
+                    }
                     if !reason.is_empty() {
                         details = details.push(text(reason).size(12));
                     }
@@ -7303,6 +7823,10 @@ impl App {
                 );
             }
         }
+        let path_locked = draft
+            .editing_id
+            .as_ref()
+            .is_some_and(|id| !self.mapping_can_modify(id));
         let (remote_base, remote_suffix) = split_remote_path(&draft.remote_path);
         let remote_path = column![
             text(locale.text(TextKey::RemotePath)).size(13),
@@ -7312,11 +7836,11 @@ impl App {
                     Some(remote_base),
                     Message::RemoteBaseChanged,
                 )
-                .style(move |theme, status| connection_pick_list_style(theme, status, locked))
+                .style(move |theme, status| connection_pick_list_style(theme, status, path_locked))
                 .width(Length::Fixed(120.0)),
                 text_input("projects/data", &remote_suffix)
                     .id("connection-remote-path")
-                    .on_input_maybe((!locked).then_some(Message::RemoteSuffixChanged))
+                    .on_input_maybe((!path_locked).then_some(Message::RemoteSuffixChanged))
                     .width(Fill),
             ]
             .spacing(8),
@@ -7328,8 +7852,8 @@ impl App {
         ]
         .spacing(5)
         .width(Fill);
-        let mountpoint_choice = mountpoint_choice(&draft.mountpoint);
-        let custom_mountpoint = mountpoint_choice == "custom";
+        let primary_choice = mountpoint_choice(&draft.mountpoint);
+        let custom_mountpoint = primary_choice == "custom";
         let mut mountpoint = column![
             row![
                 connection_field_label(locale.text(TextKey::Mountpoint), custom_mountpoint),
@@ -7338,12 +7862,12 @@ impl App {
             .spacing(5),
             pick_list(
                 mountpoint_options(locale, &self.windows_drive_letters, &draft.mountpoint),
-                Some(mountpoint_option_label(&mountpoint_choice, locale)),
+                Some(mountpoint_option_label(&primary_choice, locale)),
                 move |label| Message::MountpointChoiceChanged(mountpoint_option_value(
                     &label, locale
                 )),
             )
-            .style(move |theme, status| connection_pick_list_style(theme, status, locked))
+            .style(move |theme, status| connection_pick_list_style(theme, status, path_locked))
             .width(Fill),
         ]
         .spacing(5)
@@ -7358,10 +7882,10 @@ impl App {
                 row![
                     text_input(locale.text(TextKey::Mountpoint), custom_value,)
                         .id("connection-mountpoint")
-                        .on_input_maybe((!locked).then_some(Message::CustomMountpointChanged))
+                        .on_input_maybe((!path_locked).then_some(Message::CustomMountpointChanged))
                         .width(Fill),
                     button(locale.text(TextKey::Browse))
-                        .on_press_maybe((!locked).then_some(Message::BrowseMountpoint)),
+                        .on_press_maybe((!path_locked).then_some(Message::BrowseMountpoint)),
                 ]
                 .spacing(8),
             );
@@ -7390,7 +7914,122 @@ impl App {
                 mountpoint = mountpoint.push(text(message).size(13));
             }
         }
-        let paths = row![remote_path, mountpoint].spacing(12);
+        let primary_controls = ConnectionEditorControls {
+            locale,
+            locked: path_locked,
+        };
+        let mut paths = column![
+            text(match locale {
+                Locale::English => "Mount points",
+                Locale::Chinese => "挂载点",
+            })
+            .size(20)
+        ]
+        .spacing(12);
+        if draft.primary_mount {
+            paths = paths.push(
+                primary_controls.freeze(
+                    row![
+                        remote_path,
+                        mountpoint,
+                        button(locale.text(TextKey::Remove)).on_press_maybe(
+                            (!path_locked && !draft.mounts.is_empty())
+                                .then_some(Message::RemovePrimaryMapping)
+                        )
+                    ]
+                    .spacing(12),
+                ),
+            );
+        }
+        for (index, mapping) in draft.mounts.iter().enumerate() {
+            let frozen = draft.editing_id.as_ref().is_some_and(|id| {
+                !self.mapping_can_modify(&format!("{}--mount-{}", id, mapping.id))
+            });
+            let controls = ConnectionEditorControls {
+                locale,
+                locked: frozen,
+            };
+            let choice = mountpoint_choice(&mapping.mountpoint);
+            let local = column![
+                text(locale.text(TextKey::Mountpoint)).size(13),
+                pick_list(
+                    mountpoint_options(locale, &self.windows_drive_letters, &mapping.mountpoint),
+                    Some(mountpoint_option_label(&choice, locale)),
+                    move |value| Message::MappingLocalChoice(
+                        index,
+                        mountpoint_option_value(&value, locale)
+                    )
+                )
+                .style(move |theme, status| connection_pick_list_style(theme, status, frozen))
+                .width(Fill),
+            ]
+            .spacing(5)
+            .width(Fill);
+            let local = if choice == "custom" {
+                local.push(
+                    row![
+                        text_input(
+                            locale.text(TextKey::Mountpoint),
+                            if mapping.mountpoint == CUSTOM_MOUNTPOINT_PENDING {
+                                ""
+                            } else {
+                                &mapping.mountpoint
+                            }
+                        )
+                        .on_input_maybe(
+                            (!frozen)
+                                .then_some(move |value| Message::MappingLocalChanged(index, value))
+                        )
+                        .width(Fill),
+                        button(locale.text(TextKey::Browse))
+                            .on_press_maybe((!frozen).then_some(Message::MappingBrowse(index))),
+                    ]
+                    .spacing(8),
+                )
+            } else {
+                local
+            };
+            let remote = column![
+                text(locale.text(TextKey::RemotePath)).size(13),
+                text_input("/data/projects", &mapping.remote_path)
+                    .on_input_maybe(
+                        (!frozen)
+                            .then_some(move |value| Message::MappingRemoteChanged(index, value))
+                    )
+                    .width(Fill),
+                text(match locale {
+                    Locale::English => "Blank: home directory; /: server root",
+                    Locale::Chinese => "留空为用户主目录，/ 为服务器根目录",
+                })
+                .size(12),
+            ]
+            .spacing(5)
+            .width(Fill);
+            paths = paths.push(
+                controls.freeze(
+                    row![
+                        remote,
+                        local,
+                        button(locale.text(TextKey::Remove)).on_press_maybe(
+                            (!frozen && (draft.primary_mount || draft.mounts.len() > 1))
+                                .then_some(Message::RemoveMountMapping(index))
+                        )
+                    ]
+                    .spacing(12),
+                ),
+            );
+        }
+        paths = paths.push(
+            button(match locale {
+                Locale::English => "+ Add mount point",
+                Locale::Chinese => "+ 添加挂载点",
+            })
+            .on_press_maybe(
+                (draft.mounts.len() + usize::from(draft.primary_mount) < 64)
+                    .then_some(Message::AddMountMapping),
+            ),
+        );
+
         let startup_control: Element<'_, Message> =
             if draft.connection_method == ConnectionMethod::Interactive {
                 container(text(match locale {
@@ -7435,15 +8074,8 @@ impl App {
             ),
         ]
         .spacing(12);
-        let details = column![
-            target,
-            transport,
-            auth_fields,
-            managed_fields,
-            organization,
-            paths
-        ]
-        .spacing(16);
+        let details =
+            column![target, transport, auth_fields, managed_fields, organization].spacing(16);
         let details: Element<'_, Message> = if source_locked {
             tooltip(
                 read_only::freeze(details.into()),
@@ -7457,14 +8089,10 @@ impl App {
         } else {
             details.into()
         };
-        let content = column![source, ssh_config_controls, identity, details]
-            .spacing(16)
-            .max_width(900);
-        editor_shell(
-            header,
-            scrollable(mounted_controls.freeze(content)),
-            &self.status,
-        )
+        let common = mounted_controls
+            .freeze(column![source, ssh_config_controls, identity, details].spacing(16));
+        let content = column![common, paths].spacing(16).max_width(900);
+        editor_shell(header, scrollable(content), &self.status)
     }
 
     fn settings_view(&self) -> Element<'_, Message> {
@@ -8069,7 +8697,7 @@ impl App {
         let locale = self.locale();
         let selected = self.log_view.as_ref().map(|log| log.server_id.clone());
         let choices = self
-            .servers
+            .mount_targets
             .iter()
             .map(|server| LogChoice {
                 id: server.id.clone(),
@@ -8175,8 +8803,7 @@ impl App {
                 .into();
         };
         if let Some(error) = interactive_terminal_error(&self.terminal_error, server_id) {
-            let can_restart_or_end =
-                interactive_session_can_restart_or_end(self.mount_statuses.get(server_id).copied());
+            let can_restart_or_end = self.session_can_end(server_id);
             return column![
                 text(locale.text(TextKey::InteractiveTerminal)).size(24),
                 text(locale.text(TextKey::InteractiveTerminalHelp)).size(13),
@@ -8212,8 +8839,7 @@ impl App {
         let terminal: Element<'_, Message> = iced_term::TerminalView::show(&session.terminal)
             .map(|event| Message::TerminalEvent(RedactedTerminalEvent(event)));
         let terminal = keyed_column([(session.generation, terminal)]).height(Fill);
-        let can_restart_or_end =
-            interactive_session_can_restart_or_end(self.mount_statuses.get(server_id).copied());
+        let can_restart_or_end = self.session_can_end(server_id);
         let controls = row![
             text(lifecycle),
             Space::new().width(Fill),
@@ -8248,7 +8874,7 @@ impl App {
                 .into();
         }
         let active: Vec<_> = self
-            .servers
+            .mount_targets
             .iter()
             .filter(|server| {
                 self.mount_statuses.get(&server.id) == Some(&MountStatus::Mounted)
@@ -8572,6 +9198,7 @@ fn connection_card<'a>(
     server: &'a ServerConfig,
     state: ConnectionCardState<'a>,
     locale: Locale,
+    mappings: Option<Element<'a, Message>>,
 ) -> Element<'a, Message> {
     let ConnectionCardState {
         status,
@@ -8666,17 +9293,26 @@ fn connection_card<'a>(
         title,
         tag_row,
         text(host).size(15),
-        text(format!(
-            "{}  ->  {}",
-            remote,
-            display_mountpoint(server, locale)
-        ))
+        text(if server.mounts.is_empty() {
+            format!("{}  ->  {}", remote, display_mountpoint(server, locale))
+        } else {
+            match locale {
+                Locale::English => format!(
+                    "{} mount points · shared authentication",
+                    server.mounts.len() + usize::from(server.primary_mount)
+                ),
+                Locale::Chinese => format!(
+                    "{} 个挂载点 · 共用认证信息",
+                    server.mounts.len() + usize::from(server.primary_mount)
+                ),
+            }
+        })
         .size(14),
         text(status_label(locale, status)).size(13),
     ]
     .spacing(4)
     .width(Fill);
-    if status == MountStatus::Mounted {
+    if status == MountStatus::Mounted && server.mounts.is_empty() {
         details = details.push(capacity_progress_view(capacity, capacity_checking, locale));
         if let Some(inode) = capacity.and_then(|capacity| capacity.inode.as_ref()) {
             details = details.push(inode_progress_view(inode, locale));
@@ -8841,15 +9477,21 @@ fn connection_card<'a>(
             )
             .into()
     };
-    container(
+    let content: Element<'a, Message> = if let Some(mappings) = mappings {
+        column![row![details, actions].spacing(8).align_y(Center), mappings]
+            .spacing(12)
+            .into()
+    } else {
         row![details, operation, open, actions]
             .spacing(8)
-            .align_y(Center),
-    )
-    .padding(16)
-    .width(Fill)
-    .style(container::rounded_box)
-    .into()
+            .align_y(Center)
+            .into()
+    };
+    container(content)
+        .padding(16)
+        .width(Fill)
+        .style(container::rounded_box)
+        .into()
 }
 
 fn visible_connections<'a>(
@@ -8879,6 +9521,12 @@ fn visible_connections<'a>(
                     server.mountpoint.as_str(),
                 ]
                 .into_iter()
+                .chain(
+                    server
+                        .mounts
+                        .iter()
+                        .flat_map(|m| [m.remote_path.as_str(), m.mountpoint.as_str()]),
+                )
                 .any(|value| value.to_lowercase().contains(&query));
             matches_tag && matches_query
         })
@@ -10171,6 +10819,7 @@ fn localize_draft_error(locale: Locale, error: &DraftError) -> String {
         return error.to_string();
     }
     match error {
+        DraftError::MountMappings(message) => message.clone(),
         DraftError::Required(field) => format!("必须填写{}", localized_draft_field(field)),
         DraftError::InvalidScalar(field) => {
             format!("{}不能包含空白字符或控制字符", localized_draft_field(field))
@@ -11141,8 +11790,27 @@ fn interactive_terminal_error<'a>(
         .map(|(_, message)| message.as_str())
 }
 
+fn mapping_is_editable(
+    busy: bool,
+    status: Option<MountStatus>,
+    pending_login: bool,
+    lifecycle: Option<InteractiveTerminalLifecycle>,
+) -> bool {
+    !busy
+        && status.unwrap_or(MountStatus::Unmounted) == MountStatus::Unmounted
+        && !(pending_login && lifecycle == Some(InteractiveTerminalLifecycle::Starting))
+}
+
 fn interactive_session_config_compatible(previous: &ServerConfig, next: &ServerConfig) -> bool {
-    previous == next && next.connection_method == ConnectionMethod::Interactive
+    let mut previous = previous.clone();
+    previous.remote_path = next.remote_path.clone();
+    previous.mountpoint = next.mountpoint.clone();
+    previous.mounts = next.mounts.clone();
+    previous.primary_mount = next.primary_mount;
+    previous.name = next.name.clone();
+    previous.tags = next.tags.clone();
+    previous.folder = next.folder.clone();
+    previous == *next && next.connection_method == ConnectionMethod::Interactive
 }
 
 fn transfer_window_settings() -> window::Settings {
@@ -11342,6 +12010,23 @@ fn open_path(path: &Path, locale: Locale) -> Result<(), String> {
     }
     #[cfg(windows)]
     drop(child);
+    Ok(())
+}
+
+fn preflight_changed_mappings(previous: &ServerConfig, next: &ServerConfig) -> Result<(), String> {
+    let previous = previous.mount_targets();
+    let home = directories::BaseDirs::new()
+        .map(|d| d.home_dir().to_owned())
+        .unwrap_or_default();
+    for target in next.mount_targets() {
+        if mountpoint_choice(&target.mountpoint) == "custom"
+            && !previous
+                .iter()
+                .any(|p| p.id == target.id && p.mountpoint == target.mountpoint)
+        {
+            preflight_custom_mountpoint(&target.mountpoint, &home).map_err(|e| e.to_string())?;
+        }
+    }
     Ok(())
 }
 
@@ -12569,8 +13254,64 @@ mod localization_tests {
     }
 
     #[test]
+    fn idle_mapping_unlocks_after_login_failure_while_active_siblings_stay_locked() {
+        use InteractiveTerminalLifecycle::{Failed, Ready, Starting};
+        assert!(!mapping_is_editable(false, None, true, Some(Starting)));
+        assert!(mapping_is_editable(false, None, true, Some(Failed)));
+        assert!(mapping_is_editable(false, None, true, None));
+        assert!(mapping_is_editable(false, None, false, Some(Ready)));
+        assert!(!mapping_is_editable(
+            false,
+            Some(MountStatus::Mounted),
+            false,
+            Some(Ready)
+        ));
+        assert!(!mapping_is_editable(true, None, false, None));
+    }
+
+    #[test]
+    fn mapping_changes_preserve_shared_session_and_startup_expands_all_paths() {
+        let previous = ServerConfig {
+            id: "work".into(),
+            connection_method: ConnectionMethod::Interactive,
+            host: "work.example".into(),
+            ..Default::default()
+        };
+        let mut next = previous.clone();
+        next.primary_mount = false;
+        next.mounts.push(mountmate_core::model::MountMapping {
+            remote_path: "/projects".into(),
+            mountpoint: "Q:".into(),
+            ..Default::default()
+        });
+        assert!(interactive_session_config_compatible(&previous, &next));
+        let mut authenticated_elsewhere = next.clone();
+        authenticated_elsewhere.user = "another-user".into();
+        assert!(!interactive_session_config_compatible(
+            &previous,
+            &authenticated_elsewhere
+        ));
+        next.primary_mount = true;
+        next.auto_mount_at_login = true;
+        assert!(startup_servers(&Settings::default(), &next.mount_targets()).is_empty());
+        next.connection_method = ConnectionMethod::Native;
+        let startup = startup_servers(&Settings::default(), &next.mount_targets());
+        assert_eq!(startup.len(), 2);
+        assert_ne!(startup[0].id, startup[1].id);
+        next.primary_mount = false;
+        assert_eq!(
+            startup_servers(&Settings::default(), &next.mount_targets()),
+            vec![startup[1].clone()]
+        );
+    }
+
+    #[test]
     fn saving_blocks_queued_editor_inputs_and_dialog_results() {
         for message in [
+            Message::AddMountMapping,
+            Message::RemovePrimaryMapping,
+            Message::RemoveMountMapping(0),
+            Message::MappingPicked("mapping-id".into(), Some(PathBuf::from("late-directory"))),
             Message::ConnectionFieldChanged(ConnectionField::Host, "late.example".into()),
             Message::PasswordChanged(SecretInput("late-password".into())),
             Message::PrivateKeyPicked(Some(PathBuf::from("late-key"))),

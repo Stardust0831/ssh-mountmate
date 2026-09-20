@@ -198,8 +198,36 @@ impl CredentialStorage {
     pub const ALL: [Self; 2] = [Self::Obscure, Self::System];
 }
 
+/// An additional remote-to-local mapping. Authentication belongs to the parent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MountMapping {
+    pub id: String,
+    #[serde(default)]
+    pub remote_path: String,
+    #[serde(default)]
+    pub mountpoint: String,
+}
+
+impl Default for MountMapping {
+    fn default() -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            remote_path: String::new(),
+            mountpoint: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerConfig {
+    #[serde(default = "default_true")]
+    pub primary_mount: bool,
+    /// The original mapping remains in remote_path/mountpoint for compatibility.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<MountMapping>,
+    /// Runtime projections refer back to the one authentication profile.
+    #[serde(skip)]
+    pub connection_id: String,
     #[serde(default)]
     pub id: String,
     #[serde(default)]
@@ -265,6 +293,9 @@ fn default_source() -> String {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            primary_mount: true,
+            mounts: Vec::new(),
+            connection_id: String::new(),
             id: String::new(),
             name: String::new(),
             folder: String::new(),
@@ -296,6 +327,47 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
+    pub fn connection_id(&self) -> &str {
+        if self.connection_id.is_empty() {
+            &self.id
+        } else {
+            &self.connection_id
+        }
+    }
+
+    pub fn mapping_id(&self, mapping: &MountMapping) -> String {
+        format!("{}--mount-{}", self.id, mapping.id)
+    }
+
+    pub fn mount_targets(&self) -> Vec<Self> {
+        let mut primary = self.clone();
+        primary.mounts.clear();
+        primary.connection_id = self.connection_id().to_owned();
+        primary.primary_mount = true;
+        let mut targets = if self.primary_mount {
+            vec![primary.clone()]
+        } else {
+            Vec::new()
+        };
+        for mapping in &self.mounts {
+            let mut target = primary.clone();
+            target.id = self.mapping_id(mapping);
+            target.remote_path = mapping.remote_path.clone();
+            target.mountpoint = mapping.mountpoint.clone();
+            target.name = format!(
+                "{} · {}",
+                self.display_name(),
+                if mapping.remote_path.is_empty() {
+                    "~"
+                } else {
+                    &mapping.remote_path
+                }
+            );
+            targets.push(target);
+        }
+        targets
+    }
+
     pub fn normalize(&mut self) {
         let display_name = self.display_name().to_owned();
         let id_source = if self.id.trim().is_empty() {
@@ -324,7 +396,8 @@ impl ServerConfig {
     }
 
     pub fn remote_name(&self) -> &str {
-        if self.connection_method != ConnectionMethod::Interactive
+        if (self.connection_id.is_empty() || self.connection_id == self.id)
+            && self.connection_method != ConnectionMethod::Interactive
             && self.mode == "ssh_config"
             && !self.host_alias.is_empty()
         {

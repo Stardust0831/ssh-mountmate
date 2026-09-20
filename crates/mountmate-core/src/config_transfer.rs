@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::ServerConfig;
 use crate::connection::{SshImportPlan, plan_server_imports};
 
-pub const CONFIG_EXPORT_SCHEMA: u32 = 1;
+pub const CONFIG_EXPORT_SCHEMA: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionExport {
@@ -39,7 +39,7 @@ impl ConnectionExport {
     }
 
     pub fn into_servers(self) -> Result<Vec<ServerConfig>, String> {
-        if self.schema != CONFIG_EXPORT_SCHEMA {
+        if ![1, CONFIG_EXPORT_SCHEMA].contains(&self.schema) {
             return Err(format!(
                 "unsupported SSH MountMate config schema: {}",
                 self.schema
@@ -85,6 +85,7 @@ impl ConnectionExport {
             server.copy_key_to_ssh_dir = false;
             server.managed_ssh_config_path.clear();
             server.normalize();
+            crate::connection::validate_mount_mappings(server, &[])?;
             if !server.password_obscured.is_empty()
                 || !server.key_pass_obscured.is_empty()
                 || !server.password_credential.is_empty()

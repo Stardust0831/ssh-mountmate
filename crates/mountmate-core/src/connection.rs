@@ -94,6 +94,8 @@ pub struct ConnectionDraft {
     pub password: String,
     pub key_passphrase: String,
     pub connection_method: ConnectionMethod,
+    pub primary_mount: bool,
+    pub mounts: Vec<crate::model::MountMapping>,
     pub remote_path: String,
     pub mountpoint: String,
     pub auto_mount_at_login: bool,
@@ -161,6 +163,8 @@ impl Default for ConnectionDraft {
             password: String::new(),
             key_passphrase: String::new(),
             connection_method: ConnectionMethod::Native,
+            primary_mount: true,
+            mounts: Vec::new(),
             remote_path: String::new(),
             mountpoint: String::new(),
             auto_mount_at_login: false,
@@ -255,6 +259,8 @@ impl ConnectionDraft {
             password: String::new(),
             key_passphrase: String::new(),
             connection_method: server.connection_method,
+            primary_mount: server.primary_mount,
+            mounts: server.mounts.clone(),
             remote_path: server.remote_path.clone(),
             mountpoint: server.mountpoint.clone(),
             auto_mount_at_login: server.auto_mount_at_login,
@@ -406,6 +412,9 @@ impl ConnectionDraft {
             id = unique_id(&sanitize_id(&name), servers);
         }
         let mut server = ServerConfig {
+            primary_mount: self.primary_mount,
+            mounts: self.mounts.clone(),
+            connection_id: String::new(),
             id,
             name,
             folder,
@@ -466,6 +475,11 @@ impl ConnectionDraft {
             },
         };
         server.normalize();
+        for mapping in &mut server.mounts {
+            mapping.mountpoint = normalize_mountpoint(&mapping.mountpoint)?;
+            mapping.remote_path = normalize_remote_path(&mapping.remote_path);
+        }
+        validate_mount_mappings(&server, servers).map_err(DraftError::MountMappings)?;
 
         if let Some(duplicate) = servers.iter().find(|candidate| {
             self.editing_id.as_deref() != Some(candidate.id.as_str())
@@ -570,6 +584,8 @@ fn resolved_secret(action: SecretAction, obscured: Option<String>) -> Result<Str
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum DraftError {
+    #[error("{0}")]
+    MountMappings(String),
     #[error("{0} is required")]
     Required(&'static str),
     #[error("{0} must not contain whitespace or control characters")]
@@ -694,10 +710,12 @@ fn validate_host_alias(value: &str) -> Result<(), DraftError> {
     }
 }
 
-fn normalize_remote_path(value: &str) -> String {
+pub fn normalize_remote_path(value: &str) -> String {
     let value = value.trim().replace('\\', "/");
     if value == "~" {
         String::new()
+    } else if let Some(suffix) = value.strip_prefix("~/") {
+        suffix.trim_matches('/').into()
     } else if value.starts_with('/') {
         let suffix = value.trim_matches('/');
         if suffix.is_empty() {
@@ -710,7 +728,7 @@ fn normalize_remote_path(value: &str) -> String {
     }
 }
 
-fn normalize_mountpoint(value: &str) -> Result<String, DraftError> {
+pub fn normalize_mountpoint(value: &str) -> Result<String, DraftError> {
     let value = value.trim();
     if value.is_empty() || value.eq_ignore_ascii_case("auto") {
         return Ok(String::new());
@@ -1083,6 +1101,90 @@ fn expand_home(path: &Path) -> PathBuf {
         };
     }
     path.into()
+}
+
+/// Validate explicit local targets across profiles before storing or mounting.
+pub fn validate_mount_mappings(
+    server: &ServerConfig,
+    others: &[ServerConfig],
+) -> Result<(), String> {
+    if !(1..=64).contains(&(server.mounts.len() + usize::from(server.primary_mount))) {
+        return Err("A connection needs 1–64 mount points / 每个连接需要 1–64 个挂载点".into());
+    }
+    let mut ids = std::collections::HashSet::new();
+    for mapping in &server.mounts {
+        if mapping.id.len() != 32
+            || !mapping.id.bytes().all(|b| b.is_ascii_hexdigit())
+            || !ids.insert(&mapping.id)
+        {
+            return Err("Invalid or repeated mount ID / 挂载点标识无效或重复".into());
+        }
+        if mapping.remote_path.chars().any(char::is_control)
+            || mapping.mountpoint.chars().any(char::is_control)
+        {
+            return Err(
+                "Mount paths must not contain control characters / 挂载路径不能含控制字符".into(),
+            );
+        }
+        normalize_mountpoint(&mapping.mountpoint).map_err(|e| e.to_string())?;
+    }
+    let explicit_key = |value: &str| -> Option<String> {
+        let value = value.trim();
+        if value.is_empty() || value.eq_ignore_ascii_case("auto") || value == HOME_MOUNTPOINT_VALUE
+        {
+            return None;
+        }
+        let path = crate::service::expand_home_path(Path::new(value));
+        let windows = cfg!(windows)
+            || windows_drive(value).is_some()
+            || (value.len() >= 3 && value.as_bytes()[1] == b':');
+        let key = crate::mountpoint::path_key(&path, windows);
+        let mut parts: Vec<&str> = Vec::new();
+        for part in key.split('/') {
+            match part {
+                "." => {}
+                ".." if parts.last().is_some_and(|p| !p.is_empty()) => {
+                    parts.pop();
+                }
+                _ => parts.push(part),
+            }
+        }
+        Some(parts.join("/"))
+    };
+    let mut local = std::collections::HashSet::new();
+    let targets = server.mount_targets();
+    let other_targets: Vec<_> = others
+        .iter()
+        .filter(|s| s.id != server.id)
+        .flat_map(ServerConfig::mount_targets)
+        .collect();
+    for target in &targets {
+        if target.remote_path.chars().any(char::is_control)
+            || target.mountpoint.chars().any(char::is_control)
+        {
+            return Err(
+                "Mount paths must not contain control characters / 挂载路径不能含控制字符".into(),
+            );
+        }
+        normalize_mountpoint(&target.mountpoint).map_err(|e| e.to_string())?;
+        if other_targets.iter().any(|other| other.id == target.id) {
+            return Err(
+                "Mount identity conflicts with another connection / 挂载标识与其他连接冲突".into(),
+            );
+        }
+        if let Some(key) = explicit_key(&target.mountpoint)
+            && (!local.insert(key.clone())
+                || other_targets
+                    .iter()
+                    .any(|other| explicit_key(&other.mountpoint).as_ref() == Some(&key)))
+        {
+            return Err(format!(
+                "Local mount point is already configured: {} / 本地挂载位置已被使用",
+                target.mountpoint
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
