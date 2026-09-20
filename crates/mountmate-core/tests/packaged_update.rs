@@ -150,7 +150,7 @@ fn run_scenario(scenario: Scenario) -> TestResult {
     let payload = locate_update_payload(&payload_root, layout.kind, env::consts::OS)?;
     let prepared = prepare_directory_payload(&layout, &payload, &transaction, env::consts::OS)?;
     let helper = materialize_update_helper(
-        &temporary.path().join("detached-updater"),
+        &environment.paths.update_helper_dir(),
         &installed_executable,
     )?;
 
@@ -265,6 +265,15 @@ fn run_scenario(scenario: Scenario) -> TestResult {
             .into());
         }
 
+        if matches!(scenario, Scenario::Commit) {
+            // The new GUI retains its health-marker startup argument even
+            // after the helper has exited. That path alone must not be treated
+            // as an active updater, including by Windows process enumeration.
+            mountmate_core::application_data::ensure_profiles_idle_for_uninstall(
+                std::slice::from_ref(&environment.paths),
+            )
+            .map_err(io::Error::other)?;
+        }
         if matches!(scenario, Scenario::Commit)
             && !terminate_processes_at(&installed_executable, PROCESS_TIMEOUT)?
         {

@@ -5136,20 +5136,29 @@ impl App {
         let settings = self.settings.clone();
         let integration = self.startup_integration_lock.clone();
         self.status = match self.locale() {
-            Locale::English => "Preparing uninstall…",
-            Locale::Chinese => "正在准备卸载…",
+            Locale::English => "Preparing uninstall; waiting briefly if an update is finishing…",
+            Locale::Chinese => "正在准备卸载；如更新正在收尾，会稍候片刻…",
         }
         .into();
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
                     use mountmate_core::application_data::{
-                        ensure_no_profile_processes, uninstall_inventory,
+                        ensure_profiles_idle_for_uninstall, uninstall_inventory,
                     };
                     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
-                    ensure_no_profile_processes(&paths)?;
+                    let profiles = vec![paths.clone()];
                     #[cfg(windows)]
-                    ensure_no_profile_processes(&AppPaths::legacy_windows())?;
+                    let profiles = {
+                        let mut profiles = profiles;
+                        for profile in [AppPaths::discover(), AppPaths::legacy_windows()] {
+                            if !profiles.contains(&profile) {
+                                profiles.push(profile);
+                            }
+                        }
+                        profiles
+                    };
+                    ensure_profiles_idle_for_uninstall(&profiles)?;
                     let targets = uninstall_inventory(&paths, &executable, &servers, &settings)?;
                     let _guard = integration.lock().map_err(|e| e.to_string())?;
                     mountmate_platform::remove_application_integration(&executable)
