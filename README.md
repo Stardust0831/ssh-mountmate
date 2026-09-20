@@ -91,6 +91,8 @@ Windows:
 - WinFsp
 - OpenSSH Client
 
+Windows release executables statically link the MSVC runtime, so launching SSH MountMate does not require a separate Visual C++ Redistributable installation. Release checks inspect DLL imports in the final executable and its bundled helpers on both x64 and ARM64.
+
 Windows release binaries (x64 and ARM64) embed the unmodified official WinFsp **2.1.25156** installer, pinned by SHA-256. Linux and macOS binaries do not include it. When the component is missing, a prompt explains that it lets remote folders appear as Windows drives. Choose **Install component** to install the bundled copy without another download, or **Later** to postpone. Windows requests administrator approval; this is normally a one-time setup. After successful installation, a pending mount continues automatically. If Windows requires a restart, the app asks you to restart before mounting.
 
 WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos — https://github.com/winfsp/winfsp. See [Third-Party Notices](THIRD_PARTY_NOTICES.md) for the license.

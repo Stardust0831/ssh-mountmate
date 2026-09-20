@@ -79,6 +79,8 @@ Windows：
 - WinFsp
 - OpenSSH Client
 
+Windows Release 程序静态链接 MSVC 运行库，启动 SSH MountMate 无需另行安装 Visual C++ Redistributable。发布流程会检查 x64 和 ARM64 最终程序及内置辅助程序的 DLL 依赖。
+
 Windows Release 二进制（x64 和 ARM64）内置未经修改的官方 WinFsp **2.1.25156** 安装包，并通过 SHA-256 固定版本。Linux 和 macOS 二进制不包含该安装包。缺少组件时，弹窗会解释它用于将远程目录显示为 Windows 盘符。选择「安装组件」即可安装内置副本，无需再次下载；也可选择「稍后」。Windows 会请求管理员授权，通常只需安装一次。安装成功后会自动继续刚才的挂载；若安装程序要求重启，会提示重启后再挂载。
 
 WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos — https://github.com/winfsp/winfsp。许可详情见[第三方声明](THIRD_PARTY_NOTICES.md)。

@@ -3,3 +3,8 @@ target-dir = "target"
 
 [term]
 color = "always"
+
+# Keep the Windows onefile runnable without installing the Visual C++ runtime.
+# Target-specific flags also apply to native C/C++ dependencies built by cc.
+[target.'cfg(all(target_os = "windows", target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]

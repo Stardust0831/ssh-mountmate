@@ -178,6 +178,11 @@ jobs:
           grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "${output}"
       - run: cargo build --release --package ssh-mountmate
 
+      - name: Verify Windows runtime independence
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./tests/rust_windows_runtime_smoke.ps1 -Binary target/release/SSHMountMate.exe
+
       - name: Verify Windows icon resources
         if: runner.os == 'Windows'
         shell: pwsh
@@ -481,6 +486,11 @@ jobs:
           New-Item -ItemType Directory -Force target/onefile | Out-Null
           Copy-Item target/release/SSHMountMate.exe target/onefile/SSHMountMate.exe
           ./tests/rust_windows_icon_smoke.ps1 -Binary target/onefile/SSHMountMate.exe
+          ./tests/rust_windows_runtime_smoke.ps1 -Binary @(
+            'target/onefile/SSHMountMate.exe',
+            'target/release/bin/rclone.exe',
+            'target/release/bin/plink.exe'
+          )
           $onefileHome = Join-Path $env:RUNNER_TEMP 'onefile-home'
           $env:HOME = $onefileHome
           $env:USERPROFILE = $onefileHome
