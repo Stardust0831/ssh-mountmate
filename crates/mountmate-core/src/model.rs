@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const SETTINGS_SCHEMA_VERSION: u32 = 15;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 16;
 pub const DEFAULT_VFS_UPLOAD_TRANSFERS: u16 = 12;
 pub const MIN_VFS_UPLOAD_TRANSFERS: u16 = 1;
 pub const MAX_VFS_UPLOAD_TRANSFERS: u16 = 32;
@@ -36,7 +36,7 @@ fn default_cache_age() -> String {
 }
 
 fn default_write_back() -> String {
-    "5s".into()
+    "1s".into()
 }
 
 fn default_dir_cache_time() -> String {
@@ -608,6 +608,9 @@ impl Settings {
                 self.accent_color = AccentColor::Custom;
             }
         }
+        if version < 16 && self.vfs_write_back == "5s" {
+            self.vfs_write_back = default_write_back();
+        }
         if !(MIN_VFS_UPLOAD_TRANSFERS..=MAX_VFS_UPLOAD_TRANSFERS)
             .contains(&self.vfs_upload_transfers)
         {
@@ -678,7 +681,7 @@ mod tests {
         assert_eq!(settings.vfs_cache_mode, "full");
         assert_eq!(settings.vfs_cache_max_size, "20G");
         assert_eq!(settings.vfs_cache_max_age, "30m");
-        assert_eq!(settings.vfs_write_back, "5s");
+        assert_eq!(settings.vfs_write_back, "1s");
         assert_eq!(settings.dir_cache_time, "5m");
     }
 
@@ -693,7 +696,7 @@ mod tests {
             ..Settings::default()
         }
         .migrate();
-        assert_eq!(recommended.vfs_write_back, "5s");
+        assert_eq!(recommended.vfs_write_back, "1s");
 
         let custom = Settings {
             settings_schema_version: 8,
@@ -705,6 +708,31 @@ mod tests {
         }
         .migrate();
         assert_eq!(custom.vfs_write_back, "0s");
+    }
+
+    #[test]
+    fn schema_16_shortens_previous_write_back_default_and_preserves_other_values() {
+        assert_eq!(Settings::default().vfs_write_back, "1s");
+        let old: Settings =
+            serde_json::from_str(r#"{"settings_schema_version":15,"vfs_write_back":"5s"}"#)
+                .unwrap();
+        let migrated = old.migrate();
+        assert_eq!(migrated.vfs_write_back, "1s");
+        for value in ["0s", "1s", "17s", "30s", "1m"] {
+            let old = Settings {
+                settings_schema_version: 15,
+                vfs_write_back: value.into(),
+                ..Settings::default()
+            };
+            assert_eq!(old.migrate().vfs_write_back, value);
+        }
+        let edited = Settings {
+            vfs_write_back: "5s".into(),
+            ..migrated
+        };
+        let reloaded: Settings =
+            serde_json::from_str(&serde_json::to_string(&edited).unwrap()).unwrap();
+        assert_eq!(reloaded.migrate(), edited);
     }
 
     #[test]

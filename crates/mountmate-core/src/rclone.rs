@@ -616,7 +616,7 @@ mod tests {
         assert!(
             command
                 .windows(2)
-                .any(|item| item == ["--vfs-write-back", "5s"])
+                .any(|item| item == ["--vfs-write-back", "1s"])
         );
         assert!(
             command
@@ -758,7 +758,7 @@ mod tests {
             ["--cache-dir", "cache"],
             ["--log-file", "alpha.log"],
             ["--vfs-cache-mode", "full"],
-            ["--vfs-write-back", "5s"],
+            ["--vfs-write-back", "1s"],
             ["--dir-cache-time", "5m"],
             ["--addr", "127.0.0.1:0"],
         ] {

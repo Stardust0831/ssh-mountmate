@@ -105,7 +105,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "Add-WindowsCapability -O
 macOS:
 
 - bundled rclone, or a source-build configured/system rclone
-- macFUSE or FUSE-T
+- macFUSE or FUSE-T for the FUSE backend; no extra filesystem component for built-in NFS
 - OpenSSH Client
 
 Important macOS note: SSH MountMate release builds use the bundled official rclone binary, so users normally do not need Homebrew rclone. If you override rclone or run from source, do not use the Homebrew `rclone` package for mounting. Homebrew's rclone package cannot run `rclone mount` on macOS. Use the official rclone binary instead:
@@ -137,6 +137,15 @@ migrated settings. Changing the option affects only the next mount, never interr
 mount, and never falls back silently if NFS startup fails. NFS filesystem semantics, performance,
 and cache behavior can differ from FUSE. Windows continues to use WinFsp and Linux continues to use
 FUSE3 regardless of this stored macOS setting.
+
+The NFS option avoids a separate filesystem installation on macOS by using the system's built-in
+NFS client. It is not a portable replacement for WinFsp: the pinned rclone 1.74.4 `nfsmount`
+and `serve nfs` implementations are built only for Unix platforms. Windows' own NFS mount utility requires the
+optional **Client for NFS** component and would need a separate backend integration. Linux can
+use NFS in principle, but normally needs NFS client utilities (such as `nfs-common` or `nfs-utils`)
+and mount privileges. SSH MountMate currently supports the NFS option on macOS only.
+See the [pinned rclone implementation](https://github.com/rclone/rclone/blob/v1.74.4/cmd/nfsmount/nfsmount.go)
+and [Microsoft's NFS mount documentation](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/mount).
 
 If macOS blocks the downloaded app because it is not notarized, remove the quarantine attribute after unzipping:
 
@@ -414,7 +423,7 @@ slow local connection cannot monopolize the listener or delay normal shutdown in
 
 ## Transfers And Remote Refresh
 
-Mounted connection cards show rclone's real VFS upload queue. The recommended cache profile keeps rclone's upstream five-second write-back window so Explorer/Finder can finish close, rename, and metadata operations before remote upload begins. When automatic transfer display is enabled, queued or active uploads open one shared bottom-right progress window that summarizes active connections and can expand to show details. The Transfer center remains available for manually viewing all mounts together. A file is only shown as cloud-synced after rclone reports no queued or active uploads. SSH MountMate warns before unmounting or exiting while uploads remain.
+Mounted connection cards show rclone's real VFS upload queue. The recommended cache profile waits one second after a file closes before uploading, reducing the delay while retaining a short window for close, rename, and metadata operations. Upgrading from v0.6.13 or earlier changes the previous value of 5s to 1s; other values are preserved. The change applies on the next mount. When automatic transfer display is enabled, queued or active uploads open one shared bottom-right progress window that summarizes active connections and can expand to show details. The Transfer center remains available for manually viewing all mounts together. A file is only shown as cloud-synced after rclone reports no queued or active uploads. SSH MountMate warns before unmounting or exiting while uploads remain.
 
 The simultaneous-upload setting limits how many different cached files rclone may upload at once. The default is 12, with presets for 4 and 8 and a custom range of 1 through 32. Upgrading from v0.6.12 or earlier changes the previous value of 4 to 12; other valid values are preserved. Changes take effect on the next mount. Extra files remain queued in the local cache. Rewriting the same path does not create reliable parallel revisions: rclone cancels or reschedules that path's write-back and the latest local content may overwrite another writer's remote change.
 
@@ -424,7 +433,7 @@ still waits for rclone's queue and disk-cache counters to report an idle state b
 remote synchronized. rclone's own queue is intentionally short-lived and does not expose a durable
 history, so this smoothing is kept in the app and is reset after each confirmed idle period.
 
-rclone writes a closed file back to the remote after `--vfs-write-back` (5 seconds by default), and
+rclone writes a closed file back to the remote after `--vfs-write-back` (1 second by default in SSH MountMate), and
 `--vfs-cache-min-free-space` is a cache eviction target rather than a reserved per-file allowance.
 Open or recently written files can temporarily exceed cache limits and cannot be evicted while in
 use. The app therefore keeps the existing full-file VFS cache semantics; allowing a small uncached

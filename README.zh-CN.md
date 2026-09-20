@@ -93,7 +93,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "Add-WindowsCapability -O
 macOS：
 
 - 内置 rclone，或源码构建使用的配置/系统 rclone
-- macFUSE 或 FUSE-T
+- FUSE 后端需要 macFUSE 或 FUSE-T；内置 NFS 无需额外文件系统组件
 - OpenSSH Client
 
 macOS 重要提示：SSH MountMate Release 构建会使用内置的官方 rclone，通常不需要用户安装 Homebrew rclone。如果你手动覆盖 rclone 或从源码运行，不要使用 Homebrew 安装的 `rclone` 做挂载。Homebrew 版 rclone 在 macOS 上不能执行 `rclone mount`，请改用 rclone 官方二进制：
@@ -123,6 +123,13 @@ v0.4.0 之后的开发版本还会在 macOS 的“设置 -> 挂载方式”中�
 不需要 macFUSE 或 FUSE-T。新设置和旧设置迁移仍默认使用 FUSE；修改只影响下一次挂载，
 不会中断已有挂载，NFS 启动失败时也不会静默回退。NFS 的文件系统语义、性能和缓存行为可能
 与 FUSE 不同。无论该 macOS 设置字段为何值，Windows 仍使用 WinFsp，Linux 仍使用 FUSE3。
+
+macOS 的 NFS 方案利用系统自带的 NFS 客户端，因此免装额外文件系统组件，不能直接替代 Windows 上的 WinFsp。
+项目固定的 rclone 1.74.4 仅在 Unix 平台编译 `nfsmount` 和 `serve nfs`；Windows 自带的 NFS 挂载工具要求先安装
+“Client for NFS”可选组件，还需要另外适配后端。Linux 原理上也可以使用 NFS，但通常需要
+`nfs-common` 或 `nfs-utils` 等客户端工具和挂载权限。SSH MountMate 当前仅在 macOS 开放 NFS 选项。
+参考 [rclone 对应版本的实现](https://github.com/rclone/rclone/blob/v1.74.4/cmd/nfsmount/nfsmount.go)
+和 [Microsoft NFS 挂载文档](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/mount)。
 
 如果 macOS 因为程序未公证而阻止打开，解压后可以移除 quarantine 属性：
 
@@ -378,7 +385,7 @@ OpenSSH 和交互式共享 SSH 连接则继续使用各自 SSH 实现的主机�
 
 ## 传输进度和远端刷新
 
-已挂载连接的卡片会显示 rclone 真实的 VFS 上传队列。推荐缓存配置保留 rclone 上游默认的 5 秒写回窗口，让资源管理器或 Finder 先完成关闭文件、重命名和属性更新，再开始远端上传。启用自动显示传输后，文件进入队列或开始上传时，右下角会打开一个共享进度窗，汇总有传输任务的连接，并可展开查看详情。传输中心继续作为手动查看全部挂载的汇总入口。只有 rclone 报告队列与活动上传均为空时，程序才显示“云端已同步”。仍有上传时取消挂载或退出，程序会先警告。
+已挂载连接的卡片会显示 rclone 真实的 VFS 上传队列。推荐缓存配置在文件关闭后等待 1 秒再上传，缩短等待，同时给关闭文件、重命名和属性更新保留短暂窗口。从 v0.6.13 或更早版本升级时，原值 5s 调整为 1s，其他值保留；下次挂载生效。启用自动显示传输后，文件进入队列或开始上传时，右下角会打开一个共享进度窗，汇总有传输任务的连接，并可展开查看详情。传输中心继续作为手动查看全部挂载的汇总入口。只有 rclone 报告队列与活动上传均为空时，程序才显示“云端已同步”。仍有上传时取消挂载或退出，程序会先警告。
 
 “同时上传文件数”限制 rclone 同时上传多少个不同的缓存文件。默认值为 12，可选择 4、8，或在 1 到 32 之间自定义；从 v0.6.12 或更早版本升级时，原值 4 调整为 12，其他有效值保留；下次挂载时生效。超出数量的文件继续留在本地缓存排队。同一路径被再次修改不会形成可靠的并行版本：rclone 会取消或重新安排该路径的写回，最新的本地内容仍可能覆盖其他写入者的远端修改。
 
