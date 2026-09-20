@@ -282,6 +282,12 @@ impl Drop for DownloadScratch {
 mod tests {
     use super::*;
 
+    fn tempdir() -> tempfile::TempDir {
+        // macOS exposes its system temporary directory through /var, a symlink.
+        // Resolve that fixture base before testing our own linked-path checks.
+        tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap()
+    }
+
     fn profile(root: &Path) -> AppPaths {
         AppPaths {
             config_dir: root.join("config"),
@@ -327,7 +333,7 @@ mod tests {
 
     #[test]
     fn cleans_current_and_legacy_updater_files_without_touching_user_data() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempdir();
         let current = profile(&temp.path().join("current"));
         let mut legacy = profile(&temp.path().join("legacy"));
         legacy.data_dir = current.data_dir.clone();
@@ -363,7 +369,7 @@ mod tests {
 
     #[test]
     fn old_helper_commit_and_exit_are_both_required_before_first_upgrade_cleanup() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempdir();
         let paths = profile(temp.path());
         let stale = leftovers(&paths);
         for path in &stale {
@@ -393,7 +399,7 @@ mod tests {
 
     #[test]
     fn unfinished_update_is_retained_and_retried_on_next_startup() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempdir();
         let paths = profile(temp.path());
         let stale = leftovers(&paths);
         for path in &stale {
@@ -414,7 +420,7 @@ mod tests {
 
     #[test]
     fn pending_preparation_prevents_cleanup_across_profiles() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempdir();
         let paths = profile(temp.path());
         let lock = lock_updates(&paths).unwrap();
         let stale = leftovers(&paths);
@@ -433,7 +439,7 @@ mod tests {
 
     #[test]
     fn scratch_is_removed_after_success_or_failure_without_removing_staged_payload() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempdir();
         let archive = temp.path().join("archive.zip");
         let extracted = temp.path().join("extracted");
         let staged = temp.path().join("prepared.exe");
@@ -458,7 +464,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn linked_roots_and_payload_children_are_retained() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempdir();
         let paths = profile(temp.path());
         let outside = temp.path().join("user-files");
         let keep = outside.join("SSHMountMate-linux-x64.zip");
