@@ -491,7 +491,7 @@ fn safe_ssh_filename(value: &str) -> String {
     }
 }
 
-fn quote_ssh_value(value: &str) -> String {
+pub(crate) fn quote_ssh_value(value: &str) -> String {
     if value.is_empty()
         || value
             .chars()
@@ -654,8 +654,9 @@ pub fn scan_host_keys(
     command
         .args(["-T", "8", "-p", &port, "-t", "rsa,ecdsa,ed25519"])
         .arg(host)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     #[cfg(windows)]
     command.creation_flags(CREATE_NO_WINDOW);
     let mut child = command.spawn().map_err(|source| SshError::Io {
@@ -663,6 +664,14 @@ pub fn scan_host_keys(
         source,
     })?;
     let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let error_reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        if let Some(mut stderr) = stderr {
+            stderr.read_to_end(&mut output)?;
+        }
+        Ok::<_, std::io::Error>(String::from_utf8_lossy(&output).into_owned())
+    });
     let reader = std::thread::spawn(move || {
         let mut output = String::new();
         if let Some(mut stdout) = stdout {
@@ -677,6 +686,7 @@ pub fn scan_host_keys(
             let _ = child.kill();
             let _ = child.wait();
             let _ = reader.join();
+            let _ = error_reader.join();
             return Err(SshError::Io {
                 path: keyscan.to_owned(),
                 source,
@@ -687,9 +697,15 @@ pub fn scan_host_keys(
         let _ = child.kill();
         let _ = child.wait();
         let _ = reader.join();
+        let _ = error_reader.join();
         return Err(SshError::Command("ssh-keyscan timed out".into()));
     }
     let status = status.expect("timeout was handled above");
+    let diagnostics = error_reader
+        .join()
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
     let output = reader
         .join()
         .map_err(|_| SshError::Command("ssh-keyscan output reader panicked".into()))?
@@ -699,14 +715,16 @@ pub fn scan_host_keys(
         })?;
     if !status.success() {
         return Err(SshError::Command(format!(
-            "ssh-keyscan exited unsuccessfully ({status})"
+            "ssh-keyscan exited unsuccessfully ({status}) for {host}:{port}: {}",
+            concise_ssh_diagnostics(&diagnostics)
         )));
     }
     let keys = normalize_host_key_output(host, &port, &output);
     if keys.is_empty() {
-        return Err(SshError::Command(
-            "ssh-keyscan returned no usable host keys".into(),
-        ));
+        return Err(SshError::Command(format!(
+            "ssh-keyscan returned no usable host keys for {host}:{port}: {}",
+            concise_ssh_diagnostics(&diagnostics)
+        )));
     }
     Ok(keys)
 }
@@ -738,7 +756,7 @@ fn normalize_port(port: &str) -> &str {
     if port.trim().is_empty() { "22" } else { port }
 }
 
-fn validate_port(port: &str) -> Result<String, SshError> {
+pub(crate) fn validate_port(port: &str) -> Result<String, SshError> {
     let port = normalize_port(port);
     match port.parse::<u16>() {
         Ok(value) if value > 0 => Ok(value.to_string()),
@@ -910,7 +928,7 @@ fn known_hosts_file_contains_hashed_marker(path: &Path, marker: &str) -> bool {
     })
 }
 
-fn hashed_host_matches(value: &str, marker: &str) -> bool {
+pub(crate) fn hashed_host_matches(value: &str, marker: &str) -> bool {
     let Some(value) = value.strip_prefix("|1|") else {
         return false;
     };
@@ -926,6 +944,26 @@ fn hashed_host_matches(value: &str, marker: &str) -> bool {
     };
     let key = hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, &salt);
     hmac::verify(&key, marker.as_bytes(), &tag).is_ok()
+}
+
+pub(crate) fn concise_ssh_diagnostics(output: &str) -> String {
+    let details = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .take(6)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let details = details
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+        .take(1600)
+        .collect::<String>();
+    if details.is_empty() {
+        "no diagnostic output; check the host, port and network connection".into()
+    } else {
+        details
+    }
 }
 
 pub fn readable_file(path: &Path) -> Option<PathBuf> {

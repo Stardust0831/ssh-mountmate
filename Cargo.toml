@@ -7,7 +7,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.6.15"
+version = "0.6.16"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -46,7 +46,7 @@ ssh-key = "0.6.7"
 tempfile = "3.20"
 thiserror = "2.0"
 tray-icon = { version = "0.24.1", default-features = false }
-tokio = { version = "1.48", features = ["rt"] }
+tokio = { version = "1.48", features = ["rt", "sync"] }
 sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }
 sys-locale = "0.3"
 url = "2.5"

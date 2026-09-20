@@ -91,12 +91,14 @@ mkdir -p "$remote_root" "$mountpoint" "$test_root/home"
 printf '%s\n' 'initial remote content' >"$remote_root/initial.txt"
 
 port="$(allocate_loopback_port)"
+host_key="$test_root/server-host-key"
+ssh-keygen -q -t ecdsa -b 256 -N '' -f "$host_key"
 server_ready=false
 for _ in {1..20}; do
   "$server_rclone" --cache-dir "$test_root/server-cache" \
     --log-file "$test_root/sftp-server.log" -vv \
     serve sftp "$remote_root" --addr "127.0.0.1:$port" \
-    --user "$server_user" --pass "$server_password" \
+    --user "$server_user" --pass "$server_password" --key "$host_key" \
     --dir-cache-time 0s --poll-interval 0 &
   server_pid=$!
   for _ in {1..100}; do
@@ -124,6 +126,10 @@ export XDG_CACHE_HOME="$test_root/cache"
 export XDG_STATE_HOME="$test_root/state"
 config_dir="$XDG_CONFIG_HOME/rsshmount"
 mkdir -p "$config_dir"
+awk -v marker="[127.0.0.1]:${port}" '{ print marker, $1, $2 }' "$host_key.pub" >"$config_dir/known_hosts"
+SSH_MOUNTMATE_HOST_KEY_TEST_PORT="$port" \
+SSH_MOUNTMATE_HOST_KEY_TEST_PUBLIC="$(cat "$host_key.pub")" \
+  cargo test --package mountmate-core host_key::tests::live_host_key_probe --all-features -- --ignored --exact --test-threads=1
 password_obscured="$("$rclone" obscure "$server_password")"
 jq -n \
   --arg user "$server_user" \

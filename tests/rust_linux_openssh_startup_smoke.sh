@@ -190,6 +190,7 @@ control_candidates=(
   "${TMPDIR:-/tmp}/ssh-mountmate-${state_digest:0:16}/${control_name}"
 )
 mkdir -p "${config_dir}"
+cp "${known_hosts}" "${config_dir}/known_hosts"
 
 # Imported OpenSSH snapshots are deliberately stale: the original config and
 # alias must still control host, user, port, and identity during real mounts.
@@ -369,7 +370,7 @@ for _ in $(seq 1 150); do
     xdotool search --onlyvisible --name '^File transfer$' 2>/dev/null || true
   )
   if [[ "${#popup_windows[@]}" -eq 1 ]] \
-    && grep -Fq 'shared transfer popup opened for 2 connection(s)' "${test_root}/gui.trace" 2>/dev/null; then
+    && grep -Eq 'shared transfer popup (opened for|tracking) 2 connection\(s\)' "${test_root}/gui.trace" 2>/dev/null; then
     break
   fi
   sleep 0.1
@@ -378,7 +379,7 @@ if [[ "${#popup_windows[@]}" -ne 1 ]]; then
   echo "expected one shared transfer popup window, found ${#popup_windows[@]}" >&2
   exit 1
 fi
-grep -F 'shared transfer popup opened for 2 connection(s)' "${test_root}/gui.trace"
+grep -E 'shared transfer popup (opened for|tracking) 2 connection\(s\)' "${test_root}/gui.trace"
 
 "${binary}" --show-transfers
 for _ in $(seq 1 50); do

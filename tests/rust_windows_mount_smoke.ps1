@@ -169,6 +169,12 @@ try {
 
   $configDir = Join-Path $env:LOCALAPPDATA 'ssh-mountmate/config'
   New-Item -ItemType Directory -Force $configDir | Out-Null
+  "[127.0.0.1]:$port $($hostKeyFields[0]) $hostKeyBlob" |
+    Set-Content (Join-Path $configDir 'known_hosts')
+  $env:SSH_MOUNTMATE_HOST_KEY_TEST_PORT = "$port"
+  $env:SSH_MOUNTMATE_HOST_KEY_TEST_PUBLIC = "$($hostKeyFields[0]) $hostKeyBlob"
+  cargo test --package mountmate-core host_key::tests::live_host_key_probe --all-features -- --ignored --exact --test-threads=1
+  if ($LASTEXITCODE -ne 0) { throw 'SSH host-key handshake fallback failed' }
   $passwordObscured = (& $rclone obscure 'test-only-password').Trim()
   if ($LASTEXITCODE -ne 0 -or -not $passwordObscured) { throw 'rclone obscure failed' }
   $servers = @(

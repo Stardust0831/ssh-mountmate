@@ -6,6 +6,7 @@ pub mod connection;
 pub mod credential;
 pub mod data_migration;
 pub mod dependency;
+pub mod host_key;
 pub mod interactive_ssh;
 pub mod model;
 pub mod mountpoint;

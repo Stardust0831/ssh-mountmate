@@ -12,6 +12,7 @@ use thiserror::Error;
 use crate::capacity::{CapacityError, CapacityInfo, mounted_capacity};
 use crate::connection::{SshImportPlan, plan_ssh_imports};
 use crate::credential::{CredentialError, SystemCredentialStore, hydrate_server_from_system};
+use crate::host_key::{HostKeyReview, discover_host_keys};
 use crate::interactive_ssh::{InteractiveSshError, InteractiveSshSession};
 use crate::mountpoint::{HOME_MOUNTPOINT_VALUE, MountpointAllocator, SystemMountpointProbe};
 use crate::paths::AppPaths;
@@ -28,8 +29,8 @@ use crate::runtime::{
     SystemProcessControl,
 };
 use crate::ssh::{
-    KnownHostsManager, ResolvedSshConfig, SshError, known_hosts_marker, list_ssh_config_hosts,
-    resolve_ssh_config, select_known_hosts_for_marker,
+    ResolvedSshConfig, SshError, known_hosts_marker, list_ssh_config_hosts, resolve_ssh_config,
+    select_known_hosts_for_marker,
 };
 use crate::storage::{StorageError, read_json};
 use crate::transfer::TransferSnapshot;
@@ -37,6 +38,14 @@ use crate::{ConnectionMethod, MountState, ServerConfig, Settings};
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
+    #[error("SSH host key confirmation required for {}:{} (changed: {}). Open SSH MountMate to review the server fingerprint before mounting.", .0.host(), .0.port(), .0.changed())]
+    HostKeyConfirmation(Box<HostKeyReview>),
+    #[error("Could not read the SSH server fingerprint for {host}:{port}: {detail}")]
+    HostKeyProbe {
+        host: String,
+        port: String,
+        detail: String,
+    },
     #[error("rclone was not found in the application bundle, managed directory, or PATH")]
     RcloneMissing,
     #[error(transparent)]
@@ -91,7 +100,8 @@ impl MountService {
         let rclone = resolve_rclone(&self.paths, &self.app_root, None)?
             .ok_or(ServiceError::RcloneMissing)?;
         let prepared_server = self.prepare_server_credentials(server)?;
-        self.ensure_remote(&prepared_server, external_ssh.as_deref())?;
+        let (effective_server, trusted_hosts) =
+            self.ensure_remote(&prepared_server, external_ssh.as_deref(), true)?;
 
         let home = directories::BaseDirs::new()
             .map(|directories| directories.home_dir().to_owned())
@@ -128,6 +138,19 @@ impl MountService {
             }
         });
         self.finish_secret_use(server, &result)?;
+        if effective_server.connection_method == ConnectionMethod::Native
+            && matches!(&result, Err(ServiceError::Runtime(RuntimeError::NotReady { tail, .. })) if host_key_mismatch(tail))
+        {
+            let review = self.review_host_key(
+                &effective_server,
+                trusted_hosts.as_deref(),
+                Path::new("ssh"),
+                Path::new("ssh-keyscan"),
+            )?;
+            if !review.matches_previous() {
+                return Err(ServiceError::HostKeyConfirmation(Box::new(review)));
+            }
+        }
         result
     }
 
@@ -157,7 +180,7 @@ impl MountService {
         let state: MountState = read_json(&self.paths.state_file(&server.id))?;
         let external_ssh = self.interactive_ssh_arguments(server)?;
         let prepared_server = self.prepare_server_credentials(server)?;
-        self.ensure_remote(&prepared_server, external_ssh.as_deref())?;
+        self.ensure_remote(&prepared_server, external_ssh.as_deref(), false)?;
         let result = mounted_capacity(
             &prepared_server,
             &state,
@@ -335,7 +358,8 @@ impl MountService {
         &self,
         server: &ServerConfig,
         external_ssh_arguments: Option<&[String]>,
-    ) -> Result<(), ServiceError> {
+        verify_saved_key: bool,
+    ) -> Result<(ServerConfig, Option<PathBuf>), ServiceError> {
         let resolved = if native_server_needs_ssh_defaults(server) {
             let config_value = if !server.ssh_config_path.trim().is_empty() {
                 &server.ssh_config_path
@@ -358,6 +382,21 @@ impl MountService {
         } else {
             self.known_hosts_for(&server, resolved.as_ref())?
         };
+        // Detect a replaced server key before sending login credentials. If
+        // discovery is unavailable, rclone still validates the existing binding.
+        // Capacity refreshes reuse trust without performing additional probes.
+        if verify_saved_key
+            && let Some(trusted) = known_hosts.as_deref()
+            && let Ok(review) = self.review_host_key(
+                &server,
+                Some(trusted),
+                Path::new("ssh"),
+                Path::new("ssh-keyscan"),
+            )
+            && !review.includes_trusted_key()
+        {
+            return Err(ServiceError::HostKeyConfirmation(Box::new(review)));
+        }
         let mut remote = RcloneRemote::for_server_with_external_ssh(
             &server,
             resolved.as_ref(),
@@ -374,7 +413,7 @@ impl MountService {
             remote.wrap_external_ssh(&executable, true)?;
         }
         write_rclone_remote(&self.paths, &remote)?;
-        Ok(())
+        Ok((server.into_owned(), known_hosts))
     }
 
     fn interactive_ssh_arguments(
@@ -458,7 +497,6 @@ impl MountService {
         ssh: &Path,
         keyscan: &Path,
     ) -> Result<Option<PathBuf>, ServiceError> {
-        let manager = KnownHostsManager::new(&self.paths);
         let fallback = || fallback_known_hosts(&self.paths, resolved, default, server, ssh);
         // Honor an existing host-key binding before scanning. Otherwise a
         // fresh app profile silently replaces OpenSSH's trusted key with the
@@ -466,14 +504,45 @@ impl MountService {
         if let Some(path) = fallback() {
             return Ok(Some(path));
         }
-        match manager.pin_first_seen(keyscan, &server.host, &server.port) {
-            Ok(Some(path)) => Ok(Some(path)),
-            Ok(None) => Ok(fallback()),
-            Err(error @ (SshError::InvalidHost(_) | SshError::InvalidPort(_))) => {
-                Err(ServiceError::Ssh(error))
-            }
-            Err(error) => fallback().map(Some).ok_or(ServiceError::Ssh(error)),
+        let review = self.review_host_key(server, None, ssh, keyscan)?;
+        // Another mapping may have been confirmed while discovery was running.
+        if let Some(path) = fallback() {
+            return Ok(Some(path));
         }
+        Err(ServiceError::HostKeyConfirmation(Box::new(review)))
+    }
+
+    fn review_host_key(
+        &self,
+        server: &ServerConfig,
+        source: Option<&Path>,
+        ssh: &Path,
+        keyscan: &Path,
+    ) -> Result<HostKeyReview, ServiceError> {
+        let keys = discover_host_keys(&self.paths, keyscan, ssh, &server.host, &server.port)
+            .map_err(|error| match error {
+                SshError::InvalidHost(_) | SshError::InvalidPort(_) => ServiceError::Ssh(error),
+                _ => ServiceError::HostKeyProbe {
+                    host: server.host.clone(),
+                    port: server.port.clone(),
+                    detail: error.to_string(),
+                },
+            })?;
+        Ok(HostKeyReview::new(
+            &self.paths,
+            &server.host,
+            &server.port,
+            keys,
+            source,
+        )?)
+    }
+
+    pub fn confirm_host_key(&self, review: &HostKeyReview) -> Result<(), ServiceError> {
+        Ok(review.confirm(&self.paths)?)
+    }
+
+    pub fn host_key_is_confirmed(&self, review: &HostKeyReview) -> bool {
+        review.is_confirmed(&self.paths)
     }
 
     fn reserve_recorded_mountpoints(
@@ -540,6 +609,13 @@ pub fn relative_refresh_dir(requested: &str, mountpoint: &str, windows: bool) ->
         requested_normalized.strip_prefix(&prefix)
     }?;
     Some(normalize_refresh_relative_path(relative))
+}
+
+fn host_key_mismatch(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("knownhosts: key mismatch")
+        || detail.contains("host key mismatch")
+        || detail.contains("remote host identification has changed")
 }
 
 fn imported_ssh_server(
@@ -811,6 +887,56 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn first_use_returns_a_review_without_saving_keys_until_confirmed() {
+        let temp = tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: temp.path().join("config"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            data_dir: temp.path().join("data"),
+        };
+        let scanner = temp.path().join("ssh-keyscan");
+        let key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
+        fs::write(
+            &scanner,
+            format!("#!/bin/sh\nprintf '%s\\n' '[login.example]:2222 {key}'\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&scanner, fs::Permissions::from_mode(0o700)).unwrap();
+        let server = ServerConfig {
+            host: "login.example".into(),
+            port: "2222".into(),
+            ..ServerConfig::default()
+        };
+        let service = MountService::new(paths.clone(), temp.path().into());
+        let default = temp.path().join("missing-known-hosts");
+        let error = service
+            .known_hosts_for_with_tools(&server, None, &default, Path::new("missing-ssh"), &scanner)
+            .unwrap_err();
+        let ServiceError::HostKeyConfirmation(review) = error else {
+            panic!("expected a fingerprint review")
+        };
+        assert!(!review.changed());
+        assert!(!paths.known_hosts().exists());
+        service.confirm_host_key(&review).unwrap();
+        fs::remove_file(&scanner).unwrap();
+        assert_eq!(
+            service
+                .known_hosts_for_with_tools(
+                    &server,
+                    None,
+                    &default,
+                    Path::new("missing-ssh"),
+                    &scanner
+                )
+                .unwrap(),
+            Some(paths.known_hosts())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn trusted_host_key_is_used_before_a_successful_network_scan() {
         let temp = tempdir().unwrap();
         let paths = AppPaths {
@@ -910,7 +1036,7 @@ mod tests {
         fs::write(paths.known_hosts(),
             "[edited.example]:2303 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti\n").unwrap();
         let service = MountService::new(paths.clone(), temp.path().into());
-        service.ensure_remote(&saved, None).unwrap();
+        service.ensure_remote(&saved, None, false).unwrap();
         let mut config = configparser::ini::Ini::new_cs();
         config.load(paths.rclone_config()).unwrap();
         for (option, expected) in [
@@ -943,7 +1069,7 @@ mod tests {
             .unwrap()
             .apply_secrets(Some("obscured-new-password".into()), None)
             .unwrap();
-        service.ensure_remote(&password, None).unwrap();
+        service.ensure_remote(&password, None, false).unwrap();
         config.load(paths.rclone_config()).unwrap();
         assert_eq!(
             config.get(password.remote_name(), "pass").as_deref(),

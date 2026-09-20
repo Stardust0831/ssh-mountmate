@@ -77,6 +77,7 @@ use mountmate_platform::{
 };
 
 mod cli;
+mod host_key_dialog;
 mod i18n;
 mod icons;
 mod read_only;
@@ -656,6 +657,7 @@ struct App {
     service: MountService,
     mount_statuses: HashMap<String, MountStatus>,
     busy: HashSet<String>,
+    host_key_prompts: VecDeque<host_key_dialog::Prompt>,
     transfers: HashMap<String, TransferSnapshot>,
     transfer_history: HashMap<String, TransferProgressHistory>,
     transfer_errors: HashMap<String, String>,
@@ -1491,10 +1493,13 @@ enum Message {
         ids: Vec<String>,
         result: rfd::MessageDialogResult,
     },
+    HostKeyPrompt(host_key_dialog::Prompt),
+    HostKeyDecision(bool),
+    CopyHostKeyDetails,
     MountFinished {
         id: String,
         operation: MountOperation,
-        result: Result<String, String>,
+        result: Result<Option<String>, String>,
     },
     RetryOperation(String, MountOperation),
     DismissOperationError(String),
@@ -1855,6 +1860,7 @@ impl App {
             service,
             mount_statuses: HashMap::new(),
             busy: HashSet::new(),
+            host_key_prompts: VecDeque::new(),
             transfers: HashMap::new(),
             transfer_history: HashMap::new(),
             transfer_errors: HashMap::new(),
@@ -2320,6 +2326,7 @@ impl App {
             }
             Message::TransfersLoaded(results) => {
                 self.transfer_refreshing = false;
+                let previous_active = self.active_transfer_ids();
                 let mut notifications = Vec::new();
                 for (id, result) in results {
                     match result {
@@ -2358,6 +2365,13 @@ impl App {
                             }
                         }
                     }
+                }
+                let active = self.active_transfer_ids();
+                if self.transfer_popup.is_some() && active != previous_active {
+                    diagnostic_trace(&format!(
+                        "shared transfer popup tracking {} connection(s)",
+                        active.len()
+                    ));
                 }
                 let ready_unmounts = self
                     .pending_unmount_after_sync
@@ -4275,6 +4289,20 @@ impl App {
                     );
                 }
             }
+            Message::HostKeyPrompt(prompt) => {
+                self.host_key_prompts.push_back(prompt);
+                return self.show_main_window();
+            }
+            Message::HostKeyDecision(confirmed) => {
+                if let Some(prompt) = self.host_key_prompts.pop_front() {
+                    let _ = prompt.reply.try_send(confirmed);
+                }
+            }
+            Message::CopyHostKeyDetails => {
+                if let Some(prompt) = self.host_key_prompts.front() {
+                    return clipboard::write(prompt.description.clone());
+                }
+            }
             Message::MountFinished {
                 id,
                 operation,
@@ -4284,7 +4312,7 @@ impl App {
                 self.busy.remove(&id);
                 let mut tasks = Vec::new();
                 match result {
-                    Ok(message) => {
+                    Ok(Some(message)) => {
                         self.operation_errors.remove(&id);
                         self.mount_statuses.insert(
                             id.clone(),
@@ -4302,6 +4330,15 @@ impl App {
                             tasks.push(self.capacity_task());
                             tasks.push(self.transfer_task());
                         }
+                    }
+                    Ok(None) => {
+                        self.operation_errors.remove(&id);
+                        self.mount_statuses
+                            .insert(id.clone(), MountStatus::Unmounted);
+                        self.status = match locale {
+                            Locale::English => "Mount cancelled".into(),
+                            Locale::Chinese => "已取消挂载".into(),
+                        };
                     }
                     Err(error) => {
                         self.operation_errors.insert(
@@ -6476,44 +6513,55 @@ impl App {
         let settings = self.settings.clone();
         let locale = self.locale();
         let result_id = id.clone();
-        Task::perform(
-            async move {
-                tokio::task::spawn_blocking(move || match operation {
+        Task::run(
+            iced::stream::channel(2, async move |mut output| {
+                use iced::futures::SinkExt;
+                let result = match operation {
                     MountOperation::Mount => {
-                        let server = server
-                            .ok_or_else(|| locale.text(TextKey::ConnectionGone).to_owned())?;
-                        service
-                            .mount(&server, &settings)
-                            .map(|state| match locale {
-                                Locale::English => format!(
-                                    "Mounted {} at {}",
-                                    display_name,
-                                    state.mountpoint.display()
-                                ),
-                                Locale::Chinese => format!(
-                                    "已将 {} 挂载到 {}",
-                                    display_name,
-                                    state.mountpoint.display()
-                                ),
-                            })
-                            .map_err(|error| localize_service_error(locale, &error))
+                        if let Some(server) = server {
+                            host_key_dialog::mount(service, server, settings, locale, &mut output)
+                                .await
+                                .map(|state| {
+                                    state.map(|state| match locale {
+                                        Locale::English => format!(
+                                            "Mounted {} at {}",
+                                            display_name,
+                                            state.mountpoint.display()
+                                        ),
+                                        Locale::Chinese => format!(
+                                            "已将 {} 挂载到 {}",
+                                            display_name,
+                                            state.mountpoint.display()
+                                        ),
+                                    })
+                                })
+                        } else {
+                            Err(locale.text(TextKey::ConnectionGone).to_owned())
+                        }
                     }
-                    MountOperation::Unmount => service
-                        .unmount(&id)
-                        .map(|()| match locale {
-                            Locale::English => format!("Unmounted {display_name}"),
-                            Locale::Chinese => format!("已卸载 {display_name}"),
-                        })
-                        .map_err(|error| error.to_string()),
-                })
-                .await
-                .unwrap_or_else(|error| Err(error.to_string()))
-            },
-            move |result| Message::MountFinished {
-                id: result_id.clone(),
-                operation,
-                result,
-            },
+                    MountOperation::Unmount => tokio::task::spawn_blocking(move || {
+                        service
+                            .unmount(&id)
+                            .map(|()| {
+                                Some(match locale {
+                                    Locale::English => format!("Unmounted {display_name}"),
+                                    Locale::Chinese => format!("已卸载 {display_name}"),
+                                })
+                            })
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .unwrap_or_else(|error| Err(error.to_string())),
+                };
+                let _ = output
+                    .send(Message::MountFinished {
+                        id: result_id,
+                        operation,
+                        result,
+                    })
+                    .await;
+            }),
+            |message| message,
         )
     }
 
@@ -6643,7 +6691,7 @@ impl App {
 
     fn view(&self, window: window::Id) -> Element<'_, Message> {
         if window == self.main_window {
-            match self.screen {
+            let base = match self.screen {
                 Screen::Connections => self.main_view(),
                 Screen::TransferCenter => self.transfer_center_view(),
                 Screen::ConnectionEditor => container(self.connection_editor_view())
@@ -6656,6 +6704,42 @@ impl App {
                     .width(Fill)
                     .height(Fill)
                     .into(),
+            };
+            if let Some(prompt) = self.host_key_prompts.front() {
+                let dialog = container(
+                    column![
+                        text(&prompt.title).size(24),
+                        scrollable(text(&prompt.description).size(15)).height(Length::Fixed(330.0)),
+                        row![
+                            button(text(&prompt.cancel)).on_press(Message::HostKeyDecision(false)),
+                            button(text(match self.locale() {
+                                Locale::English => "Copy details",
+                                Locale::Chinese => "复制详情",
+                            }))
+                            .on_press(Message::CopyHostKeyDetails),
+                            Space::new().width(Fill),
+                            button(text(&prompt.accept)).on_press(Message::HostKeyDecision(true)),
+                        ]
+                        .spacing(10)
+                        .align_y(Center),
+                    ]
+                    .spacing(18),
+                )
+                .padding(24)
+                .max_width(700)
+                .style(container::rounded_box);
+                stack![
+                    base,
+                    iced::widget::opaque(container(dialog).center_x(Fill).center_y(Fill).style(
+                        |_| {
+                            container::Style::default()
+                                .background(Color::from_rgba(0.0, 0.0, 0.0, 0.45))
+                        }
+                    ))
+                ]
+                .into()
+            } else {
+                base
             }
         } else if self.log_window == Some(window) {
             self.log_viewer_view()

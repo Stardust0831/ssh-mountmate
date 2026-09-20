@@ -401,14 +401,13 @@ responses, and rotating 2FA codes are entered only in the terminal owned by Open
 
 SSH MountMate requires host key validation for native rclone SFTP connections.
 
-For rclone SFTP remotes, the app first looks for an existing host-and-port binding in its managed `known_hosts`, SSH config trust files, or the user's default `known_hosts`. Only when no existing binding is available does it record keys returned by `ssh-keyscan` in its managed file. Existing trusted keys are not replaced by network scan results.
+The app first reuses an existing host-and-port binding from its managed `known_hosts`, SSH config trust files, or the user's default `known_hosts`. For a new server, it displays the address, port and SHA256 host-key fingerprints. Choose **Trust and mount** to save exactly those keys and continue, or **Cancel** to leave trust unchanged. The dialog can copy its details for verification.
 
-If host key scanning fails or returns no usable key, the app may use an existing readable
-`known_hosts` file only when it already contains a binding for the exact host and port. Otherwise
-the mount stops. Native SFTP never silently starts without a host-key binding. OpenSSH and
-interactive shared-SSH transports continue to apply their own SSH host-key policy.
+If `ssh-keyscan` fails (including the unsupported-KEX bug in some Windows OpenSSH versions), the app tries a normal SSH handshake with authentication disabled and an isolated temporary trust file. It does not use your password, private key, agent or SSH config for this probe. Temporary files are removed afterward. If neither probe obtains a public key, a dialog shows the diagnostics and offers **Retry** or **Cancel**.
 
-If rclone reports `knownhosts: key mismatch`, SSH MountMate stops the mount rather than disabling validation. Verify the new fingerprint with the server administrator before updating the host's entry in the applicable `known_hosts` file. A server host-key fingerprint is separate from your login password or client private key.
+If a changed host key is detected, the app pauses mounting and displays the saved and newly received fingerprints. Verify the change with the server administrator before choosing **Replace key and mount**. Confirmation only updates SSH MountMate's managed trust file; it does not edit your own SSH files or disable host-key checking. Concurrent confirmations cannot silently overwrite one another.
+
+Headless/login-startup mounting requires an existing trusted binding; complete first-use confirmation in the GUI before using it. OpenSSH and interactive shared-SSH transports continue to apply their own SSH host-key policy. Server fingerprints identify the server and are separate from your login password or client private key.
 
 ## Local Control Authentication
 
