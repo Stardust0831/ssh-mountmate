@@ -26,7 +26,7 @@ It uses rclone for the actual mount operation and provides a small GUI around th
 - Mount or unmount all saved connections from the main window.
 - Build native Rust packages for Windows, macOS, and Linux on x64 and arm64 with GitHub Actions.
 
-## Configuration backup and Windows uninstall
+## Configuration backup and automatic update cleanup
 
 Settings can export connections as JSON and open the batch import preview for either an SSH config
 or an SSH MountMate export. Exports include connection names, hosts, users, paths, tags and
@@ -40,13 +40,18 @@ and `state` subdirectories. Existing profiles in `%APPDATA%\rsshmount` and
 Active old mounts or update transactions defer migration until they finish and the app restarts.
 Conflicting files are retained and reported instead of overwritten.
 
-The Windows uninstall action in Settings closes the app after confirmation, removes its executable,
-application and legacy data directories, saved credentials, logs, caches, update helpers, downloads,
-extracted payloads and recognized update transaction files beside the executable. It also removes
-login startup, Explorer menus, notification registration and generated SSH profiles. For a custom
-cache root, only subdirectories belonging to current connections are removed. External SSH config
-files and private keys, JSON exports outside application directories, and shared WinFsp remain.
-Export connections, finish uploads and unmount first; unuploaded cache contents are deleted.
+The app automatically removes updater-owned ZIP downloads, partial downloads, extracted copies,
+unused update helpers and stale update markers at startup, after any active update has committed
+and its helper has exited. This also runs immediately when an older version updates into v0.6.11,
+including leftovers in the old Windows profile. Busy or linked files are retained and retried on
+later launches. Newly prepared updates discard redundant downloads and extraction directories
+as soon as staging finishes, including failed preparation attempts.
+
+Connection configuration, credentials, mount caches (including queued uploads), SSH files,
+installed dependencies and manually downloaded executable copies are retained. The updater
+removes its previous executable backup only after the new app confirms a healthy launch;
+interrupted recovery backups beside the executable are retained for recovery. There is no
+uninstall button. Connection export/import remains available in Settings.
 
 Windows releases also provide versioned single files, such as `SSHMountMate-v0.6.9-amd64.exe`.
 ZIPs retain `SSHMountMate.exe` for older updaters. Subsequent updates started from this version

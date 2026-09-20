@@ -50,7 +50,6 @@ keyring = { workspace = true, features = ["windows-native"] }
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
-    "Win32_Security_Credentials",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Threading",

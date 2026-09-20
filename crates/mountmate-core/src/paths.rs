@@ -168,7 +168,7 @@ impl AppPaths {
     }
 
     /// Directories used by pre-0.6 Windows builds. They are returned only for
-    /// migration and explicit uninstall cleanup; normal runtime paths never
+    /// migration and export-path validation; normal runtime paths never
     /// create them.
     pub fn legacy_application_directories(&self) -> Vec<PathBuf> {
         #[cfg(target_os = "windows")]

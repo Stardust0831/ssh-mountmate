@@ -577,55 +577,6 @@ pub fn delete_server_credentials(
     delete_credential_references(store, &references)
 }
 
-/// Remove this application's Windows entries, including entries orphaned by
-/// an earlier interrupted connection removal. Never enumerate secret contents.
-#[cfg(windows)]
-pub fn delete_all_application_credentials() -> Result<(), CredentialError> {
-    use windows_sys::Win32::Security::Credentials::{
-        CRED_TYPE_GENERIC, CREDENTIALW, CredDeleteW, CredEnumerateW, CredFree,
-    };
-    let filter: Vec<u16> = "ssh-mountmate:*".encode_utf16().chain(Some(0)).collect();
-    let mut count = 0;
-    let mut entries: *mut *mut CREDENTIALW = std::ptr::null_mut();
-    if unsafe { CredEnumerateW(filter.as_ptr(), 0, &mut count, &mut entries) } == 0 {
-        let error = std::io::Error::last_os_error();
-        return if error.raw_os_error() == Some(1168) {
-            Ok(())
-        } else {
-            Err(CredentialError::Unavailable(error.to_string()))
-        };
-    }
-    struct Entries(*mut *mut CREDENTIALW);
-    impl Drop for Entries {
-        fn drop(&mut self) {
-            unsafe { CredFree(self.0.cast()) }
-        }
-    }
-    let _owned = Entries(entries);
-    for index in 0..count as usize {
-        let entry = unsafe { &**entries.add(index) };
-        if entry.Type != CRED_TYPE_GENERIC || entry.TargetName.is_null() {
-            continue;
-        }
-        let mut length = 0;
-        while unsafe { *entry.TargetName.add(length) } != 0 {
-            length += 1;
-        }
-        let target = String::from_utf16_lossy(unsafe {
-            std::slice::from_raw_parts(entry.TargetName, length)
-        });
-        if target.starts_with("ssh-mountmate:")
-            && target.ends_with(&format!(".{CREDENTIAL_SERVICE}"))
-            && unsafe { CredDeleteW(entry.TargetName, CRED_TYPE_GENERIC, 0) } == 0
-        {
-            return Err(CredentialError::Unavailable(
-                std::io::Error::last_os_error().to_string(),
-            ));
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;

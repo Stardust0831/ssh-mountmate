@@ -1,5 +1,7 @@
+use crate::update_cleanup::{DownloadScratch, lock_updates};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -38,11 +40,14 @@ pub enum UpdateWorkflowError {
         "automatic updates are unavailable for Windows/Linux onedir installations because current Releases only contain canonical onefile packages"
     )]
     UnsupportedOnedir,
+    #[error("{0}")]
+    Maintenance(String),
 }
 
 #[derive(Debug, Clone)]
 pub struct PreparedUpdateLaunch {
     helper_executable: PathBuf,
+    _maintenance_lock: Arc<fs::File>,
     authorization: UpdateHelperAuthorization,
     prepared: PreparedPayload,
     transaction: TransactionPaths,
@@ -84,6 +89,12 @@ pub fn prepare_update_install(
     if !automatic_update_layout_supported(layout.kind, std::env::consts::OS) {
         return Err(UpdateWorkflowError::UnsupportedOnedir);
     }
+    let maintenance_lock = lock_updates(paths).map_err(UpdateWorkflowError::Maintenance)?;
+    if crate::update_cleanup::updater_is_running(std::slice::from_ref(paths)) {
+        return Err(UpdateWorkflowError::Maintenance(
+            "Another update is still finishing. 更新仍在收尾，请稍后重试。".into(),
+        ));
+    }
     let _recovered_backup = recover_previous_update(&layout)?;
     let parent = capture_current_process_identity(current_executable)?;
     let helper_executable =
@@ -93,6 +104,12 @@ pub fn prepare_update_install(
     let cache = paths.update_cache_dir();
     let archive = cache.join(asset.name());
     let extracted = cache.join(format!("payload-{}", &digest[..16]));
+    let _scratch = DownloadScratch(vec![
+        archive.clone(),
+        archive.with_extension("zip.part"),
+        archive.with_extension("zip.backup"),
+        extracted.clone(),
+    ]);
     download_verified_asset(asset, &archive, progress)?;
     safe_extract_zip(&archive, &extracted)?;
     let payload = locate_update_payload(&extracted, layout.kind, std::env::consts::OS)?;
@@ -117,6 +134,7 @@ pub fn prepare_update_install(
         }
     };
     Ok(PreparedUpdateLaunch {
+        _maintenance_lock: maintenance_lock,
         helper_executable,
         authorization,
         prepared,
@@ -163,6 +181,7 @@ mod tests {
         fs::write(&plan, b"authorized update plan").unwrap();
         let prepared = PreparedUpdateLaunch {
             helper_executable: temp.path().join("must-not-launch"),
+            _maintenance_lock: Arc::new(fs::File::create(temp.path().join("lock")).unwrap()),
             authorization: UpdateHelperAuthorization {
                 plan_path: plan.clone(),
                 token: "test-only-token".into(),

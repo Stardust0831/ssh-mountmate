@@ -633,7 +633,6 @@ struct App {
     pending_commands: VecDeque<AppCommand>,
     settings: Settings,
     startup_integration_lock: Arc<Mutex<()>>,
-    integration_jobs: usize,
     export_pending: bool,
     startup_notice: Option<String>,
     system_locale: Locale,
@@ -693,7 +692,6 @@ struct App {
     terminal_error: Option<(String, String)>,
     custom_setting: Option<CustomSettingDraft>,
     editor_saving: bool,
-    maintenance_pending: bool,
     ssh_import_loading: bool,
     ssh_import_plan: Option<SshImportPlan>,
     ssh_import_actions: Vec<ImportAction>,
@@ -706,6 +704,8 @@ struct App {
     update_checking: bool,
     update_error: Option<String>,
     update_downloading: bool,
+    update_cleanup_started: bool,
+    update_cleanup_pending: bool,
     update_progress: Arc<Mutex<UpdateDownloadProgress>>,
     prepared_update: Option<PreparedUpdateLaunch>,
     dependency_status: Option<DependencyStatus>,
@@ -1444,6 +1444,7 @@ enum Message {
         result: Result<UpdateInfo, String>,
     },
     DownloadUpdate,
+    UpdateCleanupFinished(Result<mountmate_core::update_cleanup::CleanupReport, String>),
     UpdatePrepared(Result<PreparedUpdateLaunch, String>),
     InstallUpdateDecision(bool),
     CheckDependencies,
@@ -1464,9 +1465,6 @@ enum Message {
     ExportConnections,
     ImportConnections,
     ConnectionsExported(Result<bool, String>),
-    UninstallApplication,
-    UninstallDecision(bool),
-    UninstallFinished(Result<String, String>),
     SettingsSaved(Result<SettingsMutation, String>),
     StartupReconciled(Result<(), String>),
     Mount(String),
@@ -1585,7 +1583,6 @@ fn is_editor_mutation(message: &Message) -> bool {
             | Message::ToggleSettingsConnectionPreferences
             | Message::OpenBatchManagement
             | Message::ImportConnections
-            | Message::UninstallApplication
     )
 }
 
@@ -1817,7 +1814,6 @@ impl App {
             pending_commands: VecDeque::new(),
             settings,
             startup_integration_lock: Arc::new(Mutex::new(())),
-            integration_jobs: 1,
             export_pending: false,
             startup_notice,
             system_locale,
@@ -1877,7 +1873,6 @@ impl App {
             terminal_error: None,
             custom_setting: None,
             editor_saving: false,
-            maintenance_pending: false,
             ssh_import_loading: false,
             ssh_import_plan: None,
             ssh_import_actions: Vec::new(),
@@ -1890,6 +1885,8 @@ impl App {
             update_checking: false,
             update_error: None,
             update_downloading: false,
+            update_cleanup_started: false,
+            update_cleanup_pending: true,
             update_progress: Arc::new(Mutex::new(UpdateDownloadProgress::default())),
             prepared_update: None,
             dependency_status: None,
@@ -1930,14 +1927,6 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
-        if self.maintenance_pending
-            && !matches!(
-                message,
-                Message::UninstallDecision(_) | Message::UninstallFinished(_)
-            )
-        {
-            return Task::none();
-        }
         if self.editor_saving && is_editor_mutation(&message) {
             return Task::none();
         }
@@ -2061,12 +2050,15 @@ impl App {
                     self.main_window_ready = true;
                     self.main_window_opening = false;
                     self.initialize_tray();
-                    if let Some(authorization) = self.update_health.take()
+                    let health = self.update_health.take();
+                    let mut health_confirmed = true;
+                    if let Some(authorization) = &health
                         && let Err(error) = write_update_health_marker(
                             &self.paths.update_state_dir(),
-                            &authorization,
+                            authorization,
                         )
                     {
+                        health_confirmed = false;
                         self.status = format!("Update health confirmation failed: {error}");
                     }
                     let native_smoke = native_integration_smoke_enabled();
@@ -2079,6 +2071,38 @@ impl App {
                         self.global_progress_state()
                     };
                     let mut tasks = vec![set_native_global_progress(id, progress)];
+                    if !self.update_cleanup_started {
+                        self.update_cleanup_started = true;
+                        if health_confirmed {
+                            let profiles = vec![self.paths.clone()];
+                            #[cfg(windows)]
+                            let profiles = {
+                                let mut profiles = profiles;
+                                for profile in [AppPaths::discover(), AppPaths::legacy_windows()] {
+                                    if !profiles.contains(&profile) {
+                                        profiles.push(profile);
+                                    }
+                                }
+                                profiles
+                            };
+                            tasks.push(Task::perform(
+                                async move {
+                                    tokio::task::spawn_blocking(move || {
+                                        mountmate_core::update_cleanup::cleanup_update_files(
+                                            &profiles,
+                                            health.as_ref().map(|h| h.marker_path.as_path()),
+                                            std::time::Duration::from_secs(60),
+                                        )
+                                    })
+                                    .await
+                                    .map_err(|e| e.to_string())?
+                                },
+                                Message::UpdateCleanupFinished,
+                            ));
+                        } else {
+                            self.update_cleanup_pending = false;
+                        }
+                    }
                     if native_smoke {
                         tasks.push(show_native_notification(
                             native_integration_smoke_notification(),
@@ -3685,8 +3709,12 @@ impl App {
                     }
                 }
             }
+            Message::UpdateCleanupFinished(result) => {
+                self.update_cleanup_pending = false;
+                diagnostic_trace(&format!("update file cleanup: {result:?}"));
+            }
             Message::DownloadUpdate => {
-                if !self.update_downloading {
+                if !self.update_downloading && !self.update_cleanup_pending {
                     return self.prepare_update_task();
                 }
             }
@@ -3787,7 +3815,6 @@ impl App {
             Message::RegisterFileManagerMenu => return self.file_manager_menu_task(true),
             Message::UnregisterFileManagerMenu => return self.file_manager_menu_task(false),
             Message::FileManagerMenuFinished(result) => {
-                self.integration_jobs = self.integration_jobs.saturating_sub(1);
                 self.status = match result {
                     Ok(true) => locale.text(TextKey::FileManagerMenuRegistered).into(),
                     Ok(false) => locale.text(TextKey::FileManagerMenuRemoved).into(),
@@ -3826,7 +3853,7 @@ impl App {
                             paths.state_dir.clone(),
                         ]);
                         if owned_roots.iter().any(|root| path.starts_with(root)) {
-                            return Err("Save the export outside application data so uninstall will preserve it. 请将导出文件保存在应用目录之外。".into());
+                            return Err("Save the backup outside application data. 请将导出文件保存在应用目录之外。".into());
                         }
                         tokio::task::spawn_blocking(move || {
                             write_connection_export(&path, &servers).map(|_| true)
@@ -3868,18 +3895,6 @@ impl App {
                 self.invalidate_mountpoint_preflight();
                 self.screen = Screen::ConnectionEditor;
             }
-            Message::UninstallApplication => return self.confirm_uninstall(),
-            Message::UninstallDecision(false) => {
-                self.maintenance_pending = false;
-            }
-            Message::UninstallDecision(true) => return self.uninstall_application(),
-            Message::UninstallFinished(result) => match result {
-                Ok(_) => return iced::exit(),
-                Err(error) => {
-                    self.maintenance_pending = false;
-                    self.status = error;
-                }
-            },
             Message::SettingsSaved(result) => {
                 self.editor_saving = false;
                 match result {
@@ -3896,7 +3911,6 @@ impl App {
                 }
             }
             Message::StartupReconciled(result) => {
-                self.integration_jobs = self.integration_jobs.saturating_sub(1);
                 if let Err(error) = result {
                     diagnostic_trace(&format!("login startup reconciliation failed: {error}"));
                     self.status = match locale {
@@ -5039,7 +5053,6 @@ impl App {
     }
 
     fn file_manager_menu_task(&mut self, register: bool) -> Task<Message> {
-        self.integration_jobs += 1;
         self.status = self
             .locale()
             .text(if register {
@@ -5072,112 +5085,6 @@ impl App {
                 .unwrap_or_else(|error| Err(error.to_string()))
             },
             Message::FileManagerMenuFinished,
-        )
-    }
-
-    fn uninstall_available(&self) -> bool {
-        cfg!(windows)
-            && self.integration_jobs == 0
-            && !self.export_pending
-            && !self.editor_saving
-            && !self.connection_list_saving
-            && self.busy.is_empty()
-            && !self.update_downloading
-            && !self.update_checking
-            && self.prepared_update.is_none()
-            && !self.win_fsp_install_pending
-            && !self.dependency_checking
-            && !self.capacity_refreshing
-            && !self.transfer_refreshing
-            && !self.ssh_import_loading
-            && self.interactive_terminals.is_empty()
-            && self.servers.iter().all(|s| self.can_modify(&s.id))
-    }
-
-    fn confirm_uninstall(&mut self) -> Task<Message> {
-        if !self.uninstall_available() {
-            self.status = match self.locale() {
-                Locale::English => "Finish operations, unmount all connections and end SSH sessions before uninstalling.",
-                Locale::Chinese => "请先完成当前操作、取消所有挂载并结束 SSH 会话，再卸载软件。",
-            }.into();
-            return Task::none();
-        }
-        self.maintenance_pending = true;
-        let description = match self.locale() {
-            Locale::English => {
-                "Uninstall SSH MountMate and delete its connections, settings, saved credentials, logs, mount caches and update files, including old backups and the running executable?\n\nExport connections in Settings first if you want to restore them later. Local cache files that have not uploaded will be lost. External SSH config files and private keys, exported JSON files and the shared WinFsp component are retained.\n\nThe app will close to finish removal."
-            }
-            Locale::Chinese => {
-                "卸载 SSH MountMate，并删除连接、设置、已存凭据、日志、挂载缓存、更新文件、旧备份和当前程序本体？\n\n如需日后恢复连接，请先取消并在设置中导出配置。缓存中尚未上传的文件也会被删除。外部 SSH 配置与私钥、自行导出的 JSON，以及系统共享组件 WinFsp 将保留。\n\n程序会退出以完成清理。"
-            }
-        };
-        Task::perform(
-            async move {
-                rfd::AsyncMessageDialog::new()
-                    .set_title(APP_NAME)
-                    .set_level(rfd::MessageLevel::Warning)
-                    .set_description(description)
-                    .set_buttons(rfd::MessageButtons::YesNo)
-                    .show()
-                    .await
-                    == rfd::MessageDialogResult::Yes
-            },
-            Message::UninstallDecision,
-        )
-    }
-
-    fn uninstall_application(&mut self) -> Task<Message> {
-        if !self.maintenance_pending || !self.uninstall_available() {
-            self.maintenance_pending = false;
-            return Task::none();
-        }
-        let paths = self.paths.clone();
-        let servers = self.servers.clone();
-        let settings = self.settings.clone();
-        let integration = self.startup_integration_lock.clone();
-        self.status = match self.locale() {
-            Locale::English => "Preparing uninstall; waiting briefly if an update is finishing…",
-            Locale::Chinese => "正在准备卸载；如更新正在收尾，会稍候片刻…",
-        }
-        .into();
-        Task::perform(
-            async move {
-                tokio::task::spawn_blocking(move || {
-                    use mountmate_core::application_data::{
-                        ensure_profiles_idle_for_uninstall, uninstall_inventory,
-                    };
-                    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
-                    let profiles = vec![paths.clone()];
-                    #[cfg(windows)]
-                    let profiles = {
-                        let mut profiles = profiles;
-                        for profile in [AppPaths::discover(), AppPaths::legacy_windows()] {
-                            if !profiles.contains(&profile) {
-                                profiles.push(profile);
-                            }
-                        }
-                        profiles
-                    };
-                    ensure_profiles_idle_for_uninstall(&profiles)?;
-                    let targets = uninstall_inventory(&paths, &executable, &servers, &settings)?;
-                    let _guard = integration.lock().map_err(|e| e.to_string())?;
-                    mountmate_platform::remove_application_integration(&executable)
-                        .map_err(|e| e.to_string())?;
-                    for server in &servers {
-                        delete_server_credentials(server, &SystemCredentialStore)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    #[cfg(windows)]
-                    mountmate_core::credential::delete_all_application_credentials()
-                        .map_err(|e| e.to_string())?;
-                    mountmate_core::ssh::remove_managed_ssh_integration()?;
-                    mountmate_core::uninstall::launch_cleanup(&targets)?;
-                    Ok(String::new())
-                })
-                .await
-                .map_err(|e| e.to_string())?
-            },
-            Message::UninstallFinished,
         )
     }
 
@@ -8056,25 +7963,19 @@ impl App {
                 .as_ref()
                 .is_some_and(|info| info.asset.is_some())
                 .then_some(Message::DownloadUpdate)
-                .filter(|_| !self.update_downloading),
+                .filter(|_| !self.update_downloading && !self.update_cleanup_pending),
         );
-        update_section = update_section.push(row![check, install].spacing(10));
-        let mut maintenance = column![
+        update_section = update_section.push(row![check, install].spacing(10))
+            .push(text(match locale {
+                Locale::English => "Update downloads, extracted copies and unused helpers are cleaned automatically after updates and at startup.",
+                Locale::Chinese => "更新完成后及启动时，会自动清理更新包、解压副本和不再使用的更新助手。",
+            }).size(13));
+        let maintenance = column![
             text(match locale {Locale::English => "Connections and application data", Locale::Chinese => "连接配置与应用数据"}).size(20),
             text(match locale {Locale::English => "Export connection details as JSON. Passwords and private key contents are not included. Import previews each connection; automatic mounts stay off until enabled.", Locale::Chinese => "将连接信息导出为 JSON，不包含密码和私钥内容。导入时可逐条预览，自动挂载需重新启用。"}).size(13),
             row![button(match locale {Locale::English => "Export connections", Locale::Chinese => "导出连接配置"}).on_press(Message::ExportConnections),
                 button(match locale {Locale::English => "Import connections", Locale::Chinese => "导入连接配置"}).on_press(Message::ImportConnections)].spacing(10),
         ].spacing(8).max_width(640);
-        if cfg!(windows) {
-            maintenance = maintenance.push(
-                button(match locale {
-                    Locale::English => "Uninstall SSH MountMate",
-                    Locale::Chinese => "卸载 SSH MountMate",
-                })
-                .style(button::danger)
-                .on_press(Message::UninstallApplication),
-            );
-        }
         let content = column![
             mount_backend,
             credential_storage,

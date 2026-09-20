@@ -149,6 +149,32 @@ fn run_scenario(scenario: Scenario) -> TestResult {
     let transaction = plan_transaction_paths(&layout)?;
     let payload = locate_update_payload(&payload_root, layout.kind, env::consts::OS)?;
     let prepared = prepare_directory_payload(&layout, &payload, &transaction, env::consts::OS)?;
+    // Simulate an older GUI holding a prepared update while the new GUI fixture
+    // starts. It must not clean the helper before this test launches it.
+    fs::create_dir_all(&environment.paths.data_dir)?;
+    let maintenance_lock =
+        File::create(environment.paths.data_dir.join("update-maintenance.lock"))?;
+    fs2::FileExt::lock_exclusive(&maintenance_lock)?;
+    let stale_archive = environment
+        .paths
+        .update_cache_dir()
+        .join("SSHMountMate-windows-x64.zip");
+    let stale_payload = environment
+        .paths
+        .update_cache_dir()
+        .join("payload-0123456789abcdef");
+    fs::create_dir_all(&stale_payload)?;
+    fs::write(&stale_archive, b"old downloaded update")?;
+    fs::write(
+        stale_payload.join("SSHMountMate.exe"),
+        b"old extracted copy",
+    )?;
+    let preserved_cache = environment
+        .paths
+        .mount_cache_dir("test-remote")
+        .join("queued-upload");
+    fs::create_dir_all(preserved_cache.parent().unwrap())?;
+    fs::write(&preserved_cache, b"unuploaded data")?;
     let helper = materialize_update_helper(
         &environment.paths.update_helper_dir(),
         &installed_executable,
@@ -198,6 +224,7 @@ fn run_scenario(scenario: Scenario) -> TestResult {
             &helper_stdout,
             &helper_stderr,
         )?;
+        drop(maintenance_lock);
         let status = match updater.wait_timeout(HELPER_TIMEOUT)? {
             Some(status) => status,
             None => {
@@ -266,13 +293,22 @@ fn run_scenario(scenario: Scenario) -> TestResult {
         }
 
         if matches!(scenario, Scenario::Commit) {
-            // The new GUI retains its health-marker startup argument even
-            // after the helper has exited. That path alone must not be treated
-            // as an active updater, including by Windows process enumeration.
-            mountmate_core::application_data::ensure_profiles_idle_for_uninstall(
-                std::slice::from_ref(&environment.paths),
-            )
-            .map_err(io::Error::other)?;
+            // No cleanup request is sent to the helper. The newly launched GUI
+            // must collect legacy files on this very first update into it.
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while [&helper, &stale_archive, &stale_payload]
+                .iter()
+                .any(|p| p.exists())
+            {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::other(
+                        "new GUI did not clean legacy update files after commit",
+                    )
+                    .into());
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            assert_eq!(fs::read(&preserved_cache)?, b"unuploaded data");
         }
         if matches!(scenario, Scenario::Commit)
             && !terminate_processes_at(&installed_executable, PROCESS_TIMEOUT)?

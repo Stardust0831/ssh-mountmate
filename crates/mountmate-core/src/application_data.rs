@@ -1,9 +1,6 @@
-//! Inventory and validation for explicit removal of application-owned files.
+//! Detect active profile processes and validate application-owned cleanup paths.
 use crate::{data_migration::is_link, paths::AppPaths};
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{fs, path::Path};
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,20 +19,6 @@ struct ProfileProcess {
 
 pub fn ensure_no_profile_processes(paths: &AppPaths) -> Result<(), String> {
     wait_for_profile_processes(std::time::Duration::ZERO, || profile_processes(paths))
-}
-
-/// An update can still be committing its backup after the new GUI appears.
-/// Wait briefly for that helper, but never stop it or an active mount.
-pub fn ensure_profiles_idle_for_uninstall(profiles: &[AppPaths]) -> Result<(), String> {
-    wait_for_profile_processes(std::time::Duration::from_secs(5), || {
-        let mut processes = Vec::new();
-        for paths in profiles {
-            processes.extend(profile_processes(paths)?);
-        }
-        processes.sort_by_key(|p| p.pid);
-        processes.dedup_by_key(|p| p.pid);
-        Ok(processes)
-    })
 }
 
 fn wait_for_profile_processes(
@@ -166,7 +149,7 @@ fn normalized_path(path: &Path, windows: bool) -> String {
     path
 }
 
-fn path_is_within(path: &Path, root: &Path, windows: bool) -> bool {
+pub(crate) fn path_is_within(path: &Path, root: &Path, windows: bool) -> bool {
     let path = normalized_path(path, windows);
     let root = normalized_path(root, windows);
     !root.is_empty() && (path == root || path.starts_with(&format!("{root}/")))
@@ -263,35 +246,6 @@ fn recorded_mount_matches(
     state.process_started_at == Some(started_at)
 }
 
-/// Only recognize updater transaction names, never a broad executable glob.
-pub fn is_update_transaction(name: &str) -> bool {
-    is_update_transaction_for(name, "SSHMountMate")
-}
-
-fn is_update_transaction_for(name: &str, current_stem: &str) -> bool {
-    let Some((program, phase)) = name
-        .strip_prefix('.')
-        .and_then(|s| s.split_once(".ssh-mountmate-"))
-    else {
-        return false;
-    };
-    if program != current_stem
-        && program != "SSHMountMate"
-        && !program
-            .strip_prefix("SSHMountMate-v")
-            .is_some_and(|v| semver::Version::parse(v).is_ok())
-    {
-        return false;
-    }
-    let phase = phase.strip_suffix(".exe").unwrap_or(phase);
-    phase == "backup"
-        || ["prepared-", "recovered-"].iter().any(|p| {
-            phase
-                .strip_prefix(p)
-                .is_some_and(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
-        })
-}
-
 pub fn validate_removal_tree(path: &Path) -> Result<(), String> {
     crate::data_migration::validate_ancestors(path).map_err(|e| e.to_string())?;
     validate_removal_children(path)
@@ -316,67 +270,10 @@ fn validate_removal_children(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn uninstall_inventory(
-    paths: &AppPaths,
-    executable: &Path,
-    servers: &[crate::ServerConfig],
-    settings: &crate::Settings,
-) -> Result<Vec<PathBuf>, String> {
-    let mut targets = vec![
-        paths.config_dir.clone(),
-        paths.cache_dir.clone(),
-        paths.state_dir.clone(),
-        paths.data_dir.clone(),
-        executable.to_owned(),
-    ];
-    targets.extend(paths.legacy_application_directories());
-    // Custom cache roots may be shared. Only the exact per-connection cache is
-    // owned by this application, never the user's chosen parent directory.
-    if !settings.cache_root.as_os_str().is_empty() && settings.cache_root != paths.cache_dir {
-        for server in servers {
-            let remote = server.remote_name();
-            if remote.is_empty()
-                || Path::new(remote).components().count() != 1
-                || remote == "."
-                || remote == ".."
-                || remote.contains(['/', '\\', ':'])
-            {
-                return Err("Invalid per-connection cache path".into());
-            }
-            targets.push(crate::service::expand_home_path(&settings.cache_root).join(remote));
-        }
-    }
-    let parent = executable.parent().ok_or("Executable has no parent")?;
-    let stem = executable
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or("Invalid executable name")?;
-    for entry in fs::read_dir(parent).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        if entry
-            .file_name()
-            .to_str()
-            .is_some_and(|name| is_update_transaction_for(name, stem))
-        {
-            targets.push(entry.path());
-        }
-    }
-    targets.sort();
-    targets.dedup();
-    let all = targets.clone();
-    targets.retain(|p| !all.iter().any(|root| root != p && p.starts_with(root)));
-    for target in &targets {
-        if !target.is_absolute() || target.parent().is_none() {
-            return Err("Uninstall requires absolute owned paths".into());
-        }
-        validate_removal_tree(target)?;
-    }
-    Ok(targets)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn windows_paths() -> AppPaths {
         let data_dir = PathBuf::from("C:/Users/test/AppData/Local/ssh-mountmate");
@@ -526,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn old_state_cannot_block_uninstall_just_because_a_pid_is_reused() {
+    fn old_state_cannot_block_migration_just_because_a_pid_is_reused() {
         let mut state = recorded_mount();
         let arguments = vec![
             state.rclone.display().to_string(),
@@ -580,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_rechecks_until_update_helper_finishes() {
+    fn process_wait_rechecks_until_update_helper_finishes() {
         let mut inspections = 0;
         wait_for_profile_processes(std::time::Duration::from_secs(1), || {
             inspections += 1;
@@ -626,30 +523,6 @@ mod tests {
         assert!(mount_error.contains("请先取消挂载"));
     }
 
-    #[test]
-    fn recognizes_only_transaction_files() {
-        assert!(is_update_transaction_for(
-            ".my-app.ssh-mountmate-backup.exe",
-            "my-app"
-        ));
-        assert!(!is_update_transaction_for(
-            ".neighbor.ssh-mountmate-backup.exe",
-            "my-app"
-        ));
-        assert!(is_update_transaction(
-            ".SSHMountMate.ssh-mountmate-backup.exe"
-        ));
-        assert!(is_update_transaction(
-            ".SSHMountMate-v0.6.9.ssh-mountmate-prepared-0123456789abcdef0123456789abcdef.exe"
-        ));
-        for name in [
-            "SSHMountMate.exe",
-            ".other.ssh-mountmate-backup.exe",
-            ".SSHMountMate.ssh-mountmate-recovered-important.exe",
-        ] {
-            assert!(!is_update_transaction(name));
-        }
-    }
     #[cfg(unix)]
     #[test]
     fn rejects_symlink_trees_without_touching_target() {
