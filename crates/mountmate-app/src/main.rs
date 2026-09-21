@@ -1533,7 +1533,6 @@ fn source_config_mutation(message: &Message) -> bool {
             message,
             Message::ConnectionTagsChanged(_)
                 | Message::ConnectionAuthChanged(_)
-                | Message::ConnectionMethodChanged(_)
                 | Message::PasswordChanged(_)
                 | Message::KeyPassphraseChanged(_)
                 | Message::ClearSecret(_)
@@ -7839,7 +7838,9 @@ impl App {
                 )),
                 |method| Message::ConnectionMethodChanged(method.value),
             )
-            .style(move |theme, status| connection_pick_list_style(theme, status, locked))
+            .style(move |theme, status| {
+                connection_pick_list_style(theme, status, mounted_controls.locked)
+            })
             .width(Fill)
         ]
         .spacing(5);
@@ -7849,14 +7850,17 @@ impl App {
                 transport_choice,
                 transport_help(locale),
             ),
-            labeled_control(locale.text(TextKey::Authentication), authentication),
+            labeled_control(
+                locale.text(TextKey::Authentication),
+                freeze_ssh_config_fields(authentication, locale, source_locked),
+            ),
         ]
         .spacing(12);
 
         if source_locked {
             ssh_config_controls = ssh_config_controls.push(text(match locale {
-                Locale::English => "Connection fields are read from SSH config. Edit that file and reload to change them; OpenSSH resolves it again when connecting.",
-                Locale::Chinese => "连接字段来自 SSH 配置，修改源文件后重新读取即可更新；连接时由 OpenSSH 读取配置。",
+                Locale::English => "Address and authentication fields come from SSH config; the connection method can be changed here. Edit the source file and reload to update its fields.",
+                Locale::Chinese => "地址和认证信息来自 SSH 配置，连接方式可在此切换；如需修改配置字段，请编辑源文件后重新读取。",
             }).size(13));
         }
 
@@ -8149,21 +8153,19 @@ impl App {
             ),
         ]
         .spacing(12);
-        let details =
-            column![target, transport, auth_fields, managed_fields, organization].spacing(16);
-        let details: Element<'_, Message> = if source_locked {
-            tooltip(
-                read_only::freeze(details.into()),
-                text(match locale {
-                    Locale::English => "Read from SSH config; edit the source file and reload.",
-                    Locale::Chinese => "来自 SSH 配置；请修改源文件后重新读取。",
-                }),
-                tooltip::Position::FollowCursor,
-            )
-            .into()
-        } else {
-            details.into()
-        };
+        // Only fields owned by the SSH file are frozen by its source. The
+        // transport selector remains editable until a mount makes the whole
+        // shared connection read-only via mounted_controls below.
+        let details = column![
+            freeze_ssh_config_fields(target, locale, source_locked),
+            transport,
+            freeze_ssh_config_fields(
+                column![auth_fields, managed_fields, organization].spacing(16),
+                locale,
+                source_locked,
+            ),
+        ]
+        .spacing(16);
         let common = mounted_controls
             .freeze(column![source, ssh_config_controls, identity, details].spacing(16));
         let content = column![common, paths].spacing(16).max_width(900);
@@ -9714,6 +9716,27 @@ fn moved_connection_order(
 struct ConnectionEditorControls {
     locale: Locale,
     locked: bool,
+}
+
+fn freeze_ssh_config_fields<'a>(
+    content: impl Into<Element<'a, Message>>,
+    locale: Locale,
+    source_locked: bool,
+) -> Element<'a, Message> {
+    let content = content.into();
+    if source_locked {
+        tooltip(
+            read_only::freeze(content),
+            text(match locale {
+                Locale::English => "Read from SSH config; edit the source file and reload.",
+                Locale::Chinese => "来自 SSH 配置；请修改源文件后重新读取。",
+            }),
+            tooltip::Position::FollowCursor,
+        )
+        .into()
+    } else {
+        content
+    }
 }
 
 impl ConnectionEditorControls {
@@ -13505,6 +13528,49 @@ mod localization_tests {
             startup_servers(&Settings::default(), &next.mount_targets()),
             vec![startup[1].clone()]
         );
+    }
+
+    #[test]
+    fn ssh_config_transport_can_switch_and_persist_without_unlocking_source_fields() {
+        let mut draft = ConnectionDraft::from_server(&ServerConfig {
+            id: "cluster".into(),
+            source: "ssh_config".into(),
+            mode: "ssh_config".into(),
+            name: "Cluster".into(),
+            host_alias: "cluster".into(),
+            host: "cluster.example".into(),
+            user: "alice".into(),
+            ssh_config_path: "~/.ssh/config".into(),
+            connection_method: ConnectionMethod::Openssh,
+            auto_mount_at_login: true,
+            ..ServerConfig::default()
+        });
+        for method in [ConnectionMethod::Interactive, ConnectionMethod::Openssh] {
+            let message = Message::ConnectionMethodChanged(method);
+            assert!(!source_config_mutation(&message));
+            // Mounted/busy and saving guards still block this edit.
+            assert!(is_editor_mutation(&message));
+            draft.set_connection_method(method);
+            let saved = draft.validate(&[]).unwrap().server;
+            assert_eq!(saved.connection_method, method);
+            assert_eq!(saved.host_alias, "cluster");
+            assert_eq!(saved.host, "cluster.example");
+            assert_eq!(saved.user, "alice");
+            assert_eq!(saved.ssh_config_path, "~/.ssh/config");
+            assert!(!saved.auto_mount_at_login);
+            draft = ConnectionDraft::from_server(&saved);
+            assert_eq!(draft.source, ConnectionSource::SshConfig);
+            assert_eq!(draft.connection_method, method);
+        }
+        for message in [
+            Message::ConnectionFieldChanged(ConnectionField::Host, "other.example".into()),
+            Message::ConnectionFieldChanged(ConnectionField::User, "bob".into()),
+            Message::ConnectionFieldChanged(ConnectionField::Port, "2222".into()),
+            Message::ConnectionFieldChanged(ConnectionField::KeyFile, "other-key".into()),
+            Message::ConnectionAuthChanged(AuthMethod::Password),
+        ] {
+            assert!(source_config_mutation(&message));
+        }
     }
 
     #[test]
