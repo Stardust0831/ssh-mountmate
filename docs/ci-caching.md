@@ -59,3 +59,33 @@ Compare a cold run with a second manual run on the same commit. Check restore
 hits, per-step timings and storage size rather than assuming every run has the
 same runner speed or queue delay. Main caches expire under GitHub's normal
 retention rules; an infrequent release may legitimately need a cold build.
+
+## Measured validation (2026-09-21)
+
+The baseline is the successful [v0.6.20 run](https://github.com/Stardust0831/ssh-mountmate/actions/runs/35581081955).
+The [cold run](https://github.com/Stardust0831/ssh-mountmate/actions/runs/35594998953)
+and [warm run](https://github.com/Stardust0831/ssh-mountmate/actions/runs/35598687369)
+both used commit `1c39fb6` and passed quality, all six native package integrations
+and the signed release-set exercise. Publishing was intentionally skipped.
+
+| Job / scope | Before | Cold cache | Warm cache |
+| --- | ---: | ---: | ---: |
+| Complete validation, excluding publish | 38.4 min | 30.1 min | 16.5 min |
+| Quality | 7.1 min | 7.6 min | 3.7 min |
+| Windows x64 | 23.7 min | 22.1 min | 8.7 min |
+| Windows ARM64 | 23.6 min | 25.0 min | 13.5 min |
+| macOS Intel | 29.4 min | 28.7 min | 14.4 min |
+| macOS ARM64 | 11.3 min | 16.0 min | 8.1 min |
+| Linux x64 | 16.6 min | 15.4 min | 7.6 min |
+| Linux ARM64 | 17.5 min | 17.7 min | 10.7 min |
+
+Complete validation is measured from the first job starting to release-set
+completion, including the original quality/build dependency and inter-job waits.
+Individual rows include each job's setup, tests and cache handling. They cannot
+be added because jobs run concurrently. Runner speed varies, so these are
+observations from successful runs rather than a runtime guarantee.
+
+The warm run reduced complete validation time by about 57%. Storage after the
+cold run was 7.77 GiB, retaining all seven Rust caches and six current rclone
+caches, plus two small rclone entries from the initial workflow debugging.
+Windows/Linux packaging took 5–7 seconds after eliminating the second compile.
