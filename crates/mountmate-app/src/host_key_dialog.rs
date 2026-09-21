@@ -77,19 +77,10 @@ pub async fn mount(
             }
             Err(error @ ServiceError::HostKeyProbe { .. }) => {
                 let _guard = DIALOG_LOCK.lock().await;
-                let (title, retry, cancel, explanation) = match locale {
-                    Locale::English => (
-                        "Could not read server fingerprint",
-                        "Retry",
-                        "Cancel",
-                        "No server public key was received, so there is no fingerprint to confirm yet. Check the server address, SSH port and network connection, then retry. Your login credentials have not been used.",
-                    ),
-                    Locale::Chinese => (
-                        "暂时无法读取服务器指纹",
-                        "重试",
-                        "取消",
-                        "尚未获取到服务器公钥，因此暂时没有可确认的指纹。请检查服务器地址、SSH 端口和网络连接后重试。此探测过程未使用你的登录凭据。",
-                    ),
+                let (title, explanation) = probe_failure_text(locale, &error);
+                let (retry, cancel) = match locale {
+                    Locale::English => ("Retry", "Cancel"),
+                    Locale::Chinese => ("重试", "取消"),
                 };
                 if !ask(
                     output,
@@ -105,6 +96,34 @@ pub async fn mount(
             }
             Err(error) => return Err(crate::localize_service_error(locale, &error)),
         }
+    }
+}
+
+fn probe_failure_text(locale: Locale, error: &ServiceError) -> (&'static str, String) {
+    use crate::connection_error::{SshFailure, diagnose};
+    let failure = match error {
+        ServiceError::HostKeyProbe { detail, .. } => diagnose(detail),
+        _ => None,
+    }
+    // Discovery deliberately uses no credentials. Authentication diagnostics
+    // from this probe cannot establish that the user's password/key is wrong.
+    .filter(|failure| !matches!(failure, SshFailure::Authentication | SshFailure::PrivateKey));
+    let (fallback_title, explanation) = match locale {
+        Locale::English => (
+            "Could not read server fingerprint",
+            "No server public key was received, so there is no fingerprint to confirm yet. Check the server address, SSH port and network connection, then retry. Your login credentials have not been used.",
+        ),
+        Locale::Chinese => (
+            "暂时无法读取服务器指纹",
+            "尚未获取到服务器公钥，因此暂时没有可确认的指纹。请检查服务器地址、SSH 端口和网络连接后重试。此探测过程未使用你的登录凭据。",
+        ),
+    };
+    match failure {
+        Some(failure) => (
+            failure.title(locale),
+            format!("{}\n\n{explanation}", failure.summary(locale)),
+        ),
+        None => (fallback_title, explanation.into()),
     }
 }
 
@@ -150,5 +169,34 @@ fn review_text(
             "更新指纹并挂载",
             "取消",
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unreachable_server_is_explained_before_fingerprint_details() {
+        let error = ServiceError::HostKeyProbe {
+            host: "cluster".into(),
+            port: "22".into(),
+            detail: "ssh: connect to host cluster port 22: Connection timed out".into(),
+        };
+        let (title, explanation) = probe_failure_text(Locale::Chinese, &error);
+        assert!(title.contains("SSH 连接超时"));
+        assert!(explanation.contains("VPN"));
+        assert!(explanation.contains("未使用你的登录凭据"));
+    }
+
+    #[test]
+    fn credential_free_probe_does_not_diagnose_bad_credentials() {
+        let error = ServiceError::HostKeyProbe {
+            host: "cluster".into(),
+            port: "22".into(),
+            detail: "ssh: Permission denied (publickey).".into(),
+        };
+        let (title, _) = probe_failure_text(Locale::Chinese, &error);
+        assert_eq!(title, "暂时无法读取服务器指纹");
     }
 }

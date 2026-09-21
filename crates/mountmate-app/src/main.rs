@@ -77,6 +77,7 @@ use mountmate_platform::{
 };
 
 mod cli;
+mod connection_error;
 mod host_key_dialog;
 mod i18n;
 mod icons;
@@ -944,6 +945,9 @@ fn mountpoint_preflight_result_is_current(
 }
 
 fn mount_error_summary(locale: Locale, cause: &str) -> String {
+    if let Some(failure) = connection_error::diagnose(cause) {
+        return failure.summary(locale);
+    }
     let prefix = match locale {
         Locale::English => "Last operation failed: ",
         Locale::Chinese => "上次操作失败：",
@@ -4348,7 +4352,8 @@ impl App {
                                 cause: error.clone(),
                             },
                         );
-                        self.status = error;
+                        self.status = connection_error::diagnose(&error)
+                            .map_or(error, |failure| failure.summary(locale));
                         tasks.push(self.status_task(StatusPublishPolicy::Silent));
                     }
                 }
@@ -7300,7 +7305,11 @@ impl App {
                 }
             }
             if let Some(error) = self.operation_errors.get(id) {
-                details = details.push(text(mount_error_summary(locale, &error.cause)).size(12));
+                details = details.push(
+                    text(mount_error_summary(locale, &error.cause))
+                        .size(12)
+                        .style(text::danger),
+                );
             }
             let operation = if waiting {
                 Message::CancelPendingUnmount(id.clone())
@@ -9395,7 +9404,9 @@ fn connection_card<'a>(
         details = details.push(
             container(
                 column![
-                    text(mount_error_summary(locale, &error.cause)).size(13),
+                    text(mount_error_summary(locale, &error.cause))
+                        .size(13)
+                        .style(text::danger),
                     row![
                         button(match locale {
                             Locale::English => "Retry",
@@ -10777,6 +10788,16 @@ fn application_theme(mode: AppearanceMode, accent: AccentColor, system_dark: boo
 }
 
 fn localize_service_error(locale: Locale, error: &ServiceError) -> String {
+    let diagnostics = match error {
+        ServiceError::Runtime(mountmate_core::runtime::RuntimeError::NotReady { tail, .. }) => {
+            Some(tail.as_str())
+        }
+        ServiceError::Ssh(mountmate_core::ssh::SshError::Command(detail)) => Some(detail.as_str()),
+        _ => None,
+    };
+    if let Some(failure) = diagnostics.and_then(connection_error::diagnose) {
+        return format!("{}\n\n{error}", failure.summary(locale));
+    }
     if let ServiceError::Runtime(mountmate_core::runtime::RuntimeError::NotReady { tail, .. }) =
         error
         && tail.contains("error receiving version packet")
@@ -12222,6 +12243,42 @@ mod localization_tests {
         assert_eq!(summary.lines().count(), 1);
         assert!(summary.chars().count() <= MOUNT_ERROR_SUMMARY_MAX_CHARS);
         assert!(summary.ends_with('…'));
+    }
+
+    #[test]
+    fn ssh_failure_is_visible_even_after_startup_notices_and_long_log_paths() {
+        let tail = "NOTICE: Serving remote control on http://127.0.0.1:5572/\n\
+                    NOTICE: Starting mount\n\
+                    CRITICAL: Failed to create file system: couldn't connect SSH: \
+                    ssh: handshake failed: ssh: unable to authenticate, \
+                    attempted methods [none password], no supported methods remain";
+        let error = ServiceError::Runtime(mountmate_core::runtime::RuntimeError::NotReady {
+            log: PathBuf::from(format!("/logs/{}/mount.log", "x".repeat(240))),
+            tail: tail.into(),
+        });
+        let detail = localize_service_error(Locale::Chinese, &error);
+        assert!(detail.starts_with("SSH 登录失败：身份验证未通过"));
+        assert!(detail.contains(tail), "keep original diagnostics available");
+        let summary = mount_error_summary(Locale::Chinese, &detail);
+        assert!(summary.starts_with("SSH 登录失败：身份验证未通过"));
+        assert!(summary.contains("相同地址、端口和账号"));
+        assert!(!summary.contains("mount.log"));
+        assert_eq!(summary.lines().count(), 2);
+    }
+
+    #[test]
+    fn sftp_startup_failure_keeps_its_existing_explanation() {
+        for detail in ["unexpected EOF", "packet too long"] {
+            let error = ServiceError::Runtime(mountmate_core::runtime::RuntimeError::NotReady {
+                log: "mount.log".into(),
+                tail: format!("couldn't initialise SFTP: error receiving version packet: {detail}"),
+            });
+            let localized = localize_service_error(Locale::Chinese, &error);
+            let summary = mount_error_summary(Locale::Chinese, &localized);
+            assert!(summary.contains("SFTP"));
+            assert!(!summary.contains("身份验证未通过"));
+            assert!(localized.contains(detail));
+        }
     }
 
     #[test]
