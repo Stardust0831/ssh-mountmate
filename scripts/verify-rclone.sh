@@ -14,7 +14,9 @@ test "$actual" = "$expected"
 version_output=$("$binary" version)
 grep -Fx "rclone $expected_version" <<< "$version_output"
 grep -Fx -- "- os/type: $(go env GOOS)" <<< "$version_output"
-grep -Fx -- "- os/arch: $(go env GOARCH)" <<< "$version_output"
+# rclone appends "(ARMv8 compatible)" to the ARM64 architecture name.
+actual_arch=$(awk '$1 == "-" && $2 == "os/arch:" { print $3 }' <<< "$version_output")
+test "$actual_arch" = "$(go env GOARCH)"
 grep -Fx -- "- go/version: $(go env GOVERSION)" <<< "$version_output"
 grep -Eq '^- go/tags:.*cmount' <<< "$version_output"
 "$binary" mount --help >/dev/null
