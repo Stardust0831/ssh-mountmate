@@ -5,7 +5,12 @@ expected_version=${RCLONE_CUSTOM_VERSION:-v1.74.4-lustre-quota}
 test -s "$binary"
 expected=$(tr -d '[:space:]' < "$binary.sha256")
 [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
-test "$(shasum -a 256 "$binary" | awk '{print $1}')" = "$expected"
+if [[ "$(uname -s)" = Darwin ]]; then
+  actual=$(shasum -a 256 "$binary" | awk '{print $1}')
+else
+  actual=$(sha256sum "$binary" | awk '{print $1}')
+fi
+test "$actual" = "$expected"
 version_output=$("$binary" version)
 grep -Fx "rclone $expected_version" <<< "$version_output"
 grep -Fx -- "- os/type: $(go env GOOS)" <<< "$version_output"
