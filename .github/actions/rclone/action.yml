@@ -1,0 +1,82 @@
+name: Verified patched rclone
+description: Reuse an exact, verified native build or rebuild from pinned source
+inputs:
+  runner:
+    description: Runner image label (including OS generation)
+    required: true
+  save:
+    description: Whether this trusted default-branch run can populate the cache
+    default: 'false'
+outputs:
+  cache-hit:
+    description: Whether a valid cached binary was reused
+    value: ${{ steps.verify.outputs.valid }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+      with:
+        go-version: '1.25.0'
+        check-latest: false
+        cache: false
+    - name: Fingerprint native build inputs
+      id: key
+      shell: bash
+      env:
+        BUILD_RUNNER: ${{ inputs.runner }}
+        SOURCE_HASH: ${{ hashFiles('scripts/build-rclone.sh', 'scripts/verify-rclone.sh', 'patches/**', '.github/actions/rclone/action.yml') }}
+      run: |
+        set -euo pipefail
+        fingerprint="${RUNNER_TEMP}/rclone-toolchain.txt"
+        {
+          go version
+          go env GOOS GOARCH GOAMD64 GOARM64 CGO_ENABLED CC CXX CGO_CFLAGS CGO_CPPFLAGS CGO_CXXFLAGS CGO_LDFLAGS GOFLAGS GOTOOLCHAIN
+          printf '%s\n' "${RCLONE_CUSTOM_VERSION:-v1.74.4-lustre-quota}"
+          if [ "${RUNNER_OS}" != Windows ]; then cc --version; fi
+        } > "$fingerprint"
+        digest=$(shasum -a 256 "$fingerprint" | awk '{print $1}')
+        echo "key=mountmate-rclone-v1-${BUILD_RUNNER}-${RUNNER_ARCH}-${SOURCE_HASH}-${digest}" >> "$GITHUB_OUTPUT"
+    - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      id: cache
+      with:
+        path: .ci-cache/rclone
+        key: ${{ steps.key.outputs.key }}
+    - name: Check cached digest, version and mount features
+      id: verify
+      shell: bash
+      env:
+        CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+      run: |
+        set -euo pipefail
+        binary=.ci-cache/rclone/rclone
+        if [ "$RUNNER_OS" = Windows ]; then binary+=.exe; fi
+        valid=false
+        if [ "$CACHE_HIT" = true ] && bash scripts/verify-rclone.sh "$binary"; then
+          valid=true
+        fi
+        echo "valid=$valid" >> "$GITHUB_OUTPUT"
+    - name: Build and test patched source on a cache miss
+      if: steps.verify.outputs.valid != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p .ci-cache/rclone
+        binary=.ci-cache/rclone/rclone
+        if [ "$RUNNER_OS" = Windows ]; then binary+=.exe; fi
+        bash scripts/build-rclone.sh "$binary"
+        shasum -a 256 "$binary" | awk '{print $1}' > "$binary.sha256"
+        bash scripts/verify-rclone.sh "$binary"
+    - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      if: inputs.save == 'true' && steps.cache.outputs.cache-hit != 'true'
+      with:
+        path: .ci-cache/rclone
+        key: ${{ steps.key.outputs.key }}
+    - name: Stage verified binary
+      shell: bash
+      env:
+        CACHE_VALID: ${{ steps.verify.outputs.valid }}
+      run: |
+        set -euo pipefail
+        mkdir -p target/release/bin
+        cp .ci-cache/rclone/* target/release/bin/
+        echo "Patched rclone: verified cache hit = ${CACHE_VALID}" >> "$GITHUB_STEP_SUMMARY"

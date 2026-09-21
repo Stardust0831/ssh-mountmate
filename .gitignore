@@ -22,3 +22,6 @@ build/*.spec
 
 .DS_Store
 Thumbs.db
+
+# CI-only verified helper cache
+.ci-cache/

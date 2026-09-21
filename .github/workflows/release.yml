@@ -2,22 +2,44 @@ name: Release SSH MountMate
 
 on:
   push:
+    branches: [main]
+    paths:
+      - '**/Cargo.toml'
+      - Cargo.lock
+      - '.cargo/**'
+      - 'rust-toolchain*'
+      - '.github/workflows/release.yml'
+      - '.github/actions/**'
+      - 'scripts/build-rclone.sh'
+      - 'scripts/verify-rclone.sh'
+      - 'scripts/stage-winfsp.ps1'
+      - 'scripts/trim-ci-caches.sh'
+      - 'patches/**'
+      - 'distribution/winfsp.json'
     tags:
       - "v*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing release tag, for example v0.4.1-alpha.1"
-        required: true
+        description: "Existing release tag; leave empty to validate this branch and warm main caches"
+        required: false
         type: string
       publish:
-        description: "Create or update the GitHub release after all builds pass"
+        description: "Publish a new GitHub release for the specified tag after all checks pass"
         required: true
         default: false
         type: boolean
 
 permissions:
   contents: read
+
+# Cancel superseded branch validation, but never interrupt tag publication.
+concurrency:
+  group: release-${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' && inputs.tag == '' && inputs.publish != true }}
+
+env:
+  CARGO_INCREMENTAL: '0'
 
 jobs:
   quality:
@@ -27,10 +49,29 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.tag || github.ref }}
+      - name: Resolve package version and validate release request
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
+          REQUESTED_PUBLISH: ${{ inputs.publish || false }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          test -n "$version"
+          if [ -n "$REQUESTED_TAG" ]; then test "$REQUESTED_TAG" = "v${version}"; fi
+          if [ "$REQUESTED_PUBLISH" = true ]; then test -n "$REQUESTED_TAG"; fi
+          echo "RELEASE_TAG=v${version}" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: 1.97.0
           components: rustfmt, clippy
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          prefix-key: mountmate-rust-v1
+          shared-key: quality-ubuntu-latest
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' && !inputs.tag }}
       - name: Enforce Rust-only product tree
         shell: bash
         run: |
@@ -97,7 +138,6 @@ jobs:
           cmp "${generated}" licenses/RUST-THIRD-PARTY.txt
 
   build:
-    needs: quality
     strategy:
       fail-fast: false
       matrix:
@@ -137,23 +177,28 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.tag || github.ref }}
-      - name: Validate release version
+      - name: Resolve package version and validate release request
         shell: bash
         env:
-          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          REQUESTED_TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
+          REQUESTED_PUBLISH: ${{ inputs.publish || false }}
         run: |
           set -euo pipefail
-          test -z "$(git ls-files '*.py' '*.spec' pyproject.toml launcher.py)"
-          python_action='actions/setup''-python'
-          if git grep -n "${python_action}" -- .github; then
-            echo 'Python setup actions are not allowed in the Rust release tree' >&2
-            exit 1
-          fi
           version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
-          test "${RELEASE_TAG}" = "v${version}"
+          test -n "$version"
+          if [ -n "$REQUESTED_TAG" ]; then test "$REQUESTED_TAG" = "v${version}"; fi
+          if [ "$REQUESTED_PUBLISH" = true ]; then test -n "$REQUESTED_TAG"; fi
+          echo "RELEASE_TAG=v${version}" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: 1.97.0
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          prefix-key: mountmate-rust-v1
+          shared-key: ${{ matrix.os }}-${{ runner.arch }}
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' && !inputs.tag }}
       - name: Install Linux GUI dependencies
         if: runner.os == 'Linux'
         shell: bash
@@ -187,6 +232,43 @@ jobs:
           echo "${FUSE_T_SHA256}  ${RUNNER_TEMP}/${package}" | shasum -a 256 --check
           sudo installer -pkg "${RUNNER_TEMP}/${package}" -target /
           test -e /usr/local/lib/libfuse-t.dylib
+      - name: Prepare verified patched rclone
+        uses: ./.github/actions/rclone
+        with:
+          runner: ${{ matrix.os }}
+          save: ${{ github.ref == 'refs/heads/main' && !inputs.tag }}
+
+      - name: Prepare verified Plink
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          PLINK_VERSION: '0.84'
+          PLINK_ARCH: ${{ matrix.plink_arch }}
+          PLINK_SHA256: ${{ matrix.plink_sha256 }}
+        run: |
+          $plinkUrl = "https://the.earth.li/~sgtatham/putty/$env:PLINK_VERSION/$env:PLINK_ARCH/plink.exe"
+          Invoke-WebRequest $plinkUrl -OutFile target/release/bin/plink.exe
+          $actual = (Get-FileHash -Algorithm SHA256 target/release/bin/plink.exe).Hash.ToLowerInvariant()
+          if ($actual -ne $env:PLINK_SHA256) { throw "Plink SHA-256 mismatch: $actual" }
+          $actual | Set-Content -NoNewline target/release/bin/plink.exe.sha256
+
+      - name: Set Linux embedded payloads before compiling
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          echo "SSH_MOUNTMATE_EMBED_RCLONE_PATH=$(pwd)/target/release/bin/rclone" >> "$GITHUB_ENV"
+          echo "SSH_MOUNTMATE_EMBED_RCLONE_SHA256=$(tr -d '[:space:]' < target/release/bin/rclone.sha256)" >> "$GITHUB_ENV"
+
+      - name: Set Windows embedded payloads before compiling
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          foreach ($payload in @('RCLONE', 'PLINK')) {
+            $binary = "target/release/bin/$($payload.ToLowerInvariant()).exe"
+            "SSH_MOUNTMATE_EMBED_${payload}_PATH=$((Resolve-Path $binary).Path)" >> $env:GITHUB_ENV
+            "SSH_MOUNTMATE_EMBED_${payload}_SHA256=$((Get-Content "$binary.sha256" -Raw).Trim())" >> $env:GITHUB_ENV
+          }
+
       - run: cargo test --workspace --all-features
       - name: Exercise native system credential store
         if: runner.os == 'Windows' || runner.os == 'macOS'
@@ -257,83 +339,9 @@ jobs:
         shell: pwsh
         run: ./tests/rust_windows_gui_smoke.ps1 -Binary target/release/SSHMountMate.exe
 
-      - name: Install pinned Go for patched rclone
-        uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
-        with:
-          go-version: '1.25.0'
-          check-latest: false
-          cache: false
-      - name: Build patched rclone
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p target/release/bin
-          case "${{ matrix.rclone_platform }}" in
-            linux) goos=linux ;;
-            osx) goos=darwin ;;
-            *) echo "unsupported rclone platform" >&2; exit 1 ;;
-          esac
-          case "${{ matrix.rclone_arch }}" in
-            amd64) goarch=amd64 ;;
-            arm64) goarch=arm64 ;;
-            *) echo "unsupported rclone architecture" >&2; exit 1 ;;
-          esac
-          scripts/build-rclone.sh target/release/bin/rclone "$goos" "$goarch"
-          chmod 755 target/release/bin/rclone
-          shasum -a 256 target/release/bin/rclone | awk '{print $1}' > target/release/bin/rclone.sha256
-
-      - name: Bundle verified rclone and Plink
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          PLINK_VERSION: '0.84'
-          PLINK_ARCH: ${{ matrix.plink_arch }}
-          PLINK_SHA256: ${{ matrix.plink_sha256 }}
-        run: |
-          New-Item -ItemType Directory -Force target/release/bin | Out-Null
-          bash scripts/build-rclone.sh target/release/bin/rclone.exe windows ${{ matrix.rclone_arch }}
-          if ($LASTEXITCODE -ne 0) { throw "patched rclone build failed" }
-          (Get-FileHash -Algorithm SHA256 target/release/bin/rclone.exe).Hash.ToLowerInvariant() |
-            Set-Content -NoNewline target/release/bin/rclone.exe.sha256
-          $plinkUrl = "https://the.earth.li/~sgtatham/putty/$env:PLINK_VERSION/$env:PLINK_ARCH/plink.exe"
-          Invoke-WebRequest $plinkUrl -OutFile target/release/bin/plink.exe
-          $plinkActual = (Get-FileHash -Algorithm SHA256 target/release/bin/plink.exe).Hash.ToLowerInvariant()
-          if ($plinkActual -ne $env:PLINK_SHA256) { throw "Plink SHA-256 mismatch: $plinkActual" }
-          $plinkActual | Set-Content -NoNewline target/release/bin/plink.exe.sha256
-
-      - name: Assemble directory bundle
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          root="target/package/SSHMountMate"
-          mkdir -p "${root}/bin"
-          cp target/release/SSHMountMate "${root}/SSHMountMate"
-          cp target/release/bin/rclone target/release/bin/rclone.sha256 "${root}/bin/"
-          cp THIRD_PARTY_NOTICES.md licenses/*.txt distribution/SSHMountMate.install-layout "${root}/"
-          chmod 755 "${root}/SSHMountMate" "${root}/bin/rclone"
-          "${root}/SSHMountMate" --version
-
-      - name: Assemble directory bundle
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $root = 'target/package/SSHMountMate'
-          New-Item -ItemType Directory -Force "$root/bin" | Out-Null
-          Copy-Item target/release/SSHMountMate.exe "$root/SSHMountMate.exe"
-          Copy-Item target/release/bin/rclone.exe, target/release/bin/rclone.exe.sha256, target/release/bin/plink.exe, target/release/bin/plink.exe.sha256 "$root/bin/"
-          Copy-Item THIRD_PARTY_NOTICES.md, licenses/*.txt, distribution/SSHMountMate.install-layout $root
-          $process = Start-Process -FilePath "$root/SSHMountMate.exe" -ArgumentList '--version' -Wait -PassThru
-          if ($process.ExitCode -ne 0) { throw "release executable smoke test failed" }
-          $plink = Start-Process -FilePath "$root/bin/plink.exe" -ArgumentList '-V' -Wait -PassThru
-          if ($plink.ExitCode -ne 0) { throw "release Plink smoke test failed" }
-
       - name: Assemble macOS application bundle
         if: runner.os == 'macOS'
         shell: bash
-        env:
-          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
           app="target/package/SSH MountMate.app"
@@ -377,14 +385,11 @@ jobs:
           "${app}/Contents/Resources/bin/rclone" version
           test -z "$(find "${extracted}" -type f \( -iname '*.py' -o -iname 'python*' -o -iname 'libpython*' \) -print -quit)"
 
-      - name: Build and package embedded-rclone onefile
+      - name: Package and verify embedded-rclone onefile
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
-          export SSH_MOUNTMATE_EMBED_RCLONE_PATH="$(pwd)/target/release/bin/rclone"
-          export SSH_MOUNTMATE_EMBED_RCLONE_SHA256="$(tr -d '[:space:]' < target/release/bin/rclone.sha256)"
-          cargo build --release --package ssh-mountmate
           mkdir -p target/onefile release
           cp target/release/SSHMountMate target/onefile/SSHMountMate
           chmod 755 target/onefile/SSHMountMate
@@ -407,16 +412,10 @@ jobs:
           "${rclone_path}" version
           test -z "$(find "${extracted}" -type f \( -iname '*.py' -o -iname 'python*' -o -iname 'libpython*' \) -print -quit)"
 
-      - name: Build and package embedded-rclone onefile
+      - name: Package and verify embedded-rclone onefile
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $env:SSH_MOUNTMATE_EMBED_RCLONE_PATH = (Resolve-Path 'target/release/bin/rclone.exe').Path
-          $env:SSH_MOUNTMATE_EMBED_RCLONE_SHA256 = (Get-Content 'target/release/bin/rclone.exe.sha256' -Raw).Trim()
-          $env:SSH_MOUNTMATE_EMBED_PLINK_PATH = (Resolve-Path 'target/release/bin/plink.exe').Path
-          $env:SSH_MOUNTMATE_EMBED_PLINK_SHA256 = (Get-Content 'target/release/bin/plink.exe.sha256' -Raw).Trim()
-          cargo build --release --package ssh-mountmate
-          if ($LASTEXITCODE -ne 0) { throw "onefile build failed" }
           New-Item -ItemType Directory -Force target/onefile, release | Out-Null
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
           Copy-Item target/release/SSHMountMate.exe "release/SSHMountMate-v$version-${{ matrix.rclone_arch }}.exe"
@@ -555,7 +554,7 @@ jobs:
           if-no-files-found: error
 
   release-set:
-    needs: build
+    needs: [quality, build]
     runs-on: ubuntu-latest
 
     steps:
@@ -563,6 +562,18 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.tag || github.ref }}
+      - name: Resolve package version and validate release request
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
+          REQUESTED_PUBLISH: ${{ inputs.publish || false }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          test -n "$version"
+          if [ -n "$REQUESTED_TAG" ]; then test "$REQUESTED_TAG" = "v${version}"; fi
+          if [ "$REQUESTED_PUBLISH" = true ]; then test -n "$REQUESTED_TAG"; fi
+          echo "RELEASE_TAG=v${version}" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: release-assets
@@ -597,8 +608,6 @@ jobs:
 
       - name: Exercise signed release set with an ephemeral test key
         shell: bash
-        env:
-          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
           version="${RELEASE_TAG#v}"
@@ -617,7 +626,7 @@ jobs:
 
   publish:
     needs: release-set
-    if: github.event_name == 'push' || inputs.publish
+    if: (github.event_name == 'push' && github.ref_type == 'tag') || inputs.publish
     runs-on: ubuntu-latest
     environment: production-update-signing
     permissions:
@@ -628,6 +637,18 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.tag || github.ref }}
+      - name: Resolve package version and validate release request
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
+          REQUESTED_PUBLISH: ${{ inputs.publish || false }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          test -n "$version"
+          if [ -n "$REQUESTED_TAG" ]; then test "$REQUESTED_TAG" = "v${version}"; fi
+          if [ "$REQUESTED_PUBLISH" = true ]; then test -n "$REQUESTED_TAG"; fi
+          echo "RELEASE_TAG=v${version}" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: 1.97.0
@@ -642,8 +663,6 @@ jobs:
 
       - name: Verify the existing tag identifies this exact build
         shell: bash
-        env:
-          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
           git fetch --force origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
@@ -660,7 +679,6 @@ jobs:
       - name: Create and verify signed update manifest
         shell: bash
         env:
-          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
           UPDATE_ED25519_PRIVATE_KEY_PKCS8_B64: ${{ secrets.UPDATE_ED25519_PRIVATE_KEY_PKCS8_B64 }}
           UPDATE_ED25519_KEY_ID: ${{ vars.UPDATE_ED25519_KEY_ID }}
         run: |
@@ -793,3 +811,19 @@ jobs:
           test "${verified}" = true
           test "$(gh api "repos/${GH_REPO}/releases/tags/${tag}" --jq .id)" = "${release_id}"
           trap - ERR
+
+  cache-budget:
+    needs: [quality, build]
+    if: always() && github.ref == 'refs/heads/main' && !inputs.tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Keep reproducible CI caches within the 8 GiB target
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/trim-ci-caches.sh
