@@ -10779,6 +10779,21 @@ fn application_theme(mode: AppearanceMode, accent: AccentColor, system_dark: boo
 fn localize_service_error(locale: Locale, error: &ServiceError) -> String {
     if let ServiceError::Runtime(mountmate_core::runtime::RuntimeError::NotReady { tail, .. }) =
         error
+        && tail.contains("error receiving version packet")
+        && tail.contains("packet too long")
+    {
+        let explanation = match locale {
+            Locale::English => {
+                "The SFTP startup stream was invalid. This often means a login script, local SSH command or terminal output was sent where SFTP binary data was expected. Test the same SSH alias with system sftp; server shell startup scripts must not print to standard output during SFTP sessions. This is not a capacity or file-size limit."
+            }
+            Locale::Chinese => {
+                "SFTP 启动时收到的协议数据无效，常见原因是登录脚本、本地 SSH 命令或终端输出混入了 SFTP 数据流。请用系统 sftp 测试相同 SSH 别名；服务器启动脚本在 SFTP 会话中不应向标准输出打印文本。这不是容量或文件大小超限。"
+            }
+        };
+        return format!("{explanation}\n\n{error}");
+    }
+    if let ServiceError::Runtime(mountmate_core::runtime::RuntimeError::NotReady { tail, .. }) =
+        error
         && tail.contains("couldn't initialise SFTP")
         && (tail.contains("unexpected EOF") || tail.contains("error receiving version packet"))
     {

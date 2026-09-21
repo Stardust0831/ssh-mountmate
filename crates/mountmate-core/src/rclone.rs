@@ -298,7 +298,21 @@ fn default_username() -> String {
 }
 
 fn openssh_command(server: &ServerConfig, windows: bool) -> Result<String, RcloneConfigError> {
-    let mut arguments = vec!["ssh".to_owned(), "-o".into(), "BatchMode=yes".into()];
+    // Like system sftp, require a clean binary channel. Interactive profile
+    // settings can otherwise write LocalCommand output or allocate a PTY on
+    // the SFTP stream. These overrides do not change host trust or routing.
+    let mut arguments = [
+        "ssh",
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "PermitLocalCommand=no",
+        "-o",
+        "RemoteCommand=none",
+    ]
+    .map(str::to_owned)
+    .to_vec();
     arguments.extend(openssh_target_arguments(server)?);
     Ok(arguments
         .iter()

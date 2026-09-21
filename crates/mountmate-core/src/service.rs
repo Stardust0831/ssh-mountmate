@@ -178,7 +178,12 @@ impl MountService {
             return Ok(None);
         }
         let state: MountState = read_json(&self.paths.state_file(&server.id))?;
-        if let Ok(Some(capacity)) = session_capacity(&state) {
+        // Only native SFTP can run quota commands on the existing SSH client.
+        // rclone's external-SSH backend starts extra processes/sessions for
+        // About; retain the direct command path for OpenSSH/shared transports.
+        if server.connection_method == ConnectionMethod::Native
+            && let Ok(Some(capacity)) = session_capacity(&state)
+        {
             return Ok(Some(capacity));
         }
         // Older or unavailable RC backends retain the existing fallback path.

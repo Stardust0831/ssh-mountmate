@@ -1,0 +1,116 @@
+--- a/backend/sftp/sftp.go
++++ b/backend/sftp/sftp.go
+@@ -791,7 +791,17 @@
+ 		sftp.MaxPacketUnchecked(int(f.opt.ChunkSize)),
+ 		sftp.MaxConcurrentRequestsPerFile(f.opt.Concurrency),
+ 	)
+-	return sftp.NewClientPipe(pr, pw, opts...)
++	sftpClient, err := sftp.NewClientPipe(pr, pw, opts...)
++	if err != nil {
++		// Terminate/reap the failed session before reading its bounded stderr.
++		_ = s.Close()
++		if external, ok := s.(*sshSessionExternal); ok {
++			if detail := external.diagnostics.String(); detail != "" {
++				return nil, fmt.Errorf("%w; OpenSSH: %s", err, detail)
++			}
++		}
++	}
++	return sftpClient, err
+ }
+ 
+ // Get an SFTP connection from the pool, or open a new one
+@@ -958,7 +968,11 @@
+ 		// validation by default. Users can enable it by setting
+ 		// known_hosts_file. See: https://rclone.org/sftp/#host-key-validation
+ 		sshConfig.HostKeyCallback = ssh.InsecureIgnoreHostKey()
+-		fs.Logf(name, "No host key validation is being performed. Set known_hosts_file to enable it. See: https://rclone.org/sftp/#host-key-validation")
++		if len(opt.SSH) == 0 {
++			fs.Logf(name, "No host key validation is being performed. Set known_hosts_file to enable it. See: https://rclone.org/sftp/#host-key-validation")
++		} else {
++			fs.Debugf(name, "Host key validation is delegated to the configured external SSH transport")
++		}
+ 	}
+ 
+ 	if opt.UseInsecureCipher && (opt.Ciphers != nil || opt.KeyExchange != nil) {
+--- a/backend/sftp/ssh_external.go
++++ b/backend/sftp/ssh_external.go
+@@ -82,6 +82,7 @@
+ 	runningSFTP bool
+ 	waitOnce    sync.Once // ensure Wait() is only called once
+ 	waitErr     error     // result of the Wait() call
++	diagnostics sshStartupDiagnostics
+ }
+ 
+ func (f *Fs) newSSHSessionExternal() *sshSessionExternal {
+@@ -133,6 +134,11 @@
+ 
+ 	fs.Debugf(s.f, "ssh external: running: %v", fs.SpaceSepList(s.cmd.Args))
+ 
++	// Preserve startup errors instead of discarding SSH stderr. Remote
++	// command sessions provide their own stderr sink via SetStderr.
++	if s.cmd.Stderr == nil {
++		s.cmd.Stderr = &s.diagnostics
++	}
+ 	// start the process
+ 	err := s.cmd.Start()
+ 	if err != nil {
+--- /dev/null
++++ b/backend/sftp/ssh_startup_diagnostics.go
+@@ -0,0 +1,32 @@
++//go:build !plan9
++
++package sftp
++
++import (
++	"strings"
++	"sync"
++)
++
++// Keep only a bounded error prefix; successful long-lived sessions may write
++// arbitrary amounts of stderr. Stdout remains an untouched SFTP byte stream.
++type sshStartupDiagnostics struct {
++	mu   sync.Mutex
++	data []byte
++}
++
++func (d *sshStartupDiagnostics) Write(p []byte) (int, error) {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	remaining := 4096 - len(d.data)
++	if remaining > len(p) {
++		remaining = len(p)
++	}
++	d.data = append(d.data, p[:remaining]...)
++	return len(p), nil
++}
++
++func (d *sshStartupDiagnostics) String() string {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	return strings.TrimSpace(string(d.data))
++}
+--- /dev/null
++++ b/backend/sftp/ssh_startup_diagnostics_test.go
+@@ -0,0 +1,22 @@
++//go:build !plan9
++
++package sftp
++
++import (
++	"github.com/stretchr/testify/require"
++	"strings"
++	"testing"
++)
++
++func TestSSHStartupDiagnosticsAreBounded(t *testing.T) {
++	var d sshStartupDiagnostics
++	message := []byte(strings.Repeat("x", 10000))
++	n, err := d.Write(message)
++	require.NoError(t, err)
++	require.Equal(t, len(message), n)
++	require.Len(t, d.String(), 4096)
++	n, err = d.Write([]byte("discarded"))
++	require.NoError(t, err)
++	require.Equal(t, 9, n)
++	require.Len(t, d.String(), 4096)
++}

@@ -33,6 +33,7 @@ tar -xzf "$archive_path" -C "$src" --strip-components=1
 patch --forward --batch -d "$src" -p1 < "$(cd "$(dirname "$0")/.." && pwd)/patches/rclone-v1.74.4-lustre-quota.patch"
 patch --forward --batch -d "$src" -p1 < "$(cd "$(dirname "$0")/.." && pwd)/patches/rclone-v1.74.4-host-key-retry.patch"
 patch --forward --batch -d "$src" -p1 < "$(cd "$(dirname "$0")/.." && pwd)/patches/rclone-v1.74.4-lustre-details.patch"
+patch --forward --batch -d "$src" -p1 < "$(cd "$(dirname "$0")/.." && pwd)/patches/rclone-v1.74.4-external-ssh-validation.patch"
 mkdir -p "$output_dir"
 case "$goos" in
   linux|darwin) cgo_enabled=1 ;;

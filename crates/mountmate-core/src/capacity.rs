@@ -317,6 +317,11 @@ fn ssh_capacity_output(
             return Ok(None);
         };
         let mut arguments = vec![
+            "-T".into(),
+            "-o".into(),
+            "PermitLocalCommand=no".into(),
+            "-o".into(),
+            "RemoteCommand=none".into(),
             "-o".into(),
             "BatchMode=yes".into(),
             "-o".into(),

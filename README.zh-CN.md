@@ -402,7 +402,7 @@ Rust 程序在 Windows 上提供原生系统托盘图标，在 macOS 上提供�
 ## 容量显示
 
 对已挂载连接，SSH MountMate 会通过挂载进程的本机认证接口读取已用容量、总容量和配额。
-挂载进程用 `lfs project -d` 读取该远端目录的 Lustre project ID，再用 `lfs quota -p`
+原生 SFTP 的挂载进程用 `lfs project -d` 读取该远端目录的 Lustre project ID，再用 `lfs quota -p`
 获取容量与 inode 的软硬配额。Lustre 配额不可用时，返回普通文件系统统计；挂载进程接口
 不可用时，仍保留独立 SSH 查询、本地挂载点统计和 `rclone about` 等回退方式。
 
@@ -411,7 +411,9 @@ Rust 程序在 Windows 上提供原生系统托盘图标，在 macOS 上提供�
 `KiB`、`MiB`、`GiB`、`TiB` 后缀，现有数值换算保持不变。
 
 原生 SFTP 的配额查询复用挂载时验证过的 SSH 会话，因此密码和私钥登录都无需额外配置
-系统 SSH 或再次确认指纹。OpenSSH 和交互式连接沿用各自的挂载连接方式。多个挂载点按
+系统 SSH 或再次确认指纹。OpenSSH 和交互式连接使用独立配额命令，避免额外初始化 SFTP。
+OpenSSH 挂载禁用终端分配、`LocalCommand` 和 `RemoteCommand`，防止终端配置干扰二进制
+数据流；服务器地址、跳板和指纹校验仍遵循 SSH 配置。多个挂载点按
 各自远端目录查询。更新后请重新挂载，让挂载进程使用包含完整配额字段的新版 rclone。
 
 ## 设置

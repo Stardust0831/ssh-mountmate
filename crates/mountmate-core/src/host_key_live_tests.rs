@@ -41,7 +41,7 @@ fn list(rclone: &Path, paths: &AppPaths, algorithms: Option<&str>) -> std::proce
         "--max-depth",
         "1",
         "--log-level",
-        "ERROR",
+        "NOTICE",
     ]);
     if let Some(algorithms) = algorithms {
         cmd.args(["--sftp-host-key-algorithms", algorithms]);
@@ -255,4 +255,49 @@ fn live_multi_algorithm_authentication() {
             .unwrap();
     write_rclone_remote(&paths, &cfg).unwrap();
     assert!(list(&rclone, &paths, None).status.success());
+
+    // Imported terminal profiles must not inject text/PTY processing into the
+    // binary SFTP stream. Keep the alias, identity and strict trust policy.
+    let ssh_config = root.join("ssh-config");
+    let ssh_path = |path: &Path| quote_ssh_value(&path.to_string_lossy().replace('\\', "/"));
+    fs::write(&ssh_config, format!(
+        "Host fixture\n HostName 127.0.0.1\n Port {port}\n User fixture\n IdentityFile {}\n IdentitiesOnly yes\n UserKnownHostsFile {}\n StrictHostKeyChecking yes\n RequestTTY force\n RemoteCommand echo UNEXPECTED_REMOTE_COMMAND\n PermitLocalCommand yes\n LocalCommand echo UNEXPECTED_LOCAL_COMMAND\n",
+        ssh_path(&login_key), ssh_path(&paths.known_hosts()),
+    )).unwrap();
+    connection.connection_method = crate::ConnectionMethod::Openssh;
+    connection.mode = "ssh_config".into();
+    connection.source = "ssh_config".into();
+    connection.host_alias = "fixture".into();
+    connection.ssh_config_path = ssh_config.display().to_string();
+    let mut cfg = RcloneRemote::for_server(&connection, None, None, cfg!(windows)).unwrap();
+    // Windows shipping tests exercise the app's actual connector proxy too.
+    if let Some(proxy) = std::env::var_os("SSH_MOUNTMATE_TEST_APP") {
+        cfg.wrap_external_ssh(Path::new(&proxy), cfg!(windows))
+            .unwrap();
+    }
+    write_rclone_remote(&paths, &cfg).unwrap();
+    let listing = list(&rclone, &paths, None);
+    assert!(
+        listing.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listing.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&listing.stdout).trim(),
+        "verified.txt"
+    );
+    assert!(!String::from_utf8_lossy(&listing.stderr).contains("No host key validation"));
+    // Transport overrides must not suppress a real host-key rejection.
+    fs::write(
+        paths.known_hosts(),
+        format!("[127.0.0.1]:{port} {wrong_key}\n"),
+    )
+    .unwrap();
+    let rejected = list(&rclone, &paths, None);
+    assert!(!rejected.status.success());
+    let detail = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        detail.contains("REMOTE HOST IDENTIFICATION HAS CHANGED"),
+        "{detail}"
+    );
 }

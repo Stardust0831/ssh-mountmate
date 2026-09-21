@@ -451,7 +451,7 @@ The Rust application keeps a native system-tray icon on Windows, a menu-bar item
 ## Capacity Display
 
 For mounted connections, SSH MountMate reads capacity and quota details through the mount process's
-authenticated loopback interface. The backend uses `lfs project -d` to identify the remote directory's
+authenticated loopback interface for native SFTP. The backend uses `lfs project -d` to identify the remote directory's
 Lustre project, then `lfs quota -p` to obtain block and inode soft/hard limits. When no usable Lustre
 quota exists, it returns normal filesystem statistics. If the mount interface is unavailable, the app
 retains its separate SSH, local mountpoint and `rclone about` fallback paths.
@@ -467,7 +467,9 @@ retaining the existing scaling.
 
 Native SFTP quota queries reuse the mount's verified SSH session, so both password and private-key
 login work without another system SSH configuration or fingerprint confirmation. OpenSSH and
-interactive connections retain their configured transport. Each directory mapping queries its own
+interactive connections run quota commands directly, avoiding an extra SFTP initialization.
+OpenSSH mounts disable PTY allocation, `LocalCommand` and `RemoteCommand` to protect the binary
+stream while retaining the SSH profile's server, jump host and trust policy. Each directory mapping queries its own
 remote path. Remount after upgrading so the mount uses the bundled rclone with complete quota fields.
 
 ## Settings
