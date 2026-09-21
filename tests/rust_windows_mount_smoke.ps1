@@ -175,6 +175,9 @@ try {
   $env:SSH_MOUNTMATE_HOST_KEY_TEST_PUBLIC = "$($hostKeyFields[0]) $hostKeyBlob"
   cargo test --package mountmate-core host_key::tests::live_host_key_probe --all-features -- --ignored --exact --test-threads=1
   if ($LASTEXITCODE -ne 0) { throw 'SSH host-key handshake fallback failed' }
+  $env:SSH_MOUNTMATE_TEST_RCLONE = $rclone
+  cargo test --package mountmate-core host_key::live_tests::live_multi_algorithm_authentication --all-features -- --ignored --exact --test-threads=1
+  if ($LASTEXITCODE -ne 0) { throw 'Multi-algorithm SSH trust and authentication failed' }
   $passwordObscured = (& $rclone obscure 'test-only-password').Trim()
   if ($LASTEXITCODE -ne 0 -or -not $passwordObscured) { throw 'rclone obscure failed' }
   $servers = @(

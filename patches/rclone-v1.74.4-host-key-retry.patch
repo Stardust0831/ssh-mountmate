@@ -1,0 +1,65 @@
+--- a/backend/sftp/sftp.go
++++ b/backend/sftp/sftp.go
+@@ -811,7 +811,7 @@
+ 	err = f.pacer.Call(func() (bool, error) {
+ 		c, err = f.sftpConnection(ctx)
+ 		if err != nil {
+-			return true, err
++			return retrySftpConnection(err), err
+ 		}
+ 		return false, nil
+ 	})
+--- /dev/null
++++ b/backend/sftp/host_key_retry.go
+@@ -0,0 +1,20 @@
++//go:build !plan9
++
++package sftp
++
++import (
++	"errors"
++	"strings"
++
++	"golang.org/x/crypto/ssh/knownhosts"
++)
++
++// A new network attempt cannot fix a rejected host identity. Return it to the
++// caller immediately so the user can review trust instead of waiting for all
++// low-level retries. Transient network and SFTP failures keep their retries.
++func retrySftpConnection(err error) bool {
++	var keyError *knownhosts.KeyError
++	var revokedError *knownhosts.RevokedError
++	return !errors.As(err, &keyError) && !errors.As(err, &revokedError) &&
++		!strings.Contains(err.Error(), "no common algorithm for host key")
++}
+--- /dev/null
++++ b/backend/sftp/host_key_retry_test.go
+@@ -0,0 +1,28 @@
++//go:build !plan9
++
++package sftp
++
++import (
++	"fmt"
++	"io"
++	"testing"
++
++	"golang.org/x/crypto/ssh/knownhosts"
++)
++
++func TestHostIdentityErrorsAreNotRetried(t *testing.T) {
++	for _, err := range []error{
++		&knownhosts.KeyError{},
++		&knownhosts.RevokedError{},
++		fmt.Errorf("ssh: handshake failed: ssh: no common algorithm for host key"),
++	} {
++		if retrySftpConnection(fmt.Errorf("couldn't connect SSH: %w", err)) {
++			t.Fatalf("host identity error must fail immediately: %v", err)
++		}
++	}
++	for _, err := range []error{io.EOF, io.ErrUnexpectedEOF, fmt.Errorf("connection reset by peer")} {
++		if !retrySftpConnection(fmt.Errorf("couldn't initialise SFTP: %w", err)) {
++			t.Fatalf("transient connection error lost its retries: %v", err)
++		}
++	}
++}

@@ -10777,6 +10777,21 @@ fn application_theme(mode: AppearanceMode, accent: AccentColor, system_dark: boo
 }
 
 fn localize_service_error(locale: Locale, error: &ServiceError) -> String {
+    if let ServiceError::Runtime(mountmate_core::runtime::RuntimeError::NotReady { tail, .. }) =
+        error
+        && tail.contains("couldn't initialise SFTP")
+        && (tail.contains("unexpected EOF") || tail.contains("error receiving version packet"))
+    {
+        let explanation = match locale {
+            Locale::English => {
+                "The SSH connection reached SFTP startup, but the server closed the SFTP session. A working SSH shell does not guarantee SFTP is available. Check SFTP with the same address, port and account, or ask the server administrator to check its SFTP subsystem. Your password or private key is not identified as the cause by this error."
+            }
+            Locale::Chinese => {
+                "SSH 连接已进入 SFTP 启动阶段，但服务器关闭了 SFTP 会话。SSH 终端能登录并不代表 SFTP 一定可用。请用相同地址、端口和账号测试 SFTP，或请管理员检查服务器的 SFTP 子系统。这条错误本身不能说明密码或私钥有误。"
+            }
+        };
+        return format!("{explanation}\n\n{error}");
+    }
     if locale == Locale::English {
         return error.to_string();
     }

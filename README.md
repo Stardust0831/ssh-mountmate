@@ -403,7 +403,9 @@ SSH MountMate requires host key validation for native rclone SFTP connections.
 
 The app first reuses an existing host-and-port binding from its managed `known_hosts`, SSH config trust files, or the user's default `known_hosts`. For a new server, it displays the address, port and SHA256 host-key fingerprints. Choose **Trust and mount** to save exactly those keys and continue, or **Cancel** to leave trust unchanged. The dialog can copy its details for verification.
 
-If `ssh-keyscan` fails (including the unsupported-KEX bug in some Windows OpenSSH versions), the app tries a normal SSH handshake with authentication disabled and an isolated temporary trust file. It does not use your password, private key, agent or SSH config for this probe. Temporary files are removed afterward. If neither probe obtains a public key, a dialog shows the diagnostics and offers **Retry** or **Cancel**.
+First-use discovery tries a normal SSH handshake and stops as soon as it receives the public key, falling back to `ssh-keyscan` if needed. The handshake disables authentication and uses an isolated temporary trust file, without your password, private key, agent or SSH config. Temporary files are removed afterward. If neither probe obtains a public key, a dialog shows the diagnostics and offers **Retry** or **Cancel**.
+
+An existing trusted binding requires no extra network probe. Native SFTP negotiates a trusted public-key type and verifies the key during the actual connection, preventing a false mismatch when discovery approved Ed25519 but the mount would otherwise choose RSA. This applies to both password and private-key login. Permanent host-identity failures return immediately instead of repeatedly retrying the same error.
 
 If a changed host key is detected, the app pauses mounting and displays the saved and newly received fingerprints. Verify the change with the server administrator before choosing **Replace key and mount**. Confirmation only updates SSH MountMate's managed trust file; it does not edit your own SSH files or disable host-key checking. Concurrent confirmations cannot silently overwrite one another.
 

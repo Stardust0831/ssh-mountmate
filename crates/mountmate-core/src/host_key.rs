@@ -1,10 +1,14 @@
 //! Host-key discovery is separate from trust: only an explicit confirmation
 //! may write discovered keys into the application's known_hosts file.
+#[cfg(test)]
+#[path = "host_key_live_tests.rs"]
+mod live_tests;
+
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -85,10 +89,6 @@ impl HostKeyReview {
 
     pub(crate) fn matches_previous(&self) -> bool {
         same_keys(&self.keys, &self.previous)
-    }
-
-    pub(crate) fn includes_trusted_key(&self) -> bool {
-        self.keys.iter().any(|key| self.previous.contains(key))
     }
 
     pub fn is_confirmed(&self, paths: &AppPaths) -> bool {
@@ -201,6 +201,38 @@ fn read_bindings(path: &Path, marker: &str) -> Result<Vec<String>, SshError> {
         .collect())
 }
 
+/// Negotiate only key types for which this host has an approved public key.
+/// OpenSSH does this automatically; rclone's Go SSH client otherwise prefers
+/// its own default algorithm even when known_hosts contains only another type.
+pub(crate) fn trusted_host_key_algorithms(
+    path: &Path,
+    host: &str,
+    port: &str,
+) -> Result<Vec<&'static str>, SshError> {
+    let bindings = read_bindings(path, &known_hosts_marker(host, port))?;
+    let has_type = |kind: &str| {
+        bindings
+            .iter()
+            .any(|line| line.split_whitespace().nth(1) == Some(kind))
+    };
+    let mut algorithms = Vec::new();
+    for kind in [
+        "ssh-ed25519",
+        "ecdsa-sha2-nistp256",
+        "ecdsa-sha2-nistp384",
+        "ecdsa-sha2-nistp521",
+    ] {
+        if has_type(kind) {
+            algorithms.push(kind);
+        }
+    }
+    if has_type("ssh-rsa") {
+        // RSA public-key encoding is ssh-rsa even with modern SHA-2 signatures.
+        algorithms.extend(["rsa-sha2-512", "rsa-sha2-256", "ssh-rsa"]);
+    }
+    Ok(algorithms)
+}
+
 pub(crate) fn discover_host_keys(
     paths: &AppPaths,
     keyscan: &Path,
@@ -210,14 +242,15 @@ pub(crate) fn discover_host_keys(
 ) -> Result<Vec<String>, SshError> {
     validate_host_alias(host)?;
     validate_port(port)?;
-    match scan_host_keys(keyscan, host, port, Duration::from_secs(12)) {
+    // One ordinary handshake avoids ssh-keyscan's Windows KEX bug and its
+    // separate connection for each key type. Mounts negotiate the saved type.
+    match probe_host_keys(paths, ssh, host, port, Duration::from_secs(12)) {
         Ok(keys) => Ok(keys),
-        Err(scan_error) => probe_host_keys(paths, ssh, host, port, Duration::from_secs(12))
-            .map_err(|probe_error| {
-                SshError::Command(format!(
-                    "{scan_error}\nSSH handshake fallback: {probe_error}"
-                ))
-            }),
+        Err(probe_error) => {
+            scan_host_keys(keyscan, host, port, Duration::from_secs(8)).map_err(|scan_error| {
+                SshError::Command(format!("{probe_error}\nssh-keyscan fallback: {scan_error}"))
+            })
+        }
     }
 }
 
@@ -320,7 +353,24 @@ pub(crate) fn probe_host_keys(
         }
         String::from_utf8_lossy(&bytes).into_owned()
     });
-    let result = child.wait_timeout(timeout);
+    let deadline = Instant::now() + timeout;
+    let result = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break Ok(None);
+        }
+        let status = child.wait_timeout(remaining.min(Duration::from_millis(50)));
+        if !matches!(status, Ok(None)) {
+            break status;
+        }
+        // Host verification precedes authentication. Once the public key is
+        // written, avoid waiting for server login delays or authentication.
+        if read_optional(&temporary)
+            .is_ok_and(|content| !normalize_host_key_output(host, &port, &content).is_empty())
+        {
+            break Ok(None);
+        }
+    };
     if !matches!(result, Ok(Some(_))) {
         let _ = child.kill();
         let _ = child.wait();
@@ -401,6 +451,15 @@ mod tests {
                 .lines()
                 .count(),
             1
+        );
+        assert_eq!(
+            trusted_host_key_algorithms(&paths.known_hosts(), "example.com", "2222").unwrap(),
+            ["ssh-ed25519"]
+        );
+        assert!(
+            trusted_host_key_algorithms(&paths.known_hosts(), "example.com", "22")
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -520,6 +579,10 @@ mod tests {
         )
         .unwrap();
         assert!(review.changed());
+        assert_eq!(
+            trusted_host_key_algorithms(&paths.known_hosts(), "example.com", "2222").unwrap(),
+            ["ssh-ed25519"]
+        );
         review.confirm(&paths).unwrap();
         assert_eq!(
             fs::read_to_string(paths.known_hosts()).unwrap(),
@@ -576,7 +639,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn failed_keyscan_reports_stderr_and_probe_uses_no_login_credentials() {
+    fn probe_uses_no_login_credentials_and_stops_as_soon_as_key_arrives() {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempdir().unwrap();
         let paths = paths(&temp.path().join("profile with spaces"));
@@ -597,13 +660,15 @@ for arg do
 done
 printf '%s\n' '[example.com]:2222 {KEY}' > "$file"
 echo 'Permission denied (publickey).' >&2
-exit 255
+exec sleep 10
 "#,
             temp.path().join("arguments").display()
         );
         fs::write(&ssh, fixture).unwrap();
         fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        let started = Instant::now();
         let keys = discover_host_keys(&paths, &keyscan, &ssh, "example.com", "2222").unwrap();
+        assert!(started.elapsed() < Duration::from_secs(3));
         assert_eq!(keys, [format!("[example.com]:2222 {KEY}")]);
         let arguments = fs::read_to_string(temp.path().join("arguments")).unwrap();
         for required in [

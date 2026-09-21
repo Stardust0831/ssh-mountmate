@@ -7,6 +7,7 @@ use std::time::Duration;
 use configparser::ini::{Ini, WriteOptions};
 use thiserror::Error;
 
+use crate::host_key::trusted_host_key_algorithms;
 use crate::model::{AuthMethod, ConnectionMethod};
 use crate::paths::AppPaths;
 use crate::ssh::{
@@ -28,6 +29,8 @@ pub enum RcloneConfigError {
     MissingInteractiveConnector,
     #[error("native SFTP requires a readable host-key binding")]
     MissingHostKeyBinding,
+    #[error(transparent)]
+    HostKey(#[from] crate::ssh::SshError),
     #[error("invalid rclone config at {path}: {message}")]
     InvalidConfig { path: PathBuf, message: String },
     #[error(transparent)]
@@ -127,6 +130,11 @@ impl RcloneRemote {
             .and_then(readable_file)
             .filter(|path| known_hosts_file_has_binding(path, &known_hosts_marker(host, port)))
             .ok_or(RcloneConfigError::MissingHostKeyBinding)?;
+        let algorithms = trusted_host_key_algorithms(&known_hosts, host, port)?;
+        if algorithms.is_empty() {
+            return Err(RcloneConfigError::MissingHostKeyBinding);
+        }
+        options.push(("host_key_algorithms".into(), algorithms.join(" ")));
         options.push(("known_hosts_file".into(), known_hosts.display().to_string()));
         Ok(Self { name, options })
     }
@@ -815,6 +823,11 @@ mod tests {
                 .contains(&("known_hosts_file".into(), known_hosts.display().to_string()))
         );
         assert!(!remote.options.iter().any(|(key, _)| key == "key_file"));
+        assert!(
+            remote
+                .options
+                .contains(&("host_key_algorithms".into(), "ssh-ed25519".into()))
+        );
         assert!(
             remote
                 .options

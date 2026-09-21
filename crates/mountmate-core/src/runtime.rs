@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -349,6 +349,9 @@ impl<'a> MountRuntime<'a> {
 
         let remote = server.remote_spec();
         let log = self.paths.mount_log(server.remote_name());
+        // Logs are retained across mounts, but recovery must only inspect the
+        // current attempt (an old mismatch must not mask today's SFTP error).
+        let log_start = fs::metadata(&log).map_or(0, |metadata| metadata.len());
         let rc_addr = allocate_loopback_address()?;
         let rc_user = "mountmate".to_owned();
         let rc_pass = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
@@ -408,7 +411,7 @@ impl<'a> MountRuntime<'a> {
             }
             return Err(RuntimeError::NotReady {
                 log: state.log.clone(),
-                tail: log_tail(&state.log, 24),
+                tail: log_tail_since(&state.log, 24, log_start),
             });
         }
         state.phase = MountPhase::Mounted;
@@ -687,7 +690,12 @@ fn allocate_loopback_address() -> Result<String, RuntimeError> {
     Ok(format!("127.0.0.1:{port}"))
 }
 
+#[cfg(test)]
 fn log_tail(path: &Path, line_count: usize) -> String {
+    log_tail_since(path, line_count, 0)
+}
+
+fn log_tail_since(path: &Path, line_count: usize, start: u64) -> String {
     if line_count == 0 {
         return String::new();
     }
@@ -695,6 +703,9 @@ fn log_tail(path: &Path, line_count: usize) -> String {
         return String::new();
     };
     let mut reader = BufReader::new(file);
+    if reader.seek(SeekFrom::Start(start)).is_err() {
+        return String::new();
+    }
     let mut lines = VecDeque::with_capacity(line_count);
     let mut bytes = Vec::new();
     while reader.read_until(b'\n', &mut bytes).unwrap_or(0) > 0 {
@@ -1276,6 +1287,26 @@ mod tests {
 
         assert_eq!(log_tail(&log, 2), "three\nfour");
         assert_eq!(log_tail(&log, 0), "");
+    }
+
+    #[test]
+    fn mount_error_excludes_previous_attempts_from_retained_log() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("mount.log");
+        fs::write(&log, "old attempt: knownhosts: key mismatch\n").unwrap();
+        let start = fs::metadata(&log).unwrap().len();
+        assert!(log_tail_since(&log, 24, start).is_empty());
+        writeln!(
+            OpenOptions::new().append(true).open(&log).unwrap(),
+            "new attempt: SFTP unexpected EOF"
+        )
+        .unwrap();
+        assert_eq!(
+            log_tail_since(&log, 24, start),
+            "new attempt: SFTP unexpected EOF"
+        );
+        assert!(fs::read_to_string(log).unwrap().contains("old attempt"));
     }
 
     #[test]

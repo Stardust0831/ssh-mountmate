@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build the pinned rclone release with the small SFTP Lustre quota patch.
+# Build the pinned rclone release with SFTP quota and host-key retry fixes.
 # Usage: build-rclone.sh OUTPUT [GOOS] [GOARCH]
 output=${1:?output path required}
 goos=${2:-$(go env GOOS)}
@@ -31,6 +31,7 @@ src=$(mktemp -d "$work/source.XXXXXX")
 trap 'rm -rf "$src"' EXIT
 tar -xzf "$archive_path" -C "$src" --strip-components=1
 patch --forward --batch -d "$src" -p1 < "$(cd "$(dirname "$0")/.." && pwd)/patches/rclone-v1.74.4-lustre-quota.patch"
+patch --forward --batch -d "$src" -p1 < "$(cd "$(dirname "$0")/.." && pwd)/patches/rclone-v1.74.4-host-key-retry.patch"
 mkdir -p "$output_dir"
 case "$goos" in
   linux|darwin) cgo_enabled=1 ;;
