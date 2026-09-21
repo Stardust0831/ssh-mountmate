@@ -450,11 +450,11 @@ The Rust application keeps a native system-tray icon on Windows, a menu-bar item
 
 ## Capacity Display
 
-For mounted connections, SSH MountMate shows used and total capacity on each card. It first tries
-to read the remote directory's Lustre project ID with `lfs project -d` and its quota with
-`lfs quota -p`. If that query fails, Lustre is unavailable, or there is no nonzero hard block limit,
-the app tries the filesystem capacity reported by the local mountpoint, then `rclone about`, and
-finally a non-interactive remote `df -Pk` query.
+For mounted connections, SSH MountMate reads capacity and quota details through the mount process's
+authenticated loopback interface. The backend uses `lfs project -d` to identify the remote directory's
+Lustre project, then `lfs quota -p` to obtain block and inode soft/hard limits. When no usable Lustre
+quota exists, it returns normal filesystem statistics. If the mount interface is unavailable, the app
+retains its separate SSH, local mountpoint and `rclone about` fallback paths.
 
 When Lustre project quota data is available, the hard block limit (`blimit`) is the displayed total
 and the capacity percentage is calculated against it. A lower block soft limit (`bquota`) gets a
@@ -465,10 +465,10 @@ treat the hard capacity as full. Whether writes continue after the soft limit de
 grace and enforcement policy. Capacity labels use `KiB`, `MiB`, `GiB`, and `TiB` suffixes while
 retaining the existing scaling.
 
-Interactive connections reuse their existing verified shared SSH session for the Lustre and `df`
-queries. Other supported profiles need a working non-interactive system SSH login; native SFTP's
-saved passwords and key passphrases are not passed to `ssh`. Password-based native connections
-without an imported or app-managed SSH profile skip these SSH queries.
+Native SFTP quota queries reuse the mount's verified SSH session, so both password and private-key
+login work without another system SSH configuration or fingerprint confirmation. OpenSSH and
+interactive connections retain their configured transport. Each directory mapping queries its own
+remote path. Remount after upgrading so the mount uses the bundled rclone with complete quota fields.
 
 ## Settings
 

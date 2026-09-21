@@ -9,7 +9,7 @@ use std::os::windows::process::CommandExt;
 
 use thiserror::Error;
 
-use crate::capacity::{CapacityError, CapacityInfo, mounted_capacity};
+use crate::capacity::{CapacityError, CapacityInfo, mounted_capacity, session_capacity};
 use crate::connection::{SshImportPlan, plan_ssh_imports};
 use crate::credential::{CredentialError, SystemCredentialStore, hydrate_server_from_system};
 use crate::host_key::{HostKeyReview, discover_host_keys};
@@ -178,6 +178,10 @@ impl MountService {
             return Ok(None);
         }
         let state: MountState = read_json(&self.paths.state_file(&server.id))?;
+        if let Ok(Some(capacity)) = session_capacity(&state) {
+            return Ok(Some(capacity));
+        }
+        // Older or unavailable RC backends retain the existing fallback path.
         let external_ssh = self.interactive_ssh_arguments(server)?;
         let prepared_server = self.prepare_server_credentials(server)?;
         self.ensure_remote(&prepared_server, external_ssh.as_deref())?;

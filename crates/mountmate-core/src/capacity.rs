@@ -10,6 +10,7 @@ use serde::Deserialize;
 use thiserror::Error;
 use wait_timeout::ChildExt;
 
+use crate::rc::{HttpRcClient, RcApi};
 use crate::rclone::openssh_target_arguments;
 use crate::{AuthMethod, MountState, ServerConfig};
 
@@ -141,6 +142,42 @@ struct RcloneAbout {
     total: Option<u64>,
     used: Option<u64>,
     free: Option<u64>,
+    #[serde(rename = "lustreQuota")]
+    lustre_quota: Option<LustreQuotaDetails>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LustreQuotaDetails {
+    soft_total: Option<u64>,
+    inodes_used: Option<u64>,
+    inodes_total: Option<u64>,
+    inodes_soft_total: Option<u64>,
+}
+
+/// Query the backend already owned by the mount. Its SSH session carries the
+/// verified host key and login credentials, including passwords/passphrases.
+pub(crate) fn session_capacity(state: &MountState) -> Result<Option<CapacityInfo>, CapacityError> {
+    let client = HttpRcClient::with_credentials(
+        &state.rc_addr,
+        &state.rc_user,
+        &state.rc_pass,
+        Duration::from_secs(12),
+    )
+    .map_err(|error| CapacityError::Command(error.to_string()))?;
+    capacity_from_session(&client, &state.remote)
+}
+
+fn capacity_from_session(
+    client: &impl RcApi,
+    remote: &str,
+) -> Result<Option<CapacityInfo>, CapacityError> {
+    let response = client
+        .call("operations/about", serde_json::json!({ "fs": remote }))
+        .map_err(|error| CapacityError::Command(error.to_string()))?;
+    let about: RcloneAbout = serde_json::from_value(response)
+        .map_err(|error| CapacityError::InvalidResponse(error.to_string()))?;
+    Ok(capacity_from_about(about))
 }
 
 pub fn mounted_capacity(
@@ -215,11 +252,26 @@ fn capacity_from_about(about: RcloneAbout) -> Option<CapacityInfo> {
     let used = about
         .used
         .or_else(|| Some(total?.saturating_sub(about.free?)));
-    capacity_from_usage(
+    let mut capacity = capacity_from_usage(
         total.unwrap_or_default(),
         used.unwrap_or_default(),
         CapacitySource::RcloneAbout,
-    )
+    )?;
+    if let Some(quota) = about.lustre_quota {
+        capacity.source = CapacitySource::LustreProjectQuota;
+        capacity.soft_total = quota
+            .soft_total
+            .filter(|soft| *soft > 0 && *soft <= capacity.total);
+        if let (Some(used), Some(total)) = (quota.inodes_used, quota.inodes_total) {
+            capacity.inode = inode_from_usage(total, used).map(|mut inode| {
+                inode.soft_total = quota
+                    .inodes_soft_total
+                    .filter(|soft| *soft > 0 && *soft <= total);
+                inode
+            });
+        }
+    }
+    Some(capacity)
 }
 
 fn lustre_project_capacity(
@@ -345,14 +397,27 @@ pub fn parse_lustre_quota(output: &str) -> Option<CapacityInfo> {
         {
             continue;
         }
-        let fields: Vec<_> = line.split_whitespace().collect();
-        if fields.len() < 4 {
-            continue;
-        }
-        let Some(used_kib) = parse_quota_used_token(fields[1]) else {
+        let row: Vec<_> = line.split_whitespace().collect();
+        // lfs places long filesystem paths on their own line. The following
+        // numeric row then starts directly with used blocks.
+        let fields = if row
+            .first()
+            .and_then(|value| parse_quota_used_token(value))
+            .is_some()
+        {
+            &row[..]
+        } else if row.len() > 1 {
+            &row[1..]
+        } else {
             continue;
         };
-        let Some(limit_kib) = parse_quota_limit_token(fields[3]) else {
+        if fields.len() < 3 {
+            continue;
+        }
+        let Some(used_kib) = parse_quota_used_token(fields[0]) else {
+            continue;
+        };
+        let Some(limit_kib) = parse_quota_limit_token(fields[2]) else {
             continue;
         };
         let mut capacity = capacity_from_usage(
@@ -360,21 +425,21 @@ pub fn parse_lustre_quota(output: &str) -> Option<CapacityInfo> {
             used_kib.saturating_mul(1024),
             CapacitySource::LustreProjectQuota,
         )?;
-        if let Some(soft_kib) = parse_quota_limit_token(fields[2])
+        if let Some(soft_kib) = parse_quota_limit_token(fields[1])
             && soft_kib <= limit_kib
         {
             capacity.soft_total = Some(soft_kib.saturating_mul(1024));
         }
         // lfs quota columns after the byte quota are: files used, quota, limit, grace.
         // A zero limit means unlimited, so leave inode information unavailable.
-        if fields.len() >= 8
+        if fields.len() >= 7
             && let (Some(inode_used), Some(inode_limit)) = (
-                parse_quota_used_token(fields[5]),
-                parse_quota_limit_token(fields[7]),
+                parse_quota_used_token(fields[4]),
+                parse_quota_limit_token(fields[6]),
             )
         {
             capacity.inode = inode_from_usage(inode_limit, inode_used).map(|mut inode| {
-                if let Some(inode_soft) = parse_quota_limit_token(fields[6])
+                if let Some(inode_soft) = parse_quota_limit_token(fields[5])
                     && inode_soft <= inode_limit
                 {
                     inode.soft_total = Some(inode_soft);
@@ -683,6 +748,7 @@ mod tests {
             total: Some(100),
             used: None,
             free: Some(40),
+            ..Default::default()
         })
         .unwrap();
         assert_eq!((from_free.used, from_free.total), (60, 100));
@@ -691,9 +757,70 @@ mod tests {
             total: None,
             used: Some(25),
             free: Some(75),
+            ..Default::default()
         })
         .unwrap();
         assert_eq!((from_parts.used, from_parts.total), (25, 100));
+    }
+
+    #[test]
+    fn session_quota_preserves_both_soft_limits_and_uses_mounted_path() {
+        struct MountedSession;
+        impl RcApi for MountedSession {
+            fn call(
+                &self,
+                method: &str,
+                params: serde_json::Value,
+            ) -> Result<serde_json::Value, crate::rc::RcError> {
+                assert_eq!(method, "operations/about");
+                assert_eq!(
+                    params,
+                    serde_json::json!({"fs": "sai:/project with spaces"})
+                );
+                Ok(serde_json::json!({
+                    "used": 40960000, "total": 102400000, "free": 61440000,
+                    "lustreQuota": {
+                        "softTotal": 30720000,
+                        "inodesUsed": 700, "inodesTotal": 1000, "inodesSoftTotal": 500
+                    }
+                }))
+            }
+        }
+        let capacity = capacity_from_session(&MountedSession, "sai:/project with spaces")
+            .unwrap()
+            .unwrap();
+        assert_eq!(capacity.source, CapacitySource::LustreProjectQuota);
+        assert_eq!((capacity.used, capacity.total), (40960000, 102400000));
+        assert_eq!(capacity.soft_limit_percent(), Some(30.0));
+        assert!(capacity.soft_limit_exceeded());
+        let inode = capacity.inode.unwrap();
+        assert_eq!((inode.used, inode.total), (700, 1000));
+        assert_eq!(inode.soft_limit_percent(), Some(50.0));
+        assert!(inode.soft_limit_exceeded());
+    }
+
+    #[test]
+    fn quota_details_ignore_unlimited_or_inconsistent_limits() {
+        for soft in [0, 101] {
+            let about: RcloneAbout = serde_json::from_value(serde_json::json!({
+                "total": 100, "used": 25,
+                "lustreQuota": {"softTotal": soft, "inodesTotal": 0, "inodesUsed": 12}
+            }))
+            .unwrap();
+            let capacity = capacity_from_about(about).unwrap();
+            assert_eq!(capacity.soft_total, None);
+            assert_eq!(capacity.inode, None);
+        }
+    }
+
+    #[test]
+    fn wrapped_quota_row_keeps_blocks_and_inodes_in_their_columns() {
+        let wrapped = parse_lustre_quota("Disk quotas for prj 42 (pid 42):\nFilesystem kbytes quota limit grace files quota limit grace\n/very/long/filesystem/name\n 40000* 30000 100000 - 700* 500 1000 6d\n").unwrap();
+        let normal =
+            parse_lustre_quota("/lustre 40000* 30000 100000 - 700* 500 1000 6d\n").unwrap();
+        assert_eq!(wrapped, normal);
+        assert_eq!(wrapped.soft_total, Some(30000 * 1024));
+        assert_eq!(wrapped.inode.unwrap().soft_total, Some(500));
     }
 
     #[test]

@@ -1,0 +1,342 @@
+--- a/fs/types.go
++++ b/fs/types.go
+@@ -352,12 +352,22 @@
+ //
+ // If a value is nil then it isn't supported by that backend
+ type Usage struct {
+-	Total   *int64 `json:"total,omitempty"`   // quota of bytes that can be used
+-	Used    *int64 `json:"used,omitempty"`    // bytes in use
+-	Trashed *int64 `json:"trashed,omitempty"` // bytes in trash
+-	Other   *int64 `json:"other,omitempty"`   // other usage e.g. gmail in drive
+-	Free    *int64 `json:"free,omitempty"`    // bytes which can be uploaded before reaching the quota
+-	Objects *int64 `json:"objects,omitempty"` // objects in the storage system
++	Total       *int64            `json:"total,omitempty"`       // quota of bytes that can be used
++	Used        *int64            `json:"used,omitempty"`        // bytes in use
++	Trashed     *int64            `json:"trashed,omitempty"`     // bytes in trash
++	Other       *int64            `json:"other,omitempty"`       // other usage e.g. gmail in drive
++	Free        *int64            `json:"free,omitempty"`        // bytes which can be uploaded before reaching the quota
++	Objects     *int64            `json:"objects,omitempty"`     // objects in the storage system
++	LustreQuota *LustreQuotaUsage `json:"lustreQuota,omitempty"` // optional project quota details
++}
++
++// LustreQuotaUsage supplements the hard byte limit in Usage without changing
++// the standard filesystem capacity reported to the operating system.
++type LustreQuotaUsage struct {
++	SoftTotal       *int64 `json:"softTotal,omitempty"`
++	InodesUsed      *int64 `json:"inodesUsed,omitempty"`
++	InodesTotal     *int64 `json:"inodesTotal,omitempty"`
++	InodesSoftTotal *int64 `json:"inodesSoftTotal,omitempty"`
+ }
+ 
+ // WriterAtCloser wraps io.WriterAt and io.Closer
+--- a/backend/sftp/sftp.go
++++ b/backend/sftp/sftp.go
+@@ -1990,24 +1990,42 @@
+ func lustreQuotaCommand(pathArg string) string {
+ 	return "p=" + pathArg + `; command -v lfs >/dev/null 2>&1 || exit 1
+ r=$(readlink -f -- "$p" 2>/dev/null || printf '%s' "$p")
+-t=$(LC_ALL=C df -P -T "$r" 2>/dev/null | awk 'NR==2 {print $2}')
++d=$(LC_ALL=C df -P -T "$r" 2>/dev/null | awk 'NR==2 {print $2 "\t" $7}')
++t=${d%%	*}
++m=${d#*	}
+ [ "$t" = lustre ] || exit 1
+ id=$(lfs project -d "$r" 2>/dev/null | awk 'NF >= 3 && $1 ~ /^[0-9]+$/ {print $1; exit}')
+ [ -n "$id" ] || exit 1
+-q=$(LC_ALL=C lfs quota -p "$id" "$r" 2>/dev/null) || exit 1
+-printf '%s\n' "$q" | awk '
+-NF >= 3 && $1 ~ /^[0-9]+[*]?$/ {used=$1; hard=$3}
+-NF >= 4 && $2 ~ /^[0-9]+[*]?$/ && $1 !~ /^[0-9]+[*]?$/ {used=$2; hard=$4}
+-used != "" {gsub(/[*]/,"",used); gsub(/[*]/,"",hard); print used, hard; exit}'`
++for target in "$r" "$m"; do
++q=$(LC_ALL=C lfs quota -p "$id" "$target" 2>/dev/null) || continue
++row=$(printf '%s\n' "$q" | awk '
++function emit(n, used, soft, hard, files, isoft, ihard) {
++  used=$(n+1); soft=$(n+2); hard=$(n+3)
++  gsub(/[*]/,"",used); gsub(/[*]/,"",soft); gsub(/[*]/,"",hard)
++  if (hard !~ /^[0-9]+$/ || hard+0 <= 0) return
++  files="-"; isoft="-"; ihard="-"
++  if (NF >= n+7) { files=$(n+5); isoft=$(n+6); ihard=$(n+7) }
++  gsub(/[*]/,"",files); gsub(/[*]/,"",isoft); gsub(/[*]/,"",ihard)
++  print used, soft, hard, files, isoft, ihard; exit
++}
++NF >= 3 && $1 ~ /^[0-9]+[*]?$/ {emit(0)}
++NF >= 4 && $2 ~ /^[0-9]+[*]?$/ && $1 !~ /^[0-9]+[*]?$/ {emit(1)}')
++[ -z "$row" ] || { printf '%s\n' "$row"; exit 0; }
++done
++exit 1`
+ }
+ 
+ func parseLustreQuota(stdout []byte) *fs.Usage {
+ 	fields := strings.Fields(string(stdout))
+-	if len(fields) != 2 {
++	if len(fields) != 2 && len(fields) != 6 {
+ 		return nil
+ 	}
++	hardIndex := 1
++	if len(fields) == 6 {
++		hardIndex = 2
++	}
+ 	used, errUsed := strconv.ParseInt(fields[0], 10, 64)
+-	hard, errHard := strconv.ParseInt(fields[1], 10, 64)
++	hard, errHard := strconv.ParseInt(fields[hardIndex], 10, 64)
+ 	if errUsed != nil || errHard != nil || used < 0 || hard <= 0 || used > math.MaxInt64/1024 || hard > math.MaxInt64/1024 {
+ 		return nil
+ 	}
+@@ -2017,7 +2035,22 @@
+ 	if free < 0 {
+ 		free = 0
+ 	}
+-	return &fs.Usage{Total: fs.NewUsageValue(hard), Used: fs.NewUsageValue(used), Free: fs.NewUsageValue(free)}
++	details := &fs.LustreQuotaUsage{}
++	if len(fields) == 6 {
++		if soft, err := strconv.ParseInt(fields[1], 10, 64); err == nil && soft > 0 && soft <= hard/1024 {
++			details.SoftTotal = fs.NewUsageValue(soft * 1024)
++		}
++		inodeUsed, usedErr := strconv.ParseInt(fields[3], 10, 64)
++		inodeHard, hardErr := strconv.ParseInt(fields[5], 10, 64)
++		if usedErr == nil && hardErr == nil && inodeUsed >= 0 && inodeHard > 0 {
++			details.InodesUsed = fs.NewUsageValue(inodeUsed)
++			details.InodesTotal = fs.NewUsageValue(inodeHard)
++			if soft, err := strconv.ParseInt(fields[4], 10, 64); err == nil && soft > 0 && soft <= inodeHard {
++				details.InodesSoftTotal = fs.NewUsageValue(soft)
++			}
++		}
++	}
++	return &fs.Usage{Total: fs.NewUsageValue(hard), Used: fs.NewUsageValue(used), Free: fs.NewUsageValue(free), LustreQuota: details}
+ }
+ 
+ // Shutdown the backend, closing any background tasks and any
+--- a/backend/sftp/lustre_quota_test.go
++++ b/backend/sftp/lustre_quota_test.go
+@@ -3,6 +3,7 @@
+ package sftp
+ 
+ import (
++	"encoding/json"
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
+@@ -56,8 +57,8 @@
+ 		name, fs, quota, exit string
+ 		wantFree              int64
+ 	}{
+-		{"over soft quota", "lustre", "/lustre 40000* 30000 100000 - 3 0 0 -", "0", 61440000},
+-		{"wrapped filesystem", "lustre", "/very/long/filesystem\n 40000* 30000 100000* - 3 0 0 -", "0", 61440000},
++		{"over soft quota", "lustre", "/lustre 40000* 30000 100000 - 700* 500 1000 -", "0", 61440000},
++		{"wrapped filesystem", "lustre", "/very/long/filesystem\n 40000* 30000 100000* - 700* 500 1000 -", "0", 61440000},
+ 		{"hard limit reached", "lustre", "/lustre 100000 30000 100000 - 3 0 0 -", "0", 0},
+ 		{"no hard limit", "lustre", "/lustre 40000 30000 0 - 3 0 0 -", "0", -1},
+ 		{"quota command failed", "lustre", "/lustre 40000 30000 100000 - 3 0 0 -", "1", -1},
+@@ -79,6 +80,37 @@
+ 			u := parseLustreQuota(out)
+ 			require.NotNil(t, u)
+ 			require.Equal(t, tc.wantFree, *u.Free)
++			if tc.name == "over soft quota" || tc.name == "wrapped filesystem" {
++				require.Equal(t, int64(30720000), *u.LustreQuota.SoftTotal)
++				require.Equal(t, int64(700), *u.LustreQuota.InodesUsed)
++				require.Equal(t, int64(500), *u.LustreQuota.InodesSoftTotal)
++				require.Equal(t, int64(1000), *u.LustreQuota.InodesTotal)
++			}
+ 		})
+ 	}
+ }
++
++func TestLustreQuotaDetails(t *testing.T) {
++	u := parseLustreQuota([]byte("40000 30000 100000 700 500 1000"))
++	require.NotNil(t, u)
++	require.Equal(t, int64(102400000), *u.Total)
++	require.Equal(t, int64(30720000), *u.LustreQuota.SoftTotal)
++	require.Equal(t, int64(700), *u.LustreQuota.InodesUsed)
++	require.Equal(t, int64(1000), *u.LustreQuota.InodesTotal)
++	require.Equal(t, int64(500), *u.LustreQuota.InodesSoftTotal)
++	// RC reshapes Usage through JSON; these fields must survive that boundary.
++	payload, err := json.Marshal(u)
++	require.NoError(t, err)
++	require.JSONEq(t, `{"total":102400000,"used":40960000,"free":61440000,"lustreQuota":{"softTotal":30720000,"inodesUsed":700,"inodesTotal":1000,"inodesSoftTotal":500}}`, string(payload))
++	for _, input := range []string{
++		"40 0 100 7 0 0", "40 - 100 7 - -", "40 101 100 7 5 0",
++	} {
++		u := parseLustreQuota([]byte(input))
++		require.NotNil(t, u)
++		require.Nil(t, u.LustreQuota.SoftTotal)
++		require.Nil(t, u.LustreQuota.InodesTotal)
++	}
++	equal := parseLustreQuota([]byte("40 100 100 7 10 10"))
++	require.Equal(t, int64(102400), *equal.LustreQuota.SoftTotal)
++	require.Equal(t, int64(10), *equal.LustreQuota.InodesSoftTotal)
++}
+--- /dev/null
++++ b/backend/sftp/lustre_quota_live_test.go
+@@ -0,0 +1,172 @@
++//go:build !plan9
++
++package sftp
++
++import (
++	"bytes"
++	"context"
++	"crypto/ed25519"
++	"crypto/rand"
++	"encoding/pem"
++	"fmt"
++	"io"
++	"net"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	pkgSftp "github.com/pkg/sftp"
++	"github.com/rclone/rclone/fs"
++	"github.com/rclone/rclone/fs/cache"
++	"github.com/rclone/rclone/fs/config/configmap"
++	"github.com/rclone/rclone/fs/config/obscure"
++	_ "github.com/rclone/rclone/fs/operations"
++	"github.com/rclone/rclone/fs/rc"
++	"github.com/stretchr/testify/require"
++	"golang.org/x/crypto/ssh"
++	"golang.org/x/crypto/ssh/knownhosts"
++)
++
++// Exercise the production SSH connection pool and operations/about RC route.
++// The server returns quota command output; Unix shell formatting is covered
++// separately by TestLustreQuotaCommand. This transport test runs on Windows too.
++func TestLustreQuotaRCReusesAuthenticatedSession(t *testing.T) {
++	for _, auth := range []string{"password", "private-key"} {
++		t.Run(auth, func(t *testing.T) {
++			root := t.TempDir()
++			_, privateKey, err := ed25519.GenerateKey(rand.Reader)
++			require.NoError(t, err)
++			signer, err := ssh.NewSignerFromKey(privateKey)
++			require.NoError(t, err)
++			cfg := &ssh.ServerConfig{}
++			cfg.PasswordCallback = func(_ ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
++				if auth == "password" && string(password) == "fixture-password" {
++					return nil, nil
++				}
++				return nil, fmt.Errorf("unexpected password authentication")
++			}
++			cfg.PublicKeyCallback = func(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
++				if auth == "private-key" && bytes.Equal(key.Marshal(), signer.PublicKey().Marshal()) {
++					return nil, nil
++				}
++				return nil, fmt.Errorf("unexpected key authentication")
++			}
++			cfg.AddHostKey(signer)
++			listener, err := net.Listen("tcp", "127.0.0.1:0")
++			require.NoError(t, err)
++			t.Cleanup(func() { _ = listener.Close() })
++			var connections atomic.Int32
++			var commands atomic.Int32
++			go func() {
++				for {
++					raw, err := listener.Accept()
++					if err != nil {
++						return
++					}
++					connections.Add(1)
++					go func() {
++						defer raw.Close()
++						_ = raw.SetDeadline(time.Now().Add(20 * time.Second))
++						conn, channels, requests, err := ssh.NewServerConn(raw, cfg)
++						if err != nil {
++							return
++						}
++						defer conn.Close()
++						go ssh.DiscardRequests(requests)
++						for incoming := range channels {
++							channel, requests, err := incoming.Accept()
++							if err != nil {
++								return
++							}
++							go func() {
++								defer channel.Close()
++								for request := range requests {
++									switch request.Type {
++									case "subsystem":
++										var payload struct{ Name string }
++										if ssh.Unmarshal(request.Payload, &payload) != nil || payload.Name != "sftp" {
++											_ = request.Reply(false, nil)
++											continue
++										}
++										_ = request.Reply(true, nil)
++										server, err := pkgSftp.NewServer(channel)
++										if err == nil {
++											_ = server.Serve()
++											_ = server.Close()
++										}
++										return
++									case "exec":
++										var payload struct{ Command string }
++										_ = ssh.Unmarshal(request.Payload, &payload)
++										_ = request.Reply(true, nil)
++										status := uint32(1)
++										if strings.Contains(payload.Command, "lfs quota -p") {
++											commands.Add(1)
++											_, _ = io.WriteString(channel, "40000 30000 100000 700 500 1000\n")
++											status = 0
++										}
++										_, _ = channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{status}))
++										return
++									default:
++										_ = request.Reply(false, nil)
++									}
++								}
++							}()
++						}
++					}()
++				}
++			}()
++			host, port, err := net.SplitHostPort(listener.Addr().String())
++			require.NoError(t, err)
++			trust := filepath.Join(root, "known_hosts")
++			require.NoError(t, os.WriteFile(trust, []byte(knownhosts.Line([]string{listener.Addr().String()}, signer.PublicKey())+"\n"), 0600))
++			options := configmap.Simple{
++				"host": host, "port": port, "user": "fixture", "known_hosts_file": trust,
++				"host_key_algorithms": "ssh-ed25519", "lustre_quota": "true", "shell_type": "unix", "disable_hashcheck": "true",
++			}
++			if auth == "password" {
++				options["pass"] = obscure.MustObscure("fixture-password")
++			} else {
++				block, err := ssh.MarshalPrivateKey(privateKey, "fixture")
++				require.NoError(t, err)
++				keyPath := filepath.Join(root, "login-key")
++				require.NoError(t, os.WriteFile(keyPath, pem.EncodeToMemory(block), 0600))
++				options["key_file"] = keyPath
++			}
++			ctx := context.Background()
++			name := "quota-" + auth
++			remoteDirectory := filepath.Join(root, "project with spaces")
++			require.NoError(t, os.Mkdir(remoteDirectory, 0700))
++			remoteRoot := filepath.ToSlash(remoteDirectory)
++			info, err := fs.Find("sftp")
++			require.NoError(t, err)
++			mapper := fs.ConfigMap("sftp", info.Options, name, options)
++			backend, err := NewFs(ctx, name, remoteRoot, mapper)
++			require.NoError(t, err)
++			t.Cleanup(func() { _ = backend.(*Fs).Shutdown(ctx) })
++			remote := name + ":" + remoteRoot
++			cache.Put(remote, backend)
++			t.Cleanup(func() { cache.Clear() })
++			// No external SSH config or usable on-disk credentials are needed by RC.
++			delete(options, "pass")
++			delete(options, "key_file")
++			call := rc.Calls.Get("operations/about")
++			require.NotNil(t, call)
++			for range 2 {
++				out, err := call.Fn(ctx, rc.Params{"fs": remote})
++				require.NoError(t, err)
++				details, ok := out["lustreQuota"].(map[string]any)
++				require.True(t, ok, "%#v", out)
++				require.Equal(t, float64(30720000), details["softTotal"])
++				require.Equal(t, float64(700), details["inodesUsed"])
++				require.Equal(t, float64(1000), details["inodesTotal"])
++				require.Equal(t, float64(500), details["inodesSoftTotal"])
++			}
++			require.Equal(t, int32(2), commands.Load())
++			require.Equal(t, int32(1), connections.Load(), "capacity refresh opened another SSH connection")
++		})
++	}
++}
