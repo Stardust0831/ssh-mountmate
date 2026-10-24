@@ -3,6 +3,7 @@ members = [
     "crates/mountmate-app",
     "crates/mountmate-core",
     "crates/mountmate-platform",
+    "crates/mountmate-sai",
 ]
 resolver = "2"
 

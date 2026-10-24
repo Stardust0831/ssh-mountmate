@@ -260,7 +260,7 @@ Intel Mac 选择 `x64`，Apple Silicon 选择 `arm64`；两者都包含原生应
 5. 选择：
    - `SSH config`：从已有 SSH Host 中选择，并自动填充默认值。
    - `SSH config (batch)`：选择一个 SSH config 文件，预览后批量导入其中全部具体 `Host`。
-   - `SAI cluster`：从 SAI 预设开始。HostName 和端口会预填，只需填写用户名和密钥文件。
+   - `SAI cluster`：可点击**登录 SAI 账号**检查账号配置支持，也可使用预设手动填写用户名和密钥文件。账号配置仍需 [Identity/Portal 配套接口](docs/sai-account-setup.md)启用；未启用时会明确提示，手动配置仍可使用。
    - `Manual`：手动填写主机、用户名、端口和认证信息。
 6. 选择远端路径。默认基准目录是 `$HOME`。
 7. 如果默认连接方式不适合，可以选择连接方式。

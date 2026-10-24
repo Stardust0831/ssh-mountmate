@@ -82,6 +82,7 @@ mod host_key_dialog;
 mod i18n;
 mod icons;
 mod read_only;
+mod sai_setup;
 mod transfer_center;
 mod tray;
 
@@ -686,6 +687,7 @@ struct App {
     popup_close_notice_shown: bool,
     screen: Screen,
     connection_draft: Option<ConnectionDraft>,
+    sai_setup: sai_setup::State,
     connection_tags_input: String,
     connection_custom_mountpoint: String,
     windows_drive_letters: Vec<char>,
@@ -1390,6 +1392,7 @@ enum Message {
     LogAction(text_editor::Action),
     CloseLog,
     CancelEditor,
+    SaiSetup(sai_setup::Message),
     ConnectionSourceChanged(ConnectionSource),
     BatchImportSourceChanged(BatchImportSource),
     ConnectionFieldChanged(ConnectionField, String),
@@ -1532,6 +1535,7 @@ fn source_config_mutation(message: &Message) -> bool {
         || matches!(
             message,
             Message::ConnectionTagsChanged(_)
+                | Message::SaiSetup(_)
                 | Message::ConnectionAuthChanged(_)
                 | Message::PasswordChanged(_)
                 | Message::KeyPassphraseChanged(_)
@@ -1548,6 +1552,7 @@ fn is_editor_mutation(message: &Message) -> bool {
     matches!(
         message,
         Message::AddMountMapping
+            | Message::SaiSetup(_)
             | Message::RemovePrimaryMapping
             | Message::RemoveMountMapping(_)
             | Message::MappingRemoteBaseChanged(_, _)
@@ -1891,6 +1896,7 @@ impl App {
             popup_close_notice_shown: false,
             screen,
             connection_draft: None,
+            sai_setup: sai_setup::State::default(),
             connection_tags_input: String::new(),
             connection_custom_mountpoint: String::new(),
             windows_drive_letters: Vec::new(),
@@ -1963,6 +1969,15 @@ impl App {
         if self.editor_saving && is_editor_mutation(&message) {
             return Task::none();
         }
+        if self.sai_setup.in_progress()
+            && is_editor_mutation(&message)
+            && !matches!(
+                message,
+                Message::SaiSetup(_) | Message::CancelEditor | Message::ConnectionSourceChanged(_)
+            )
+        {
+            return Task::none();
+        }
         if let Some(draft) = &self.connection_draft {
             let row = match &message {
                 Message::RemoveMountMapping(i)
@@ -2014,6 +2029,17 @@ impl App {
             return Task::none();
         }
         let task = self.update_message(message);
+        if self.screen != Screen::ConnectionEditor
+            || self.connection_draft.as_ref().is_none_or(|draft| {
+                draft.source != ConnectionSource::SaiCluster
+                    || draft
+                        .editing_id
+                        .as_deref()
+                        .is_some_and(|id| !self.can_modify(id))
+            })
+        {
+            self.sai_setup.reset();
+        }
         self.sync_tray();
         task
     }
@@ -2511,6 +2537,7 @@ impl App {
                     return Task::none();
                 }
                 let mut draft = ConnectionDraft::default();
+                self.sai_setup.reset();
                 draft.ssh_config_path = default_ssh_config_path().display().to_string();
                 self.connection_draft = Some(draft);
                 self.windows_drive_letters = available_windows_drive_letters();
@@ -3228,6 +3255,7 @@ impl App {
             }
             Message::CancelEditor => {
                 if !self.editor_saving {
+                    self.sai_setup.reset();
                     self.connection_draft = None;
                     self.settings_draft = None;
                     self.ssh_import_plan = None;
@@ -3239,6 +3267,7 @@ impl App {
                 }
             }
             Message::ConnectionSourceChanged(source) => {
+                self.sai_setup.reset();
                 if let Some(draft) = &mut self.connection_draft {
                     draft.source = source;
                     if matches!(
@@ -3278,6 +3307,19 @@ impl App {
                     if source == BatchImportSource::SshConfig {
                         return self.load_ssh_config();
                     }
+                }
+            }
+            Message::SaiSetup(message) => {
+                if self.screen == Screen::ConnectionEditor
+                    && let Some(draft) = &mut self.connection_draft
+                    && draft.source == ConnectionSource::SaiCluster
+                {
+                    let (task, configured) =
+                        self.sai_setup.update(message, &self.paths.data_dir, locale);
+                    if let Some(configured) = configured {
+                        configured.apply_to(draft);
+                    }
+                    return task.map(Message::SaiSetup);
                 }
             }
             Message::ConnectionFieldChanged(field, value) => {
@@ -4148,6 +4190,7 @@ impl App {
                     return Task::none();
                 }
                 let mut draft = ConnectionDraft::default();
+                self.sai_setup.reset();
                 draft.source = ConnectionSource::SshConfigBatch;
                 draft.batch_import_source = BatchImportSource::SshMountMateConfig;
                 self.connection_draft = Some(draft);
@@ -4382,6 +4425,7 @@ impl App {
                     return Task::none();
                 }
                 let can_modify = self.can_modify(&id);
+                self.sai_setup.reset();
                 if let Some(server) = self.servers.iter().find(|server| server.id == id) {
                     self.connection_draft = Some(ConnectionDraft::from_server(server));
                     self.windows_drive_letters = available_windows_drive_letters();
@@ -4857,7 +4901,7 @@ impl App {
     }
 
     fn save_connection(&mut self) -> Task<Message> {
-        if self.editor_saving || self.connection_list_saving {
+        if self.editor_saving || self.connection_list_saving || self.sai_setup.in_progress() {
             return Task::none();
         }
         if let Some(draft) = &self.connection_draft
@@ -7567,7 +7611,8 @@ impl App {
                 locale.text(TextKey::Save)
             })
             .on_press_maybe(
-                (!self.editor_saving && mountpoint_allows_save).then_some(Message::SaveConnection),
+                (!self.editor_saving && !self.sai_setup.in_progress() && mountpoint_allows_save)
+                    .then_some(Message::SaveConnection),
             ),
         ]
         .spacing(10)
@@ -7756,6 +7801,14 @@ impl App {
             }
         }
         let source_locked = draft.source == ConnectionSource::SshConfig;
+        if draft.source == ConnectionSource::SaiCluster && self.sai_setup.in_progress() {
+            let content = controls.freeze(
+                column![source, self.sai_setup.view(locale).map(Message::SaiSetup)]
+                    .spacing(16)
+                    .max_width(900),
+            );
+            return editor_shell(header, scrollable(content), &self.status);
+        }
         let mounted_controls = controls;
         let locked = locked || source_locked;
         let controls = ConnectionEditorControls { locale, locked };
@@ -8177,8 +8230,11 @@ impl App {
             ),
         ]
         .spacing(16);
-        let common = mounted_controls
-            .freeze(column![source, ssh_config_controls, identity, details].spacing(16));
+        let mut common = column![source, ssh_config_controls].spacing(16);
+        if draft.source == ConnectionSource::SaiCluster {
+            common = common.push(self.sai_setup.view(locale).map(Message::SaiSetup));
+        }
+        let common = mounted_controls.freeze(common.push(identity).push(details));
         let content = column![common, paths].spacing(16).max_width(900);
         editor_shell(header, scrollable(content), &self.status)
     }
@@ -12153,10 +12209,16 @@ fn open_path(path: &Path, locale: Locale) -> Result<(), String> {
     #[cfg(not(windows))]
     {
         let mut child = child;
-        child.wait().map_err(|error| match locale {
+        let status = child.wait().map_err(|error| match locale {
             Locale::English => format!("Could not finish opening {}: {error}", path.display()),
             Locale::Chinese => format!("无法完成打开 {}：{error}", path.display()),
         })?;
+        if !status.success() {
+            return Err(match locale {
+                Locale::English => format!("Could not open {} ({status}).", path.display()),
+                Locale::Chinese => format!("无法打开 {}（{status}）。", path.display()),
+            });
+        }
     }
     #[cfg(windows)]
     drop(child);
@@ -13579,6 +13641,7 @@ mod localization_tests {
             Message::ConnectionFieldChanged(ConnectionField::Port, "2222".into()),
             Message::ConnectionFieldChanged(ConnectionField::KeyFile, "other-key".into()),
             Message::ConnectionAuthChanged(AuthMethod::Password),
+            Message::SaiSetup(sai_setup::Message::Start),
         ] {
             assert!(source_config_mutation(&message));
         }
@@ -13594,6 +13657,10 @@ mod localization_tests {
             Message::ConnectionFieldChanged(ConnectionField::Host, "late.example".into()),
             Message::PasswordChanged(SecretInput("late-password".into())),
             Message::PrivateKeyPicked(Some(PathBuf::from("late-key"))),
+            Message::SaiSetup(sai_setup::Message::Finished(
+                0,
+                Err(mountmate_sai::Error::Expired),
+            )),
             Message::SshConfigPicked(Some(PathBuf::from("late-config"))),
             Message::MountpointPicked(Some(PathBuf::from("late-mountpoint"))),
             Message::ConnectionSourceChanged(ConnectionSource::SshConfig),

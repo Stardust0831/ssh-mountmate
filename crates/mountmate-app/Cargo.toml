@@ -14,6 +14,7 @@ iced = { workspace = true, features = ["advanced"] }
 iced_term.workspace = true
 mountmate-core = { path = "../mountmate-core" }
 mountmate-platform = { path = "../mountmate-platform" }
+mountmate-sai = { path = "../mountmate-sai" }
 rfd.workspace = true
 sys-locale.workspace = true
 tokio.workspace = true

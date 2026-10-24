@@ -286,7 +286,7 @@ On macOS, choose the `x64` asset for Intel Macs and `arm64` for Apple Silicon; b
 5. Choose either:
    - `SSH config`: select an existing `Host` entry and let the app fill defaults.
    - `SSH config (batch)`: choose an SSH config file, preview it, then import all concrete `Host` entries.
-   - `SAI cluster`: start from the SAI preset. HostName and port are prefilled; fill username and key file.
+   - `SAI cluster`: choose **Sign in to SAI** to check account setup support, or fill username and key file using the preset. Account setup requires the pending [Identity/Portal integration](docs/sai-account-setup.md); until enabled, MountMate explains that the service is unavailable and keeps manual setup available.
    - `Manual`: enter host, username, port, and authentication details yourself.
 6. Pick a remote path. `$HOME` is the default base.
 7. Choose a connection method if the default does not fit.
