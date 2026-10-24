@@ -12209,10 +12209,16 @@ fn open_path(path: &Path, locale: Locale) -> Result<(), String> {
     #[cfg(not(windows))]
     {
         let mut child = child;
-        child.wait().map_err(|error| match locale {
+        let status = child.wait().map_err(|error| match locale {
             Locale::English => format!("Could not finish opening {}: {error}", path.display()),
             Locale::Chinese => format!("无法完成打开 {}：{error}", path.display()),
         })?;
+        if !status.success() {
+            return Err(match locale {
+                Locale::English => format!("Could not open {} ({status}).", path.display()),
+                Locale::Chinese => format!("无法打开 {}（{status}）。", path.display()),
+            });
+        }
     }
     #[cfg(windows)]
     drop(child);
