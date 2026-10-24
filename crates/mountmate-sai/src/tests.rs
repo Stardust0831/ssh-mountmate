@@ -1,4 +1,5 @@
 use super::*;
+use crate::enrollment::EnrollmentState;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -6,6 +7,9 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
+
+#[path = "native_tests.rs"]
+mod native;
 
 #[derive(Clone, Debug)]
 struct Request {
@@ -142,6 +146,391 @@ fn enrollment(request: &Request, state: &str) -> Value {
     let body: Value = serde_json::from_str(&request.body).unwrap();
     let public = ssh_key::PublicKey::from_openssh(body["public_key"].as_str().unwrap()).unwrap();
     json!({"request_id":body["request_id"], "site_id":body["site_id"], "public_key_fingerprint":public.fingerprint(ssh_key::HashAlg::Sha256).to_string(), "state":state})
+}
+
+fn v2_configuration(request: &Request, origin: &str) -> Reply {
+    let mut response: Value = serde_json::from_str(&standard_reply(request, origin).body).unwrap();
+    response["ssh_access"] = json!("public-key/v2");
+    reply(200, response)
+}
+
+fn verification(request: &Request, origin: &str) -> Value {
+    let mut response = enrollment(request, "pending");
+    response["verification_url"] = json!(format!(
+        "{origin}/portal/#/portal/ssh-device?request_id={}",
+        response["request_id"].as_str().unwrap()
+    ));
+    response["reason"] = json!("verification_required");
+    response
+}
+
+#[tokio::test]
+async fn browser_confirmation_is_reported_once_then_site_application_continues() {
+    let mut registered = None;
+    let mut polls = 0;
+    let service = Fixture::new(move |request, origin| match request.path.as_str() {
+        "/v1/auth/config?client=ssh-mountmate" => Some(v2_configuration(request, origin)),
+        "/v1/account/ssh/keys" => {
+            let response = verification(request, origin);
+            registered = Some(response.clone());
+            Some(reply(202, response))
+        }
+        path if path.starts_with("/v1/account/ssh/keys/") => {
+            polls += 1;
+            let mut response = registered.clone().unwrap();
+            if polls >= 2 {
+                response.as_object_mut().unwrap().remove("verification_url");
+                response.as_object_mut().unwrap().remove("reason");
+            }
+            if polls >= 3 {
+                response["state"] = json!("applied");
+            }
+            Some(reply(200, response))
+        }
+        _ => None,
+    });
+    let session = service.session().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut progress = Vec::new();
+    let configured = session
+        .enroll_with_progress(&session.connections()[0], root.path(), |event| {
+            progress.push(event)
+        })
+        .await
+        .unwrap();
+    assert!(configured.key_file.is_file());
+    assert_eq!(progress.len(), 2);
+    assert!(matches!(
+        progress[0],
+        EnrollmentProgress::VerificationRequired(_)
+    ));
+    assert_eq!(progress[1], EnrollmentProgress::Applying);
+    let requests = service.requests.lock().unwrap();
+    let registration = requests
+        .iter()
+        .find(|r| r.path == "/v1/account/ssh/keys")
+        .unwrap();
+    let request: Value = serde_json::from_str(&registration.body).unwrap();
+    assert_eq!(
+        progress[0],
+        EnrollmentProgress::VerificationRequired(format!(
+            "{}portal/#/portal/ssh-device?request_id={}",
+            service.base,
+            request["request_id"].as_str().unwrap()
+        ))
+    );
+    // Approval uses a browser, not a bearer-authenticated request from the adapter.
+    assert!(!requests.iter().any(|r| r.path.starts_with("/portal/")));
+}
+
+#[test]
+fn verification_destinations_and_failure_reasons_are_bound_to_the_operation() {
+    use crate::enrollment::{EnrollmentReason, Status};
+    let portal = Url::parse("https://www.open-sai.com").unwrap();
+    let request_id = "a".repeat(64);
+    let approved = format!("{portal}portal/#/portal/ssh-device?request_id={request_id}");
+    let response = |url: Option<String>| Enrollment {
+        request_id: request_id.clone(),
+        site_id: "site".into(),
+        public_key_fingerprint: "SHA256:synthetic".into(),
+        state: EnrollmentState::Pending,
+        verification_url: url,
+        reason: Some(EnrollmentReason::VerificationRequired),
+    };
+    for url in [
+        approved.replace("www.open-sai.com", "untrusted.example"),
+        approved.replace("https:", "http:"),
+        approved.replace("www.open-sai.com", "www.open-sai.com:444"),
+        approved.replace("www.open-sai.com", "user@www.open-sai.com"),
+        approved.replace("/portal/#", "/other/#"),
+        approved.replace("/portal/#", "/portal/?token=forbidden#"),
+        approved.replace("ssh-device", "other-action"),
+        approved.replace(&request_id, &"b".repeat(64)),
+        format!("{approved}&request_id={request_id}"),
+        format!("{approved}&next=https://untrusted.example"),
+        format!("{approved}#extra"),
+    ] {
+        assert!(matches!(
+            response(Some(url)).validate(&request_id, "site", "SHA256:synthetic", &portal, true),
+            Err(Error::Contract)
+        ));
+    }
+    assert!(matches!(
+        response(None).validate(&request_id, "site", "SHA256:synthetic", &portal, true),
+        Err(Error::Contract)
+    ));
+    assert!(matches!(
+        response(Some(approved.clone())).validate(
+            &request_id,
+            "site",
+            "SHA256:synthetic",
+            &portal,
+            false
+        ),
+        Err(Error::Contract)
+    ));
+    assert!(matches!(
+        response(Some(approved)).validate(&request_id, "site", "SHA256:synthetic", &portal, true),
+        Ok(Status::Pending(Some(_)))
+    ));
+    for (reason, error) in [
+        (EnrollmentReason::ApprovalExpired, Error::ApprovalExpired),
+        (EnrollmentReason::KeyRevoked, Error::KeyRevoked),
+        (EnrollmentReason::KeyExpired, Error::KeyExpired),
+        (EnrollmentReason::SyncFailed, Error::SyncFailed),
+    ] {
+        let mut failed = response(None);
+        failed.state = EnrollmentState::Failed;
+        failed.reason = Some(reason);
+        assert!(
+            matches!(failed.validate(&request_id, "site", "SHA256:synthetic", &portal, true), Err(actual) if actual == error)
+        );
+    }
+    let unknown = reply(
+        200,
+        json!({"request_id":request_id, "site_id":"site", "public_key_fingerprint":"SHA256:synthetic", "state":"pending", "reason":"unknown"}),
+    );
+    assert!(serde_json::from_str::<Enrollment>(&unknown.body).is_err());
+}
+
+#[tokio::test]
+async fn cancelled_browser_approval_keeps_the_key_and_original_retry_identity() {
+    let service = Fixture::new(|request, origin| match request.path.as_str() {
+        "/v1/auth/config?client=ssh-mountmate" => Some(v2_configuration(request, origin)),
+        "/v1/account/ssh/keys" => Some(reply(202, verification(request, origin))),
+        _ => None,
+    });
+    let session = service.session().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut confirmations = 0;
+    for _ in 0..2 {
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                session.enroll_with_progress(&session.connections()[0], root.path(), |progress| {
+                    if matches!(progress, EnrollmentProgress::VerificationRequired(_)) {
+                        confirmations += 1;
+                    }
+                })
+            )
+            .await
+            .is_err()
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    assert_eq!(confirmations, 2);
+    let requests = service.requests.lock().unwrap();
+    let registrations: Vec<_> = requests
+        .iter()
+        .filter(|r| r.path == "/v1/account/ssh/keys")
+        .collect();
+    assert_eq!(registrations.len(), 2);
+    assert_eq!(registrations[0].body, registrations[1].body);
+    assert!(
+        !requests
+            .iter()
+            .any(|r| r.path.starts_with("/v1/account/ssh/keys/"))
+    );
+}
+
+#[tokio::test]
+async fn browser_confirmation_timeout_is_distinct_from_site_sync_timeout() {
+    let service = Fixture::new(|request, origin| {
+        (request.path == "/v1/auth/config?client=ssh-mountmate")
+            .then(|| v2_configuration(request, origin))
+    });
+    let session = service.session().await;
+    let root = tempfile::tempdir().unwrap();
+    let key = key::load_or_create(root.path(), b"pending-confirmation").unwrap();
+    let response: Enrollment = serde_json::from_value(json!({
+        "request_id":key.request_id, "site_id":session.connections()[0].site_id,
+        "public_key_fingerprint":key.fingerprint, "state":"pending",
+        "reason":"verification_required",
+        "verification_url":format!("{}portal/#/portal/ssh-device?request_id={}", service.base, key.request_id),
+    })).unwrap();
+    assert_eq!(
+        session
+            .wait_for_key(
+                response,
+                &key,
+                &session.connections()[0],
+                Duration::from_millis(10),
+                &mut |_| {}
+            )
+            .await,
+        Err(Error::VerificationPending)
+    );
+    assert!(key.path.is_file());
+}
+
+#[tokio::test]
+async fn retired_key_requires_explicit_reauthorization_and_restart_resumes_the_new_intent() {
+    use sha2::{Digest, Sha256};
+    for (reason, error) in [
+        ("key_revoked", Error::KeyRevoked),
+        ("key_expired", Error::KeyExpired),
+    ] {
+        let retired = Arc::new(AtomicBool::new(false));
+        let approved = Arc::new(AtomicBool::new(false));
+        let retirement = retired.clone();
+        let approval = approved.clone();
+        let mut original: Option<Request> = None;
+        let mut replacement: Option<Request> = None;
+        let service = Fixture::new(move |request, origin| match request.path.as_str() {
+            "/v1/auth/config?client=ssh-mountmate" => Some(v2_configuration(request, origin)),
+            "/v1/account/ssh/keys" => {
+                let original = original.get_or_insert_with(|| request.clone());
+                if request.body == original.body {
+                    let mut response = enrollment(
+                        request,
+                        if retirement.load(Ordering::SeqCst) {
+                            "failed"
+                        } else {
+                            "applied"
+                        },
+                    );
+                    if retirement.load(Ordering::SeqCst) {
+                        response["reason"] = json!(reason);
+                    }
+                    return Some(reply(200, response));
+                }
+                if replacement.is_none() {
+                    replacement = Some(request.clone());
+                    return Some(reply(503, json!({})));
+                }
+                assert_eq!(replacement.as_ref().unwrap().body, request.body);
+                Some(reply(
+                    200,
+                    if approval.load(Ordering::SeqCst) {
+                        enrollment(request, "applied")
+                    } else {
+                        verification(request, origin)
+                    },
+                ))
+            }
+            path if path.starts_with("/v1/account/ssh/keys/") => {
+                let request = replacement.as_ref().unwrap();
+                Some(reply(
+                    200,
+                    if approval.load(Ordering::SeqCst) {
+                        enrollment(request, "applied")
+                    } else {
+                        verification(request, origin)
+                    },
+                ))
+            }
+            _ => None,
+        });
+        let root = tempfile::tempdir().unwrap();
+        let session = service.session().await;
+        let old = session
+            .enroll(&session.connections()[0], root.path())
+            .await
+            .unwrap();
+        let previous_bytes = Sha256::digest(std::fs::read(&old.key_file).unwrap());
+        let mut saved_draft = ConnectionDraft::default();
+        old.apply_to(&mut saved_draft);
+        let saved = saved_draft.validate(&[]).unwrap().server;
+        retired.store(true, Ordering::SeqCst);
+        assert_eq!(
+            session
+                .enroll(&session.connections()[0], root.path())
+                .await
+                .unwrap_err(),
+            error
+        );
+        // Only the explicit action can select a replacement. Ambiguous transport
+        // failure after selection must not manufacture another key on restart.
+        assert_eq!(
+            session
+                .reauthorize_with_progress(&session.connections()[0], root.path(), |_| {})
+                .await
+                .unwrap_err(),
+            Error::Network
+        );
+        assert_eq!(
+            Sha256::digest(std::fs::read(&old.key_file).unwrap()),
+            previous_bytes
+        );
+        drop(session);
+        let session = service.session().await;
+        let next = session
+            .enroll_with_progress(&session.connections()[0], root.path(), |event| {
+                if matches!(event, EnrollmentProgress::VerificationRequired(_)) {
+                    approved.store(true, Ordering::SeqCst);
+                }
+            })
+            .await
+            .unwrap();
+        assert_ne!(next.key_file, old.key_file);
+        assert_eq!(saved.key_file, old.key_file.to_string_lossy());
+        assert_eq!(
+            Sha256::digest(std::fs::read(&old.key_file).unwrap()),
+            previous_bytes
+        );
+        // A stale UI recovery action cannot rotate an already current valid key.
+        let resumed = session
+            .reauthorize_with_progress(&session.connections()[0], root.path(), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(resumed.key_file, next.key_file);
+        let requests = service.requests.lock().unwrap();
+        let registrations: Vec<Value> = requests
+            .iter()
+            .filter(|r| r.path == "/v1/account/ssh/keys")
+            .map(|r| serde_json::from_str(&r.body).unwrap())
+            .collect();
+        assert_eq!(registrations.len(), 6);
+        assert_eq!(registrations[0], registrations[1]);
+        assert_eq!(registrations[1], registrations[2]);
+        assert_ne!(
+            registrations[2]["request_id"],
+            registrations[3]["request_id"]
+        );
+        assert_ne!(
+            registrations[2]["public_key"],
+            registrations[3]["public_key"]
+        );
+        assert_eq!(registrations[3], registrations[4]);
+        assert_eq!(registrations[4], registrations[5]);
+        assert_eq!(
+            std::fs::read_to_string(old.key_file.parent().unwrap().join("current-key")).unwrap(),
+            registrations[3]["request_id"].as_str().unwrap()
+        );
+    }
+}
+
+#[test]
+fn replacement_selector_cannot_escape_or_silently_replace_a_missing_current_key() {
+    let root = tempfile::tempdir().unwrap();
+    let previous = key::load_or_create(root.path(), b"context").unwrap();
+    let next = key::renew(root.path(), b"context", &previous.request_id).unwrap();
+    let again = key::renew(root.path(), b"context", &previous.request_id).unwrap();
+    assert_eq!(again.path, next.path);
+    assert_eq!(again.request_id, next.request_id);
+    let selector = previous.path.parent().unwrap().join("current-key");
+    std::fs::write(&selector, "../outside").unwrap();
+    assert!(matches!(
+        key::load_or_create(root.path(), b"context"),
+        Err(Error::KeyStorage)
+    ));
+    std::fs::write(&selector, &next.request_id).unwrap();
+    std::fs::remove_file(&next.path).unwrap();
+    assert!(matches!(
+        key::load_or_create(root.path(), b"context"),
+        Err(Error::KeyStorage)
+    ));
+    assert!(previous.path.is_file());
+    assert!(!next.path.exists());
+    #[cfg(unix)]
+    {
+        std::fs::remove_file(&selector).unwrap();
+        std::os::unix::fs::symlink(&previous.path, &selector).unwrap();
+        assert!(matches!(
+            key::load_or_create(root.path(), b"context"),
+            Err(Error::KeyStorage)
+        ));
+    }
 }
 #[tokio::test]
 async fn setup_waits_for_application_and_reuses_key_across_sessions() {
@@ -403,6 +792,8 @@ async fn timeout_retains_key_and_pending_is_not_success() {
         site_id: session.connections()[0].site_id.clone(),
         public_key_fingerprint: key.fingerprint.clone(),
         state: EnrollmentState::Pending,
+        verification_url: None,
+        reason: None,
     };
     assert_eq!(
         session
@@ -410,7 +801,8 @@ async fn timeout_retains_key_and_pending_is_not_success() {
                 response,
                 &key,
                 &session.connections()[0],
-                Duration::from_millis(10)
+                Duration::from_millis(10),
+                &mut |_| {},
             )
             .await,
         Err(Error::SyncPending)

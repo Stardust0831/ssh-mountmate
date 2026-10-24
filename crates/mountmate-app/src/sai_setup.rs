@@ -2,7 +2,9 @@
 use crate::i18n::Locale;
 use iced::widget::{button, column, container, pick_list, text};
 use iced::{Element, Fill, Task};
-use mountmate_sai::{Client, ConfiguredConnection, Connection, Error, Login, Session};
+use mountmate_sai::{
+    Client, ConfiguredConnection, Connection, EnrollmentProgress, Error, Login, PORTAL, Session,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -14,8 +16,11 @@ pub enum Message {
     Authorized(u64, Result<Arc<Session>, Error>),
     Select(Connection),
     Enroll,
+    Reauthorize,
+    EnrollmentProgress(u64, EnrollmentProgress),
     Finished(u64, Result<ConfiguredConnection, Error>),
     OpenBrowser,
+    OpenConsole,
     BrowserOpened(u64, bool),
 }
 #[derive(Default)]
@@ -29,6 +34,7 @@ pub struct State {
     ready: bool,
     error: Option<Error>,
     browser_failed: bool,
+    verification_url: Option<String>,
 }
 impl State {
     pub fn reset(&mut self) {
@@ -42,6 +48,9 @@ impl State {
     }
     pub fn in_progress(&self) -> bool {
         self.pending || self.session.is_some()
+    }
+    fn needs_new_key(&self) -> bool {
+        matches!(self.error, Some(Error::KeyRevoked | Error::KeyExpired))
     }
     fn track(&mut self, task: Task<Message>) -> Task<Message> {
         let (task, handle) = task.abortable();
@@ -108,21 +117,60 @@ impl State {
                     self.error = None;
                 }
             }
-            Message::Enroll if !self.pending => {
+            action @ (Message::Enroll | Message::Reauthorize) if !self.pending => {
+                let replace_retired = matches!(action, Message::Reauthorize);
+                if replace_retired && !self.needs_new_key() {
+                    return (Task::none(), None);
+                }
                 if let (Some(session), Some(site)) = (self.session.clone(), self.selected.clone()) {
                     self.pending = true;
                     self.error = None;
+                    self.verification_url = None;
+                    self.browser_failed = false;
+                    self.generation = self.generation.wrapping_add(1);
                     let generation = self.generation;
                     let data_dir = data_dir.to_owned();
-                    let task = Task::perform(
-                        async move { session.enroll(&site, &data_dir).await },
-                        move |result| Message::Finished(generation, result),
+                    let task = Task::run(
+                        iced::stream::channel(2, async move |mut output| {
+                            use iced::futures::SinkExt;
+                            let progress = |progress| {
+                                let _ = output
+                                    .try_send(Message::EnrollmentProgress(generation, progress));
+                            };
+                            let result = if replace_retired {
+                                session
+                                    .reauthorize_with_progress(&site, &data_dir, progress)
+                                    .await
+                            } else {
+                                session
+                                    .enroll_with_progress(&site, &data_dir, progress)
+                                    .await
+                            };
+                            let _ = output.send(Message::Finished(generation, result)).await;
+                        }),
+                        |message| message,
                     );
                     return (self.track(task), None);
                 }
             }
+            Message::EnrollmentProgress(generation, progress)
+                if generation == self.generation && self.pending =>
+            {
+                match progress {
+                    EnrollmentProgress::VerificationRequired(url) => {
+                        self.verification_url = Some(url.clone());
+                        self.browser_failed = false;
+                        return (self.open_browser(&url, locale), None);
+                    }
+                    EnrollmentProgress::Applying => {
+                        self.verification_url = None;
+                        self.browser_failed = false;
+                    }
+                }
+            }
             Message::Finished(generation, result) if generation == self.generation => {
                 self.pending = false;
+                self.verification_url = None;
                 match result {
                     Ok(configured) => {
                         self.reset();
@@ -138,28 +186,33 @@ impl State {
                 }
             }
             Message::OpenBrowser => {
-                if let Some(login) = &self.login {
-                    let path = PathBuf::from(login.verification_url());
-                    let generation = self.generation;
-                    return (
-                        Task::perform(
-                            async move {
-                                tokio::task::spawn_blocking(move || super::open_path(&path, locale))
-                                    .await
-                                    .is_ok_and(|result| result.is_ok())
-                            },
-                            move |ok| Message::BrowserOpened(generation, ok),
-                        ),
-                        None,
-                    );
+                if let Some(url) = self
+                    .verification_url
+                    .as_deref()
+                    .or_else(|| self.login.as_ref().map(Login::verification_url))
+                {
+                    return (self.open_browser(url, locale), None);
                 }
             }
+            Message::OpenConsole => return (self.open_browser(PORTAL, locale), None),
             Message::BrowserOpened(generation, ok) if generation == self.generation => {
                 self.browser_failed = !ok
             }
             _ => {}
         }
         (Task::none(), None)
+    }
+    fn open_browser(&self, url: &str, locale: Locale) -> Task<Message> {
+        let path = PathBuf::from(url);
+        let generation = self.generation;
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || super::open_path(&path, locale))
+                    .await
+                    .is_ok_and(|result| result.is_ok())
+            },
+            move |ok| Message::BrowserOpened(generation, ok),
+        )
     }
     pub fn view(&self, locale: Locale) -> Element<'_, Message> {
         let tr = |en, zh| match locale {
@@ -175,7 +228,7 @@ impl State {
             content = content
                 .push(text(tr(
                     "Open the page and enter this code:",
-                    "打开登录页面并输入验证码：",
+                    "打开登录页面并输入登录码：",
                 )))
                 .push(text(login.verification_url()).size(14))
                 .push(text(login.user_code()).size(24))
@@ -192,14 +245,32 @@ impl State {
         } else if let Some(session) = &self.session {
             if session.connections().is_empty() {
                 content = content.push(text(tr(
-                    "This account has no available SSH sites. Check access in the SAI console.",
-                    "此账号暂无可用的 SSH 站点，请在 SAI 控制台检查接入权限。",
-                )));
+                    "You are signed in, but this account has no available SSH sites. Check access in the SAI console.",
+                    "登录成功，但此账号暂无可用的 SSH 站点。请在 SAI 控制台查看接入权限。",
+                )))
+                .push(button(tr("Open SAI console", "打开 SAI 控制台")).on_press(Message::OpenConsole));
             } else if self.pending {
-                content = content.push(text(tr(
-                    "Registering the public key and waiting for the site to apply it…",
-                    "正在登记公钥，等待站点确认生效…",
-                )));
+                if let Some(url) = &self.verification_url {
+                    content = content
+                        .push(text(tr(
+                            "Confirm this connection in the browser. Setup will continue automatically after confirmation.",
+                            "请在浏览器确认此连接，确认后会自动完成配置。",
+                        )))
+                        .push(button(tr("Open confirmation page", "打开确认页面")).on_press(Message::OpenBrowser));
+                    if self.browser_failed {
+                        content = content
+                            .push(text(tr(
+                                "Could not open the browser. Open this address manually:",
+                                "无法打开浏览器，请手动打开以下地址：",
+                            )))
+                            .push(text(url).size(14));
+                    }
+                } else {
+                    content = content.push(text(tr(
+                        "Registering the public key and waiting for the site to apply it…",
+                        "正在登记公钥，等待站点确认生效…",
+                    )));
+                }
             } else {
                 content = content
                     .push(
@@ -210,9 +281,21 @@ impl State {
                         )
                         .width(Fill),
                     )
-                    .push(
-                        button(tr("Authorize this device", "授权此设备")).on_press(Message::Enroll),
+                    .push(if self.needs_new_key() {
+                        button(tr("Authorize with a new key", "使用新密钥重新授权"))
+                            .on_press(Message::Reauthorize)
+                    } else {
+                        button(tr("Continue setup", "继续配置")).on_press(Message::Enroll)
+                    });
+                if self.needs_new_key() {
+                    content = content.push(
+                        text(tr(
+                            "The previous private key stays available for existing connections.",
+                            "原私钥会保留，已有连接不会被改写。",
+                        ))
+                        .size(14),
                     );
+                }
             }
             content = content.push(text(tr("The private key stays on this device. After registration, cancelling setup or deleting a connection does not revoke access; remove the key in the SAI console.",
                 "私钥保存在本机。登记后，取消配置或删除连接不会撤销授权；请在 SAI 控制台移除公钥。")).size(14));
@@ -233,6 +316,23 @@ impl State {
         }
         if let Some(error) = self.error {
             content = content.push(text(error_text(error, locale)));
+            if matches!(
+                error,
+                Error::Forbidden | Error::KeyRevoked | Error::KeyExpired | Error::SyncFailed
+            ) {
+                content = content.push(
+                    button(tr("Open SAI console", "打开 SAI 控制台"))
+                        .on_press(Message::OpenConsole),
+                );
+            }
+        }
+        if self.browser_failed && self.login.is_none() && self.verification_url.is_none() {
+            content = content
+                .push(text(tr(
+                    "Could not open the browser. Open the SAI console manually:",
+                    "无法打开浏览器，请手动打开 SAI 控制台：",
+                )))
+                .push(text(PORTAL).size(14));
         }
         if self.in_progress() {
             content = content
@@ -259,7 +359,11 @@ fn error_text(error: Error, locale: Locale) -> String {
         Error::Forbidden => "此账号无法执行该操作，请在 SAI 控制台检查 SSH 接入权限。",
         Error::KeyStorage => "无法安全创建或读取本机 SSH 密钥，请检查应用数据目录权限。",
         Error::SyncPending => "公钥仍在同步，请重试。重试会使用原来的本机密钥。",
+        Error::VerificationPending => "仍需在浏览器确认此连接，请重试。重试会使用原来的本机密钥。",
         Error::SyncFailed => "服务未能将公钥应用到站点，请在 SAI 控制台检查。",
+        Error::ApprovalExpired => "浏览器确认已过期，请重试并重新确认。重试会使用原来的本机密钥。",
+        Error::KeyRevoked => "此设备的 SSH 密钥已被撤销。如需再次连接，请使用新密钥重新授权。",
+        Error::KeyExpired => "此设备的 SSH 密钥已过期。请使用新密钥重新授权。",
     }
     .into()
 }
@@ -271,6 +375,14 @@ mod tests {
         let mut state = State::default();
         let generation = state.generation;
         state.reset();
+        let _ = state.update(
+            Message::EnrollmentProgress(
+                generation,
+                EnrollmentProgress::VerificationRequired("https://www.open-sai.com/portal/".into()),
+            ),
+            Path::new("unused"),
+            Locale::English,
+        );
         let _ = state.update(
             Message::LoginStarted(generation, Err(Error::Unavailable)),
             Path::new("unused"),
@@ -284,5 +396,6 @@ mod tests {
         assert!(!state.in_progress());
         assert!(state.error.is_none());
         assert!(!state.ready);
+        assert!(state.verification_url.is_none());
     }
 }
