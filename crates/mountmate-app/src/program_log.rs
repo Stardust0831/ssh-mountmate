@@ -338,6 +338,10 @@ mod tests {
     #[test]
     fn history_is_bounded_and_read_only() {
         let mut log = ProgramLog::new(Locale::Chinese);
+        log.info("Read-only log".into());
+        // Exercise history limits without repeatedly shaping hundreds of
+        // Unicode lines on headless runners. View refresh has separate coverage.
+        let _ = log.update(Message::Follow(false));
         for i in 0..MAX_ENTRIES + 10 {
             log.info(format!("消息 {i}"));
         }
