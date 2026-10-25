@@ -34,6 +34,7 @@ patch --forward --batch -d "$src" -p1 < "$(cd "$(dirname "$0")/.." && pwd)/patch
 patch --forward --batch -d "$src" -p1 < "$(cd "$(dirname "$0")/.." && pwd)/patches/rclone-v1.74.4-host-key-retry.patch"
 patch --forward --batch -d "$src" -p1 < "$(cd "$(dirname "$0")/.." && pwd)/patches/rclone-v1.74.4-lustre-details.patch"
 patch --forward --batch -d "$src" -p1 < "$(cd "$(dirname "$0")/.." && pwd)/patches/rclone-v1.74.4-external-ssh-validation.patch"
+patch --forward --batch -d "$src" -p1 < "$(cd "$(dirname "$0")/.." && pwd)/patches/rclone-v1.74.4-advisory-quota.patch"
 mkdir -p "$output_dir"
 case "$goos" in
   linux|darwin) cgo_enabled=1 ;;
@@ -51,6 +52,7 @@ esac
   # live Lustre cluster. Packaged mount integration runs later in CI; upstream
   # TestIntegration cases require separately provisioned test servers.
   go test ./backend/sftp -skip '^TestIntegration'
+  go test ./vfs -run '^(TestVFSStatfsLustreQuotaIsAdvisory|TestFillInMissingSizes)$'
   GOOS="$goos" GOARCH="$goarch" CGO_ENABLED="$cgo_enabled" \
     go build -tags cmount -trimpath -buildvcs=false \
       -ldflags "-s -w -X github.com/rclone/rclone/fs.Version=${custom_version}" \

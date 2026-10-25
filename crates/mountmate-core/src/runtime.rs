@@ -231,7 +231,7 @@ impl MountpointControl for SystemMountpointControl {
                 }
                 return Ok(());
             }
-            if path.exists() {
+            if crate::mountpoint::windows_path_occupied(path) {
                 return Err("Windows folder mount targets must not already exist".into());
             }
             if let Some(parent) = path.parent() {

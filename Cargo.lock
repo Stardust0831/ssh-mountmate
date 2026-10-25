@@ -5423,6 +5423,7 @@ name = "ssh-mountmate"
 version = "0.6.21"
 dependencies = [
  "async-channel 2.5.0",
+ "chrono",
  "dark-light",
  "directories",
  "gtk",

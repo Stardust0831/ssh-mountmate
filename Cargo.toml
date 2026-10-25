@@ -19,6 +19,7 @@ anyhow = "1.0"
 async-channel = "2.5"
 base64 = "0.22"
 bcrypt = "0.19.3"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 configparser = { version = "3.1", features = ["indexmap"] }
 directories = "6.0"
 dark-light = "2.0"

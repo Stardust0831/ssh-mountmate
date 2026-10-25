@@ -1,0 +1,147 @@
+--- a/vfs/vfs.go
++++ b/vfs/vfs.go
+@@ -702,6 +702,14 @@
+ 		if u.Used != nil {
+ 			used = *u.Used
+ 		}
++		if u.LustreQuota != nil {
++			// A project quota snapshot may lag an elastic allowance or describe
++			// a different quota subject from the one enforcing SFTP writes.
++			// Treat capacity as unknown to file managers so they try the write.
++			// operations/about still returns the unmodified quota for display;
++			// real server write errors and local cache limits remain authoritative.
++			total, used, free = -1, -1, -1
++		}
+ 	}
+ 
+ 	if int64(vfs.Opt.DiskSpaceTotalSize) >= 0 {
+--- a/backend/sftp/lustre_quota_live_test.go
++++ b/backend/sftp/lustre_quota_live_test.go
+@@ -9,7 +9,6 @@
+ 	"crypto/rand"
+ 	"encoding/pem"
+ 	"fmt"
+-	"io"
+ 	"net"
+ 	"os"
+ 	"path/filepath"
+@@ -25,6 +24,7 @@
+ 	"github.com/rclone/rclone/fs/config/obscure"
+ 	_ "github.com/rclone/rclone/fs/operations"
+ 	"github.com/rclone/rclone/fs/rc"
++	"github.com/rclone/rclone/vfs"
+ 	"github.com/stretchr/testify/require"
+ 	"golang.org/x/crypto/ssh"
+ 	"golang.org/x/crypto/ssh/knownhosts"
+@@ -60,6 +60,8 @@
+ 			t.Cleanup(func() { _ = listener.Close() })
+ 			var connections atomic.Int32
+ 			var commands atomic.Int32
++			var quotaUsed atomic.Int64
++			quotaUsed.Store(40000)
+ 			go func() {
+ 				for {
+ 					raw, err := listener.Accept()
+@@ -105,7 +107,7 @@
+ 										status := uint32(1)
+ 										if strings.Contains(payload.Command, "lfs quota -p") {
+ 											commands.Add(1)
+-											_, _ = io.WriteString(channel, "40000 30000 100000 700 500 1000\n")
++											_, _ = fmt.Fprintf(channel, "%d 30000 100000 700 500 1000\n", quotaUsed.Load())
+ 											status = 0
+ 										}
+ 										_, _ = channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{status}))
+@@ -167,6 +169,28 @@
+ 			}
+ 			require.Equal(t, int32(2), commands.Load())
+ 			require.Equal(t, int32(1), connections.Load(), "capacity refresh opened another SSH connection")
++
++			// A full quota snapshot must not prevent a file manager from trying
++			// an upload that the authenticated SFTP server will actually accept.
++			quotaUsed.Store(120000)
++			mount := vfs.New(ctx, backend, nil)
++			t.Cleanup(mount.Shutdown)
++			total, _, free := mount.Statfs()
++			require.Greater(t, free, int64(102400000))
++			require.GreaterOrEqual(t, total, free)
++			out, err := call.Fn(ctx, rc.Params{"fs": remote})
++			require.NoError(t, err)
++			require.Equal(t, float64(102400000), out["total"])
++			require.Equal(t, float64(122880000), out["used"])
++			require.Equal(t, float64(0), out["free"])
++			handle, err := mount.OpenFile("accepted-upload.txt", os.O_CREATE|os.O_WRONLY, 0600)
++			require.NoError(t, err)
++			_, err = handle.Write([]byte("elastic quota upload"))
++			require.NoError(t, err)
++			require.NoError(t, handle.Close())
++			stored, err := os.ReadFile(filepath.Join(remoteDirectory, "accepted-upload.txt"))
++			require.NoError(t, err)
++			require.Equal(t, "elastic quota upload", string(stored))
+ 		})
+ 	}
+ }
+--- /dev/null
++++ b/vfs/lustre_quota_test.go
+@@ -0,0 +1,62 @@
++package vfs
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/rclone/rclone/fs"
++	"github.com/rclone/rclone/vfs/vfscommon"
++	"github.com/stretchr/testify/require"
++)
++
++type quotaStatfsFs struct {
++	fs.Fs
++	features fs.Features
++}
++
++func (f *quotaStatfsFs) Features() *fs.Features { return &f.features }
++
++// Exercise the actual statfs path used by FUSE, WinFsp and NFS, including its
++// cached snapshot. Ordinary filesystem full/near-full reports stay intact.
++func TestVFSStatfsLustreQuotaIsAdvisory(t *testing.T) {
++	for _, tc := range []struct {
++		name       string
++		used, free int64
++		quota      bool
++	}{
++		{"quota nearly full", 99, 1, true},
++		{"quota full", 100, 0, true},
++		{"quota exceeded", 120, 0, true},
++		{"filesystem nearly full", 99, 1, false},
++		{"filesystem full", 100, 0, false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			usage := &fs.Usage{Total: fs.NewUsageValue(int64(100)), Used: fs.NewUsageValue(tc.used), Free: fs.NewUsageValue(tc.free)}
++			if tc.quota {
++				usage.LustreQuota = &fs.LustreQuotaUsage{}
++			}
++			backend := &quotaStatfsFs{features: fs.Features{
++				About: func(context.Context) (*fs.Usage, error) { return usage, nil },
++			}}
++			mount := &VFS{ctx: context.Background(), f: backend,
++				Opt: vfscommon.Options{DirCacheTime: fs.Duration(time.Hour), DiskSpaceTotalSize: -1}}
++			for range 2 {
++				total, used, free := mount.Statfs()
++				if tc.quota {
++					require.Equal(t, int64(unknownFreeBytes), total)
++					require.Equal(t, int64(0), used)
++					require.Equal(t, int64(unknownFreeBytes), free)
++				} else {
++					require.Equal(t, int64(100), total)
++					require.Equal(t, tc.used, used)
++					require.Equal(t, tc.free, free)
++				}
++				// Statfs must not rewrite the quota exposed by About/RC.
++				require.Equal(t, int64(100), *usage.Total)
++				require.Equal(t, tc.used, *usage.Used)
++				require.Equal(t, tc.free, *usage.Free)
++			}
++		})
++	}
++}

@@ -1,5 +1,6 @@
 //! Editor-only SAI setup; authentication never enters the mount service or saved settings.
 use crate::i18n::Locale;
+use crate::program_log::Level;
 use iced::widget::{button, column, container, pick_list, text};
 use iced::{Element, Fill, Task};
 use mountmate_sai::{
@@ -48,6 +49,86 @@ impl State {
     }
     pub fn in_progress(&self) -> bool {
         self.pending || self.session.is_some()
+    }
+    /// Only human-readable state goes to the program log. Device codes, URLs,
+    /// tokens and connection/key material must stay out of its history.
+    pub fn feedback(&self, locale: Locale) -> Option<(Level, String)> {
+        let tr = |en: &str, zh: &str| {
+            if locale == Locale::English {
+                en.to_owned()
+            } else {
+                zh.to_owned()
+            }
+        };
+        if self.browser_failed {
+            return Some((
+                Level::Error,
+                tr(
+                    "SAI: Could not open the browser. Open the address in the setup panel manually.",
+                    "SAI：无法打开浏览器，请手动打开配置面板中的地址。",
+                ),
+            ));
+        }
+        if let Some(error) = self.error {
+            return Some((Level::Error, error_text(error, locale)));
+        }
+        if self.ready {
+            return Some((
+                Level::Info,
+                tr(
+                    "SAI: Public key applied. Review the mount paths and save the connection.",
+                    "SAI：公钥已生效，请检查挂载路径并保存连接。",
+                ),
+            ));
+        }
+        if self.login.is_some() {
+            return Some((
+                Level::Info,
+                tr(
+                    "SAI: Open the sign-in page and enter the code shown in the setup panel. Waiting for authorization…",
+                    "SAI：请打开登录页面并输入配置面板中的登录码，正在等待授权…",
+                ),
+            ));
+        }
+        if let Some(session) = &self.session {
+            if session.connections().is_empty() {
+                return Some((
+                    Level::Warning,
+                    tr(
+                        "SAI: Signed in, but no SSH sites are available. Check access in the SAI console.",
+                        "SAI：登录成功，但此账号暂无可用 SSH 站点，请在 SAI 控制台查看接入权限。",
+                    ),
+                ));
+            }
+            return Some((
+                Level::Info,
+                if self.verification_url.is_some() {
+                    tr(
+                        "SAI: Confirm this connection in the browser to continue.",
+                        "SAI：请在浏览器确认此连接，确认后会继续配置。",
+                    )
+                } else if self.pending {
+                    tr(
+                        "SAI: Registering the public key and waiting for the site to apply it…",
+                        "SAI：正在登记公钥，等待站点确认生效…",
+                    )
+                } else {
+                    tr(
+                        "SAI: Signed in. Choose a site and continue setup.",
+                        "SAI：登录成功，请选择站点并继续配置。",
+                    )
+                },
+            ));
+        }
+        self.pending.then(|| {
+            (
+                Level::Info,
+                tr(
+                    "SAI: Checking service and starting sign-in…",
+                    "SAI：正在检查服务并发起登录…",
+                ),
+            )
+        })
     }
     fn needs_new_key(&self) -> bool {
         matches!(self.error, Some(Error::KeyRevoked | Error::KeyExpired))
@@ -315,7 +396,12 @@ impl State {
                 .push(button(tr("Sign in to SAI", "登录 SAI 账号")).on_press(Message::Start));
         }
         if let Some(error) = self.error {
-            content = content.push(text(error_text(error, locale)));
+            content = content.push(
+                container(text(error_text(error, locale)).size(16))
+                    .padding(12)
+                    .width(Fill)
+                    .style(|theme| Level::Error.style(theme)),
+            );
             if matches!(
                 error,
                 Error::Forbidden | Error::KeyRevoked | Error::KeyExpired | Error::SyncFailed
@@ -370,6 +456,49 @@ fn error_text(error: Error, locale: Locale) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unavailable_sign_in_produces_noticeable_feedback_and_ignores_stale_results() {
+        let mut state = State {
+            pending: true,
+            ..State::default()
+        };
+        assert!(
+            state
+                .feedback(Locale::Chinese)
+                .unwrap()
+                .1
+                .contains("正在检查服务")
+        );
+        let _ = state.update(
+            Message::LoginStarted(state.generation, Err(Error::Unavailable)),
+            Path::new("unused"),
+            Locale::Chinese,
+        );
+        let (level, message) = state.feedback(Locale::Chinese).unwrap();
+        assert_eq!(level, Level::Error);
+        assert!(message.contains("尚未启用"));
+        state.reset();
+        let _ = state.update(
+            Message::LoginStarted(state.generation.wrapping_sub(1), Err(Error::Network)),
+            Path::new("unused"),
+            Locale::Chinese,
+        );
+        assert_eq!(state.feedback(Locale::Chinese), None);
+    }
+
+    #[test]
+    fn browser_feedback_does_not_copy_confirmation_urls_to_the_log() {
+        let state = State {
+            browser_failed: true,
+            verification_url: Some("https://example.invalid/confirm?secret=fixture".into()),
+            ..State::default()
+        };
+        let (level, message) = state.feedback(Locale::English).unwrap();
+        assert_eq!(level, Level::Error);
+        assert!(!message.contains("fixture"));
+        assert!(!message.contains("https://"));
+    }
+
     #[test]
     fn cancelled_generation_ignores_late_results() {
         let mut state = State::default();
