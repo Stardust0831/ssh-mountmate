@@ -78,7 +78,7 @@ pub struct CapacityInfo {
     pub percent: u8,
     pub source: CapacitySource,
     /// The Lustre block soft limit, when the capacity came from a project
-    /// quota. The hard limit remains `total` and is the primary capacity.
+    /// quota. `total` is the reported hard limit, not a client-side write gate.
     pub soft_total: Option<u64>,
     /// Optional inode usage for filesystems (notably Lustre) that expose it.
     pub inode: Option<InodeInfo>,
@@ -255,7 +255,11 @@ fn capacity_from_about(about: RcloneAbout) -> Option<CapacityInfo> {
     let mut capacity = capacity_from_usage(
         total.unwrap_or_default(),
         used.unwrap_or_default(),
-        CapacitySource::RcloneAbout,
+        if about.lustre_quota.is_some() {
+            CapacitySource::LustreProjectQuota
+        } else {
+            CapacitySource::RcloneAbout
+        },
     )?;
     if let Some(quota) = about.lustre_quota {
         capacity.source = CapacitySource::LustreProjectQuota;
@@ -503,7 +507,11 @@ fn capacity_from_usage(total: u64, used: u64, source: CapacitySource) -> Option<
     if total == 0 {
         return None;
     }
-    let used = used.min(total);
+    let used = if source == CapacitySource::LustreProjectQuota {
+        used
+    } else {
+        used.min(total)
+    };
     let percent = ((used as u128 * 100 + total as u128 / 2) / total as u128).min(100) as u8;
     Some(CapacityInfo {
         used,
@@ -519,7 +527,6 @@ fn inode_from_usage(total: u64, used: u64) -> Option<InodeInfo> {
     if total == 0 {
         return None;
     }
-    let used = used.min(total);
     let percent = ((used as u128 * 100 + total as u128 / 2) / total as u128).min(100) as u8;
     Some(InodeInfo {
         used,
@@ -630,7 +637,7 @@ mod tests {
             "Disk quotas for prj 42 (pid 42):\nFilesystem  kbytes quota limit grace files quota limit grace\n/lustre 1200 0 1000 - 3 0 0 -\n",
         )
         .unwrap();
-        assert_eq!(capacity.used, 1000 * 1024);
+        assert_eq!(capacity.used, 1200 * 1024);
         assert_eq!(capacity.total, 1000 * 1024);
         assert_eq!(capacity.percent, 100);
         assert_eq!(capacity.source, CapacitySource::LustreProjectQuota);
@@ -731,12 +738,12 @@ mod tests {
     }
 
     #[test]
-    fn lustre_inode_usage_is_clamped_and_unlimited_inode_quota_is_ignored() {
+    fn lustre_inode_usage_is_preserved_and_unlimited_inode_quota_is_ignored() {
         let over_limit = parse_lustre_quota("/lustre 10 0 20 - 12 0 10 -\n").unwrap();
         assert_eq!(
             over_limit.inode,
             Some(InodeInfo {
-                used: 10,
+                used: 12,
                 total: 10,
                 percent: 100,
                 soft_total: None,
@@ -816,6 +823,21 @@ mod tests {
             assert_eq!(capacity.soft_total, None);
             assert_eq!(capacity.inode, None);
         }
+    }
+
+    #[test]
+    fn quota_session_preserves_usage_above_the_reported_limit() {
+        let about: RcloneAbout = serde_json::from_value(serde_json::json!({
+            "total": 100, "used": 120, "free": 0,
+            "lustreQuota": {"softTotal": 80, "inodesTotal": 10, "inodesUsed": 12}
+        }))
+        .unwrap();
+        let capacity = capacity_from_about(about).unwrap();
+        assert_eq!(
+            (capacity.used, capacity.total, capacity.percent),
+            (120, 100, 100)
+        );
+        assert_eq!(capacity.inode.unwrap().used, 12);
     }
 
     #[test]
