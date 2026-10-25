@@ -98,7 +98,14 @@ impl MountpointProbe for SystemMountpointProbe {
     }
 
     fn path_exists(&self, path: &Path) -> bool {
-        path.exists()
+        #[cfg(windows)]
+        {
+            windows_path_occupied(path)
+        }
+        #[cfg(not(windows))]
+        {
+            path.exists()
+        }
     }
 
     fn path_is_dir(&self, path: &Path) -> bool {
@@ -111,6 +118,17 @@ impl MountpointProbe for SystemMountpointProbe {
 
     fn windows_volume_kind(&self, path: &Path) -> WindowsVolumeKind {
         system_windows_volume_kind(path)
+    }
+}
+
+/// A disconnected junction or WinFsp reparse point still occupies its name.
+/// Following it with Path::exists can report false and allocate the same path
+/// again. Treat lookup failures other than absence as occupied as well.
+#[cfg(any(windows, test))]
+pub(crate) fn windows_path_occupied(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
     }
 }
 
@@ -451,10 +469,10 @@ impl<'a> MountpointAllocator<'a> {
                 format!("{root}-{index}")
             };
             let candidate = parent.join(name);
-            if self.is_reserved(&candidate) || self.probe.path_is_mount(&candidate) {
-                continue;
-            }
-            if self.windows && self.probe.path_exists(&candidate) {
+            if self.is_reserved(&candidate)
+                || (self.windows && self.probe.path_exists(&candidate))
+                || self.probe.path_is_mount(&candidate)
+            {
                 continue;
             }
             if !self.windows
@@ -491,16 +509,20 @@ fn validate_custom_path(
     if windows && is_windows_unc(path) {
         return Err(MountpointError::WindowsUncPath(path.to_owned()));
     }
-    if is_reserved(path) || probe.path_is_mount(path) {
+    if is_reserved(path) {
+        return Err(MountpointError::AlreadyReserved(path.to_owned()));
+    }
+    // Check the entry before following a potentially disconnected mount.
+    if windows && probe.path_exists(path) {
+        return Err(MountpointError::WindowsTargetExists(path.to_owned()));
+    }
+    if probe.path_is_mount(path) {
         return Err(MountpointError::AlreadyReserved(path.to_owned()));
     }
     if windows {
         let parent = windows_parent(path);
         if !probe.path_exists(&parent) {
             return Err(MountpointError::ParentMissing(parent));
-        }
-        if probe.path_exists(path) {
-            return Err(MountpointError::WindowsTargetExists(path.to_owned()));
         }
         match probe.windows_volume_kind(&parent) {
             WindowsVolumeKind::Fixed => {}
@@ -644,6 +666,47 @@ mod tests {
             name: "Alpha Server".into(),
             mountpoint: mountpoint.into(),
             ..ServerConfig::default()
+        }
+    }
+
+    #[test]
+    fn disconnected_folder_link_still_occupies_its_mountpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let parent = temp.path().join("mnt");
+        std::fs::create_dir(&parent).unwrap();
+        let link = parent.join("Alpha_Server");
+        std::fs::create_dir(&target).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        #[cfg(windows)]
+        {
+            // Directory junctions do not require the symlink privilege.
+            let output = std::process::Command::new("cmd.exe")
+                .args(["/D", "/C", "mklink", "/J"])
+                .arg(&link)
+                .arg(&target)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
+        std::fs::remove_dir(&target).unwrap();
+        assert!(!link.exists());
+        assert!(windows_path_occupied(&link));
+        assert!(!windows_path_occupied(&target));
+        #[cfg(windows)]
+        {
+            let probe = SystemMountpointProbe;
+            assert!(probe.path_exists(&link));
+            assert!(matches!(
+                validate_custom_path(&link, true, &probe, |_| false),
+                Err(MountpointError::WindowsTargetExists(_))
+            ));
+            let mut allocator = MountpointAllocator::new(temp.path().into(), true, &probe);
+            assert_eq!(
+                allocator.resolve(&server(HOME_MOUNTPOINT_VALUE)).unwrap(),
+                parent.join("Alpha_Server-2")
+            );
         }
     }
 

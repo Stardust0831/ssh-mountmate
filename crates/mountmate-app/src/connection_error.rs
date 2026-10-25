@@ -1,6 +1,29 @@
-//! Explain explicit SSH failures without guessing that every mount error is a
-//! bad password. Classification only uses diagnostics from the current attempt.
+//! Explain explicit SSH and local mountpoint failures without guessing that
+//! every mount error is a bad password. Only use the current attempt's diagnostics.
 use crate::i18n::Locale;
+
+/// Promote actionable diagnostics before the generic wrapper or log path is
+/// clipped for the connection card and program-log banner.
+pub fn summary(cause: &str, locale: Locale) -> Option<String> {
+    let lower = cause.to_ascii_lowercase();
+    if [
+        "cannot create winfsp-fuse file system: mount point in use",
+        "mountpoint path already exists:",
+        "windows drive is already in use",
+        "windows folder mountpoint target must not already exist:",
+        "windows folder mount targets must not already exist",
+        "mountpoint is already mounted or reserved:",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
+    {
+        return Some(match locale {
+            Locale::Chinese => "挂载失败：本地挂载点已被占用\n请先卸载旧挂载，或换用空闲盘符/尚不存在的目录；断开的旧挂载仍可能占用位置。".into(),
+            Locale::English => "Mount failed: local mountpoint is occupied\nUnmount the old mount or choose a free drive/new folder. Disconnected mounts may still occupy their path.".into(),
+        });
+    }
+    diagnose(cause).map(|failure| failure.summary(locale))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SshFailure {
@@ -130,6 +153,7 @@ pub fn diagnose(cause: &str) -> Option<SshFailure> {
         && has(&[
             "connection reset",
             "connection closed",
+            "an existing connection was forcibly closed by the remote host",
             "remote host has closed",
             "unexpected eof",
             "handshake failed: eof",
@@ -237,6 +261,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn winfsp_collision_is_visible_after_startup_messages() {
+        let cause = "mount did not become ready; log: C:\\logs\\mount.log\n\
+            NOTICE: Serving remote control on http://127.0.0.1:1234/\n\
+            NOTICE: Symlinks support enabled\n\
+            Cannot create WinFsp-FUSE file system: mount point in use.\n\
+            CRITICAL: Fatal error: failed to mount FUSE fs: mount stopped before calling Init: mount failed";
+        for locale in [Locale::English, Locale::Chinese] {
+            let message = summary(cause, locale).unwrap();
+            assert_eq!(message.lines().count(), 2);
+            assert!(!message.contains("mount.log"));
+            assert!(message.chars().count() <= crate::MOUNT_ERROR_SUMMARY_MAX_CHARS);
+        }
+        assert!(
+            summary(cause, Locale::Chinese)
+                .unwrap()
+                .contains("挂载点已被占用")
+        );
+        assert!(summary("SFTP permission denied opening /data", Locale::English).is_none());
+    }
+
+    #[test]
     fn recognizes_native_openssh_and_plink_failures() {
         for (cause, expected) in [
             (
@@ -302,6 +347,10 @@ mod tests {
             ),
             (
                 "couldn't connect SSH: ssh: handshake failed: EOF",
+                SshFailure::Disconnected,
+            ),
+            (
+                "couldn't connect SSH: ssh: handshake failed: read tcp: wsarecv: An existing connection was forcibly closed by the remote host.",
                 SshFailure::Disconnected,
             ),
         ] {

@@ -950,8 +950,8 @@ fn mountpoint_preflight_result_is_current(
 }
 
 fn mount_error_summary(locale: Locale, cause: &str) -> String {
-    if let Some(failure) = connection_error::diagnose(cause) {
-        return failure.summary(locale);
+    if let Some(summary) = connection_error::summary(cause, locale) {
+        return summary;
     }
     let prefix = match locale {
         Locale::English => "Last operation failed: ",
@@ -4538,10 +4538,9 @@ impl App {
                                 cause: error.clone(),
                             },
                         );
-                        self.status = self.program_log.error(
-                            connection_error::diagnose(&error)
-                                .map_or(error, |failure| failure.summary(locale)),
-                        );
+                        self.status = self
+                            .program_log
+                            .error(connection_error::summary(&error, locale).unwrap_or(error));
                         tasks.push(self.status_task(StatusPublishPolicy::Silent));
                     }
                 }

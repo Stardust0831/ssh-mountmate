@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use iced::widget::{
     Space, button, checkbox, column, container, pane_grid, row, text, text_editor, text_input,
 };
-use iced::{Center, Element, Fill, Font, Task, Theme, clipboard};
+use iced::{Center, Element, Fill, Task, Theme, clipboard};
 
 use crate::i18n::Locale;
 
@@ -164,10 +164,18 @@ impl ProgramLog {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        self.content = text_editor::Content::with_text(&lines);
-        if self.follow {
-            self.content
-                .perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+        // Reuse the editor's font and viewport. Creating Content::with_text
+        // here shapes the entire history synchronously before layout, at its
+        // default metrics, on every message (including mount progress).
+        self.content.perform(text_editor::Action::SelectAll);
+        self.content
+            .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
+                lines.into(),
+            )));
+        if !self.follow {
+            self.content.perform(text_editor::Action::Move(
+                text_editor::Motion::DocumentStart,
+            ));
         }
         self.pending = 0;
     }
@@ -286,7 +294,6 @@ impl ProgramLog {
                         "程序运行消息会显示在这里",
                     ))
                     .on_action(Message::Action)
-                    .font(Font::MONOSPACE)
                     .size(14)
                     .height(Fill),
             );
@@ -339,20 +346,27 @@ mod tests {
     fn history_is_bounded_and_read_only() {
         let mut log = ProgramLog::new(Locale::Chinese);
         log.info("Read-only log".into());
-        // Exercise history limits without repeatedly shaping hundreds of
-        // Unicode lines on headless runners. View refresh has separate coverage.
-        let _ = log.update(Message::Follow(false));
         for i in 0..MAX_ENTRIES + 10 {
             log.info(format!("消息 {i}"));
         }
         assert_eq!(log.entries.len(), MAX_ENTRIES);
         assert_eq!(log.entries.front().unwrap().message, "消息 10");
+        assert!(!log.content.text().contains("] 消息 9\n"));
+        assert!(log.content.text().contains("] 消息 509"));
         let full = "字".repeat(MAX_MESSAGE_CHARS + 100);
         assert_eq!(log.error(full.clone()), full);
         assert_eq!(
             log.entries.back().unwrap().message.chars().count(),
             MAX_MESSAGE_CHARS + 1
         );
+        let cursor = log.content.cursor();
+        let last_line = log.content.line_count() - 1;
+        assert_eq!(cursor.position.line, last_line);
+        assert_eq!(
+            cursor.position.column,
+            log.content.line(last_line).unwrap().text.len()
+        );
+        assert!(cursor.selection.is_none());
         let original = log.content.text();
         let _ = log.update(Message::Action(text_editor::Action::Edit(
             text_editor::Edit::Insert('X'),
