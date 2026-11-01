@@ -105,7 +105,15 @@ impl std::fmt::Debug for Login {
 }
 impl Login {
     pub fn verification_url(&self) -> &str {
+        self.details
+            .verification_uri_complete()
+            .map_or_else(|| self.manual_verification_url(), |uri| uri.secret())
+    }
+    pub fn manual_verification_url(&self) -> &str {
         self.details.verification_uri().as_str()
+    }
+    pub fn has_complete_verification_url(&self) -> bool {
+        self.details.verification_uri_complete().is_some()
     }
     pub fn user_code(&self) -> &str {
         self.details.user_code().secret()
@@ -244,7 +252,9 @@ impl Client {
             .await
             .map_err(|_| Error::Authorization)?;
         trusted_url(details.verification_uri().as_str(), &self.issuer)?;
-        // The browser receives the plain verification URL, not a URL containing the code.
+        if let Some(uri) = details.verification_uri_complete() {
+            trusted_url(uri.secret(), &self.issuer)?;
+        }
         if details.expires_in().is_zero()
             || details.interval().is_zero()
             || details.interval() > LOGIN_LIMIT

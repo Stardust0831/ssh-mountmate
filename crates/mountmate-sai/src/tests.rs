@@ -687,6 +687,97 @@ async fn issuer_and_endpoint_mismatches_stop_before_credentials() {
     }
 }
 #[tokio::test]
+async fn complete_verification_uri_preserves_the_original_device_authorization() {
+    let service = Fixture::new(|request, origin| {
+        if request.path != "/device" {
+            return None;
+        }
+        let mut body: Value = serde_json::from_str(&standard_reply(request, origin).body).unwrap();
+        body["verification_uri_complete"] = json!(format!("{origin}/verify?user_code=ABCD-EFGH"));
+        Some(reply(200, body))
+    });
+    let client = service.client().await.unwrap();
+    let login = client.start_login().await.unwrap();
+    assert!(login.has_complete_verification_url());
+    assert_eq!(
+        login.verification_url(),
+        service
+            .base
+            .join("verify?user_code=ABCD-EFGH")
+            .unwrap()
+            .as_str()
+    );
+    assert_eq!(
+        login.manual_verification_url(),
+        service.base.join("verify").unwrap().as_str()
+    );
+    assert_eq!(login.user_code(), "ABCD-EFGH");
+    assert!(!format!("{login:?}").contains("ABCD-EFGH"));
+    client.finish_login(&login).await.unwrap();
+    let requests = service.requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/device")
+            .count(),
+        1
+    );
+    let token = requests
+        .iter()
+        .find(|request| request.path == "/token")
+        .unwrap();
+    let fields: std::collections::HashMap<_, _> =
+        url::form_urlencoded::parse(token.body.as_bytes()).collect();
+    assert_eq!(fields["device_code"], "secret-device-code");
+    assert!(!fields.contains_key("user_code"));
+}
+
+#[tokio::test]
+async fn absent_complete_verification_uri_retains_the_native_manual_fallback() {
+    let service = Fixture::new(|_, _| None);
+    let client = service.client().await.unwrap();
+    let login = client.start_login().await.unwrap();
+    assert!(!login.has_complete_verification_url());
+    assert_eq!(login.verification_url(), login.manual_verification_url());
+    assert_eq!(login.user_code(), "ABCD-EFGH");
+}
+
+#[tokio::test]
+async fn unsafe_complete_verification_uri_is_rejected_before_browser_or_token_use() {
+    for kind in ["origin", "credentials", "fragment"] {
+        let service = Fixture::new(move |request, origin| {
+            if request.path != "/device" {
+                return None;
+            }
+            let mut body: Value =
+                serde_json::from_str(&standard_reply(request, origin).body).unwrap();
+            let unsafe_uri = match kind {
+                "origin" => "https://untrusted.example/verify?user_code=ABCD-EFGH".to_owned(),
+                "credentials" => format!(
+                    "{}/verify?user_code=ABCD-EFGH",
+                    origin.replace("://", "://user@")
+                ),
+                _ => format!("{origin}/verify?user_code=ABCD-EFGH#unexpected"),
+            };
+            body["verification_uri_complete"] = json!(unsafe_uri);
+            Some(reply(200, body))
+        });
+        assert!(matches!(
+            service.client().await.unwrap().start_login().await,
+            Err(Error::Contract)
+        ));
+        assert!(
+            !service
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.path == "/token")
+        );
+    }
+}
+
+#[tokio::test]
 async fn device_polling_handles_pending_slow_down_and_denial() {
     let mut polls = 0;
     let service = Fixture::new(move |request, _| {
