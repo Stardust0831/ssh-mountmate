@@ -13726,7 +13726,7 @@ mod localization_tests {
     }
 
     #[test]
-    fn structured_remote_path_keeps_incomplete_input_until_save() {
+    fn structured_remote_path_preserves_native_names_through_save() {
         let suffix = "  project\\data set/  ";
         let relative = compose_remote_path("$HOME", suffix);
         let (_, editable_suffix) = split_remote_path(&relative);
@@ -13743,14 +13743,11 @@ mod localization_tests {
         draft.auth = AuthMethod::Password;
         draft.password = "test-password".into();
         draft.remote_path = relative;
-        assert_eq!(
-            draft.validate(&[]).unwrap().server.remote_path,
-            "project/data set"
-        );
+        assert_eq!(draft.validate(&[]).unwrap().server.remote_path, suffix);
         draft.remote_path = compose_remote_path("/", "srv\\data set/");
         assert_eq!(
             draft.validate(&[]).unwrap().server.remote_path,
-            "/srv/data set"
+            r"/srv\data set"
         );
     }
 

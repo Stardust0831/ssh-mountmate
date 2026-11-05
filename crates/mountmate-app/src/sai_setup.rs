@@ -527,9 +527,12 @@ impl State {
         }
         if !self.roots.is_empty() {
             content = content.push(
-                scrollable(choices.width(Fill))
-                    .width(Fill)
-                    .height(iced::Length::Fixed(200.0)),
+                scrollable(choices.width(Fill).padding(iced::Padding {
+                    right: 12.0,
+                    ..iced::Padding::ZERO
+                }))
+                .width(Fill)
+                .height(iced::Length::Fixed(200.0)),
             );
         }
         if self.roots_pending {
