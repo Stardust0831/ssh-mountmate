@@ -11,6 +11,9 @@ use std::sync::{
 #[path = "native_tests.rs"]
 mod native;
 
+#[path = "mount_tests.rs"]
+mod mount_directory;
+
 #[derive(Clone, Debug)]
 struct Request {
     method: String,

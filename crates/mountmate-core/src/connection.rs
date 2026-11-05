@@ -717,7 +717,6 @@ fn validate_host_alias(value: &str) -> Result<(), DraftError> {
 }
 
 pub fn normalize_remote_path(value: &str) -> String {
-    let value = value.trim().replace('\\', "/");
     if value == "~" {
         String::new()
     } else if let Some(suffix) = value.strip_prefix("~/") {

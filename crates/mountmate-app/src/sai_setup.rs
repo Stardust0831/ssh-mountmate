@@ -1,10 +1,13 @@
 //! Editor-only SAI setup; authentication never enters the mount service or saved settings.
 use crate::i18n::Locale;
-use iced::widget::{button, column, container, pick_list, text};
+use iced::widget::{button, checkbox, column, container, pick_list, scrollable, text};
 use iced::{Element, Fill, Task};
+use mountmate_core::connection::ConnectionDraft;
 use mountmate_sai::{
-    Client, ConfiguredConnection, Connection, EnrollmentProgress, Error, Login, PORTAL, Session,
+    Client, ConfiguredConnection, Connection, EnrollmentProgress, Error, Login, MountRole,
+    MountRoot, MountRootPage, PORTAL, Session,
 };
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -15,6 +18,9 @@ pub enum Message {
     LoginStarted(u64, Result<Box<(Client, Login)>, Error>),
     Authorized(u64, Result<Arc<Session>, Error>),
     Select(Connection),
+    LoadMountRoots,
+    MountRootsLoaded(u64, u64, Result<MountRootPage, Error>),
+    ToggleMountRoot(String, bool),
     Enroll,
     Reauthorize,
     EnrollmentProgress(u64, EnrollmentProgress),
@@ -37,12 +43,23 @@ pub struct State {
     browser_failed: bool,
     verification_url: Option<String>,
     show_device_code: bool,
+    roots: Vec<MountRoot>,
+    selected_roots: HashSet<String>,
+    roots_cursor: Option<String>,
+    roots_loaded: bool,
+    roots_pending: bool,
+    roots_error: Option<Error>,
+    roots_generation: u64,
+    roots_task: Option<iced::task::Handle>,
+    existing_mount_paths: HashSet<String>,
+    mount_slots: usize,
 }
 impl State {
     pub fn reset(&mut self) {
         if let Some(task) = self.task.take() {
             task.abort();
         }
+        self.reset_roots();
         *self = Self {
             generation: self.generation.wrapping_add(1),
             ..Self::default()
@@ -64,10 +81,26 @@ impl State {
         message: Message,
         data_dir: &Path,
         _locale: Locale,
+        draft: &ConnectionDraft,
     ) -> (Task<Message>, Option<ConfiguredConnection>) {
         match message {
             Message::Start if !self.pending => {
                 self.reset();
+                self.existing_mount_paths = draft
+                    .mounts
+                    .iter()
+                    .map(|mapping| mapping.remote_path.clone())
+                    .collect();
+                if draft.primary_mount {
+                    self.existing_mount_paths.insert(draft.remote_path.clone());
+                }
+                let unused_primary = draft.editing_id.is_none()
+                    && draft.primary_mount
+                    && draft.remote_path.is_empty()
+                    && draft.mountpoint.is_empty();
+                self.mount_slots = 64usize
+                    .saturating_sub(draft.mounts.len() + usize::from(draft.primary_mount))
+                    + usize::from(unused_primary);
                 self.pending = true;
                 let generation = self.generation;
                 let task = Task::perform(
@@ -106,6 +139,7 @@ impl State {
                     Ok(session) => {
                         self.selected = session.connections().first().cloned();
                         self.session = Some(session);
+                        return (self.load_roots(), None);
                     }
                     Err(error) => self.error = Some(error),
                 }
@@ -116,8 +150,46 @@ impl State {
                     .as_ref()
                     .is_some_and(|s| s.connections().contains(&site))
                 {
+                    self.reset_roots();
                     self.selected = Some(site);
                     self.error = None;
+                    return (self.load_roots(), None);
+                }
+            }
+            Message::LoadMountRoots if !self.pending && !self.roots_pending => {
+                return (self.load_roots(), None);
+            }
+            Message::MountRootsLoaded(generation, request, result)
+                if generation == self.generation
+                    && request == self.roots_generation
+                    && self.roots_pending =>
+            {
+                self.roots_pending = false;
+                match result {
+                    Ok(page)
+                        if page
+                            .items
+                            .iter()
+                            .all(|item| self.roots.iter().all(|old| old.id != item.id)) =>
+                    {
+                        self.roots.extend(page.items);
+                        self.roots_cursor = page.next_cursor;
+                        self.roots_loaded = true;
+                    }
+                    Ok(_) => self.roots_error = Some(Error::Contract),
+                    Err(error) => self.roots_error = Some(error),
+                }
+            }
+            Message::ToggleMountRoot(id, checked) if !self.pending => {
+                if let Some(root) = self.roots.iter().find(|root| root.id == id) {
+                    if checked
+                        && (self.existing_mount_paths.contains(&root.path)
+                            || self.additional_selections() < self.mount_slots)
+                    {
+                        self.selected_roots.insert(id);
+                    } else if !checked {
+                        self.selected_roots.remove(&id);
+                    }
                 }
             }
             action @ (Message::Enroll | Message::Reauthorize) if !self.pending => {
@@ -126,6 +198,11 @@ impl State {
                     return (Task::none(), None);
                 }
                 if let (Some(session), Some(site)) = (self.session.clone(), self.selected.clone()) {
+                    if let Some(task) = self.roots_task.take() {
+                        task.abort();
+                    }
+                    self.roots_pending = false;
+                    self.roots_generation = self.roots_generation.wrapping_add(1);
                     self.pending = true;
                     self.error = None;
                     self.verification_url = None;
@@ -176,9 +253,15 @@ impl State {
                 self.verification_url = None;
                 match result {
                     Ok(configured) => {
+                        let roots = self
+                            .roots
+                            .iter()
+                            .filter(|root| self.selected_roots.contains(&root.id))
+                            .cloned()
+                            .collect();
                         self.reset();
                         self.ready = true;
-                        return (Task::none(), Some(configured));
+                        return (Task::none(), Some(configured.with_mount_roots(roots)));
                     }
                     Err(error) => {
                         if error == Error::Expired {
@@ -207,6 +290,51 @@ impl State {
             _ => {}
         }
         (Task::none(), None)
+    }
+    fn reset_roots(&mut self) {
+        if let Some(task) = self.roots_task.take() {
+            task.abort();
+        }
+        self.roots_generation = self.roots_generation.wrapping_add(1);
+        self.roots.clear();
+        self.selected_roots.clear();
+        self.roots_cursor = None;
+        self.roots_loaded = false;
+        self.roots_pending = false;
+        self.roots_error = None;
+    }
+    fn additional_selections(&self) -> usize {
+        self.roots
+            .iter()
+            .filter(|root| {
+                self.selected_roots.contains(&root.id)
+                    && !self.existing_mount_paths.contains(&root.path)
+            })
+            .map(|root| &root.path)
+            .collect::<HashSet<_>>()
+            .len()
+    }
+    fn load_roots(&mut self) -> Task<Message> {
+        let (Some(session), Some(site)) = (self.session.clone(), self.selected.clone()) else {
+            return Task::none();
+        };
+        if !session.has_mount_directory_discovery()
+            || (self.roots_loaded && self.roots_cursor.is_none())
+        {
+            return Task::none();
+        }
+        self.roots_generation = self.roots_generation.wrapping_add(1);
+        let (generation, request) = (self.generation, self.roots_generation);
+        let cursor = self.roots_cursor.clone();
+        self.roots_pending = true;
+        self.roots_error = None;
+        let (task, handle) = Task::perform(
+            async move { session.mount_roots(&site, cursor.as_deref()).await },
+            move |result| Message::MountRootsLoaded(generation, request, result),
+        )
+        .abortable();
+        self.roots_task = Some(handle.abort_on_drop());
+        task
     }
     fn open_browser(&self, url: &str) -> Task<Message> {
         let url = url.to_owned();
@@ -290,21 +418,23 @@ impl State {
                     )));
                 }
             } else {
-                content = content
-                    .push(
-                        pick_list(
-                            session.connections().to_vec(),
-                            self.selected.clone(),
-                            Message::Select,
-                        )
-                        .width(Fill),
+                content = content.push(
+                    pick_list(
+                        session.connections().to_vec(),
+                        self.selected.clone(),
+                        Message::Select,
                     )
-                    .push(if self.needs_new_key() {
-                        button(tr("Authorize with a new key", "使用新密钥重新授权"))
-                            .on_press(Message::Reauthorize)
-                    } else {
-                        button(tr("Continue setup", "继续配置")).on_press(Message::Enroll)
-                    });
+                    .width(Fill),
+                );
+                if session.has_mount_directory_discovery() {
+                    content = content.push(self.directory_view(locale));
+                }
+                content = content.push(if self.needs_new_key() {
+                    button(tr("Authorize with a new key", "使用新密钥重新授权"))
+                        .on_press(Message::Reauthorize)
+                } else {
+                    button(tr("Continue setup", "继续配置")).on_press(Message::Enroll)
+                });
                 if self.needs_new_key() {
                     content = content.push(
                         text(tr(
@@ -362,6 +492,89 @@ impl State {
             .style(container::rounded_box)
             .into()
     }
+    fn directory_view(&self, locale: Locale) -> Element<'_, Message> {
+        let tr = |en, zh| if locale == Locale::Chinese { zh } else { en };
+        let mut content =
+            column![text(tr("Mount directories (optional)", "挂载目录（可选）"))].spacing(8);
+        let mut choices = column![].spacing(8);
+        let has_room = self.additional_selections() < self.mount_slots;
+        for root in &self.roots {
+            let selected = self.selected_roots.contains(&root.id);
+            let id = root.id.clone();
+            let role = match root.role {
+                MountRole::Read => tr("Read only", "只读"),
+                MountRole::Write => tr("Read / write", "读写"),
+            };
+            let choice = checkbox(selected)
+                .label(format!("{} · {role}", root.display_name))
+                .width(Fill)
+                .text_wrapping(text::Wrapping::WordOrGlyph);
+            choices = choices.push(
+                column![
+                    choice.on_toggle_maybe(
+                        (selected || has_room || self.existing_mount_paths.contains(&root.path))
+                            .then_some(move |checked| {
+                                Message::ToggleMountRoot(id.clone(), checked)
+                            })
+                    ),
+                    text(&root.path)
+                        .size(13)
+                        .width(Fill)
+                        .wrapping(text::Wrapping::WordOrGlyph),
+                ]
+                .spacing(3),
+            );
+        }
+        if !self.roots.is_empty() {
+            content = content.push(
+                scrollable(choices.width(Fill))
+                    .width(Fill)
+                    .height(iced::Length::Fixed(200.0)),
+            );
+        }
+        if self.roots_pending {
+            content = content.push(text(tr("Loading directories…", "正在读取目录…")));
+        } else if let Some(error) = self.roots_error {
+            let message = match error {
+                Error::Unavailable => tr(
+                    "Directory discovery is unavailable. Enter paths manually or retry.",
+                    "目录发现暂不可用。可手动填写路径或重试。",
+                ),
+                Error::Forbidden => tr(
+                    "Directory access was not authorized. Enter paths manually or sign in again.",
+                    "未获目录读取授权。可手动填写路径或重新登录。",
+                ),
+                Error::Network => tr(
+                    "Could not load directories. Check your connection and retry.",
+                    "无法读取目录，请检查网络后重试。",
+                ),
+                Error::Contract => tr(
+                    "The directory response is incompatible. Contact the SAI service administrator.",
+                    "目录数据不兼容，请联系 SAI 服务管理员。",
+                ),
+                _ => {
+                    return column![
+                        content,
+                        text(error_text(error, locale)),
+                        button(tr("Sign in again", "重新登录")).on_press(Message::Start)
+                    ]
+                    .into();
+                }
+            };
+            content = content.push(text(message));
+            content = content.push(if error == Error::Forbidden {
+                button(tr("Sign in again", "重新登录")).on_press(Message::Start)
+            } else {
+                button(tr("Retry directories", "重试读取目录")).on_press(Message::LoadMountRoots)
+            });
+        } else if self.roots_cursor.is_some() {
+            content = content
+                .push(button(tr("More directories", "更多目录")).on_press(Message::LoadMountRoots));
+        } else if self.roots_loaded && self.roots.is_empty() {
+            content = content.push(text(tr("No available directories.", "暂无可用目录。")));
+        }
+        content.into()
+    }
 }
 fn error_text(error: Error, locale: Locale) -> String {
     if locale == Locale::English {
@@ -389,6 +602,37 @@ fn error_text(error: Error, locale: Locale) -> String {
 mod tests {
     use super::*;
     #[test]
+    fn directory_selection_uses_the_existing_editors_remaining_mapping_slots() {
+        let mut draft = ConnectionDraft::default();
+        draft.editing_id = Some("existing".into());
+        draft.mounts = (0..62)
+            .map(|_| mountmate_core::model::MountMapping::default())
+            .collect();
+        let mut state = State::default();
+        let _ = state.update(Message::Start, Path::new("unused"), Locale::English, &draft);
+        state.pending = false;
+        state.roots = (0..2)
+            .map(|index| MountRoot {
+                id: format!("directory-{index}"),
+                display_name: format!("Directory {index}"),
+                kind: mountmate_sai::MountRootKind::ProjectRoot,
+                path: format!("/data/{index}"),
+                role: MountRole::Read,
+            })
+            .collect();
+        for id in ["directory-0", "directory-1"] {
+            let _ = state.update(
+                Message::ToggleMountRoot(id.into(), true),
+                Path::new("unused"),
+                Locale::English,
+                &draft,
+            );
+        }
+        assert_eq!(state.selected_roots, HashSet::from(["directory-0".into()]));
+        state.reset();
+        assert!(state.selected_roots.is_empty());
+    }
+    #[test]
     fn cancelled_generation_ignores_late_results() {
         let mut state = State::default();
         let generation = state.generation;
@@ -400,22 +644,44 @@ mod tests {
             ),
             Path::new("unused"),
             Locale::English,
+            &ConnectionDraft::default(),
         );
         let _ = state.update(
             Message::LoginStarted(generation, Err(Error::Unavailable)),
             Path::new("unused"),
             Locale::English,
+            &ConnectionDraft::default(),
         );
         let _ = state.update(
             Message::Finished(generation, Err(Error::SyncFailed)),
             Path::new("unused"),
             Locale::English,
+            &ConnectionDraft::default(),
         );
         let _ = state.update(
             Message::BrowserOpened(generation, false),
             Path::new("unused"),
             Locale::English,
+            &ConnectionDraft::default(),
         );
+        state.roots_pending = true;
+        let _ = state.update(
+            Message::MountRootsLoaded(generation, state.roots_generation, Err(Error::Forbidden)),
+            Path::new("unused"),
+            Locale::English,
+            &ConnectionDraft::default(),
+        );
+        assert!(state.roots_error.is_none());
+        let old_request = state.roots_generation;
+        state.reset_roots();
+        state.roots_pending = true;
+        let _ = state.update(
+            Message::MountRootsLoaded(state.generation, old_request, Err(Error::Forbidden)),
+            Path::new("unused"),
+            Locale::English,
+            &ConnectionDraft::default(),
+        );
+        assert!(state.roots_error.is_none());
         assert!(!state.in_progress());
         assert!(state.error.is_none());
         assert!(!state.ready);

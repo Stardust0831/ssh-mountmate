@@ -1,18 +1,16 @@
 # SAI account setup adapter
 
-**Status: client implementation against a proposed service contract.** The APIs below are
-not yet deployed. MountMate checks capability before starting login; unsupported services
-show an explanation and keep manual SAI setup available. Server work is tracked in
-[Identity #115](https://github.com/AI4SAI/sai-identity/issues/115) and
-[Portal #564](https://github.com/AI4SAI/sai-portal/issues/564).
+MountMate checks the service's versioned capabilities before starting login.
+Directory discovery is an optional extension to the existing connection and device-key
+flow. Services without that extension retain manual mount-path configuration.
 
 ## Client boundary
 
-`mountmate-sai` owns discovery, device authorization, permitted connections and public-key
-registration. The app's `sai_setup.rs` owns temporary editor state. Only after the selected
-site reports `applied` does the adapter fill an ordinary `ConnectionDraft`. Existing validation,
-save, host-key review and mount handling remain responsible for the connection. No core
-mount code or saved connection schema changes are needed.
+`mountmate-sai` owns discovery, device authorization, permitted connections, public-key
+registration and directory discovery. The app's `sai_setup.rs` owns temporary editor state.
+Only after the selected site reports `applied` does the adapter fill an ordinary
+`ConnectionDraft`. Existing validation, save, host-key review and mount handling remain
+responsible for the connection. The saved connection schema stays unchanged.
 
 The first version uses Native SFTP and a dedicated local Ed25519 key, without writing SSH
 config entries or requiring an SSH CA. Keys live under the app data directory at
@@ -39,7 +37,8 @@ missing selected-key data fails closed instead of falling back to a retired key.
 Production trust roots are Portal `https://www.open-sai.com` and Identity issuer
 `https://id.open-sai.com/realms/sai`. There is no production HTTP/issuer override. HTTP keeps
 normal system proxy behavior, TLS validation, no redirects, 10-second connect and 20-second
-request timeouts, and a 128 KiB response limit. Discovery issuer must match exactly;
+request timeouts, and a 128 KiB response limit for login and key operations. Directory
+pages have a separate bounded 2 MiB limit. Discovery issuer must match exactly;
 token/device/verification URLs must share the trusted issuer origin, without URL credentials
 or fragments. Errors exclude response bodies and OAuth secrets. The browser receives the
 plain verification URL; users enter the displayed code there.
@@ -50,13 +49,17 @@ Register public client `ssh-mountmate` for standard Device Authorization (RFC 86
 client secret or password grant. Browser login, MFA, consent and sensitive-action policy
 belong to Identity. Requested scopes are `openid sai.ssh.read sai.ssh.keys.write`; resource
 and audience are `sai-portal`. Do not grant unrelated billing, compute/storage or offline scopes.
+When the service advertises `mount_roots=ssh.mount-roots/v1`, the same device authorization
+also requests optional `sai.ssh.mounts.read`. This consent permits directory names, paths
+and read/write metadata. Existing SSH grants alone do not permit directory discovery.
 
 Agree on a Portal-compatible subject sector and explicit authorized-party allowlist. Portal
 binds the verified `(iss, sub)` to its account; MountMate does not derive Unix usernames from
 email, nickname or subject. Send `client_id` and `resource` to device and token endpoints,
 and scopes to the device endpoint. The OAuth library handles pending and `slow_down`; login
 is bounded by the advertised expiry and 15 minutes. Granted scopes, when supplied, must
-contain the requested scopes. Tokens must be Bearer with positive `expires_in`. Portal owns
+contain the three basic scopes. Missing directory consent leaves ordinary setup available
+and reports directory access as unauthorized. Tokens must be Bearer with positive `expires_in`. Portal owns
 signature, issuer, audience, azp, expiry, scope and account-binding verification.
 
 ## Proposed Portal v1 contract
@@ -104,6 +107,48 @@ UTF-8 bytes, nonblank, no control characters). Site IDs are unique; `site_id`/`u
 1–128 ASCII letters/digits/underscore/hyphen/dot without a leading hyphen. Host is a DNS name
 or IP address; port is 1–65535; name is 1–128 UTF-8 bytes, nonblank, without controls. Do not
 substitute query-gateway metadata. Recheck access when registering a key.
+
+### Optional mount directories
+
+The public capability may include `"mount_roots":"ssh.mount-roots/v1"` after the matching
+Identity scope and Portal API are available. Unknown or absent directory capability keeps
+manual paths available and does not request the additional scope.
+
+`GET /v1/account/ssh/mount-roots?site_id=example-site&limit=20` uses the same trusted Portal
+origin and a Bearer token with `sai.ssh.mounts.read`. A page contains:
+
+```json
+{
+  "schema_version": "ssh.mount-roots/v1",
+  "site_id": "example-site",
+  "items": [
+    {"id":"opaque-directory-id", "display_name":"Shared results", "kind":"org_share", "path":"/data/shared results", "role":"read"}
+  ],
+  "next_cursor": null
+}
+```
+
+Directory kinds are `home`, `org_share`, `org_user_dir` and `project_root`; roles are
+`read` or `write`. Paths are server-resolved absolute paths visible through the selected
+SSH endpoint, including exact invited subdirectories. Names and paths may contain Unicode
+and spaces. The client never constructs them from usernames or organization identifiers.
+
+Each page is bound to the selected site and validates its unique IDs, canonical paths and
+known roles. The client requests 20 candidates and allows up to 2 MiB, enough for the
+maximum Unicode names and paths, including JSON escapes. `next_cursor` is an opaque value
+of at most 101 characters, passed back only to this
+endpoint. An empty page can still have a cursor; **More directories** loads the next page.
+Only a null cursor ends the list. Denial, expiry, unavailable service and invalid responses
+are shown as errors, preserving manual path entry.
+
+The setup panel lets users select several directories and shows their read/write state.
+Only explicit choices are applied after key enrollment succeeds. A fresh unused primary
+mapping receives the first choice; further choices append ordinary mappings without
+overwriting existing paths or local destinations. Existing paths are not duplicated.
+Selections respect the existing editor's remaining capacity. Users finish local destinations
+and save through the ordinary 64-mapping validation. Remote path whitespace and literal
+backslashes remain unchanged through saving, mount targets and capacity queries.
+Selection provides no new permission; SFTP and the remote filesystem enforce actual access.
 
 ### Register this device
 

@@ -3315,7 +3315,8 @@ impl App {
                     && draft.source == ConnectionSource::SaiCluster
                 {
                     let (task, configured) =
-                        self.sai_setup.update(message, &self.paths.data_dir, locale);
+                        self.sai_setup
+                            .update(message, &self.paths.data_dir, locale, draft);
                     if let Some(configured) = configured {
                         configured.apply_to(draft);
                     }
@@ -4913,7 +4914,7 @@ impl App {
         {
             let previous = previous.clone();
             let mut next = previous.clone();
-            next.remote_path = draft.remote_path.trim().to_owned();
+            next.remote_path.clone_from(&draft.remote_path);
             next.mountpoint = draft.mountpoint.trim().to_owned();
             next.mounts = draft.mounts.clone();
             next.primary_mount = draft.primary_mount;

@@ -3,10 +3,12 @@
 
 mod enrollment;
 mod key;
+mod mounts;
 mod transport;
 
 pub use enrollment::EnrollmentProgress;
 use enrollment::{Enrollment, Status as EnrollmentStatus};
+pub use mounts::{MountRole, MountRoot, MountRootKind, MountRootPage};
 
 use mountmate_core::connection::{ConnectionDraft, ConnectionSource};
 use mountmate_core::credential::CredentialKind;
@@ -28,6 +30,7 @@ const ISSUER: &str = "https://id.open-sai.com/realms/sai";
 const CLIENT_ID: &str = "ssh-mountmate";
 const RESOURCE: &str = "sai-portal";
 const SCOPES: [&str; 3] = ["openid", "sai.ssh.read", "sai.ssh.keys.write"];
+const MOUNT_SCOPE: &str = "sai.ssh.mounts.read";
 const LOGIN_LIMIT: Duration = Duration::from_secs(900);
 const SYNC_LIMIT: Duration = Duration::from_secs(120);
 type DeviceClient =
@@ -73,6 +76,7 @@ pub struct Client {
     issuer: Url,
     oauth: DeviceClient,
     browser_verification: bool,
+    mount_roots: bool,
 }
 impl std::fmt::Debug for Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -86,6 +90,7 @@ struct Configuration {
     oidc_client_id: String,
     oidc_resource: String,
     ssh_access: String,
+    mount_roots: Option<String>,
 }
 #[derive(Deserialize)]
 struct Discovery {
@@ -149,6 +154,7 @@ pub struct Session {
     token: Zeroizing<String>,
     expires_at: Instant,
     directory: Directory,
+    mount_roots_granted: bool,
 }
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -159,8 +165,13 @@ impl std::fmt::Debug for Session {
 pub struct ConfiguredConnection {
     connection: Connection,
     key_file: PathBuf,
+    mount_roots: Vec<MountRoot>,
 }
 impl ConfiguredConnection {
+    pub fn with_mount_roots(mut self, roots: Vec<MountRoot>) -> Self {
+        self.mount_roots = roots;
+        self
+    }
     /// Preserve mount paths and editor identity; reuse ordinary validation and save.
     pub fn apply_to(&self, draft: &mut ConnectionDraft) {
         draft.source = ConnectionSource::SaiCluster;
@@ -182,6 +193,7 @@ impl ConfiguredConnection {
         draft.clear_preserved_secret(CredentialKind::KeyPassphrase);
         draft.ssh_config_managed = false;
         draft.copy_key_to_ssh_dir = false;
+        mounts::apply_selected_roots(draft, &self.mount_roots);
     }
 }
 
@@ -240,13 +252,17 @@ impl Client {
             issuer,
             oauth,
             browser_verification: config.ssh_access == "public-key/v2",
+            mount_roots: config.mount_roots.as_deref() == Some(mounts::SCHEMA),
         })
     }
     pub async fn start_login(&self) -> Result<Login, Error> {
+        let scopes = SCOPES
+            .into_iter()
+            .chain(self.mount_roots.then_some(MOUNT_SCOPE));
         let details: StandardDeviceAuthorizationResponse = self
             .oauth
             .exchange_device_code()
-            .add_scopes(SCOPES.map(|scope| Scope::new(scope.into())))
+            .add_scopes(scopes.map(|scope| Scope::new(scope.into())))
             .add_extra_param("resource", RESOURCE)
             .request_async(&self.http)
             .await
@@ -306,6 +322,10 @@ impl Client {
             .expires_in()
             .filter(|value| !value.is_zero())
             .ok_or(Error::Authorization)?;
+        let mount_roots_granted = self.mount_roots
+            && token
+                .scopes()
+                .is_none_or(|scopes| scopes.iter().any(|s| s.as_str() == MOUNT_SCOPE));
         let token = Zeroizing::new(token.access_token().secret().clone());
         let expires_at = Instant::now() + lifetime.min(LOGIN_LIMIT);
         let directory: Directory = transport::json(
@@ -328,6 +348,7 @@ impl Client {
             token,
             expires_at,
             directory,
+            mount_roots_granted,
         })
     }
 }
@@ -433,6 +454,7 @@ impl Session {
         Ok(ConfiguredConnection {
             connection: site.clone(),
             key_file: key.path,
+            mount_roots: Vec::new(),
         })
     }
 
