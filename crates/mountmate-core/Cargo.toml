@@ -49,6 +49,7 @@ keyring = { workspace = true, features = ["apple-native"] }
 keyring = { workspace = true, features = ["windows-native"] }
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_NetworkManagement_WNet",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",

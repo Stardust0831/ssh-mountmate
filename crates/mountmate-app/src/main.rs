@@ -2595,7 +2595,6 @@ impl App {
                 self.sai_setup.reset();
                 draft.ssh_config_path = default_ssh_config_path().display().to_string();
                 self.connection_draft = Some(draft);
-                self.windows_drive_letters = available_windows_drive_letters();
                 self.connection_tags_input.clear();
                 self.connection_custom_mountpoint.clear();
                 self.invalidate_mountpoint_preflight();
@@ -2603,6 +2602,13 @@ impl App {
                 self.ssh_import_actions.clear();
                 self.screen = Screen::ConnectionEditor;
                 self.status = locale.text(TextKey::NewConnection).into();
+                match available_windows_drive_letters() {
+                    Ok(drives) => self.windows_drive_letters = drives,
+                    Err(error) => {
+                        self.windows_drive_letters.clear();
+                        self.status = error.to_string();
+                    }
+                }
                 return scoped_focus(EDITOR_FOCUS_SCOPE, "connection-name");
             }
             Message::ConnectionSearchChanged(value) => self.connection_search = value,
@@ -4530,7 +4536,6 @@ impl App {
                 self.sai_setup.reset();
                 if let Some(server) = self.servers.iter().find(|server| server.id == id) {
                     self.connection_draft = Some(ConnectionDraft::from_server(server));
-                    self.windows_drive_letters = available_windows_drive_letters();
                     self.connection_tags_input = server.tags.join(", ");
                     if let Some(draft) = &mut self.connection_draft {
                         draft.auto_mount_at_login |= self.settings.startup_all;
@@ -4549,6 +4554,13 @@ impl App {
                     } else {
                         connection_settings_locked_help(locale).into()
                     };
+                    match available_windows_drive_letters() {
+                        Ok(drives) => self.windows_drive_letters = drives,
+                        Err(error) => {
+                            self.windows_drive_letters.clear();
+                            self.status = error.to_string();
+                        }
+                    }
                     if self.mapping_can_modify(&id)
                         && mountpoint_choice(&server.mountpoint) == "custom"
                     {
