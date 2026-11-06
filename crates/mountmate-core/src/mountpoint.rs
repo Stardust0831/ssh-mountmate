@@ -53,6 +53,12 @@ pub enum MountpointError {
     NoFreeDrive,
     #[error("Windows drive is already in use: {0}")]
     DriveInUse(String),
+    #[error("could not read Windows drive assignments ({api}, error {code})")]
+    WindowsDriveQuery { api: &'static str, code: u32 },
+    #[error("Windows drive assignments could not be fully read: {0}")]
+    WindowsDriveSnapshot(&'static str),
+    #[error("{0}")]
+    Preparation(String),
     #[error("mountpoint must be an absolute path or start with ~: {0}")]
     NotAbsolute(PathBuf),
     #[error("Windows folder mountpoint parent does not exist: {0}")]
@@ -77,7 +83,7 @@ pub enum MountpointError {
 }
 
 pub trait MountpointProbe {
-    fn windows_drive_in_use(&self, drive: char) -> bool;
+    fn windows_drive_occupancy(&self) -> Result<u32, MountpointError>;
     fn path_exists(&self, path: &Path) -> bool;
     fn path_is_dir(&self, path: &Path) -> bool;
     fn path_is_mount(&self, path: &Path) -> bool;
@@ -93,8 +99,8 @@ pub trait MountpointProbe {
 pub struct SystemMountpointProbe;
 
 impl MountpointProbe for SystemMountpointProbe {
-    fn windows_drive_in_use(&self, drive: char) -> bool {
-        windows_drive_in_use(drive)
+    fn windows_drive_occupancy(&self) -> Result<u32, MountpointError> {
+        windows_drive_occupancy()
     }
 
     fn path_exists(&self, path: &Path) -> bool {
@@ -135,8 +141,7 @@ pub(crate) fn windows_path_occupied(path: &Path) -> bool {
 pub fn system_mountpoint_ready(path: &Path) -> bool {
     #[cfg(windows)]
     {
-        let value = path.as_os_str().to_string_lossy();
-        return windows_drive(&value).map_or_else(|| path.exists(), windows_drive_in_use);
+        return windows_mountpoint_ready(path);
     }
     #[cfg(target_os = "linux")]
     {
@@ -181,55 +186,247 @@ fn unix_device_changed(path: &Path) -> bool {
     }
 }
 
-#[cfg(windows)]
-fn windows_logical_drive_mask() -> u32 {
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetLogicalDrives() -> u32;
-    }
-
-    // GetLogicalDrives has no parameters and returns a bitmask owned by the OS.
-    unsafe { GetLogicalDrives() }
-}
-
-/// Available drive letters without opening drive roots (which can block on
-/// disconnected network drives). A failed OS query exposes no drive choices.
-pub fn available_windows_drive_letters() -> Vec<char> {
+/// Current and remembered assignments, read without opening any drive roots.
+/// An incomplete OS snapshot never makes an unobserved letter available.
+pub fn available_windows_drive_letters() -> Result<Vec<char>, MountpointError> {
     #[cfg(windows)]
     {
-        drive_letters_from_mask(windows_logical_drive_mask())
+        windows_drive_occupancy().map(drive_letters_from_mask)
     }
     #[cfg(not(windows))]
     {
-        Vec::new()
+        Ok(Vec::new())
     }
 }
 
 #[cfg(any(windows, test))]
 fn drive_letters_from_mask(mask: u32) -> Vec<char> {
-    if mask == 0 {
-        return Vec::new();
-    }
-    ('D'..='Z')
-        .rev()
-        .filter(|drive| mask & (1 << (u32::from(*drive) - u32::from('A'))) == 0)
+    WINDOWS_AUTO_DRIVES
+        .chars()
+        .filter(|drive| !drive_is_occupied(mask, *drive))
         .collect()
 }
 
-#[cfg(windows)]
-fn windows_drive_in_use(drive: char) -> bool {
-    let mask = windows_logical_drive_mask();
-    let drive = drive.to_ascii_uppercase();
-    if mask != 0 && drive.is_ascii_alphabetic() {
-        mask & (1 << (u32::from(drive) - u32::from('A'))) != 0
-    } else {
-        PathBuf::from(format!("{drive}:\\")).exists()
-    }
+fn drive_is_occupied(mask: u32, drive: char) -> bool {
+    mask & (1 << (u32::from(drive.to_ascii_uppercase()) - u32::from('A'))) != 0
 }
 
 #[cfg(not(windows))]
-fn windows_drive_in_use(drive: char) -> bool {
-    PathBuf::from(format!("{drive}:\\")).exists()
+fn windows_drive_occupancy() -> Result<u32, MountpointError> {
+    Err(MountpointError::Preparation(
+        "Windows drive assignments can only be queried on Windows".into(),
+    ))
+}
+
+#[cfg(windows)]
+fn windows_active_drive_mask() -> Result<u32, MountpointError> {
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
+
+    let mask = unsafe { GetLogicalDrives() };
+    if mask == 0 {
+        Err(MountpointError::WindowsDriveQuery {
+            api: "GetLogicalDrives",
+            code: unsafe { GetLastError() },
+        })
+    } else {
+        Ok(mask)
+    }
+}
+
+#[cfg(windows)]
+fn windows_drive_occupancy() -> Result<u32, MountpointError> {
+    use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, NO_ERROR};
+    use windows_sys::Win32::NetworkManagement::WNet::{
+        NETRESOURCEW, RESOURCE_REMEMBERED, RESOURCETYPE_DISK, WNetCloseEnum, WNetEnumResourceW,
+        WNetOpenEnumW,
+    };
+    let mut occupied = windows_active_drive_mask()?;
+    let mut handle = std::ptr::null_mut();
+    let opened = unsafe {
+        WNetOpenEnumW(
+            RESOURCE_REMEMBERED,
+            RESOURCETYPE_DISK,
+            0,
+            std::ptr::null(),
+            &mut handle,
+        )
+    };
+    if opened != NO_ERROR {
+        return Err(MountpointError::WindowsDriveQuery {
+            api: "WNetOpenEnumW",
+            code: opened,
+        });
+    }
+    let result = (|| {
+        // usize storage aligns NETRESOURCEW and leaves room for its strings.
+        let mut buffer = Vec::<usize>::new();
+        let mut required_bytes = 16_384usize;
+        loop {
+            let words = required_bytes.div_ceil(std::mem::size_of::<usize>());
+            let capacity = words
+                .checked_mul(std::mem::size_of::<usize>())
+                .and_then(|bytes| u32::try_from(bytes).ok())
+                .ok_or(MountpointError::WindowsDriveSnapshot(
+                    "WNetEnumResourceW requested an unrepresentable buffer size",
+                ))?;
+            buffer
+                .try_reserve_exact(words - buffer.len())
+                .map_err(|_| {
+                    MountpointError::WindowsDriveSnapshot(
+                        "could not allocate the WNetEnumResourceW buffer",
+                    )
+                })?;
+            buffer.resize(words, 0);
+            let mut bytes = capacity;
+            let mut count = u32::MAX;
+            let status = unsafe {
+                WNetEnumResourceW(handle, &mut count, buffer.as_mut_ptr().cast(), &mut bytes)
+            };
+            match status {
+                ERROR_NO_MORE_ITEMS => return Ok(occupied),
+                ERROR_MORE_DATA if bytes > capacity => {
+                    required_bytes = bytes as usize;
+                }
+                ERROR_MORE_DATA => {
+                    return Err(MountpointError::WindowsDriveSnapshot(
+                        "WNetEnumResourceW did not provide a larger required buffer",
+                    ));
+                }
+                NO_ERROR => {
+                    if count == 0
+                        || count as usize > capacity as usize / std::mem::size_of::<NETRESOURCEW>()
+                    {
+                        return Err(MountpointError::WindowsDriveSnapshot(
+                            "WNetEnumResourceW returned an invalid entry count",
+                        ));
+                    }
+                    let resources = unsafe {
+                        std::slice::from_raw_parts(
+                            buffer.as_ptr().cast::<NETRESOURCEW>(),
+                            count as usize,
+                        )
+                    };
+                    for resource in resources {
+                        if resource.lpLocalName.is_null() {
+                            continue;
+                        }
+                        let mut length = 0;
+                        while length < 3 && unsafe { *resource.lpLocalName.add(length) } != 0 {
+                            length += 1;
+                        }
+                        if length == 2 {
+                            let name =
+                                unsafe { std::slice::from_raw_parts(resource.lpLocalName, length) };
+                            if let Some(drive) = windows_drive(&String::from_utf16_lossy(name)) {
+                                occupied |= 1 << (u32::from(drive) - u32::from('A'));
+                            }
+                        }
+                    }
+                }
+                code => {
+                    return Err(MountpointError::WindowsDriveQuery {
+                        api: "WNetEnumResourceW",
+                        code,
+                    });
+                }
+            }
+        }
+    })();
+    let closed = unsafe { WNetCloseEnum(handle) };
+    result.and_then(|occupied| {
+        if closed == NO_ERROR {
+            Ok(occupied)
+        } else {
+            Err(MountpointError::WindowsDriveQuery {
+                api: "WNetCloseEnum",
+                code: closed,
+            })
+        }
+    })
+}
+
+#[cfg(windows)]
+fn windows_mountpoint_ready(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileStandardInfo,
+        GetFileInformationByHandleEx, OPEN_EXISTING,
+    };
+
+    let path = if let Some(drive) = windows_drive(&path.to_string_lossy()) {
+        // A remembered connection is reserved, but opening it can reconnect it.
+        // Only inspect a root whose current DOS drive has already appeared.
+        if !windows_active_drive_mask().is_ok_and(|mask| drive_is_occupied(mask, drive)) {
+            return false;
+        }
+        PathBuf::from(format!("{drive}:\\"))
+    } else {
+        path.to_owned()
+    };
+    let mut wide: Vec<_> = path.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return false;
+    }
+    wide.push(0);
+    // Follow the mount target. OPEN_REPARSE_POINT would only inspect its stub.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return false;
+    }
+    let mut info = FILE_STANDARD_INFO::default();
+    let read = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileStandardInfo,
+            (&mut info as *mut FILE_STANDARD_INFO).cast(),
+            std::mem::size_of_val(&info) as u32,
+        )
+    };
+    unsafe { CloseHandle(handle) };
+    read != 0 && info.Directory
+}
+
+pub(crate) fn prepare_mountpoint(path: &Path) -> Result<(), MountpointError> {
+    if path.as_os_str() == "*" {
+        return Err(MountpointError::Preparation(
+            "automatic '*' mountpoints must be resolved before spawning rclone".into(),
+        ));
+    }
+    #[cfg(windows)]
+    {
+        if let Some(drive) = windows_drive(&path.to_string_lossy()) {
+            if drive_is_occupied(windows_drive_occupancy()?, drive) {
+                return Err(MountpointError::DriveInUse(format!("{drive}:")));
+            }
+            return Ok(());
+        }
+        if windows_path_occupied(path) {
+            return Err(MountpointError::WindowsTargetExists(path.to_owned()));
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| MountpointError::Preparation(error.to_string()))?;
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::create_dir_all(path)
+            .map_err(|error| MountpointError::Preparation(error.to_string()))
+    }
 }
 
 #[cfg(windows)]
@@ -433,9 +630,13 @@ impl<'a> MountpointAllocator<'a> {
             }
         } else if configured == HOME_MOUNTPOINT_VALUE {
             self.allocate_home_folder(server)?
-        } else if let Some(drive) = windows_drive(configured) {
+        } else if self.windows
+            && let Some(drive) = windows_drive(configured)
+        {
             let path = PathBuf::from(format!("{drive}:"));
-            if self.probe.windows_drive_in_use(drive) || self.is_reserved(&path) {
+            if self.is_reserved(&path)
+                || drive_is_occupied(self.probe.windows_drive_occupancy()?, drive)
+            {
                 return Err(MountpointError::DriveInUse(path.display().to_string()));
             }
             path
@@ -449,12 +650,11 @@ impl<'a> MountpointAllocator<'a> {
     }
 
     fn allocate_windows_drive(&self) -> Result<PathBuf, MountpointError> {
+        let occupied = self.probe.windows_drive_occupancy()?;
         WINDOWS_AUTO_DRIVES
             .chars()
             .map(|drive| (drive, PathBuf::from(format!("{drive}:"))))
-            .find(|(drive, path)| {
-                !self.probe.windows_drive_in_use(*drive) && !self.is_reserved(path)
-            })
+            .find(|(drive, path)| !drive_is_occupied(occupied, *drive) && !self.is_reserved(path))
             .map(|(_, path)| path)
             .ok_or(MountpointError::NoFreeDrive)
     }
@@ -627,6 +827,7 @@ mod tests {
     #[derive(Default)]
     struct FakeProbe {
         drives: HashSet<char>,
+        drive_error: Option<u32>,
         existing: HashSet<String>,
         directories: HashSet<String>,
         mounts: HashSet<String>,
@@ -635,8 +836,16 @@ mod tests {
     }
 
     impl MountpointProbe for FakeProbe {
-        fn windows_drive_in_use(&self, drive: char) -> bool {
-            self.drives.contains(&drive)
+        fn windows_drive_occupancy(&self) -> Result<u32, MountpointError> {
+            if let Some(code) = self.drive_error {
+                return Err(MountpointError::WindowsDriveQuery {
+                    api: "WNetEnumResourceW",
+                    code,
+                });
+            }
+            Ok(self.drives.iter().fold(0, |mask, drive| {
+                mask | (1 << (u32::from(*drive) - u32::from('A')))
+            }))
         }
 
         fn path_exists(&self, path: &Path) -> bool {
@@ -702,6 +911,10 @@ mod tests {
                 validate_custom_path(&link, true, &probe, |_| false),
                 Err(MountpointError::WindowsTargetExists(_))
             ));
+            assert!(matches!(
+                prepare_mountpoint(&link),
+                Err(MountpointError::WindowsTargetExists(_))
+            ));
             let mut allocator = MountpointAllocator::new(temp.path().into(), true, &probe);
             assert_eq!(
                 allocator.resolve(&server(HOME_MOUNTPOINT_VALUE)).unwrap(),
@@ -711,7 +924,7 @@ mod tests {
     }
 
     #[test]
-    fn drive_choices_use_the_os_mask_and_fail_closed_without_probing_roots() {
+    fn drive_choices_use_a_complete_assignment_snapshot_without_probing_roots() {
         let occupied = (1 << 2) | (1 << 3) | (1 << 25);
         let choices = drive_letters_from_mask(occupied);
         assert_eq!(choices.first(), Some(&'Y'));
@@ -719,7 +932,7 @@ mod tests {
         assert!(!choices.contains(&'D'));
         assert!(!choices.contains(&'Z'));
         assert_eq!(choices.len(), 21);
-        assert!(drive_letters_from_mask(0).is_empty());
+        assert_eq!(drive_letters_from_mask(0).len(), 23);
         assert!(drive_letters_from_mask(u32::MAX).is_empty());
     }
 
@@ -735,6 +948,69 @@ mod tests {
         assert_eq!(
             allocator.resolve(&server("Auto")).unwrap(),
             PathBuf::from("X:")
+        );
+        assert!(matches!(
+            allocator.resolve(&server("Z:")),
+            Err(MountpointError::DriveInUse(_))
+        ));
+        assert!(probe.observed.borrow().is_empty());
+    }
+
+    #[test]
+    fn incomplete_drive_snapshot_is_not_a_free_letter_or_a_readiness_result() {
+        let probe = FakeProbe {
+            drive_error: Some(1222),
+            ..FakeProbe::default()
+        };
+        let mut allocator = MountpointAllocator::new(PathBuf::from("C:/Users/me"), true, &probe);
+        for target in ["", "Auto", "Z:"] {
+            assert_eq!(
+                allocator.resolve(&server(target)),
+                Err(MountpointError::WindowsDriveQuery {
+                    api: "WNetEnumResourceW",
+                    code: 1222,
+                })
+            );
+        }
+        assert!(probe.observed.borrow().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires the same-logon SMB fixture in rust_windows_mount_smoke.ps1"]
+    fn native_reserved_drive_is_unavailable() {
+        use crate::runtime::{MountpointControl, SystemMountpointControl};
+
+        let configured = std::env::var("SSH_MOUNTMATE_TEST_RESERVED_DRIVE").unwrap();
+        let mapping_state = std::env::var("SSH_MOUNTMATE_TEST_MAPPING_STATE").unwrap();
+        assert!(matches!(mapping_state.as_str(), "connected" | "remembered"));
+        let drive = windows_drive(&configured).expect("fixture uses a drive letter");
+        let probe = SystemMountpointProbe;
+        assert!(drive_is_occupied(
+            probe.windows_drive_occupancy().unwrap(),
+            drive
+        ));
+        assert!(!available_windows_drive_letters().unwrap().contains(&drive));
+        let mut allocator = MountpointAllocator::new(std::env::temp_dir(), true, &probe);
+        let first = allocator.resolve(&server("")).unwrap();
+        let second = allocator.resolve(&server("Auto")).unwrap();
+        assert_ne!(first, second);
+        assert_ne!(windows_drive(&first.to_string_lossy()), Some(drive));
+        assert_ne!(windows_drive(&second.to_string_lossy()), Some(drive));
+        assert!(matches!(
+            allocator.resolve(&server(&configured)),
+            Err(MountpointError::DriveInUse(_))
+        ));
+        assert!(matches!(
+            SystemMountpointControl.prepare(Path::new(&configured)),
+            Err(MountpointError::DriveInUse(_))
+        ));
+        let currently_logical = drive_is_occupied(windows_active_drive_mask().unwrap(), drive);
+        if mapping_state == "remembered" && !currently_logical {
+            assert!(!system_mountpoint_ready(Path::new(&configured)));
+        }
+        println!(
+            "native {mapping_state} drive {drive}: is occupied across UI, allocator and prepare; current logical bit={currently_logical}"
         );
     }
 

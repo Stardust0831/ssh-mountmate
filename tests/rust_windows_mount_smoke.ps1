@@ -26,6 +26,121 @@ $server = $null
 $mounted = $false
 $mountedId = $null
 $succeeded = $false
+$shareName = "mountmate-ci-$PID"
+$shareRoot = Join-Path $testRoot 'smb'
+$shareCreated = $false
+$networkMappingCreated = $false
+$networkDrive = $null
+$networkPath = "\\localhost\$shareName"
+$rememberedBefore = @()
+
+Add-Type @'
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+using System.Text;
+
+public static class MountMateDriveEvidence {
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern uint GetLogicalDrives();
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint QueryDosDevice(string name, StringBuilder target, int count);
+    [DllImport("mpr.dll", CharSet = CharSet.Unicode)]
+    private static extern int WNetGetConnection(string name, StringBuilder target, ref int count);
+    [DllImport("mpr.dll", CharSet = CharSet.Unicode)]
+    public static extern int WNetCancelConnection2(string name, uint flags, bool force);
+    [DllImport("mpr.dll", CharSet = CharSet.Unicode)]
+    private static extern int WNetOpenEnum(uint scope, uint type, uint usage, IntPtr resource, out IntPtr handle);
+    [DllImport("mpr.dll", CharSet = CharSet.Unicode)]
+    private static extern int WNetEnumResource(IntPtr handle, ref uint count, IntPtr buffer, ref uint size);
+    [DllImport("mpr.dll")] private static extern int WNetCloseEnum(IntPtr handle);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool GetTokenInformation(IntPtr token, int kind, byte[] data, uint size, out uint needed);
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Resource {
+        public uint Scope, Type, DisplayType, Usage;
+        public IntPtr LocalName, RemoteName, Comment, Provider;
+    }
+
+    private static Dictionary<string, string> RememberedConnections() {
+        IntPtr handle;
+        int status = WNetOpenEnum(3, 1, 0, IntPtr.Zero, out handle);
+        if (status != 0) throw new Win32Exception(status);
+        var drives = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        uint capacity = 16384;
+        try {
+            for (int page = 0; page < 128; page++) {
+                IntPtr buffer = Marshal.AllocHGlobal((int)capacity);
+                try {
+                    uint count = 0xffffffff, size = capacity;
+                    status = WNetEnumResource(handle, ref count, buffer, ref size);
+                    if (status == 259) return drives;
+                    if (status == 234 && size > capacity && size <= 1048576) { capacity = size; continue; }
+                    if (status != 0) throw new Win32Exception(status);
+                    if (count == 0 || count > capacity / Marshal.SizeOf<Resource>()) throw new Exception("Invalid remembered-drive page");
+                    for (int index = 0; index < count; index++) {
+                        var item = Marshal.PtrToStructure<Resource>(IntPtr.Add(buffer, index * Marshal.SizeOf<Resource>()));
+                        string name = Marshal.PtrToStringUni(item.LocalName);
+                        if (!String.IsNullOrEmpty(name)) drives.Add(name, Marshal.PtrToStringUni(item.RemoteName));
+                    }
+                } finally { Marshal.FreeHGlobal(buffer); }
+            }
+            throw new Exception("Remembered-drive enumeration exceeded its bound");
+        } finally { WNetCloseEnum(handle); }
+    }
+
+    public static string[] RememberedDrives() { return new List<string>(RememberedConnections().Keys).ToArray(); }
+
+    public static object Observe(string drive) {
+        var target = new StringBuilder(32768);
+        uint mask = GetLogicalDrives();
+        if (mask == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+        uint dos = QueryDosDevice(drive, target, target.Capacity);
+        int dosError = dos == 0 ? Marshal.GetLastWin32Error() : 0;
+        int count = 32768;
+        var remote = new StringBuilder(count);
+        int connection = WNetGetConnection(drive, remote, ref count);
+        var remembered = RememberedConnections();
+        return new { drive, logicalMaskOccupied = (mask & (1u << (drive[0] - 'A'))) != 0,
+            dosDevicePresent = dos != 0, dosError, connectionStatus = connection,
+            connectionTarget = connection == 0 ? remote.ToString() : null,
+            remembered = remembered.ContainsKey(drive),
+            rememberedTarget = remembered.ContainsKey(drive) ? remembered[drive] : null };
+    }
+
+    public static object Caller() {
+        using (var identity = WindowsIdentity.GetCurrent()) {
+            var stats = new byte[64]; uint needed;
+            if (!GetTokenInformation(identity.Token, 10, stats, (uint)stats.Length, out needed)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            string authenticationId = BitConverter.ToUInt64(stats, 8).ToString("x16");
+            var elevated = new byte[4];
+            if (!GetTokenInformation(identity.Token, 20, elevated, 4, out needed)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            return new { name = identity.Name, authenticationId, elevated = BitConverter.ToUInt32(elevated, 0) != 0 };
+        }
+    }
+}
+'@
+
+function Assert-ReservedNetworkDrive([string] $State) {
+  $observed = [MountMateDriveEvidence]::Observe($networkDrive)
+  if (-not $observed.remembered) { throw 'The fixture is not a native persistent network mapping' }
+  if ($State -eq 'connected' -and $observed.connectionStatus -ne 0) {
+    throw 'The connected SMB fixture was not confirmed by WNetGetConnection'
+  }
+  if ($State -eq 'remembered' -and $observed.connectionStatus -eq 0) {
+    throw 'The fixture remained connected after the native disconnect'
+  }
+  Write-Host ('[windows-drive-evidence] ' + (@{
+    state = $State; caller = [MountMateDriveEvidence]::Caller(); observed = $observed
+    legacyMaskMiss = -not $observed.logicalMaskOccupied
+  } | ConvertTo-Json -Compress -Depth 5))
+  $env:SSH_MOUNTMATE_TEST_RESERVED_DRIVE = $networkDrive
+  $env:SSH_MOUNTMATE_TEST_MAPPING_STATE = $State
+  cargo test --package mountmate-core mountpoint::tests::native_reserved_drive_is_unavailable `
+    --all-features -- --ignored --exact --test-threads=1
+  if ($LASTEXITCODE -ne 0) { throw "Native reserved-drive contract failed for $State" }
+}
 
 function Invoke-SSHMountMate([string[]] $Arguments, [switch] $NoCapture, [int] $TimeoutMs = 60000) {
   $processInfo = [System.Diagnostics.ProcessStartInfo]::new($binary)
@@ -157,15 +272,31 @@ try {
     throw 'Failed to start the SFTP server on an available loopback port'
   }
 
-  $drives = @('R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z') |
-    Where-Object { -not (Test-Path "${_}:\") } |
-    Select-Object -First 2
-  if ($drives.Count -ne 2) { throw 'Two free drive letters are required' }
-  $drive = $drives[0]
-  $secondaryMount = "$($drives[1]):"
+  $caller = [MountMateDriveEvidence]::Caller()
+  $rememberedBefore = @([MountMateDriveEvidence]::RememberedDrives() | Sort-Object)
+  $networkDrive = @('Z', 'Y', 'X', 'W', 'V', 'U', 'T', 'S', 'R') |
+    ForEach-Object { "${_}:" } | Where-Object {
+      $probe = [MountMateDriveEvidence]::Observe($_)
+      -not $probe.logicalMaskOccupied -and -not $probe.dosDevicePresent -and
+        -not $probe.remembered -and $probe.dosError -eq 2 -and $probe.connectionStatus -eq 2250
+    } | Select-Object -First 1
+  if (-not $networkDrive) { throw 'A verified free drive is required for the SMB fixture' }
+  if (Get-SmbShare -Name $shareName -ErrorAction SilentlyContinue) { throw 'Fixture share already exists' }
+  if ((Get-Service LanmanServer).Status -ne 'Running') { throw 'The runner SMB server must already be running' }
+  New-Item -ItemType Directory $shareRoot | Out-Null
+  Set-Content (Join-Path $shareRoot 'network-original.txt') 'original SMB content' -NoNewline
+  New-SmbShare -Name $shareName -Path $shareRoot -Temporary -CachingMode None -FullAccess $caller.name | Out-Null
+  $shareCreated = $true
+  New-SmbMapping -LocalPath $networkDrive -RemotePath $networkPath -Persistent $true | Out-Null
+  $networkMappingCreated = $true
+  if ((Get-Content "${networkDrive}\network-original.txt" -Raw) -ne 'original SMB content') { throw 'SMB fixture content mismatch' }
+  Assert-ReservedNetworkDrive 'connected'
+  if ([MountMateDriveEvidence]::WNetCancelConnection2($networkDrive, 0, $false) -ne 0) { throw 'Could not disconnect the fixture while retaining its profile' }
+  Assert-ReservedNetworkDrive 'remembered'
+  if ([MountMateDriveEvidence]::Caller().authenticationId -ne $caller.authenticationId) { throw 'The test changed logon session' }
+  $secondaryMount = $null
   $secondaryId = 'local-sftp--mount-0123456789abcdef0123456789abcdef'
-  if (-not $drive) { throw 'No free drive letter is available for the mount test' }
-  $mountpoint = "${drive}:"
+  $mountpoint = $null
 
   $configDir = Join-Path $env:LOCALAPPDATA 'ssh-mountmate/config'
   New-Item -ItemType Directory -Force $configDir | Out-Null
@@ -194,8 +325,8 @@ try {
       password_obscured = $passwordObscured
       connection_method = 'native'
       remote_path = ''
-      mountpoint = $mountpoint
-      mounts = @(@{ id = '0123456789abcdef0123456789abcdef'; remote_path = 'projects'; mountpoint = $secondaryMount })
+      mountpoint = 'auto'
+      mounts = @(@{ id = '0123456789abcdef0123456789abcdef'; remote_path = 'projects'; mountpoint = 'auto' })
       cache_mode = 'full'
     }
   )
@@ -218,6 +349,17 @@ try {
   $mounted = $true
   $mountedId = 'local-sftp'
   Invoke-SSHMountMate -Arguments @('--mount-all') -NoCapture | Out-Null
+  $stateDir = Join-Path $env:LOCALAPPDATA 'ssh-mountmate/state'
+  Wait-Until {
+    (Test-Path (Join-Path $stateDir 'local-sftp.json')) -and
+      (Test-Path (Join-Path $stateDir "$secondaryId.json"))
+  }
+  $mountpoint = (Get-Content (Join-Path $stateDir 'local-sftp.json') -Raw | ConvertFrom-Json).mountpoint
+  $secondaryMount = (Get-Content (Join-Path $stateDir "$secondaryId.json") -Raw | ConvertFrom-Json).mountpoint
+  if ($mountpoint -notmatch '^[A-Z]:$' -or $secondaryMount -notmatch '^[A-Z]:$' -or
+      $mountpoint -eq $secondaryMount -or $mountpoint -eq $networkDrive -or $secondaryMount -eq $networkDrive) {
+    throw 'Automatic mappings reused a reserved or invalid drive'
+  }
   Wait-Until { Test-Path "${mountpoint}\initial.txt" }
   if ((Get-Content "${mountpoint}\initial.txt" -Raw) -ne 'initial remote content') {
     throw 'Mounted initial file content did not match the SFTP source'
@@ -278,6 +420,10 @@ try {
   Wait-Until { -not (Test-Path "${mountpoint}\") }
   $state = Join-Path $env:LOCALAPPDATA 'ssh-mountmate/state/local-sftp.json'
   if (Test-Path $state) { throw 'Mount state remained after unmount' }
+  if (-not [MountMateDriveEvidence]::Observe($networkDrive).remembered) { throw 'Unmounting SFTP removed the original network mapping' }
+  New-SmbMapping -LocalPath $networkDrive -RemotePath $networkPath -Persistent $true | Out-Null
+  if ((Get-Content "${networkDrive}\network-original.txt" -Raw) -ne 'original SMB content') { throw 'SFTP lifecycle altered the original SMB content' }
+  Assert-ReservedNetworkDrive 'connected'
 
   Write-Host '[windows-mount-e2e] establishing verified Plink connection sharing'
   $masterInfo = [System.Diagnostics.ProcessStartInfo]::new($plink)
@@ -366,6 +512,30 @@ try {
   }
   if ($plinkMasterStdout) { $null = $plinkMasterStdout.GetAwaiter().GetResult() }
   if ($plinkMasterStderr) { $null = $plinkMasterStderr.GetAwaiter().GetResult() }
+  $networkCleaned = -not $shareCreated
+  if ($shareCreated) {
+    try {
+      $share = Get-SmbShare -Name $shareName -ErrorAction Stop
+      if ($share.Path -ne $shareRoot) { throw 'Fixture share path changed; preserving it' }
+      if ($networkMappingCreated) {
+        $mapping = [MountMateDriveEvidence]::Observe($networkDrive)
+        if (($mapping.remembered -and $mapping.rememberedTarget -ne $networkPath) -or
+            ($mapping.connectionStatus -eq 0 -and $mapping.connectionTarget -ne $networkPath)) {
+          throw 'Fixture drive now refers to another mapping; preserving it'
+        }
+        $status = [MountMateDriveEvidence]::WNetCancelConnection2($networkDrive, 1, $true)
+        if ($status -ne 0 -and $status -ne 2250) { throw "Fixture mapping cleanup failed: $status" }
+        if ([MountMateDriveEvidence]::RememberedDrives() -contains $networkDrive) { throw 'Fixture mapping profile remains' }
+      }
+      Remove-SmbShare -Name $shareName -Force -Confirm:$false
+      $rememberedAfter = @([MountMateDriveEvidence]::RememberedDrives() | Sort-Object)
+      if (($rememberedBefore -join ',') -ne ($rememberedAfter -join ',')) { throw 'Unrelated remembered mappings changed' }
+      $networkCleaned = $true
+    } catch {
+      $succeeded = $false
+      Write-Warning "SMB fixture cleanup requires inspection: $($_.Exception.Message)"
+    }
+  }
   if (-not $succeeded) {
     if (Test-Path $winFspLog) {
       Write-Host '--- WinFsp installer log ---'
@@ -381,5 +551,6 @@ try {
       Get-ChildItem $stateDir -Filter '*.log' | ForEach-Object { Get-Content $_ -Tail 100 }
     }
   }
-  Remove-Item $testRoot -Recurse -Force -ErrorAction SilentlyContinue
+  if ($networkCleaned) { Remove-Item $testRoot -Recurse -Force -ErrorAction SilentlyContinue }
+  if (-not $networkCleaned) { throw 'SMB fixture cleanup did not finish' }
 }

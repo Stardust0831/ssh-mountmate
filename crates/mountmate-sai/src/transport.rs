@@ -30,14 +30,25 @@ impl Http {
         })
     }
     pub async fn send(&self, request: reqwest::RequestBuilder) -> Result<HttpResponse, Error> {
-        self.execute(request.build().map_err(|_| Error::Contract)?)
+        self.send_bounded(request, 128 * 1024).await
+    }
+    pub async fn send_bounded(
+        &self,
+        request: reqwest::RequestBuilder,
+        body_limit: usize,
+    ) -> Result<HttpResponse, Error> {
+        self.execute(request.build().map_err(|_| Error::Contract)?, body_limit)
             .await
     }
     async fn oauth(&self, request: HttpRequest) -> Result<HttpResponse, Error> {
-        self.execute(request.try_into().map_err(|_| Error::Contract)?)
+        self.execute(request.try_into().map_err(|_| Error::Contract)?, 128 * 1024)
             .await
     }
-    async fn execute(&self, request: reqwest::Request) -> Result<HttpResponse, Error> {
+    async fn execute(
+        &self,
+        request: reqwest::Request,
+        body_limit: usize,
+    ) -> Result<HttpResponse, Error> {
         let mut response = self
             .client
             .execute(request)
@@ -49,7 +60,7 @@ impl Http {
         }
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|_| Error::Network)? {
-            if body.len().saturating_add(chunk.len()) > 128 * 1024 {
+            if body.len().saturating_add(chunk.len()) > body_limit {
                 return Err(Error::Contract);
             }
             body.extend_from_slice(&chunk);

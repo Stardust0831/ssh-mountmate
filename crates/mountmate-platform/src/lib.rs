@@ -3,6 +3,9 @@ use std::path::Path;
 use mountmate_core::ssh::SshPermissionControl;
 use thiserror::Error;
 
+mod browser;
+pub use browser::open_browser;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlobalProgressState {
     Hidden,

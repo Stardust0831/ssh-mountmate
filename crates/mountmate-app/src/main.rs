@@ -56,7 +56,7 @@ use mountmate_core::service::{MountService, ServiceError};
 use mountmate_core::ssh::{
     default_ssh_config_path, prepare_managed_ssh_server, remove_managed_ssh_server,
 };
-use mountmate_core::storage::{self, read_json};
+use mountmate_core::storage;
 use mountmate_core::transfer::{TransferFile, TransferSnapshot};
 use mountmate_core::update::{UpdateInfo, check_for_updates};
 use mountmate_core::update_helper::{
@@ -67,7 +67,7 @@ use mountmate_core::update_workflow::{PreparedUpdateLaunch, prepare_update_insta
 use mountmate_core::winfsp::{self, InstallOutcome as WinFspInstallOutcome};
 use mountmate_core::{
     APP_NAME, AccentColor, AppearanceMode, AuthMethod, ConnectionMethod, CredentialStorage,
-    FontScale, MountBackend, MountState, ServerConfig, Settings, VERSION,
+    FontScale, MountBackend, ServerConfig, Settings, VERSION,
 };
 #[cfg(windows)]
 use mountmate_platform::NativeWindowHandle;
@@ -523,11 +523,9 @@ fn run_headless(paths: &AppPaths, command: AppCommand) -> Result<(), String> {
         }
         AppCommand::Open { id } => {
             find_server(&servers, &id)?;
-            let state: MountState =
-                read_json(&paths.state_file(&id)).map_err(|error| error.to_string())?;
             let locale =
                 Locale::from_preference(Language::from_value(&settings.language), Locale::system());
-            open_path(&state.mountpoint, locale)?;
+            open_observed_mount(&service, &id, locale).1?;
         }
         AppCommand::RefreshPath { path } => {
             let result = service
@@ -634,6 +632,8 @@ fn print_refresh_result(result: &mountmate_core::rc::RefreshResult) {
     }
 }
 
+type MountObservation = Result<(MountStatus, Option<PathBuf>), String>;
+
 struct App {
     paths: AppPaths,
     _instance_lock: Arc<InstanceLock>,
@@ -659,7 +659,9 @@ struct App {
     reorder_original: Option<Vec<String>>,
     connection_list_saving: bool,
     service: MountService,
-    mount_statuses: HashMap<String, MountStatus>,
+    mount_observations: HashMap<String, MountObservation>,
+    status_reads: HashMap<String, u64>,
+    next_status_read: u64,
     busy: HashSet<String>,
     host_key_prompts: VecDeque<host_key_dialog::Prompt>,
     transfers: HashMap<String, TransferSnapshot>,
@@ -1320,6 +1322,8 @@ enum Message {
     MainWindowOpened(window::Id),
     SettingsRecoveryDialogClosed,
     Refresh,
+    CheckMount(String),
+    MountRequested(String, MountOperation),
     RefreshFinished {
         generation: u64,
         expected_status: String,
@@ -1329,7 +1333,7 @@ enum Message {
         policy: StatusPublishPolicy,
         generation: Option<u64>,
         expected_status: Option<String>,
-        results: Vec<(String, Result<MountStatus, String>)>,
+        results: Vec<(String, u64, MountObservation)>,
     },
     TransferTick,
     TransfersLoaded(Vec<(String, Result<TransferSnapshot, String>)>),
@@ -1494,7 +1498,6 @@ enum Message {
     ConnectionsExported(Result<bool, String>),
     SettingsSaved(Result<SettingsMutation, String>),
     StartupReconciled(Result<(), String>),
-    Mount(String),
     CancelPendingUnmount(String),
     UnmountWaitDecision {
         ids: Vec<String>,
@@ -1516,7 +1519,12 @@ enum Message {
     DismissOperationError(String),
     OpenOperationLog(String),
     Open(String),
-    OpenFinished(Result<(), String>),
+    OpenFinished {
+        id: String,
+        request: u64,
+        observation: MountObservation,
+        result: Result<(), String>,
+    },
     Edit(String),
     Remove(String),
     CancelRemove,
@@ -1709,8 +1717,11 @@ impl App {
             );
         }
         if self.mount_targets.iter().any(|server| {
-            self.mount_statuses.get(&server.id) == Some(&MountStatus::Mounted)
-                && !self.busy.contains(&server.id)
+            !self.busy.contains(&server.id)
+                && (matches!(
+                    self.mount_status(&server.id),
+                    Some(MountStatus::Mounted | MountStatus::Starting)
+                ) || self.mount_status_unavailable(&server.id))
         }) {
             subscriptions
                 .push(iced::time::every(Duration::from_secs(1)).map(|_| Message::TransferTick));
@@ -1871,7 +1882,9 @@ impl App {
             reorder_original: None,
             connection_list_saving: false,
             service,
-            mount_statuses: HashMap::new(),
+            mount_observations: HashMap::new(),
+            status_reads: HashMap::new(),
+            next_status_read: 0,
             busy: HashSet::new(),
             host_key_prompts: VecDeque::new(),
             transfers: HashMap::new(),
@@ -1953,7 +1966,7 @@ impl App {
         };
         let mut tasks = vec![
             open_window.map(Message::MainWindowOpened),
-            app.status_task(StatusPublishPolicy::Initial),
+            app.status_task(StatusPublishPolicy::Initial, None),
         ];
         if screen == Screen::TransferCenter {
             tasks.push(app.transfer_task());
@@ -2029,6 +2042,7 @@ impl App {
                     && !path_message
                     && row.is_none()
                     && !matches!(message, Message::CancelEditor | Message::AddMountMapping)
+                    && !matches!(&message, Message::SaiSetup(inner) if self.sai_setup.allows_while_mounted(inner))
                 {
                     return Task::none();
                 }
@@ -2049,7 +2063,7 @@ impl App {
                     || draft
                         .editing_id
                         .as_deref()
-                        .is_some_and(|id| !self.can_modify(id))
+                        .is_some_and(|id| !self.can_modify(id) && !self.sai_setup.directory_only())
             })
         {
             self.sai_setup.reset();
@@ -2129,7 +2143,7 @@ impl App {
                                 .collect();
                             return Task::batch(ids.into_iter().map(|id| {
                                 self.pending_interactive_mounts.remove(&id);
-                                self.start_mount_operation(id, Some(MountOperation::Mount))
+                                self.start_mount_operation(id, MountOperation::Mount)
                             }));
                         }
                     }
@@ -2280,7 +2294,7 @@ impl App {
                     self.status = self
                         .program_log
                         .info(locale.text(TextKey::RefreshingMountStatus).into());
-                    return self.status_task(StatusPublishPolicy::UserRefresh);
+                    return self.status_task(StatusPublishPolicy::UserRefresh, None);
                 }
                 Err(error) => self.status = self.program_log.error(error.to_string()),
             },
@@ -2312,15 +2326,26 @@ impl App {
             } => {
                 let mut errors = Vec::new();
                 let mut unmounted = Vec::new();
-                for (id, result) in results {
+                for (id, request, result) in results {
+                    let Some(result) = accept_mount_observation(
+                        &id,
+                        request,
+                        result,
+                        &self.busy,
+                        &mut self.status_reads,
+                        &mut self.mount_observations,
+                    ) else {
+                        continue;
+                    };
                     match result {
                         Ok(status) => {
-                            self.mount_statuses.insert(id.clone(), status);
-                            if status == MountStatus::Unmounted {
+                            if matches!(status, MountStatus::Unmounted | MountStatus::Stale) {
                                 unmounted.push(id);
                             }
                         }
-                        Err(error) => errors.push(error),
+                        Err(error) => {
+                            errors.push(error);
+                        }
                     }
                 }
                 let can_publish = match (generation, expected_status.as_deref()) {
@@ -2364,10 +2389,31 @@ impl App {
                 ));
                 return Task::batch(tasks);
             }
-            Message::TransferTick => return self.transfer_task(),
+            Message::TransferTick => {
+                let starting = self
+                    .mount_targets
+                    .iter()
+                    .filter(|target| {
+                        self.mount_status(&target.id) == Some(MountStatus::Starting)
+                            || self.mount_status_unavailable(&target.id)
+                    })
+                    .map(|target| target.id.clone())
+                    .collect();
+                return Task::batch([
+                    self.transfer_task(),
+                    self.status_task(StatusPublishPolicy::Silent, Some(starting)),
+                ]);
+            }
+            Message::CheckMount(id) => {
+                return self.status_task(StatusPublishPolicy::Silent, Some(vec![id]));
+            }
+            Message::MountRequested(id, operation) => {
+                return self.start_mount_operation(id, operation);
+            }
             Message::CapacityTick => return self.capacity_task(),
             Message::CapacitiesLoaded(results) => {
                 self.capacity_refreshing = false;
+                let mut recheck = Vec::new();
                 for (id, result) in results {
                     match result {
                         Ok(Some(capacity)) => {
@@ -2376,22 +2422,29 @@ impl App {
                         }
                         Ok(None) => {
                             self.capacities.remove(&id);
+                            recheck.push(id.clone());
                             self.capacity_errors.insert(id);
                         }
                         Err(_) => {
+                            recheck.push(id.clone());
                             self.capacity_errors.insert(id);
                         }
                     }
                 }
                 if self.capacity_refresh_pending {
                     self.capacity_refresh_pending = false;
-                    return self.capacity_task();
+                    return Task::batch([
+                        self.capacity_task(),
+                        self.status_task(StatusPublishPolicy::Silent, Some(recheck)),
+                    ]);
                 }
+                return self.status_task(StatusPublishPolicy::Silent, Some(recheck));
             }
             Message::TransfersLoaded(results) => {
                 self.transfer_refreshing = false;
                 let previous_active = self.active_transfer_ids();
                 let mut notifications = Vec::new();
+                let mut recheck = Vec::new();
                 for (id, result) in results {
                     match result {
                         Ok(snapshot) => {
@@ -2422,6 +2475,7 @@ impl App {
                             self.transfer_errors.remove(&id);
                         }
                         Err(error) => {
+                            recheck.push(id.clone());
                             let failures = self.transfer_failures.entry(id.clone()).or_default();
                             *failures = failures.saturating_add(1);
                             if transfer_failure_is_visible(*failures) {
@@ -2471,11 +2525,12 @@ impl App {
                 let mut tasks = vec![
                     self.reconcile_transfer_popups(),
                     set_native_global_progress(self.main_window, self.global_progress_state()),
+                    self.status_task(StatusPublishPolicy::Silent, Some(recheck)),
                 ];
                 tasks.extend(
                     ready_unmounts
                         .into_iter()
-                        .map(|id| self.start_mount_operation(id, Some(MountOperation::Unmount))),
+                        .map(|id| self.start_mount_operation(id, MountOperation::Unmount)),
                 );
                 for notification in &notifications {
                     let level = if notification.level == NativeNotificationLevel::Error {
@@ -2601,7 +2656,6 @@ impl App {
                 self.sai_setup.reset();
                 draft.ssh_config_path = default_ssh_config_path().display().to_string();
                 self.connection_draft = Some(draft);
-                self.windows_drive_letters = available_windows_drive_letters();
                 self.connection_tags_input.clear();
                 self.connection_custom_mountpoint.clear();
                 self.invalidate_mountpoint_preflight();
@@ -2611,6 +2665,13 @@ impl App {
                 self.status = self
                     .program_log
                     .info(locale.text(TextKey::NewConnection).into());
+                match available_windows_drive_letters() {
+                    Ok(drives) => self.windows_drive_letters = drives,
+                    Err(error) => {
+                        self.windows_drive_letters.clear();
+                        self.status = self.program_log.error(error.to_string());
+                    }
+                }
                 return scoped_focus(EDITOR_FOCUS_SCOPE, "connection-name");
             }
             Message::ConnectionSearchChanged(value) => self.connection_search = value,
@@ -3399,16 +3460,44 @@ impl App {
                 }
             }
             Message::SaiSetup(message) => {
+                let can_configure = self
+                    .connection_draft
+                    .as_ref()
+                    .and_then(|draft| draft.editing_id.as_ref())
+                    .is_none_or(|id| self.can_modify(id));
                 if self.screen == Screen::ConnectionEditor
                     && let Some(draft) = &mut self.connection_draft
                     && draft.source == ConnectionSource::SaiCluster
                 {
                     let previous = self.sai_setup.feedback(locale);
                     let cancelled = matches!(message, sai_setup::Message::Cancel);
+                    let directory_only = self.sai_setup.directory_only();
                     let (task, configured) =
-                        self.sai_setup.update(message, &self.paths.data_dir, locale);
-                    if let Some(configured) = configured {
-                        configured.apply_to(draft);
+                        self.sai_setup
+                            .update(message, &self.paths.data_dir, locale, draft);
+                    match configured {
+                        Some(sai_setup::Outcome::Configured(configured)) if can_configure => {
+                            configured.apply_to(draft)
+                        }
+                        Some(sai_setup::Outcome::Directories(selection)) => {
+                            if selection.apply_to(draft) {
+                                self.status = self.program_log.info(match locale {
+                                    Locale::English => "SAI: Selected directories added. Save the connection to keep them.".into(),
+                                    Locale::Chinese => "SAI：已添加所选目录，请保存连接。".into(),
+                                });
+                            } else {
+                                self.status = self.program_log.error(
+                                    match locale {
+                                        Locale::English => {
+                                            "The connection changed. Choose directories again."
+                                        }
+                                        Locale::Chinese => "连接信息已改变，请重新选择目录。",
+                                    }
+                                    .into(),
+                                );
+                            }
+                        }
+                        _ => {}
                     }
                     let feedback = self.sai_setup.feedback(locale);
                     if feedback != previous
@@ -3416,9 +3505,11 @@ impl App {
                     {
                         self.status = self.program_log.publish(level, message);
                     } else if cancelled {
-                        self.status = self.program_log.info(match locale {
-                            Locale::English => "SAI: Account setup cancelled".into(),
-                            Locale::Chinese => "SAI：已取消账号配置".into(),
+                        self.status = self.program_log.info(match (locale, directory_only) {
+                            (Locale::English, true) => "SAI: Directory selection cancelled".into(),
+                            (Locale::Chinese, true) => "SAI：已取消目录选择".into(),
+                            (Locale::English, false) => "SAI: Account setup cancelled".into(),
+                            (Locale::Chinese, false) => "SAI：已取消账号配置".into(),
                         });
                     }
                     return task.map(Message::SaiSetup);
@@ -3466,7 +3557,7 @@ impl App {
                             self.transfer_errors.contains_key(&id),
                             self.synced_polls.get(&id).copied().unwrap_or(0),
                         )
-                        && self.mount_statuses.get(&id) == Some(&MountStatus::Mounted)
+                        && self.mount_status(&id) == Some(MountStatus::Mounted)
                     {
                         unsafe_ids.push(id);
                     } else {
@@ -3897,7 +3988,7 @@ impl App {
                         );
                         return Task::batch([
                             terminal_task,
-                            self.status_task(StatusPublishPolicy::Silent),
+                            self.status_task(StatusPublishPolicy::Silent, None),
                             self.reconcile_startup_task(),
                         ]);
                     }
@@ -4413,9 +4504,9 @@ impl App {
                         self.dependency_checking = true;
                         let mut tasks = vec![self.dependency_check_task()];
                         tasks.extend(
-                            pending_mounts.into_iter().map(|id| {
-                                self.start_mount_operation(id, Some(MountOperation::Mount))
-                            }),
+                            pending_mounts
+                                .into_iter()
+                                .map(|id| self.start_mount_operation(id, MountOperation::Mount)),
                         );
                         return Task::batch(tasks);
                     }
@@ -4449,7 +4540,6 @@ impl App {
                     }
                 }
             }
-            Message::Mount(id) => return self.start_mount_operation(id, None),
             Message::CancelPendingUnmount(id) => {
                 self.pending_unmount_after_sync.remove(&id);
                 self.status = self.program_log.info(match locale {
@@ -4473,9 +4563,8 @@ impl App {
                 if result == rfd::MessageDialogResult::Yes {
                     self.confirmed_unmounts.extend(ids.iter().cloned());
                     return Task::batch(
-                        ids.into_iter().map(|id| {
-                            self.start_mount_operation(id, Some(MountOperation::Unmount))
-                        }),
+                        ids.into_iter()
+                            .map(|id| self.start_mount_operation(id, MountOperation::Unmount)),
                     );
                 }
             }
@@ -4499,17 +4588,21 @@ impl App {
                 result,
             } => {
                 self.invalidate_status_publications();
+                self.status_reads.remove(&id);
                 self.busy.remove(&id);
                 let mut tasks = Vec::new();
                 match result {
                     Ok(Some(message)) => {
                         self.operation_errors.remove(&id);
-                        self.mount_statuses.insert(
+                        self.mount_observations.insert(
                             id.clone(),
-                            match operation {
-                                MountOperation::Mount => MountStatus::Mounted,
-                                MountOperation::Unmount => MountStatus::Unmounted,
-                            },
+                            Ok((
+                                match operation {
+                                    MountOperation::Mount => MountStatus::Mounted,
+                                    MountOperation::Unmount => MountStatus::Unmounted,
+                                },
+                                None,
+                            )),
                         );
                         self.status = self.program_log.info(message);
                         if matches!(operation, MountOperation::Unmount) {
@@ -4517,14 +4610,20 @@ impl App {
                             self.confirmed_unmounts.remove(&id);
                             tasks.push(self.close_popups_for_server(&id));
                         } else {
+                            tasks.push(
+                                self.status_task(
+                                    StatusPublishPolicy::Silent,
+                                    Some(vec![id.clone()]),
+                                ),
+                            );
                             tasks.push(self.capacity_task());
                             tasks.push(self.transfer_task());
                         }
                     }
                     Ok(None) => {
                         self.operation_errors.remove(&id);
-                        self.mount_statuses
-                            .insert(id.clone(), MountStatus::Unmounted);
+                        self.mount_observations
+                            .insert(id.clone(), Ok((MountStatus::Unmounted, None)));
                         self.status = self.program_log.info(match locale {
                             Locale::English => "Mount cancelled".into(),
                             Locale::Chinese => "已取消挂载".into(),
@@ -4541,7 +4640,9 @@ impl App {
                         self.status = self
                             .program_log
                             .error(connection_error::summary(&error, locale).unwrap_or(error));
-                        tasks.push(self.status_task(StatusPublishPolicy::Silent));
+                        tasks.push(
+                            self.status_task(StatusPublishPolicy::Silent, Some(vec![id.clone()])),
+                        );
                     }
                 }
                 if let Some(command) = self.take_pending_command(&id) {
@@ -4554,21 +4655,38 @@ impl App {
                 return Task::batch(tasks);
             }
             Message::RetryOperation(id, operation) => {
-                return self.start_mount_operation(id, Some(operation));
+                return self.start_mount_operation(id, operation);
             }
             Message::DismissOperationError(id) => {
                 self.operation_errors.remove(&id);
             }
             Message::OpenOperationLog(id) => return self.open_log(id),
             Message::Open(id) => return self.open_mountpoint(id),
-            Message::OpenFinished(result) => match result {
-                Ok(()) => {
-                    self.status = self
-                        .program_log
-                        .info(locale.text(TextKey::OpenedMountpoint).into())
+            Message::OpenFinished {
+                id,
+                request,
+                observation,
+                result,
+            } => {
+                let Some(_) = accept_mount_observation(
+                    &id,
+                    request,
+                    observation,
+                    &self.busy,
+                    &mut self.status_reads,
+                    &mut self.mount_observations,
+                ) else {
+                    return Task::none();
+                };
+                match result {
+                    Ok(()) => {
+                        self.status = self
+                            .program_log
+                            .info(locale.text(TextKey::OpenedMountpoint).into())
+                    }
+                    Err(error) => self.status = self.program_log.error(error),
                 }
-                Err(error) => self.status = self.program_log.error(error),
-            },
+            }
             Message::Edit(id) => {
                 if self.connection_list_saving || self.editor_saving {
                     return Task::none();
@@ -4577,7 +4695,6 @@ impl App {
                 self.sai_setup.reset();
                 if let Some(server) = self.servers.iter().find(|server| server.id == id) {
                     self.connection_draft = Some(ConnectionDraft::from_server(server));
-                    self.windows_drive_letters = available_windows_drive_letters();
                     self.connection_tags_input = server.tags.join(", ");
                     if let Some(draft) = &mut self.connection_draft {
                         draft.auto_mount_at_login |= self.settings.startup_all;
@@ -4603,6 +4720,13 @@ impl App {
                             connection_settings_locked_help(locale).into()
                         },
                     );
+                    match available_windows_drive_letters() {
+                        Ok(drives) => self.windows_drive_letters = drives,
+                        Err(error) => {
+                            self.windows_drive_letters.clear();
+                            self.status = self.program_log.error(error.to_string());
+                        }
+                    }
                     if self.mapping_can_modify(&id)
                         && mountpoint_choice(&server.mountpoint) == "custom"
                     {
@@ -4773,14 +4897,14 @@ impl App {
         let can_mount = self.mount_targets.iter().any(|server| {
             !self.busy.contains(&server.id)
                 && !matches!(
-                    self.mount_statuses.get(&server.id),
+                    self.mount_status(&server.id),
                     Some(MountStatus::Mounted | MountStatus::Starting)
                 )
         });
         let can_unmount = self.mount_targets.iter().any(|server| {
             !self.busy.contains(&server.id)
                 && matches!(
-                    self.mount_statuses.get(&server.id),
+                    self.mount_status(&server.id),
                     Some(MountStatus::Mounted | MountStatus::Starting | MountStatus::Stale)
                 )
         });
@@ -4957,7 +5081,7 @@ impl App {
             self.pending_commands.push_back(command);
             return Task::none();
         }
-        self.start_mount_operation(id, Some(operation))
+        self.start_mount_operation(id, operation)
     }
 
     fn take_pending_command(&mut self, id: &str) -> Option<AppCommand> {
@@ -5019,7 +5143,7 @@ impl App {
         let unknown = self
             .mount_targets
             .iter()
-            .filter(|server| self.mount_statuses.get(&server.id) == Some(&MountStatus::Mounted))
+            .filter(|server| self.mount_status(&server.id) == Some(MountStatus::Mounted))
             .filter(|server| {
                 self.transfer_errors.contains_key(&server.id)
                     || !self.transfers.contains_key(&server.id)
@@ -5051,10 +5175,30 @@ impl App {
         )
     }
 
+    fn mount_status(&self, id: &str) -> Option<MountStatus> {
+        self.mount_observations
+            .get(id)
+            .and_then(|value| value.as_ref().ok())
+            .map(|(status, _)| *status)
+    }
+    fn observed_mountpoint(&self, id: &str) -> Option<&Path> {
+        self.mount_observations
+            .get(id)
+            .and_then(|value| value.as_ref().ok())
+            .filter(|(status, _)| matches!(status, MountStatus::Mounted | MountStatus::Starting))
+            .and_then(|(_, path)| path.as_deref())
+    }
+    fn mount_status_unavailable(&self, id: &str) -> bool {
+        self.mount_observations.get(id).is_some_and(Result::is_err)
+    }
+
     fn mapping_can_modify(&self, id: &str) -> bool {
+        if self.mount_status_unavailable(id) {
+            return false;
+        }
         mapping_is_editable(
             self.busy.contains(id),
-            self.mount_statuses.get(id).copied(),
+            self.mount_status(id),
             self.pending_interactive_mounts.contains(id),
             self.mount_targets
                 .iter()
@@ -5070,9 +5214,7 @@ impl App {
             .filter(|s| s.connection_id() == id)
             .all(|s| {
                 !self.busy.contains(&s.id)
-                    && interactive_session_can_restart_or_end(
-                        self.mount_statuses.get(&s.id).copied(),
-                    )
+                    && interactive_session_can_restart_or_end(self.mount_status(&s.id))
             })
     }
 
@@ -5097,7 +5239,7 @@ impl App {
         {
             let previous = previous.clone();
             let mut next = previous.clone();
-            next.remote_path = draft.remote_path.trim().to_owned();
+            next.remote_path.clone_from(&draft.remote_path);
             next.mountpoint = draft.mountpoint.trim().to_owned();
             next.mounts = draft.mounts.clone();
             next.primary_mount = draft.primary_mount;
@@ -5916,7 +6058,7 @@ impl App {
         let unknown = self
             .mount_targets
             .iter()
-            .filter(|server| self.mount_statuses.get(&server.id) == Some(&MountStatus::Mounted))
+            .filter(|server| self.mount_status(&server.id) == Some(MountStatus::Mounted))
             .filter(|server| {
                 self.transfer_errors.contains_key(&server.id)
                     || !self.transfers.contains_key(&server.id)
@@ -5980,7 +6122,7 @@ impl App {
             .filter(|server| {
                 interactive_mount_blocks_update(
                     server.connection_method,
-                    self.mount_statuses.get(&server.id).copied(),
+                    self.mount_status(&server.id),
                     self.busy.contains(&server.id),
                     self.interactive_terminals
                         .get(&server.id)
@@ -6010,7 +6152,11 @@ impl App {
         true
     }
 
-    fn status_task(&mut self, policy: StatusPublishPolicy) -> Task<Message> {
+    fn status_task(
+        &mut self,
+        policy: StatusPublishPolicy,
+        requested: Option<Vec<String>>,
+    ) -> Task<Message> {
         let (generation, expected_status) = match policy {
             StatusPublishPolicy::Silent => (None, None),
             StatusPublishPolicy::Initial | StatusPublishPolicy::UserRefresh => {
@@ -6019,23 +6165,57 @@ impl App {
             }
         };
         let service = self.service.clone();
-        let ids: Vec<_> = self
-            .mount_targets
-            .iter()
-            .map(|server| server.id.clone())
+        let targeted = requested.is_some();
+        let ids = requested.unwrap_or_else(|| {
+            self.mount_targets
+                .iter()
+                .map(|server| server.id.clone())
+                .collect()
+        });
+        let ids: Vec<_> = ids
+            .into_iter()
+            .filter(|id| {
+                !self.busy.contains(id)
+                    && (!matches!(policy, StatusPublishPolicy::Silent)
+                        || !self.status_reads.contains_key(id))
+                    && (!targeted
+                        || self.mount_status_unavailable(id)
+                        || matches!(
+                            self.mount_status(id),
+                            Some(MountStatus::Mounted | MountStatus::Starting)
+                        ))
+            })
+            .collect();
+        if ids.is_empty() {
+            return Task::none();
+        }
+        let requests: Vec<_> = ids
+            .into_iter()
+            .map(|id| {
+                let request =
+                    begin_mount_read(&id, &mut self.next_status_read, &mut self.status_reads);
+                (id, request)
+            })
             .collect();
         Task::perform(
             async move {
+                let failure_requests = requests.clone();
                 tokio::task::spawn_blocking(move || {
-                    ids.into_iter()
-                        .map(|id| {
-                            let result = service.status(&id).map_err(|error| error.to_string());
-                            (id, result)
+                    requests
+                        .into_iter()
+                        .map(|(id, request)| {
+                            let result = service.observe(&id).map_err(|error| error.to_string());
+                            (id, request, result)
                         })
                         .collect()
                 })
                 .await
-                .unwrap_or_else(|error| vec![(String::new(), Err(error.to_string()))])
+                .unwrap_or_else(|error| {
+                    failure_requests
+                        .into_iter()
+                        .map(|(id, request)| (id, request, Err(error.to_string())))
+                        .collect()
+                })
             },
             move |results| Message::StatusesLoaded {
                 policy,
@@ -6090,7 +6270,7 @@ impl App {
             .mount_targets
             .iter()
             .filter(|server| {
-                self.mount_statuses.get(&server.id) == Some(&MountStatus::Mounted)
+                self.mount_status(&server.id) == Some(MountStatus::Mounted)
                     && !self.busy.contains(&server.id)
             })
             .cloned()
@@ -6156,7 +6336,7 @@ impl App {
             .mount_targets
             .iter()
             .filter(|server| {
-                self.mount_statuses.get(&server.id) == Some(&MountStatus::Mounted)
+                self.mount_status(&server.id) == Some(MountStatus::Mounted)
                     && !self.busy.contains(&server.id)
             })
             .map(|server| server.id.clone())
@@ -6333,8 +6513,7 @@ impl App {
         self.transfers
             .iter()
             .filter(|(id, snapshot)| {
-                transfer_is_active(snapshot)
-                    && self.mount_statuses.get(*id) == Some(&MountStatus::Mounted)
+                transfer_is_active(snapshot) && self.mount_status(id) == Some(MountStatus::Mounted)
             })
             .map(|(id, _)| id.clone())
             .collect()
@@ -6355,7 +6534,7 @@ impl App {
         let mounted = self
             .mount_targets
             .iter()
-            .filter(|server| self.mount_statuses.get(&server.id) == Some(&MountStatus::Mounted));
+            .filter(|server| self.mount_status(&server.id) == Some(MountStatus::Mounted));
         let totals = transfer_totals(mounted.map(|server| {
             if self.transfer_errors.contains_key(&server.id) {
                 None
@@ -6364,7 +6543,7 @@ impl App {
             }
         }));
         let out_of_space = self.transfers.iter().any(|(id, snapshot)| {
-            self.mount_statuses.get(id) == Some(&MountStatus::Mounted) && snapshot.out_of_space
+            self.mount_status(id) == Some(MountStatus::Mounted) && snapshot.out_of_space
         });
 
         global_progress_state(&totals, out_of_space)
@@ -6670,24 +6849,15 @@ impl App {
             .map_or_else(Task::none, window::close)
     }
 
-    fn start_mount_operation(
-        &mut self,
-        id: String,
-        requested: Option<MountOperation>,
-    ) -> Task<Message> {
+    fn start_mount_operation(&mut self, id: String, operation: MountOperation) -> Task<Message> {
         if self.editor_saving {
             return Task::none();
         }
-        let current_status = self.mount_statuses.get(&id).copied();
+        let current_status = self.mount_status(&id);
         let mounted = matches!(
             current_status,
             Some(MountStatus::Mounted | MountStatus::Starting)
         );
-        let operation = requested.unwrap_or(if mounted {
-            MountOperation::Unmount
-        } else {
-            MountOperation::Mount
-        });
         if operation == MountOperation::Mount
             && cfg!(windows)
             && !mount_dependency_available(MountBackend::Fuse)
@@ -6760,8 +6930,10 @@ impl App {
             self.busy.remove(&id);
             return Task::none();
         }
-        self.mount_statuses
-            .insert(id.clone(), MountStatus::Starting);
+        self.status_reads.remove(&id);
+
+        self.mount_observations
+            .insert(id.clone(), Ok((MountStatus::Starting, None)));
         self.operation_errors.remove(&id);
         let display_name = operation_display_name(server.as_ref(), &id);
         self.status = self.program_log.info(match operation {
@@ -6888,24 +7060,32 @@ impl App {
     }
 
     fn open_mountpoint(&mut self, id: String) -> Task<Message> {
-        let state_file = self.paths.state_file(&id);
+        if self.busy.contains(&id) {
+            return Task::none();
+        }
+        let service = self.service.clone();
+        let request = begin_mount_read(&id, &mut self.next_status_read, &mut self.status_reads);
         let locale = self.locale();
         let display_name = operation_display_name(
             self.mount_targets.iter().find(|server| server.id == id),
             &id,
         );
         self.status = self.program_log.info(locale.opening(&display_name));
+        let result_id = id.clone();
         Task::perform(
             async move {
-                tokio::task::spawn_blocking(move || {
-                    let state: MountState =
-                        read_json(&state_file).map_err(|error| error.to_string())?;
-                    open_path(&state.mountpoint, locale)
-                })
-                .await
-                .unwrap_or_else(|error| Err(error.to_string()))
+                tokio::task::spawn_blocking(move || open_observed_mount(&service, &id, locale))
+                    .await
+                    .unwrap_or_else(|error| (Err(error.to_string()), Err(error.to_string())))
             },
-            Message::OpenFinished,
+            {
+                move |(observation, result)| Message::OpenFinished {
+                    id: result_id.clone(),
+                    request,
+                    observation,
+                    result,
+                }
+            },
         )
     }
 
@@ -7047,7 +7227,7 @@ impl App {
             .mount_targets
             .iter()
             .filter(|server| {
-                self.mount_statuses.get(&server.id) == Some(&MountStatus::Mounted)
+                self.mount_status(&server.id) == Some(MountStatus::Mounted)
                     && self
                         .transfers
                         .get(&server.id)
@@ -7436,29 +7616,44 @@ impl App {
                 );
             }
             for server in visible {
+                let targets: Vec<_> = self
+                    .mount_targets
+                    .iter()
+                    .filter(|target| target.connection_id() == server.id)
+                    .collect();
+                let mounted = targets
+                    .iter()
+                    .filter(|target| {
+                        self.mount_status(&target.id) == Some(MountStatus::Mounted)
+                            && !self.mount_status_unavailable(&target.id)
+                    })
+                    .count();
                 connections = connections.push(connection_card(
                     server,
                     ConnectionCardState {
+                        mount_counts: (!server.mounts.is_empty())
+                            .then_some((mounted, targets.len())),
+                        status_unavailable: targets
+                            .iter()
+                            .any(|target| self.mount_status_unavailable(&target.id)),
+                        resolved_mountpoint: self.observed_mountpoint(&server.id),
                         status: if server.mounts.is_empty() {
-                            self.mount_statuses
-                                .get(&server.id)
-                                .copied()
+                            self.mount_status(&server.id)
                                 .unwrap_or(MountStatus::Unmounted)
                         } else {
                             let statuses: Vec<_> = self
                                 .mount_targets
                                 .iter()
                                 .filter(|s| s.connection_id() == server.id)
-                                .map(|s| {
-                                    self.mount_statuses
-                                        .get(&s.id)
-                                        .copied()
-                                        .unwrap_or(MountStatus::Unmounted)
-                                })
+                                .map(|s| self.mount_status(&s.id).unwrap_or(MountStatus::Unmounted))
                                 .collect();
                             if statuses.contains(&MountStatus::Starting) {
                                 MountStatus::Starting
-                            } else if statuses.contains(&MountStatus::Mounted) {
+                            } else if !statuses.is_empty()
+                                && statuses
+                                    .iter()
+                                    .all(|status| *status == MountStatus::Mounted)
+                            {
                                 MountStatus::Mounted
                             } else {
                                 MountStatus::Unmounted
@@ -7474,7 +7669,11 @@ impl App {
                         can_modify: self.can_modify(&server.id),
                         confirming_remove: self.pending_delete.as_deref() == Some(&server.id),
                         waiting_unmount: self.pending_unmount_after_sync.contains(&server.id),
-                        operation_error: self.operation_errors.get(&server.id),
+                        operation_error: server
+                            .mounts
+                            .is_empty()
+                            .then(|| self.operation_errors.get(&server.id))
+                            .flatten(),
                         has_interactive_terminal: self
                             .interactive_terminals
                             .contains_key(&server.id),
@@ -7520,7 +7719,10 @@ impl App {
             .collect();
         let mounted = targets
             .iter()
-            .filter(|s| self.mount_statuses.get(&s.id) == Some(&MountStatus::Mounted))
+            .filter(|s| {
+                self.mount_status(&s.id) == Some(MountStatus::Mounted)
+                    && !self.mount_status_unavailable(&s.id)
+            })
             .count();
         let label = match locale {
             Locale::English => format!("Mount points ({mounted}/{})", targets.len()),
@@ -7549,12 +7751,9 @@ impl App {
         .spacing(10);
         for target in targets {
             let id = &target.id;
-            let status = self
-                .mount_statuses
-                .get(id)
-                .copied()
-                .unwrap_or(MountStatus::Unmounted);
+            let status = self.mount_status(id).unwrap_or(MountStatus::Unmounted);
             let busy = self.busy.contains(id);
+            let unavailable = self.mount_status_unavailable(id);
             let waiting = self.pending_unmount_after_sync.contains(id);
             let mut details = column![
                 text(format!(
@@ -7564,14 +7763,14 @@ impl App {
                     } else {
                         &target.remote_path
                     },
-                    display_mountpoint(target, locale)
+                    display_mountpoint(target, self.observed_mountpoint(id), locale)
                 ))
                 .size(15),
-                text(status_label(locale, status)).size(12),
+                text(connection_status_label(locale, status, None, unavailable)).size(12),
             ]
             .spacing(5)
             .width(Fill);
-            if status == MountStatus::Mounted {
+            if status == MountStatus::Mounted && !unavailable {
                 details = details.push(capacity_progress_view(
                     self.capacities.get(id),
                     self.capacity_refreshing && !self.capacity_errors.contains(id),
@@ -7588,35 +7787,18 @@ impl App {
                         details.push(text(locale.text(TextKey::TransferStateUnavailable)).size(12));
                 }
             }
+            let (operation_label, operation) =
+                mount_button_action(id, status, waiting, unavailable, locale);
             if let Some(error) = self.operation_errors.get(id) {
-                details = details.push(
-                    text(mount_error_summary(locale, &error.cause))
-                        .size(12)
-                        .style(text::danger),
-                );
+                details = details.push(mount_operation_error(id, error, locale));
             }
-            let operation = if waiting {
-                Message::CancelPendingUnmount(id.clone())
-            } else {
-                Message::Mount(id.clone())
-            };
-            let operation_label = if waiting {
-                match locale {
-                    Locale::English => "Cancel pending unmount",
-                    Locale::Chinese => "取消等待卸载",
-                }
-            } else if status == MountStatus::Mounted {
-                locale.text(TextKey::Unmount)
-            } else {
-                locale.text(TextKey::Mount)
-            };
             content = content.push(
                 container(
                     row![
                         details,
-                        button(operation_label).on_press_maybe((!busy).then_some(operation)),
+                        button(text(operation_label)).on_press_maybe((!busy).then_some(operation)),
                         button(locale.text(TextKey::Open)).on_press_maybe(
-                            (status == MountStatus::Mounted && !busy)
+                            (status == MountStatus::Mounted && !busy && !unavailable)
                                 .then_some(Message::Open(id.clone()))
                         ),
                         button(locale.text(TextKey::Logs))
@@ -7636,7 +7818,7 @@ impl App {
         let mounted: Vec<_> = self
             .mount_targets
             .iter()
-            .filter(|server| self.mount_statuses.get(&server.id) == Some(&MountStatus::Mounted))
+            .filter(|server| self.mount_status(&server.id) == Some(MountStatus::Mounted))
             .collect();
         let has_mounted_connections = !mounted.is_empty();
         let unavailable_connections = mounted
@@ -7979,7 +8161,7 @@ impl App {
                                     } else {
                                         &target.remote_path
                                     },
-                                    display_mountpoint(&target, locale)
+                                    display_mountpoint(&target, None, locale)
                                 ))
                                 .size(12),
                             );
@@ -8035,11 +8217,15 @@ impl App {
         }
         let source_locked = draft.source == ConnectionSource::SshConfig;
         if draft.source == ConnectionSource::SaiCluster && self.sai_setup.in_progress() {
-            let content = controls.freeze(
-                column![source, self.sai_setup.view(locale).map(Message::SaiSetup)]
-                    .spacing(16)
-                    .max_width(900),
-            );
+            let picker = self.sai_setup.view(locale).map(Message::SaiSetup);
+            let picker = if self.sai_setup.directory_only() {
+                picker
+            } else {
+                controls.freeze(picker)
+            };
+            let content = column![controls.freeze(source), picker]
+                .spacing(16)
+                .max_width(900);
             return editor_shell(header, scrollable(content), "");
         }
         let mounted_controls = controls;
@@ -8395,14 +8581,34 @@ impl App {
                 ),
             );
         }
+        let mut add_paths = row![].spacing(8);
+        if draft.source == ConnectionSource::SaiCluster {
+            add_paths = add_paths.push(
+                button(match locale {
+                    Locale::English => "+ Choose SAI directories",
+                    Locale::Chinese => "+ 选择 SAI 目录",
+                })
+                .on_press_maybe(
+                    (sai_setup::State::can_choose_directories(draft)
+                        && draft.mounts.len() + usize::from(draft.primary_mount) < 64)
+                        .then_some(Message::SaiSetup(sai_setup::Message::ChooseDirectories)),
+                ),
+            );
+        }
         paths = paths.push(
-            button(match locale {
-                Locale::English => "+ Add mount point",
-                Locale::Chinese => "+ 添加挂载点",
-            })
-            .on_press_maybe(
-                (draft.mounts.len() + usize::from(draft.primary_mount) < 64)
-                    .then_some(Message::AddMountMapping),
+            add_paths.push(
+                button(
+                    match (locale, draft.source == ConnectionSource::SaiCluster) {
+                        (Locale::English, true) => "+ Add mount point manually",
+                        (Locale::Chinese, true) => "+ 手动添加挂载点",
+                        (Locale::English, false) => "+ Add mount point",
+                        (Locale::Chinese, false) => "+ 添加挂载点",
+                    },
+                )
+                .on_press_maybe(
+                    (draft.mounts.len() + usize::from(draft.primary_mount) < 64)
+                        .then_some(Message::AddMountMapping),
+                ),
             ),
         );
 
@@ -9253,7 +9459,7 @@ impl App {
             .mount_targets
             .iter()
             .filter(|server| {
-                self.mount_statuses.get(&server.id) == Some(&MountStatus::Mounted)
+                self.mount_status(&server.id) == Some(MountStatus::Mounted)
                     && self
                         .transfers
                         .get(&server.id)
@@ -9345,6 +9551,9 @@ impl App {
 
 struct ConnectionCardState<'a> {
     status: MountStatus,
+    mount_counts: Option<(usize, usize)>,
+    status_unavailable: bool,
+    resolved_mountpoint: Option<&'a Path>,
     busy: bool,
     transfer: Option<&'a TransferSnapshot>,
     transfer_unavailable: bool,
@@ -9600,6 +9809,58 @@ fn inode_soft_limit_help(inode: &InodeInfo, locale: Locale) -> Option<String> {
     })
 }
 
+fn mount_operation_error<'a>(
+    id: &str,
+    error: &'a ConnectionOperationError,
+    locale: Locale,
+) -> Element<'a, Message> {
+    let id = id.to_owned();
+    let operation = error.operation;
+
+    container(
+        column![
+            text(mount_error_summary(locale, &error.cause))
+                .size(13)
+                .style(text::danger),
+            row![
+                button(match locale {
+                    Locale::English => "Retry",
+                    Locale::Chinese => "重试",
+                })
+                .on_press(mount_error_message(
+                    id.clone(),
+                    operation,
+                    MountErrorAction::Retry,
+                )),
+                button(match locale {
+                    Locale::English => "View full log",
+                    Locale::Chinese => "查看完整日志",
+                })
+                .on_press(mount_error_message(
+                    id.clone(),
+                    operation,
+                    MountErrorAction::ViewLog,
+                )),
+                button(match locale {
+                    Locale::English => "Dismiss",
+                    Locale::Chinese => "关闭",
+                })
+                .on_press(mount_error_message(
+                    id.clone(),
+                    operation,
+                    MountErrorAction::Dismiss,
+                )),
+            ]
+            .spacing(8),
+        ]
+        .spacing(6),
+    )
+    .padding(10)
+    .width(Fill)
+    .style(container::rounded_box)
+    .into()
+}
+
 fn connection_card<'a>(
     server: &'a ServerConfig,
     state: ConnectionCardState<'a>,
@@ -9608,6 +9869,9 @@ fn connection_card<'a>(
 ) -> Element<'a, Message> {
     let ConnectionCardState {
         status,
+        mount_counts,
+        status_unavailable,
+        resolved_mountpoint,
         busy,
         transfer,
         transfer_unavailable,
@@ -9633,24 +9897,11 @@ fn connection_card<'a>(
     } else {
         server.remote_path.clone()
     };
-    let operation_label = if waiting_unmount {
-        match locale {
-            Locale::English => "Cancel pending unmount",
-            Locale::Chinese => "取消等待卸载",
-        }
-    } else if matches!(status, MountStatus::Mounted | MountStatus::Starting) {
-        locale.text(TextKey::Unmount)
-    } else {
-        locale.text(TextKey::Mount)
-    };
-    let mut operation = button(operation_label);
-    if waiting_unmount {
-        operation = operation.on_press(Message::CancelPendingUnmount(id.clone()));
-    } else if !busy {
-        operation = operation.on_press(Message::Mount(id.clone()));
-    }
+    let (operation_label, action) =
+        mount_button_action(&id, status, waiting_unmount, status_unavailable, locale);
+    let operation = button(text(operation_label)).on_press_maybe((!busy).then_some(action));
     let mut open = button(locale.text(TextKey::Open));
-    if status == MountStatus::Mounted && !busy {
+    if status == MountStatus::Mounted && !busy && !status_unavailable {
         open = open.on_press(Message::Open(id.clone()));
     }
     let mut title = row![text(server.display_name()).size(22)]
@@ -9700,7 +9951,11 @@ fn connection_card<'a>(
         tag_row,
         text(host).size(15),
         text(if server.mounts.is_empty() {
-            format!("{}  ->  {}", remote, display_mountpoint(server, locale))
+            format!(
+                "{}  ->  {}",
+                remote,
+                display_mountpoint(server, resolved_mountpoint, locale)
+            )
         } else {
             match locale {
                 Locale::English => format!(
@@ -9714,7 +9969,13 @@ fn connection_card<'a>(
             }
         })
         .size(14),
-        text(status_label(locale, status)).size(13),
+        text(connection_status_label(
+            locale,
+            status,
+            mount_counts,
+            status_unavailable
+        ))
+        .size(13),
     ]
     .spacing(4)
     .width(Fill);
@@ -9732,51 +9993,9 @@ fn connection_card<'a>(
         }
     }
     if let Some(error) = operation_error {
-        let operation = error.operation;
-        details = details.push(
-            container(
-                column![
-                    text(mount_error_summary(locale, &error.cause))
-                        .size(13)
-                        .style(text::danger),
-                    row![
-                        button(match locale {
-                            Locale::English => "Retry",
-                            Locale::Chinese => "重试",
-                        })
-                        .on_press(mount_error_message(
-                            id.clone(),
-                            operation,
-                            MountErrorAction::Retry,
-                        )),
-                        button(match locale {
-                            Locale::English => "View full log",
-                            Locale::Chinese => "查看完整日志",
-                        })
-                        .on_press(mount_error_message(
-                            id.clone(),
-                            operation,
-                            MountErrorAction::ViewLog,
-                        )),
-                        button(match locale {
-                            Locale::English => "Dismiss",
-                            Locale::Chinese => "关闭",
-                        })
-                        .on_press(mount_error_message(
-                            id.clone(),
-                            operation,
-                            MountErrorAction::Dismiss,
-                        )),
-                    ]
-                    .spacing(8),
-                ]
-                .spacing(6),
-            )
-            .padding(10)
-            .width(Fill)
-            .style(container::rounded_box),
-        );
+        details = details.push(mount_operation_error(&id, error, locale));
     }
+
     if matches!(
         list_mode,
         ConnectionListMode::Batch | ConnectionListMode::Tags
@@ -11772,11 +11991,122 @@ fn delete_retired_connection_credentials(
     }
 }
 
-fn display_mountpoint(server: &ServerConfig, locale: Locale) -> &str {
-    if server.mountpoint.is_empty() {
-        locale.text(TextKey::AutoMountpoint)
+fn display_mountpoint(server: &ServerConfig, observed: Option<&Path>, locale: Locale) -> String {
+    if let Some(path) = observed {
+        mountpoint_open_path(path, cfg!(windows))
+            .to_string_lossy()
+            .into_owned()
+    } else if server.mountpoint.is_empty() {
+        locale.text(TextKey::AutoMountpoint).into()
     } else {
-        &server.mountpoint
+        server.mountpoint.clone()
+    }
+}
+
+fn begin_mount_read(id: &str, sequence: &mut u64, pending: &mut HashMap<String, u64>) -> u64 {
+    *sequence = sequence.wrapping_add(1);
+    pending.insert(id.to_owned(), *sequence);
+    *sequence
+}
+
+fn accept_mount_observation(
+    id: &str,
+    request: u64,
+    observation: MountObservation,
+    busy: &HashSet<String>,
+    pending: &mut HashMap<String, u64>,
+    observations: &mut HashMap<String, MountObservation>,
+) -> Option<Result<MountStatus, String>> {
+    if pending.get(id) != Some(&request) {
+        return None;
+    }
+    pending.remove(id);
+    if busy.contains(id) {
+        return None;
+    }
+    let status = observation
+        .as_ref()
+        .map(|(status, _)| *status)
+        .map_err(Clone::clone);
+    observations.insert(id.to_owned(), observation);
+    Some(status)
+}
+
+fn mount_button_action(
+    id: &str,
+    status: MountStatus,
+    waiting: bool,
+    unavailable: bool,
+    locale: Locale,
+) -> (String, Message) {
+    if waiting {
+        return (
+            match locale {
+                Locale::English => "Cancel pending unmount",
+                Locale::Chinese => "取消等待卸载",
+            }
+            .into(),
+            Message::CancelPendingUnmount(id.into()),
+        );
+    }
+    if unavailable {
+        return (
+            match locale {
+                Locale::English => "Check status",
+                Locale::Chinese => "检查状态",
+            }
+            .into(),
+            Message::CheckMount(id.into()),
+        );
+    }
+    let operation = if matches!(status, MountStatus::Mounted | MountStatus::Starting) {
+        MountOperation::Unmount
+    } else {
+        MountOperation::Mount
+    };
+    (
+        locale
+            .text(if operation == MountOperation::Unmount {
+                TextKey::Unmount
+            } else {
+                TextKey::Mount
+            })
+            .into(),
+        Message::MountRequested(id.into(), operation),
+    )
+}
+
+fn connection_status_label(
+    locale: Locale,
+    status: MountStatus,
+    counts: Option<(usize, usize)>,
+    unavailable: bool,
+) -> String {
+    if unavailable {
+        return match locale {
+            Locale::English => "Status unavailable",
+            Locale::Chinese => "状态暂不可用",
+        }
+        .into();
+    }
+    if let Some((mounted, total)) = counts
+        && mounted > 0
+        && mounted < total
+    {
+        return match locale {
+            Locale::English => format!("Partially mounted ({mounted}/{total})"),
+            Locale::Chinese => format!("部分已挂载（{mounted}/{total}）"),
+        };
+    }
+    status_label(locale, status).into()
+}
+
+fn mountpoint_open_path(path: &Path, windows: bool) -> PathBuf {
+    let value = path.to_string_lossy();
+    if windows && is_drive_mountpoint(&value) {
+        PathBuf::from(format!("{value}\\"))
+    } else {
+        path.to_owned()
     }
 }
 
@@ -12455,18 +12785,37 @@ fn configure_native_popup(window: &dyn window::Window, position: Point) {
     }
 }
 
+fn open_observed_mount(
+    service: &MountService,
+    id: &str,
+    locale: Locale,
+) -> (MountObservation, Result<(), String>) {
+    let observation = service.observe(id).map_err(|error| error.to_string());
+    let result = match &observation {
+        Ok((MountStatus::Mounted, Some(path))) => open_path(path, locale),
+        Ok(_) => Err(match locale {
+            Locale::English => "This mount is no longer available. Refresh or mount it again.",
+            Locale::Chinese => "此挂载当前不可用，请刷新或重新挂载。",
+        }
+        .into()),
+        Err(error) => Err(error.clone()),
+    };
+    (observation, result)
+}
+
 fn open_path(path: &Path, locale: Locale) -> Result<(), String> {
+    let path = mountpoint_open_path(path, cfg!(windows));
     let mut command = if cfg!(windows) {
         let mut command = Command::new("explorer.exe");
-        command.arg(path);
+        command.arg(&path);
         command
     } else if cfg!(target_os = "macos") {
         let mut command = Command::new("open");
-        command.arg(path);
+        command.arg(&path);
         command
     } else {
         let mut command = Command::new("xdg-open");
-        command.arg(path);
+        command.arg(&path);
         command
     };
     let child = command.spawn().map_err(|error| match locale {
@@ -12548,6 +12897,130 @@ fn preflight_changed_mappings(previous: &ServerConfig, next: &ServerConfig) -> R
 #[cfg(test)]
 mod localization_tests {
     use super::*;
+
+    #[test]
+    fn mapping_status_observations_do_not_revive_unmounted_or_busy_siblings() {
+        let mut observations = HashMap::from([
+            (
+                "first".into(),
+                Ok((MountStatus::Mounted, Some(PathBuf::from("Z:")))),
+            ),
+            (
+                "second".into(),
+                Ok((MountStatus::Mounted, Some(PathBuf::from("Y:")))),
+            ),
+        ]);
+        let mut pending = HashMap::new();
+        let mut sequence = 0;
+        let busy = HashSet::new();
+        let stale = begin_mount_read("second", &mut sequence, &mut pending);
+        pending.remove("second");
+        observations.insert("second".into(), Ok((MountStatus::Unmounted, None)));
+        assert!(
+            accept_mount_observation(
+                "second",
+                stale,
+                Ok((MountStatus::Mounted, Some(PathBuf::from("Y:")))),
+                &busy,
+                &mut pending,
+                &mut observations
+            )
+            .is_none()
+        );
+        assert_eq!(observations["second"], Ok((MountStatus::Unmounted, None)));
+        let current = begin_mount_read("second", &mut sequence, &mut pending);
+        assert_eq!(
+            accept_mount_observation(
+                "second",
+                current,
+                Ok((MountStatus::Stale, None)),
+                &busy,
+                &mut pending,
+                &mut observations
+            ),
+            Some(Ok(MountStatus::Stale))
+        );
+        assert_eq!(observations["second"], Ok((MountStatus::Stale, None)));
+        assert_eq!(
+            observations["first"],
+            Ok((MountStatus::Mounted, Some(PathBuf::from("Z:"))))
+        );
+        let current = begin_mount_read("second", &mut sequence, &mut pending);
+        assert!(
+            accept_mount_observation(
+                "second",
+                current,
+                Ok((MountStatus::Mounted, None)),
+                &HashSet::from(["second".into()]),
+                &mut pending,
+                &mut observations
+            )
+            .is_none()
+        );
+        let current = begin_mount_read("first", &mut sequence, &mut pending);
+        assert!(
+            accept_mount_observation(
+                "first",
+                current,
+                Err("read unavailable".into()),
+                &busy,
+                &mut pending,
+                &mut observations
+            )
+            .unwrap()
+            .is_err()
+        );
+        assert!(observations["first"].is_err());
+    }
+
+    #[test]
+    fn mapping_buttons_keep_their_explicit_intent_and_windows_open_uses_a_root() {
+        for status in [MountStatus::Mounted, MountStatus::Starting] {
+            let (label, action) =
+                mount_button_action("second", status, false, false, Locale::English);
+            assert_eq!(label, Locale::English.text(TextKey::Unmount));
+            assert!(
+                matches!(action,Message::MountRequested(id,MountOperation::Unmount) if id=="second")
+            );
+        }
+        let (label, action) =
+            mount_button_action("second", MountStatus::Mounted, false, true, Locale::English);
+        assert_eq!(label, "Check status");
+        assert!(matches!(action, Message::CheckMount(_)));
+        assert_eq!(
+            connection_status_label(Locale::English, MountStatus::Unmounted, Some((1, 2)), false),
+            "Partially mounted (1/2)"
+        );
+        assert_eq!(
+            mountpoint_open_path(Path::new("Y:"), true),
+            PathBuf::from("Y:\\")
+        );
+        assert_eq!(
+            mountpoint_open_path(Path::new("Y:\\folder"), true),
+            PathBuf::from("Y:\\folder")
+        );
+    }
+
+    #[test]
+    fn opening_a_mapping_requires_a_fresh_mounted_observation() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: temp.path().join("config"),
+            cache_dir: temp.path().join("cache"),
+            state_dir: temp.path().join("state"),
+            data_dir: temp.path().join("data"),
+        };
+        let server = ServerConfig {
+            id: "missing-mount".into(),
+            ..ServerConfig::default()
+        };
+        storage::save_servers(&paths, std::slice::from_ref(&server)).unwrap();
+        let service = MountService::new(paths.clone(), application_root());
+        let (observation, result) = open_observed_mount(&service, &server.id, Locale::English);
+        assert_eq!(observation, Ok((MountStatus::Unmounted, None)));
+        assert!(result.unwrap_err().contains("no longer available"));
+        assert!(run_headless(&paths, AppCommand::Open { id: server.id }).is_err());
+    }
 
     #[test]
     fn interactive_updates_require_completed_unmount_and_no_pending_login() {
@@ -13995,7 +14468,7 @@ mod localization_tests {
     }
 
     #[test]
-    fn structured_remote_path_keeps_incomplete_input_until_save() {
+    fn structured_remote_path_preserves_native_names_through_save() {
         let suffix = "  project\\data set/  ";
         let relative = compose_remote_path("$HOME", suffix);
         let (_, editable_suffix) = split_remote_path(&relative);
@@ -14012,14 +14485,11 @@ mod localization_tests {
         draft.auth = AuthMethod::Password;
         draft.password = "test-password".into();
         draft.remote_path = relative;
-        assert_eq!(
-            draft.validate(&[]).unwrap().server.remote_path,
-            "project/data set"
-        );
+        assert_eq!(draft.validate(&[]).unwrap().server.remote_path, suffix);
         draft.remote_path = compose_remote_path("/", "srv\\data set/");
         assert_eq!(
             draft.validate(&[]).unwrap().server.remote_path,
-            "/srv/data set"
+            r"/srv\data set"
         );
     }
 

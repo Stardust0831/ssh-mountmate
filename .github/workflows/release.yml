@@ -158,7 +158,7 @@ jobs:
             asset: SSHMountMate-macos-x64
             rclone_platform: osx
             rclone_arch: amd64
-          - os: macos-14
+          - os: macos-15
             asset: SSHMountMate-macos-arm64
             rclone_platform: osx
             rclone_arch: arm64
