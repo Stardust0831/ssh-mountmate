@@ -8,9 +8,17 @@ flow. Services without that extension retain manual mount-path configuration.
 
 `mountmate-sai` owns discovery, device authorization, permitted connections, public-key
 registration and directory discovery. The app's `sai_setup.rs` owns temporary editor state.
-Only after the selected site reports `applied` does the adapter fill an ordinary
-`ConnectionDraft`. Existing validation, save, host-key review and mount handling remain
+For initial setup, the adapter fills an ordinary `ConnectionDraft` only after the selected
+site reports `applied`. Existing validation, save, host-key review and mount handling remain
 responsible for the connection. The saved connection schema stays unchanged.
+
+Existing SAI connections expose directory selection beside their mount-point controls.
+This uses the same device authorization and directory picker with only
+`openid sai.ssh.read sai.ssh.mounts.read`. The returned authorized SSH host, port and
+Unix username must match the existing editor target. Multiple matching sites require an
+explicit choice. Only selected directory mappings are appended; existing credentials,
+local destinations and active mappings retain their current ownership and save guards.
+This flow never generates or enrolls a key, and tokens remain temporary editor state.
 
 The first version uses Native SFTP and a dedicated local Ed25519 key, without writing SSH
 config entries or requiring an SSH CA. Keys live under the app data directory at
@@ -141,10 +149,18 @@ endpoint. An empty page can still have a cursor; **More directories** loads the 
 Only a null cursor ends the list. Denial, expiry, unavailable service and invalid responses
 are shown as errors, preserving manual path entry.
 
+Pages retain the server's order: Home, shared folders, projects and member folders, with
+stable paths within those groups. The client does not fetch every page to construct an
+initial list. Cursors remain opaque and at most 101 characters. A `400` response with
+`detail.code=invalid_mount_roots_cursor` invalidates the temporary list and its unsubmitted
+selection. **Reload directories** starts with no cursor; saved and draft mappings remain
+unchanged. Ordinary continuation pages retain the current selection.
+
 The setup panel lets users select several directories and shows their read/write state.
-Only explicit choices are applied after key enrollment succeeds. A fresh unused primary
-mapping receives the first choice; further choices append ordinary mappings without
-overwriting existing paths or local destinations. Existing paths are not duplicated.
+During initial setup, explicit choices are applied after key enrollment succeeds.
+Adding directories to an existing connection requires only directory authorization.
+A fresh unused primary mapping receives the first choice; further choices append ordinary
+mappings without overwriting existing paths or local destinations. Existing paths are not duplicated.
 Selections respect the existing editor's remaining capacity. Users finish local destinations
 and save through the ordinary 64-mapping validation. Remote path whitespace and literal
 backslashes remain unchanged through saving, mount targets and capacity queries.

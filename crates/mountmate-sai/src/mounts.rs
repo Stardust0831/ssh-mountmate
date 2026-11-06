@@ -89,6 +89,15 @@ impl Session {
         if matches!(response.status().as_u16(), 404 | 501 | 503) {
             return Err(Error::Unavailable);
         }
+        if response.status().as_u16() == 400 {
+            let body: serde_json::Value =
+                serde_json::from_slice(response.body()).map_err(|_| Error::Contract)?;
+            return Err(if body["detail"]["code"] == "invalid_mount_roots_cursor" {
+                Error::DirectoryChanged
+            } else {
+                Error::Contract
+            });
+        }
         let page: MountRootPage = transport::json(response)?;
         page.validate(&site.site_id, cursor)?;
         Ok(page)
@@ -131,7 +140,7 @@ fn directory_text(value: &str, limit: usize) -> bool {
         && !value.chars().any(char::is_control)
 }
 
-pub(crate) fn apply_selected_roots(draft: &mut ConnectionDraft, roots: &[MountRoot]) {
+pub fn apply_selected_roots(draft: &mut ConnectionDraft, roots: &[MountRoot]) {
     let mut unused_primary = draft.editing_id.is_none()
         && draft.primary_mount
         && draft.remote_path.is_empty()

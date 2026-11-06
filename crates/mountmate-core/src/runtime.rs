@@ -334,9 +334,19 @@ impl<'a> MountRuntime<'a> {
         }
         self.mountpoints
             .prepare(request.mountpoint)
-            .map_err(|message| RuntimeError::InvalidMountpoint {
-                path: request.mountpoint.to_owned(),
-                message,
+            .map_err(|message| {
+                let target = request.mountpoint.as_os_str().to_string_lossy();
+                if self.windows
+                    && matches!(target.as_bytes(), [drive, b':'] if drive.is_ascii_alphabetic())
+                    && self.mountpoints.is_ready(request.mountpoint)
+                {
+                    RuntimeError::MountpointReserved(request.mountpoint.to_owned())
+                } else {
+                    RuntimeError::InvalidMountpoint {
+                        path: request.mountpoint.to_owned(),
+                        message,
+                    }
+                }
             })?;
         fs::create_dir_all(request.cache_dir).map_err(|source| StorageError::Io {
             path: request.cache_dir.to_owned(),
@@ -424,11 +434,17 @@ impl<'a> MountRuntime<'a> {
         Ok(state)
     }
 
-    pub fn status(&self, server_id: &str) -> Result<MountStatus, RuntimeError> {
+    /// Observe status and the recorded target from the same state read.
+    pub fn observe(&self, server_id: &str) -> Result<(MountStatus, Option<PathBuf>), RuntimeError> {
         Ok(self
             .load_state(server_id)?
-            .as_ref()
-            .map_or(MountStatus::Unmounted, |state| self.status_for(state)))
+            .map_or((MountStatus::Unmounted, None), |state| {
+                (self.status_for(&state), Some(state.mountpoint))
+            }))
+    }
+
+    pub fn status(&self, server_id: &str) -> Result<MountStatus, RuntimeError> {
+        self.observe(server_id).map(|(status, _)| status)
     }
 
     pub fn unmount(&self, server_id: &str) -> Result<(), RuntimeError> {
@@ -625,7 +641,15 @@ impl<'a> MountRuntime<'a> {
             };
             state.server_id != server_id
                 && path_key(&state.mountpoint, self.windows) == requested
-                && self.state_process_may_be_owned(&state)
+                && (self.state_process_may_be_owned(&state)
+                    || (state.phase == MountPhase::Starting
+                        && matches!(
+                            FileLock::acquire(
+                                &self.paths.mount_lock(&state.server_id),
+                                Duration::ZERO,
+                            ),
+                            Err(StorageError::LockTimeout(_))
+                        )))
         })
     }
 
@@ -1315,34 +1339,92 @@ mod tests {
     }
 
     #[test]
-    fn live_state_reserves_mountpoint_before_spawn() {
+    fn only_busy_windows_drive_preparation_is_retryable() {
+        struct RejectedMountpoint(bool);
+        impl MountpointControl for RejectedMountpoint {
+            fn prepare(&self, _path: &Path) -> Result<(), String> {
+                Err("mount target rejected".into())
+            }
+
+            fn is_ready(&self, _path: &Path) -> bool {
+                self.0
+            }
+        }
+
         let temp = tempdir().unwrap();
         let paths = paths(temp.path());
-        let (mut other, snapshot) = state(temp.path(), Some(matching_arguments(temp.path())));
-        other.server_id = "beta".into();
-        write_private_json(&paths.state_file("beta"), &other).unwrap();
-        let processes = FakeProcesses::new([Some(snapshot)]);
-        let rc = FakeRc {
-            pid: Ok(42),
-            quit_calls: RefCell::new(0),
-        };
-        let mountpoint = FakeMountpoint {
-            ready: RefCell::new(false),
-        };
-        let runtime =
-            MountRuntime::new(&paths, &processes, &rc, &mountpoint).with_options(options());
+        let processes = FakeProcesses::new([]);
+        for (target, busy, retryable) in [
+            ("Z:", true, true),
+            ("Z:", false, false),
+            (r"C:\mounts\beta", true, false),
+        ] {
+            let mountpoint = RejectedMountpoint(busy);
+            let mut runtime = MountRuntime::new(&paths, &processes, &PanicRc, &mountpoint);
+            runtime.windows = true;
+            let error = runtime
+                .mount(MountRequest {
+                    server: &server(),
+                    settings: &Settings::default(),
+                    rclone: Path::new("rclone"),
+                    mountpoint: Path::new(target),
+                    cache_dir: &temp.path().join("cache"),
+                })
+                .unwrap_err();
 
-        assert!(matches!(
-            runtime.mount(MountRequest {
-                server: &server(),
-                settings: &Settings::default(),
-                rclone: Path::new("rclone"),
-                mountpoint: &temp.path().join("mnt"),
-                cache_dir: &temp.path().join("cache"),
-            }),
-            Err(RuntimeError::MountpointReserved(_))
-        ));
+            assert_eq!(
+                matches!(&error, RuntimeError::MountpointReserved(_)),
+                retryable
+            );
+            if !retryable {
+                assert!(
+                    matches!(error, RuntimeError::InvalidMountpoint { message, .. } if message == "mount target rejected")
+                );
+            }
+        }
         assert_eq!(*processes.spawn_calls.borrow(), 0);
+    }
+
+    #[test]
+    fn live_state_reserves_mountpoint_before_spawn() {
+        for phase in [MountPhase::Mounted, MountPhase::Starting] {
+            let temp = tempdir().unwrap();
+            let paths = paths(temp.path());
+            let (mut other, snapshot) = state(temp.path(), Some(matching_arguments(temp.path())));
+            other.server_id = "beta".into();
+            other.phase = phase;
+            write_private_json(&paths.state_file("beta"), &other).unwrap();
+            let processes =
+                FakeProcesses::new([(phase == MountPhase::Mounted).then_some(snapshot)]);
+            let owner = (phase == MountPhase::Starting)
+                .then(|| FileLock::acquire(&paths.mount_lock("beta"), Duration::ZERO).unwrap());
+            let rc = FakeRc {
+                pid: Ok(42),
+                quit_calls: RefCell::new(0),
+            };
+            let mountpoint = FakeMountpoint {
+                ready: RefCell::new(false),
+            };
+            let runtime =
+                MountRuntime::new(&paths, &processes, &rc, &mountpoint).with_options(options());
+
+            assert!(matches!(
+                runtime.mount(MountRequest {
+                    server: &server(),
+                    settings: &Settings::default(),
+                    rclone: Path::new("rclone"),
+                    mountpoint: &temp.path().join("mnt"),
+                    cache_dir: &temp.path().join("cache"),
+                }),
+                Err(RuntimeError::MountpointReserved(_))
+            ));
+            assert_eq!(*processes.spawn_calls.borrow(), 0);
+            drop(owner);
+            if phase == MountPhase::Starting {
+                assert!(!runtime.mountpoint_reserved_by_other("alpha", &other.mountpoint));
+                assert!(runtime.cleanup_stale_state("beta").unwrap());
+            }
+        }
     }
 
     #[test]
@@ -1358,5 +1440,13 @@ mod tests {
         let runtime = MountRuntime::new(&paths, &processes, &PanicRc, &mountpoint);
 
         assert_eq!(runtime.status("alpha").unwrap(), MountStatus::Mounted);
+        assert_eq!(
+            runtime.observe("alpha").unwrap(),
+            (MountStatus::Mounted, Some(state.mountpoint))
+        );
+        assert_eq!(
+            runtime.observe("missing").unwrap(),
+            (MountStatus::Unmounted, None)
+        );
     }
 }

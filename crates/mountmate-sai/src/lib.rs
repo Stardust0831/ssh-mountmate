@@ -1,5 +1,5 @@
 //! SAI account setup adapter. Produces ordinary MountMate connections.
-//! See docs/sai-account-setup.md for the proposed, not yet deployed service contract.
+//! See docs/sai-account-setup.md for the versioned service contract.
 
 mod enrollment;
 mod key;
@@ -8,7 +8,7 @@ mod transport;
 
 pub use enrollment::EnrollmentProgress;
 use enrollment::{Enrollment, Status as EnrollmentStatus};
-pub use mounts::{MountRole, MountRoot, MountRootKind, MountRootPage};
+pub use mounts::{MountRole, MountRoot, MountRootKind, MountRootPage, apply_selected_roots};
 
 use mountmate_core::connection::{ConnectionDraft, ConnectionSource};
 use mountmate_core::credential::CredentialKind;
@@ -67,6 +67,8 @@ pub enum Error {
     KeyRevoked,
     #[error("This SSH key expired. Authorize with a new key to connect again.")]
     KeyExpired,
+    #[error("The directory list changed. Reload it from the beginning.")]
+    DirectoryChanged,
 }
 
 #[derive(Clone)]
@@ -102,6 +104,7 @@ struct Discovery {
 pub struct Login {
     details: StandardDeviceAuthorizationResponse,
     deadline: Instant,
+    required_scopes: Vec<&'static str>,
 }
 impl std::fmt::Debug for Login {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -155,6 +158,7 @@ pub struct Session {
     expires_at: Instant,
     directory: Directory,
     mount_roots_granted: bool,
+    key_enrollment_allowed: bool,
 }
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -256,9 +260,24 @@ impl Client {
         })
     }
     pub async fn start_login(&self) -> Result<Login, Error> {
+        self.start_authorization(true).await
+    }
+    pub async fn start_directory_login(&self) -> Result<Login, Error> {
+        if !self.mount_roots {
+            return Err(Error::Unavailable);
+        }
+        self.start_authorization(false).await
+    }
+    async fn start_authorization(&self, enrollment: bool) -> Result<Login, Error> {
         let scopes = SCOPES
             .into_iter()
+            .filter(|scope| enrollment || *scope != "sai.ssh.keys.write")
             .chain(self.mount_roots.then_some(MOUNT_SCOPE));
+        let required_scopes = if enrollment {
+            SCOPES.to_vec()
+        } else {
+            vec!["openid", "sai.ssh.read", MOUNT_SCOPE]
+        };
         let details: StandardDeviceAuthorizationResponse = self
             .oauth
             .exchange_device_code()
@@ -279,7 +298,11 @@ impl Client {
             return Err(Error::Contract);
         }
         let deadline = Instant::now() + details.expires_in().min(LOGIN_LIMIT);
-        Ok(Login { details, deadline })
+        Ok(Login {
+            details,
+            deadline,
+            required_scopes,
+        })
     }
     /// Dropping this future cancels polling and in-flight HTTP requests.
     pub async fn finish_login(&self, login: &Login) -> Result<Session, Error> {
@@ -311,7 +334,8 @@ impl Client {
         if token.access_token().secret().is_empty()
             || token.token_type() != &BasicTokenType::Bearer
             || token.scopes().is_some_and(|scopes| {
-                SCOPES
+                login
+                    .required_scopes
                     .iter()
                     .any(|required| !scopes.iter().any(|s| s.as_str() == *required))
             })
@@ -349,6 +373,7 @@ impl Client {
             expires_at,
             directory,
             mount_roots_granted,
+            key_enrollment_allowed: login.required_scopes.contains(&"sai.ssh.keys.write"),
         })
     }
 }
@@ -413,6 +438,9 @@ impl Session {
         mut on_progress: impl FnMut(EnrollmentProgress),
     ) -> Result<ConfiguredConnection, Error> {
         self.check_expiry()?;
+        if !self.key_enrollment_allowed {
+            return Err(Error::Forbidden);
+        }
         if !self.connections().contains(site) {
             return Err(Error::Contract);
         }

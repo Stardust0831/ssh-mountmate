@@ -24,8 +24,90 @@ fn optional_token() -> Reply {
 }
 
 #[tokio::test]
-async fn directories_use_optional_scope_and_continue_after_empty_pages() {
+async fn directory_login_uses_read_scopes_and_cannot_create_a_device_key() {
     let service = Fixture::new(|request, origin| match request.path.as_str() {
+        "/v1/auth/config?client=ssh-mountmate" => Some(discovery(request, origin)),
+        "/token" => Some(reply(
+            200,
+            json!({"access_token":"test-directory-token","token_type":"Bearer","expires_in":300,
+            "scope":"openid sai.ssh.read sai.ssh.mounts.read"}),
+        )),
+        path if path.starts_with("/v1/account/ssh/mount-roots?") => Some(reply(200, page())),
+        _ => None,
+    });
+    let client = service.client().await.unwrap();
+    let login = client.start_directory_login().await.unwrap();
+    let session = client.finish_login(&login).await.unwrap();
+    assert_eq!(
+        session
+            .mount_roots(&session.connections()[0], None)
+            .await
+            .unwrap()
+            .items
+            .len(),
+        2
+    );
+    let root = tempfile::tempdir().unwrap();
+    assert_eq!(
+        session
+            .enroll(&session.connections()[0], root.path())
+            .await
+            .unwrap_err(),
+        Error::Forbidden
+    );
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    let requests = service.requests.lock().unwrap();
+    let fields: std::collections::HashMap<_, _> = url::form_urlencoded::parse(
+        requests
+            .iter()
+            .find(|r| r.path == "/device")
+            .unwrap()
+            .body
+            .as_bytes(),
+    )
+    .collect();
+    assert_eq!(fields["scope"], "openid sai.ssh.read sai.ssh.mounts.read");
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.path.contains("/ssh/keys"))
+    );
+}
+
+#[tokio::test]
+async fn invalid_directory_cursor_is_a_restart_signal_without_expanding_other_bad_requests() {
+    let service = Fixture::new(|request, origin| match request.path.as_str() {
+        "/v1/auth/config?client=ssh-mountmate" => Some(discovery(request, origin)),
+        "/token" => Some(optional_token()),
+        path if path.starts_with("/v1/account/ssh/mount-roots?") => Some(reply(
+            400,
+            json!({"detail":{"code":
+            if path.contains("cursor=") {"invalid_mount_roots_cursor"} else {"another_bad_request"}}}),
+        )),
+        _ => None,
+    });
+    let session = service.session().await;
+    assert_eq!(
+        session
+            .mount_roots(&session.connections()[0], Some("obsolete"))
+            .await
+            .unwrap_err(),
+        Error::DirectoryChanged
+    );
+    assert_eq!(
+        session
+            .mount_roots(&session.connections()[0], None)
+            .await
+            .unwrap_err(),
+        Error::Contract
+    );
+}
+
+#[tokio::test]
+async fn directories_use_optional_scope_and_continue_after_empty_pages() {
+    let next_cursor = format!("00000000-0000-0000-0000-000000000001~{}", "a".repeat(64));
+    let expected_cursor = next_cursor.clone();
+    let service = Fixture::new(move |request, origin| match request.path.as_str() {
         "/v1/auth/config?client=ssh-mountmate" => Some(discovery(request, origin)),
         "/token" => Some(optional_token()),
         "/v1/account/ssh/keys" => Some(reply(200, enrollment(request, "applied"))),
@@ -34,7 +116,7 @@ async fn directories_use_optional_scope_and_continue_after_empty_pages() {
             if path.contains("cursor=") {
                 page()
             } else {
-                json!({"schema_version":"ssh.mount-roots/v1", "site_id":"cluster-1", "items":[], "next_cursor":"next-page"})
+                json!({"schema_version":"ssh.mount-roots/v1", "site_id":"cluster-1", "items":[], "next_cursor":next_cursor})
             },
         )),
         _ => None,
@@ -45,7 +127,7 @@ async fn directories_use_optional_scope_and_continue_after_empty_pages() {
         .await
         .unwrap();
     assert!(first.items.is_empty());
-    assert_eq!(first.next_cursor.as_deref(), Some("next-page"));
+    assert_eq!(first.next_cursor.as_deref(), Some(expected_cursor.as_str()));
     let second = session
         .mount_roots(&session.connections()[0], first.next_cursor.as_deref())
         .await
@@ -100,7 +182,11 @@ async fn directories_use_optional_scope_and_continue_after_empty_pages() {
             .contains("authorization: bearer secret-access-token")
     }));
     assert!(
-        pages[1].path.contains("site_id=cluster-1") && pages[1].path.contains("cursor=next-page")
+        pages[1].path.contains("site_id=cluster-1")
+            && url::Url::parse(&format!("http://fixture{}", pages[1].path))
+                .unwrap()
+                .query_pairs()
+                .any(|(key, value)| key == "cursor" && value == expected_cursor)
     );
 }
 
