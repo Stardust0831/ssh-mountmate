@@ -111,7 +111,7 @@ jobs:
             artifact: SSHMountMate-rust-macos-x64
             rclone_platform: osx
             rclone_arch: amd64
-          - os: macos-14
+          - os: macos-15
             artifact: SSHMountMate-rust-macos-arm64
             rclone_platform: osx
             rclone_arch: arm64

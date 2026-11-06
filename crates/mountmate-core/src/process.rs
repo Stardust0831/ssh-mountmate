@@ -58,31 +58,6 @@ pub enum MountStatus {
     Stale,
 }
 
-pub fn status_from_evidence(
-    state: Option<&MountState>,
-    process_running: bool,
-    command: Option<&str>,
-    mountpoint_ready: bool,
-    rc_verified: bool,
-) -> MountStatus {
-    let Some(state) = state else {
-        return MountStatus::Unmounted;
-    };
-    if !process_running {
-        return MountStatus::Stale;
-    }
-    if let Some(command) = command
-        && !command_matches_state(command, state, false)
-    {
-        return MountStatus::Stale;
-    }
-    if rc_verified || mountpoint_ready {
-        MountStatus::Mounted
-    } else {
-        MountStatus::Starting
-    }
-}
-
 pub fn path_matches_command(command: &str, path: &Path) -> bool {
     let command = normalize_command(command);
     let path = normalize_command(&path.to_string_lossy());
@@ -151,35 +126,6 @@ mod tests {
             &state,
             true
         ));
-    }
-
-    #[test]
-    fn pid_reuse_is_stale_and_never_reported_as_mounted() {
-        let state = state();
-        assert_eq!(
-            status_from_evidence(
-                Some(&state),
-                true,
-                Some("unrelated.exe --serve"),
-                true,
-                false
-            ),
-            MountStatus::Stale
-        );
-    }
-
-    #[test]
-    fn rc_or_ready_mountpoint_can_confirm_a_matching_process() {
-        let state = state();
-        let command = "rclone mount alpha:folder R:";
-        assert_eq!(
-            status_from_evidence(Some(&state), true, Some(command), false, true),
-            MountStatus::Mounted
-        );
-        assert_eq!(
-            status_from_evidence(Some(&state), true, Some(command), true, false),
-            MountStatus::Mounted
-        );
     }
 
     #[test]

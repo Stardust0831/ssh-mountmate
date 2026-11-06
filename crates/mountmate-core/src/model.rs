@@ -415,7 +415,7 @@ impl ServerConfig {
     }
 
     pub fn remote_spec(&self) -> String {
-        let path = self.remote_path.trim();
+        let path = &self.remote_path;
         if path.is_empty() {
             format!("{}:", self.remote_name())
         } else {
@@ -1055,6 +1055,19 @@ mod tests {
         assert_eq!(server.remote_spec(), "alpha:relative/path");
         server.remote_path = "/absolute/path".into();
         assert_eq!(server.remote_spec(), "alpha:/absolute/path");
+        for path in [
+            "/data/results ",
+            "/data/计算\u{3000}",
+            "/data/back\\slash",
+            " ",
+        ] {
+            server.remote_path = crate::connection::normalize_remote_path(path);
+            assert_eq!(server.remote_spec(), format!("alpha:{path}"));
+        }
+        server.remote_path = crate::connection::normalize_remote_path("~");
+        assert_eq!(server.remote_spec(), "alpha:");
+        server.remote_path = crate::connection::normalize_remote_path("~/results ");
+        assert_eq!(server.remote_spec(), "alpha:results ");
     }
 
     #[test]

@@ -162,6 +162,10 @@ impl MountService {
         self.with_runtime(|runtime| runtime.status(server_id).map_err(ServiceError::from))
     }
 
+    pub fn observe(&self, server_id: &str) -> Result<(MountStatus, Option<PathBuf>), ServiceError> {
+        self.with_runtime(|runtime| runtime.observe(server_id).map_err(ServiceError::from))
+    }
+
     pub fn transfer_snapshot(&self, server_id: &str) -> Result<TransferSnapshot, ServiceError> {
         let state: MountState = read_json(&self.paths.state_file(server_id))?;
         Ok(HttpRcClient::with_credentials(

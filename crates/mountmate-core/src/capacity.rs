@@ -381,11 +381,11 @@ fn run_with_timeout(
 }
 
 fn remote_path_for_capacity(server: &ServerConfig) -> String {
-    let path = server.remote_path.trim();
+    let path = &server.remote_path;
     if path.is_empty() {
         ".".into()
     } else {
-        path.into()
+        path.clone()
     }
 }
 
@@ -848,6 +848,15 @@ mod tests {
         assert_eq!(
             quote_remote_shell_argument("~/folder with 'quotes'"),
             "'~/folder with '\\''quotes'\\'''"
+        );
+        let server = ServerConfig {
+            remote_path: "/data/结果 \u{3000}".into(),
+            ..ServerConfig::default()
+        };
+        assert_eq!(remote_path_for_capacity(&server), server.remote_path);
+        assert_eq!(
+            quote_remote_shell_argument(&remote_path_for_capacity(&server)),
+            "'/data/结果 \u{3000}'"
         );
     }
 }
