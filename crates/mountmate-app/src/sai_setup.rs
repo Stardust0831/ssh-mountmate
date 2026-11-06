@@ -1,5 +1,6 @@
 //! Editor-only SAI setup; authentication never enters the mount service or saved settings.
 use crate::i18n::Locale;
+use crate::program_log::Level;
 use iced::widget::{button, checkbox, column, container, pick_list, scrollable, text};
 use iced::{Element, Fill, Task};
 use mountmate_core::connection::{ConnectionDraft, ConnectionSource};
@@ -164,6 +165,140 @@ impl State {
     }
     fn selection_ready(&self) -> bool {
         self.selected_roots.is_empty() || !self.roots_pending && self.roots_error.is_none()
+    }
+    /// Only human-readable state goes to the program log. Device codes, URLs,
+    /// tokens and connection/key material must stay out of its history.
+    pub fn feedback(&self, locale: Locale) -> Option<(Level, String)> {
+        let tr = |en: &str, zh: &str| {
+            if locale == Locale::English {
+                en.to_owned()
+            } else {
+                zh.to_owned()
+            }
+        };
+        if self.browser_failed {
+            return Some((
+                Level::Error,
+                tr(
+                    "SAI: Could not open the browser. Open the address in the setup panel manually.",
+                    "SAI：无法打开浏览器，请手动打开配置面板中的地址。",
+                ),
+            ));
+        }
+        if let Some(error) = self.error {
+            return Some((Level::Error, self.setup_error_text(error, locale)));
+        }
+        if self.ready {
+            return Some((
+                Level::Info,
+                tr(
+                    "SAI: Public key applied. Review the mount paths and save the connection.",
+                    "SAI：公钥已生效，请检查挂载路径并保存连接。",
+                ),
+            ));
+        }
+        if self.login.is_some() {
+            return Some((
+                Level::Info,
+                tr(
+                    "SAI: Complete sign-in in the browser. Waiting for authorization…",
+                    "SAI：请在浏览器完成登录，正在等待授权…",
+                ),
+            ));
+        }
+        if self.roots_pending {
+            return Some((
+                Level::Info,
+                tr("SAI: Loading directories…", "SAI：正在读取目录…"),
+            ));
+        }
+        if let Some(error) = self.roots_error
+            && !self.pending
+        {
+            return Some((Level::Error, directory_error_text(error, locale)));
+        }
+        if self.roots_loaded && !self.pending {
+            return Some(if self.roots.is_empty() && self.roots_cursor.is_none() {
+                (
+                    Level::Warning,
+                    tr(
+                        "SAI: No available directories. You can enter paths manually.",
+                        "SAI：暂无可用目录，可手动填写路径。",
+                    ),
+                )
+            } else {
+                (
+                    Level::Info,
+                    match locale {
+                        Locale::English => format!(
+                            "SAI: Loaded {} directories; {} selected. Choose directories in the setup panel.",
+                            self.roots.len(),
+                            self.selected_roots.len()
+                        ),
+                        Locale::Chinese => format!(
+                            "SAI：已读取 {} 个目录，已选择 {} 个。请在配置面板中选择目录。",
+                            self.roots.len(),
+                            self.selected_roots.len()
+                        ),
+                    },
+                )
+            });
+        }
+        if let Some(session) = &self.session {
+            if self.directory_only() && self.available_connections().is_empty() {
+                return Some((
+                    Level::Warning,
+                    tr(
+                        "SAI: No authorized site matches this connection. Check the account and connection settings.",
+                        "SAI：当前账号没有与此连接匹配的授权站点，请检查账号和连接信息。",
+                    ),
+                ));
+            }
+            if session.connections().is_empty() {
+                return Some((
+                    Level::Warning,
+                    tr(
+                        "SAI: Signed in, but no SSH sites are available. Check access in the SAI console.",
+                        "SAI：登录成功，但此账号暂无可用 SSH 站点，请在 SAI 控制台查看接入权限。",
+                    ),
+                ));
+            }
+            return Some((
+                Level::Info,
+                if self.verification_url.is_some() {
+                    tr(
+                        "SAI: Confirm this connection in the browser to continue.",
+                        "SAI：请在浏览器确认此连接，确认后会继续配置。",
+                    )
+                } else if self.pending {
+                    tr(
+                        "SAI: Registering the public key and waiting for the site to apply it…",
+                        "SAI：正在登记公钥，等待站点确认生效…",
+                    )
+                } else {
+                    tr(
+                        "SAI: Signed in. Choose a site and continue setup.",
+                        "SAI：登录成功，请选择站点并继续配置。",
+                    )
+                },
+            ));
+        }
+        self.pending.then(|| {
+            (
+                Level::Info,
+                tr(
+                    "SAI: Checking service and starting sign-in…",
+                    "SAI：正在检查服务并发起登录…",
+                ),
+            )
+        })
+    }
+    fn setup_error_text(&self, error: Error, locale: Locale) -> String {
+        if self.directory_only() && matches!(error, Error::Network | Error::Unavailable) {
+            directory_error_text(error, locale)
+        } else {
+            error_text(error, locale)
+        }
     }
     fn needs_new_key(&self) -> bool {
         matches!(self.error, Some(Error::KeyRevoked | Error::KeyExpired))
@@ -640,21 +775,12 @@ impl State {
             ));
         }
         if let Some(error) = self.error {
-            content = content.push(text(if self.directory_only() && error == Error::Network {
-                tr(
-                    "Could not reach SAI. Check your connection and retry.",
-                    "无法连接 SAI，请检查网络后重试。",
-                )
-                .to_owned()
-            } else if self.directory_only() && error == Error::Unavailable {
-                tr(
-                    "SAI directory discovery is unavailable. You can enter paths manually.",
-                    "SAI 目录列表暂不可用，可继续手动填写路径。",
-                )
-                .to_owned()
-            } else {
-                error_text(error, locale)
-            }));
+            content = content.push(
+                container(text(self.setup_error_text(error, locale)).size(16))
+                    .padding(12)
+                    .width(Fill)
+                    .style(|theme| Level::Error.style(theme)),
+            );
             if matches!(
                 error,
                 Error::Forbidden | Error::KeyRevoked | Error::KeyExpired | Error::SyncFailed
@@ -757,44 +883,19 @@ impl State {
         if self.roots_pending {
             content = content.push(text(tr("Loading directories…", "正在读取目录…")));
         } else if let Some(error) = self.roots_error {
-            let message = match error {
-                Error::Unavailable => tr(
-                    "Directory discovery is unavailable. Enter paths manually or retry.",
-                    "目录发现暂不可用。可手动填写路径或重试。",
-                ),
-                Error::Forbidden => tr(
-                    "Directory access was not authorized. Enter paths manually or sign in again.",
-                    "未获目录读取授权。可手动填写路径或重新登录。",
-                ),
-                Error::Network => tr(
-                    "Could not load directories. Check your connection and retry.",
-                    "无法读取目录，请检查网络后重试。",
-                ),
-                Error::Contract => tr(
-                    "The directory response is incompatible. Contact the SAI service administrator.",
-                    "目录数据不兼容，请联系 SAI 服务管理员。",
-                ),
-                Error::DirectoryChanged => tr(
-                    "The directory list changed. Reload it and choose directories again.",
-                    "目录清单已变化，请重新加载并选择。",
-                ),
-                _ => {
-                    return column![
-                        content,
-                        text(error_text(error, locale)),
-                        button(tr("Sign in again", "重新登录")).on_press(Message::Restart)
-                    ]
-                    .into();
-                }
-            };
-            content = content.push(text(message));
+            content = content.push(
+                container(text(directory_error_text(error, locale)).size(16))
+                    .padding(12)
+                    .width(Fill)
+                    .style(|theme| Level::Error.style(theme)),
+            );
             content = content.push(if error == Error::DirectoryChanged {
                 button(tr("Reload directories", "重新加载目录"))
                     .on_press(Message::RestartMountRoots)
-            } else if error == Error::Forbidden {
-                button(tr("Sign in again", "重新登录")).on_press(Message::Restart)
-            } else {
+            } else if matches!(error, Error::Unavailable | Error::Network | Error::Contract) {
                 button(tr("Retry directories", "重试读取目录")).on_press(Message::LoadMountRoots)
+            } else {
+                button(tr("Sign in again", "重新登录")).on_press(Message::Restart)
             });
         } else if self.roots_cursor.is_some() {
             content = content
@@ -804,6 +905,32 @@ impl State {
         }
         content.into()
     }
+}
+fn directory_error_text(error: Error, locale: Locale) -> String {
+    let (en, zh) = match error {
+        Error::Unavailable => (
+            "Directory discovery is unavailable. Enter paths manually or retry.",
+            "目录发现暂不可用。可手动填写路径或重试。",
+        ),
+        Error::Forbidden => (
+            "Directory access was not authorized. Enter paths manually or sign in again.",
+            "未获目录读取授权。可手动填写路径或重新登录。",
+        ),
+        Error::Network => (
+            "Could not load directories. Check your connection and retry.",
+            "无法读取目录，请检查网络后重试。",
+        ),
+        Error::Contract => (
+            "The directory response is incompatible. Contact the SAI service administrator.",
+            "目录数据不兼容，请联系 SAI 服务管理员。",
+        ),
+        Error::DirectoryChanged => (
+            "The directory list changed. Reload it and choose directories again.",
+            "目录清单已变化，请重新加载并选择。",
+        ),
+        _ => return error_text(error, locale),
+    };
+    if locale == Locale::English { en } else { zh }.into()
 }
 fn error_text(error: Error, locale: Locale) -> String {
     if locale == Locale::English {
@@ -854,6 +981,69 @@ mod tests {
             role: MountRole::Read,
         }
     }
+    #[test]
+    fn directory_feedback_reports_loading_failure_and_ignores_cancelled_results() {
+        let draft = saved_connection();
+        let mut state = State {
+            directory_target: ConnectionTarget::from_draft(&draft),
+            roots_pending: true,
+            ..State::default()
+        };
+        assert!(
+            state
+                .feedback(Locale::Chinese)
+                .unwrap()
+                .1
+                .contains("正在读取目录")
+        );
+        let generation = state.generation;
+        let request = state.roots_generation;
+        let _ = state.update(
+            Message::MountRootsLoaded(generation, request, Err(Error::Network)),
+            Path::new("unused"),
+            Locale::Chinese,
+            &draft,
+        );
+        let (level, message) = state.feedback(Locale::Chinese).unwrap();
+        assert_eq!(level, Level::Error);
+        assert!(message.contains("无法读取目录"));
+        assert!(!message.contains("密钥"));
+        let _ = state.update(
+            Message::Cancel,
+            Path::new("unused"),
+            Locale::Chinese,
+            &draft,
+        );
+        let _ = state.update(
+            Message::MountRootsLoaded(generation, request, Err(Error::Forbidden)),
+            Path::new("unused"),
+            Locale::Chinese,
+            &draft,
+        );
+        assert_eq!(state.feedback(Locale::Chinese), None);
+    }
+
+    #[test]
+    fn directory_feedback_keeps_paths_private_and_unavailable_errors_in_context() {
+        let draft = saved_connection();
+        let mut state = State {
+            directory_target: ConnectionTarget::from_draft(&draft),
+            roots_loaded: true,
+            roots: vec![folder()],
+            ..State::default()
+        };
+        let (level, message) = state.feedback(Locale::English).unwrap();
+        assert_eq!(level, Level::Info);
+        assert!(message.contains("Loaded 1 directories"));
+        assert!(!message.contains(&state.roots[0].path));
+        assert!(!message.contains(&state.roots[0].display_name));
+        state.error = Some(Error::Unavailable);
+        let (level, message) = state.feedback(Locale::Chinese).unwrap();
+        assert_eq!(level, Level::Error);
+        assert!(message.contains("目录发现暂不可用"));
+        assert!(!message.contains("账号配置"));
+    }
+
     #[test]
     fn directory_selection_preserves_credentials_and_rejects_a_different_edit_target() {
         let mut draft = saved_connection();
@@ -972,6 +1162,51 @@ mod tests {
         state.reset();
         assert!(state.selected_roots.is_empty());
     }
+    #[test]
+    fn unavailable_sign_in_produces_noticeable_feedback_and_ignores_stale_results() {
+        let mut state = State {
+            pending: true,
+            ..State::default()
+        };
+        assert!(
+            state
+                .feedback(Locale::Chinese)
+                .unwrap()
+                .1
+                .contains("正在检查服务")
+        );
+        let _ = state.update(
+            Message::LoginStarted(state.generation, Err(Error::Unavailable)),
+            Path::new("unused"),
+            Locale::Chinese,
+            &ConnectionDraft::default(),
+        );
+        let (level, message) = state.feedback(Locale::Chinese).unwrap();
+        assert_eq!(level, Level::Error);
+        assert!(message.contains("尚未启用"));
+        state.reset();
+        let _ = state.update(
+            Message::LoginStarted(state.generation.wrapping_sub(1), Err(Error::Network)),
+            Path::new("unused"),
+            Locale::Chinese,
+            &ConnectionDraft::default(),
+        );
+        assert_eq!(state.feedback(Locale::Chinese), None);
+    }
+
+    #[test]
+    fn browser_feedback_does_not_copy_confirmation_urls_to_the_log() {
+        let state = State {
+            browser_failed: true,
+            verification_url: Some("https://example.invalid/confirm?secret=fixture".into()),
+            ..State::default()
+        };
+        let (level, message) = state.feedback(Locale::English).unwrap();
+        assert_eq!(level, Level::Error);
+        assert!(!message.contains("fixture"));
+        assert!(!message.contains("https://"));
+    }
+
     #[test]
     fn cancelled_generation_ignores_late_results() {
         let mut state = State::default();

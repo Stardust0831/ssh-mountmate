@@ -22,10 +22,27 @@ It uses rclone for the actual mount operation and provides a small GUI around th
 - Bundle and verify the official rclone binary in release builds.
 - Configure global rclone VFS cache options in the GUI.
 - Show mount status, capacity usage, logs, and common actions per connection.
+- Keep timestamped application feedback in a resizable program log below every main screen.
 - Show the real rclone upload queue and remote-transfer progress after local file copies appear complete.
 - Verify remote directory contents on refresh and expose refresh/transfer actions from connection-card context menus.
 - Mount or unmount all saved connections from the main window.
 - Build native Rust packages for Windows, macOS, and Linux on x64 and arm64 with GitHub Actions.
+
+## Program log and storage capacity
+
+The **Program log** keeps the latest 500 messages for the current run, including account setup,
+mount/save results and upload notifications. Drag its divider to resize it, filter messages,
+select and copy text, or clear the history. Scrolling or selecting text pauses the live view;
+enable **Follow** to catch up. Errors and warnings reopen a collapsed log and highlight the latest
+message. Per-connection mount logs remain available for detailed rclone diagnostics.
+
+Lustre project quotas are shown as **quota snapshots**. They can lag elastic storage allowances
+or differ from the quota that actually governs SFTP writes. Bundled rclone therefore reports
+unknown capacity to file managers for these mounts, using its standard virtual 1 PiB free-space
+placeholder, so a snapshot cannot prevent an upload before it reaches the server. This number
+is not a storage entitlement. MountMate retains the reported quota and actual usage, including
+usage above the reported limit; remote write failures and local VFS cache limits still apply.
+Remount existing connections after upgrading to use this behavior.
 
 ## Multiple mount points per connection
 

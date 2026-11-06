@@ -393,6 +393,7 @@ try {
   }
   $env:SSH_MOUNTMATE_ACTIVE_PACKAGE_ROOT = $packageRoot
   $env:SSH_MOUNTMATE_ACTIVE_STATE_FILE = Join-Path $env:LOCALAPPDATA 'ssh-mountmate/state/local-sftp.json'
+  $env:SSH_MOUNTMATE_ACTIVE_REMOTE_UPLOAD = Join-Path $remoteRoot 'upload.bin'
   & cargo test --package mountmate-core --test packaged_update --all-features `
     packaged_update_preserves_real_active_mount -- `
     --ignored --exact --test-threads=1

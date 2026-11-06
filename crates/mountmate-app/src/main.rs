@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use iced::widget::{
-    Space, button, checkbox, column, container, keyed_column, pick_list, progress_bar, responsive,
-    row, rule, scrollable, stack, text, text_editor, text_input, toggler, tooltip,
+    Space, button, checkbox, column, container, keyed_column, pane_grid, pick_list, progress_bar,
+    responsive, row, rule, scrollable, stack, text, text_editor, text_input, toggler, tooltip,
 };
 use iced::{
     Center, Color, Element, Fill, Length, Point, Size, Subscription, Task, Theme, clipboard,
@@ -81,6 +81,7 @@ mod connection_error;
 mod host_key_dialog;
 mod i18n;
 mod icons;
+mod program_log;
 mod read_only;
 mod sai_setup;
 mod transfer_center;
@@ -112,6 +113,7 @@ fn editor_focus_operation(
 
 use cli::LaunchAction;
 use i18n::{Choice, LanguagePreference as Language, Locale, TextKey};
+use program_log::Level as LogLevel;
 use transfer_center::{
     TransferTotals, connection_view as transfer_connection_view, totals as transfer_totals,
 };
@@ -711,6 +713,7 @@ struct App {
     pending_delete: Option<String>,
     settings_recovery_dialog: Option<String>,
     status: String,
+    program_log: program_log::ProgramLog,
     status_generation: u64,
     update_health: Option<UpdateHealthAuthorization>,
     update_info: Option<UpdateInfo>,
@@ -949,8 +952,8 @@ fn mountpoint_preflight_result_is_current(
 }
 
 fn mount_error_summary(locale: Locale, cause: &str) -> String {
-    if let Some(failure) = connection_error::diagnose(cause) {
-        return failure.summary(locale);
+    if let Some(summary) = connection_error::summary(cause, locale) {
+        return summary;
     }
     let prefix = match locale {
         Locale::English => "Last operation failed: ",
@@ -1295,6 +1298,7 @@ impl SettingsDraft {
 
 #[derive(Debug, Clone)]
 enum Message {
+    ProgramLog(program_log::Message),
     AppCommand(AppCommand),
     TrayAction(TrayAction),
     TrayTick,
@@ -1849,6 +1853,7 @@ impl App {
             Screen::Connections
         };
         let (tray_action_sender, tray_actions) = async_channel::unbounded();
+        let startup_problem = !servers_loaded || startup_notice.is_some();
         let mut app = Self {
             paths,
             _instance_lock: instance_lock,
@@ -1930,6 +1935,15 @@ impl App {
             ssh_import_actions: Vec::new(),
             pending_delete: None,
             settings_recovery_dialog,
+            program_log: {
+                let mut log = program_log::ProgramLog::new(locale);
+                if !startup_problem {
+                    log.info(status.clone());
+                } else {
+                    log.warning(status.clone());
+                }
+                log
+            },
             status,
             status_generation: 0,
             update_health,
@@ -1959,10 +1973,10 @@ impl App {
         }
         #[cfg(windows)]
         if app.paths.config_dir == AppPaths::legacy_windows().config_dir {
-            app.status = match app.locale() {
+            app.status = app.program_log.info(match app.locale() {
                 Locale::English => "Using the previous data directory while mounts or an update are active. Unmount and restart to move data into the single ssh-mountmate folder.",
                 Locale::Chinese => "当前挂载或更新仍使用旧数据目录。取消挂载并重启后，会迁入统一的 ssh-mountmate 文件夹。",
-            }.into();
+            }.into());
         }
         if app.settings.auto_check_updates {
             app.update_checking = true;
@@ -2055,12 +2069,16 @@ impl App {
             self.sai_setup.reset();
         }
         self.sync_tray();
+        self.program_log.set_locale(self.locale());
         task
     }
 
     fn update_message(&mut self, message: Message) -> Task<Message> {
         let locale = self.locale();
         match message {
+            Message::ProgramLog(message) => {
+                return self.program_log.update(message).map(Message::ProgramLog);
+            }
             Message::UpdateProgressTick => {}
             Message::FocusEditorField { window, backwards } => {
                 if window == self.main_window
@@ -2103,7 +2121,9 @@ impl App {
                 match result {
                     Ok(true) => {
                         session.lifecycle = InteractiveTerminalLifecycle::Ready;
-                        self.status = locale.text(TextKey::InteractiveTerminalReady).into();
+                        self.status = self
+                            .program_log
+                            .info(locale.text(TextKey::InteractiveTerminalReady).into());
                         if interactive_mount_resume_once(
                             session.queued_mount,
                             session.resume_sent,
@@ -2135,7 +2155,9 @@ impl App {
                         session.lifecycle = InteractiveTerminalLifecycle::Failed;
                         session.queued_mount = false;
                         self.terminal_error = Some((id, error));
-                        self.status = locale.text(TextKey::InteractiveTerminalFailed).into();
+                        self.status = self
+                            .program_log
+                            .error(locale.text(TextKey::InteractiveTerminalFailed).into());
                     }
                 }
             }
@@ -2177,7 +2199,9 @@ impl App {
                         )
                     {
                         health_confirmed = false;
-                        self.status = format!("Update health confirmation failed: {error}");
+                        self.status = self
+                            .program_log
+                            .error(format!("Update health confirmation failed: {error}"));
                     }
                     let native_smoke = native_integration_smoke_enabled();
                     let progress = if native_smoke {
@@ -2252,10 +2276,10 @@ impl App {
             }
             Message::SettingsRecoveryDialogClosed => {}
             Message::Refresh if self.connection_list_mode == ConnectionListMode::Reorder => {
-                self.status = match locale {
+                self.status = self.program_log.info(match locale {
                     Locale::English => "Save or cancel the current order before refreshing".into(),
                     Locale::Chinese => "请先保存或取消当前排序，再刷新".into(),
-                };
+                });
             }
             Message::Refresh => match storage::load_servers(&self.paths) {
                 Ok(servers) => {
@@ -2267,10 +2291,12 @@ impl App {
                         .collect();
                     self.selected_connections
                         .retain(|id| self.servers.iter().any(|server| server.id == *id));
-                    self.status = locale.text(TextKey::RefreshingMountStatus).into();
+                    self.status = self
+                        .program_log
+                        .info(locale.text(TextKey::RefreshingMountStatus).into());
                     return self.status_task(StatusPublishPolicy::UserRefresh, None);
                 }
-                Err(error) => self.status = error.to_string(),
+                Err(error) => self.status = self.program_log.error(error.to_string()),
             },
             Message::RefreshFinished {
                 generation,
@@ -2286,8 +2312,10 @@ impl App {
                     return Task::none();
                 }
                 match result {
-                    Ok(result) => self.status = locale.refresh_complete(&result),
-                    Err(error) => self.status = error,
+                    Ok(result) => {
+                        self.status = self.program_log.info(locale.refresh_complete(&result))
+                    }
+                    Err(error) => self.status = self.program_log.error(error),
                 }
             }
             Message::StatusesLoaded {
@@ -2337,7 +2365,14 @@ impl App {
                     locale,
                     can_publish,
                 ) {
-                    self.status = status;
+                    self.status = self.program_log.publish(
+                        if errors.is_empty() {
+                            LogLevel::Info
+                        } else {
+                            LogLevel::Error
+                        },
+                        status,
+                    );
                 }
                 let mut tasks: Vec<_> = unmounted
                     .iter()
@@ -2444,6 +2479,21 @@ impl App {
                             let failures = self.transfer_failures.entry(id.clone()).or_default();
                             *failures = failures.saturating_add(1);
                             if transfer_failure_is_visible(*failures) {
+                                if self.transfer_errors.get(&id) != Some(&error) {
+                                    let name = self
+                                        .mount_targets
+                                        .iter()
+                                        .find(|server| server.id == id)
+                                        .map_or(id.as_str(), ServerConfig::display_name);
+                                    self.program_log.warning(match locale {
+                                        Locale::English => {
+                                            format!("{name}: Transfer status unavailable: {error}")
+                                        }
+                                        Locale::Chinese => {
+                                            format!("{name}：无法获取传输状态：{error}")
+                                        }
+                                    });
+                                }
                                 self.transfer_errors.insert(id, error);
                             }
                         }
@@ -2482,6 +2532,17 @@ impl App {
                         .into_iter()
                         .map(|id| self.start_mount_operation(id, MountOperation::Unmount)),
                 );
+                for notification in &notifications {
+                    let level = if notification.level == NativeNotificationLevel::Error {
+                        LogLevel::Error
+                    } else {
+                        LogLevel::Info
+                    };
+                    self.program_log.publish(
+                        level,
+                        format!("{}: {}", notification.title, notification.body),
+                    );
+                }
                 tasks.extend(notifications.into_iter().map(show_native_notification));
                 return Task::batch(tasks);
             }
@@ -2506,12 +2567,12 @@ impl App {
                     self.transfer_popup_expanded = false;
                     if !self.popup_close_notice_shown {
                         self.popup_close_notice_shown = true;
-                        self.status = match locale {
+                        self.status = self.program_log.info(match locale {
                             Locale::English => {
                                 "Transfer window hidden; uploads continue in the background".into()
                             }
                             Locale::Chinese => "传输窗口已隐藏；上传仍在后台继续".into(),
-                        };
+                        });
                         tasks.push(show_native_notification(background_transfer_notification(
                             locale,
                         )));
@@ -2536,12 +2597,12 @@ impl App {
                 self.transfer_popup_expanded = false;
                 if !self.popup_close_notice_shown {
                     self.popup_close_notice_shown = true;
-                    self.status = match locale {
+                    self.status = self.program_log.info(match locale {
                         Locale::English => {
                             "Transfer window hidden; uploads continue in the background".into()
                         }
                         Locale::Chinese => "传输窗口已隐藏；上传仍在后台继续".into(),
-                    };
+                    });
                     return Task::batch([
                         window::close(id),
                         show_native_notification(background_transfer_notification(locale)),
@@ -2601,12 +2662,14 @@ impl App {
                 self.ssh_import_plan = None;
                 self.ssh_import_actions.clear();
                 self.screen = Screen::ConnectionEditor;
-                self.status = locale.text(TextKey::NewConnection).into();
+                self.status = self
+                    .program_log
+                    .info(locale.text(TextKey::NewConnection).into());
                 match available_windows_drive_letters() {
                     Ok(drives) => self.windows_drive_letters = drives,
                     Err(error) => {
                         self.windows_drive_letters.clear();
-                        self.status = error.to_string();
+                        self.status = self.program_log.error(error.to_string());
                     }
                 }
                 return scoped_focus(EDITOR_FOCUS_SCOPE, "connection-name");
@@ -2689,7 +2752,7 @@ impl App {
                 ) {
                     Ok(tag) => tag,
                     Err(error) => {
-                        self.status = error;
+                        self.status = self.program_log.error(error);
                         return Task::none();
                     }
                 };
@@ -2713,7 +2776,7 @@ impl App {
                 let updates = match updates {
                     Ok(updates) => updates,
                     Err(error) => {
-                        self.status = error;
+                        self.status = self.program_log.error(error);
                         return Task::none();
                     }
                 };
@@ -2814,14 +2877,14 @@ impl App {
                     }
                     self.batch_tag_input.clear();
                     self.batch_existing_tag = None;
-                    self.status = match locale {
+                    self.status = self.program_log.info(match locale {
                         Locale::English => "Connection changes saved".into(),
                         Locale::Chinese => "连接修改已保存".into(),
-                    };
+                    });
                 }
                 Err(error) => {
                     self.connection_list_saving = false;
-                    self.status = error;
+                    self.status = self.program_log.error(error);
                 }
             },
             Message::BatchMountSelected => {
@@ -2907,15 +2970,22 @@ impl App {
                             .iter()
                             .flat_map(ServerConfig::mount_targets)
                             .collect();
-                        self.status = match outcome.warning {
-                            Some(warning) => warning,
-                            None => match locale {
-                                Locale::English => "Login startup preferences saved".into(),
-                                Locale::Chinese => "登录自启设置已保存".into(),
+                        self.status = self.program_log.publish(
+                            if outcome.warning.is_some() {
+                                LogLevel::Warning
+                            } else {
+                                LogLevel::Info
                             },
-                        };
+                            match outcome.warning {
+                                Some(warning) => warning,
+                                None => match locale {
+                                    Locale::English => "Login startup preferences saved".into(),
+                                    Locale::Chinese => "登录自启设置已保存".into(),
+                                },
+                            },
+                        );
                     }
-                    Err(error) => self.status = error,
+                    Err(error) => self.status = self.program_log.error(error),
                 }
             }
             Message::BatchDeleteSelected => {
@@ -2927,7 +2997,9 @@ impl App {
                     return Task::none();
                 }
                 if ids.iter().any(|id| !self.can_modify(id)) {
-                    self.status = locale.text(TextKey::UnmountBeforeRemove).into();
+                    self.status = self
+                        .program_log
+                        .warning(locale.text(TextKey::UnmountBeforeRemove).into());
                     return Task::none();
                 }
                 let mut selected_names = ids
@@ -2995,10 +3067,10 @@ impl App {
                     .cloned()
                     .collect::<Vec<_>>();
                 self.busy.extend(ids.iter().cloned());
-                self.status = match locale {
+                self.status = self.program_log.info(match locale {
                     Locale::English => format!("Removing {} connection(s)...", ids.len()),
                     Locale::Chinese => format!("正在删除 {} 个连接…", ids.len()),
-                };
+                });
                 let paths = self.paths.clone();
                 let result_ids = ids.clone();
                 return Task::perform(
@@ -3063,13 +3135,20 @@ impl App {
                             .collect();
                         self.selected_connections
                             .retain(|id| self.servers.iter().any(|server| server.id == *id));
-                        self.status = outcome.warning.unwrap_or_else(|| match locale {
-                            Locale::English => "Selected connections removed".into(),
-                            Locale::Chinese => "所选连接已删除".into(),
-                        });
+                        self.status = self.program_log.publish(
+                            if outcome.warning.is_some() {
+                                LogLevel::Warning
+                            } else {
+                                LogLevel::Info
+                            },
+                            outcome.warning.unwrap_or_else(|| match locale {
+                                Locale::English => "Selected connections removed".into(),
+                                Locale::Chinese => "所选连接已删除".into(),
+                            }),
+                        );
                         return Task::batch([terminal_task, self.reconcile_startup_task()]);
                     }
-                    Err(error) => self.status = error,
+                    Err(error) => self.status = self.program_log.error(error),
                 }
             }
             Message::MoveConnection(id, direction) => {
@@ -3148,14 +3227,14 @@ impl App {
                         .collect();
                     self.reorder_original = None;
                     self.connection_list_mode = ConnectionListMode::Browse;
-                    self.status = match locale {
+                    self.status = self.program_log.info(match locale {
                         Locale::English => "Custom order saved".into(),
                         Locale::Chinese => "自定义排序已保存".into(),
-                    };
+                    });
                 }
                 Err(error) => {
                     self.connection_list_saving = false;
-                    self.status = error;
+                    self.status = self.program_log.error(error);
                 }
             },
             Message::SettingsConnectionStartupChanged(id, value) => {
@@ -3182,14 +3261,16 @@ impl App {
                 self.screen = Screen::Connections;
                 self.connection_list_mode = ConnectionListMode::Batch;
                 self.selected_connections.clear();
-                self.status = match locale {
+                self.status = self.program_log.info(match locale {
                     Locale::English => "Batch connection management".into(),
                     Locale::Chinese => "批量管理连接".into(),
-                };
+                });
             }
             Message::OpenTransfers => {
                 self.screen = Screen::TransferCenter;
-                self.status = locale.text(TextKey::TransferCenter).into();
+                self.status = self
+                    .program_log
+                    .info(locale.text(TextKey::TransferCenter).into());
                 return self.transfer_task();
             }
             Message::CloseTransfers => {
@@ -3215,17 +3296,17 @@ impl App {
                     );
                 }
                 self.screen = Screen::Connections;
-                self.status = locale.text(TextKey::Ready).into();
+                self.status = self.program_log.info(locale.text(TextKey::Ready).into());
             }
             Message::CloseTransfersDecision(result) => {
                 if result == rfd::MessageDialogResult::Yes {
                     self.screen = Screen::Connections;
-                    self.status = match locale {
+                    self.status = self.program_log.info(match locale {
                         Locale::English => {
                             "Transfer center hidden; uploads continue in the background".into()
                         }
                         Locale::Chinese => "传输中心已隐藏；上传仍在后台继续".into(),
-                    };
+                    });
                 }
             }
             Message::OpenSettings => {
@@ -3242,7 +3323,7 @@ impl App {
                     .collect();
                 self.settings_draft = Some(draft);
                 self.screen = Screen::Settings;
-                self.status = locale.text(TextKey::Settings).into();
+                self.status = self.program_log.info(locale.text(TextKey::Settings).into());
                 self.dependency_checking = true;
                 return Task::batch([
                     self.dependency_check_task(),
@@ -3261,7 +3342,9 @@ impl App {
                     return Task::none();
                 };
                 log_view.loading = true;
-                self.status = locale.text(TextKey::LoadingLog).into();
+                self.status = self
+                    .program_log
+                    .info(locale.text(TextKey::LoadingLog).into());
                 return load_log_task(log_view.server_id.clone(), log_view.path.clone());
             }
             Message::LogLoaded { id, result } => {
@@ -3281,9 +3364,9 @@ impl App {
                             .perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
                         log_view.truncated = log.truncated;
                         log_view.existed = log.existed;
-                        self.status = locale.text(TextKey::Logs).into();
+                        self.status = self.program_log.info(locale.text(TextKey::Logs).into());
                     }
-                    Err(error) => self.status = error,
+                    Err(error) => self.status = self.program_log.error(error),
                 }
             }
             Message::CopyLog => {
@@ -3291,10 +3374,14 @@ impl App {
                     return Task::none();
                 };
                 if log_view.content.is_empty() {
-                    self.status = locale.text(TextKey::NoLogContent).into();
+                    self.status = self
+                        .program_log
+                        .info(locale.text(TextKey::NoLogContent).into());
                     return Task::none();
                 }
-                self.status = locale.text(TextKey::LogCopied).into();
+                self.status = self
+                    .program_log
+                    .info(locale.text(TextKey::LogCopied).into());
                 return clipboard::write(
                     log_view
                         .content
@@ -3323,7 +3410,9 @@ impl App {
                     self.ssh_import_actions.clear();
                     self.invalidate_mountpoint_preflight();
                     self.screen = Screen::Connections;
-                    self.status = self.locale().text(TextKey::Ready).into();
+                    self.status = self
+                        .program_log
+                        .info(self.locale().text(TextKey::Ready).into());
                     self.sync_tray();
                 }
             }
@@ -3380,6 +3469,9 @@ impl App {
                     && let Some(draft) = &mut self.connection_draft
                     && draft.source == ConnectionSource::SaiCluster
                 {
+                    let previous = self.sai_setup.feedback(locale);
+                    let cancelled = matches!(message, sai_setup::Message::Cancel);
+                    let directory_only = self.sai_setup.directory_only();
                     let (task, configured) =
                         self.sai_setup
                             .update(message, &self.paths.data_dir, locale, draft);
@@ -3388,17 +3480,37 @@ impl App {
                             configured.apply_to(draft)
                         }
                         Some(sai_setup::Outcome::Directories(selection)) => {
-                            if !selection.apply_to(draft) {
-                                self.status = match locale {
-                                    Locale::English => {
-                                        "The connection changed. Choose directories again."
+                            if selection.apply_to(draft) {
+                                self.status = self.program_log.info(match locale {
+                                    Locale::English => "SAI: Selected directories added. Save the connection to keep them.".into(),
+                                    Locale::Chinese => "SAI：已添加所选目录，请保存连接。".into(),
+                                });
+                            } else {
+                                self.status = self.program_log.error(
+                                    match locale {
+                                        Locale::English => {
+                                            "The connection changed. Choose directories again."
+                                        }
+                                        Locale::Chinese => "连接信息已改变，请重新选择目录。",
                                     }
-                                    Locale::Chinese => "连接信息已改变，请重新选择目录。",
-                                }
-                                .into();
+                                    .into(),
+                                );
                             }
                         }
                         _ => {}
+                    }
+                    let feedback = self.sai_setup.feedback(locale);
+                    if feedback != previous
+                        && let Some((level, message)) = feedback
+                    {
+                        self.status = self.program_log.publish(level, message);
+                    } else if cancelled {
+                        self.status = self.program_log.info(match (locale, directory_only) {
+                            (Locale::English, true) => "SAI: Directory selection cancelled".into(),
+                            (Locale::Chinese, true) => "SAI：已取消目录选择".into(),
+                            (Locale::English, false) => "SAI: Account setup cancelled".into(),
+                            (Locale::Chinese, false) => "SAI：已取消账号配置".into(),
+                        });
                     }
                     return task.map(Message::SaiSetup);
                 }
@@ -3640,7 +3752,10 @@ impl App {
                 ) {
                     self.mountpoint_preflight = match result {
                         Ok(()) => MountpointPreflight::Valid(value),
-                        Err(error) => MountpointPreflight::Invalid { value, error },
+                        Err(error) => {
+                            self.program_log.error(error.clone());
+                            MountpointPreflight::Invalid { value, error }
+                        }
                     };
                 }
                 return self.run_ready_mountpoint_preflight();
@@ -3815,13 +3930,13 @@ impl App {
                             .iter()
                             .filter(|item| item.status != ImportStatus::Invalid)
                             .count();
-                        self.status = locale.loaded_ssh_hosts(valid);
+                        self.status = self.program_log.info(locale.loaded_ssh_hosts(valid));
                         self.ssh_import_plan = Some(plan);
                     }
                     Err(error) => {
                         self.ssh_import_plan = None;
                         self.ssh_import_actions.clear();
-                        self.status = error;
+                        self.status = self.program_log.error(error);
                     }
                 }
             }
@@ -3861,16 +3976,23 @@ impl App {
                         self.connection_draft = None;
                         self.invalidate_mountpoint_preflight();
                         self.screen = Screen::Connections;
-                        self.status = outcome
-                            .warning
-                            .unwrap_or_else(|| locale.text(TextKey::ConnectionSaved).into());
+                        self.status = self.program_log.publish(
+                            if outcome.warning.is_some() {
+                                LogLevel::Warning
+                            } else {
+                                LogLevel::Info
+                            },
+                            outcome
+                                .warning
+                                .unwrap_or_else(|| locale.text(TextKey::ConnectionSaved).into()),
+                        );
                         return Task::batch([
                             terminal_task,
                             self.status_task(StatusPublishPolicy::Silent, None),
                             self.reconcile_startup_task(),
                         ]);
                     }
-                    Err(error) => self.status = error,
+                    Err(error) => self.status = self.program_log.error(error),
                 }
             }
 
@@ -3987,7 +4109,7 @@ impl App {
                             }
                         }
                         Err(error) => {
-                            self.status = error;
+                            self.status = self.program_log.error(error);
                             self.custom_setting = Some(custom);
                         }
                     }
@@ -4044,12 +4166,12 @@ impl App {
                 self.update_checking = false;
                 match result {
                     Ok(info) if info.is_newer => {
-                        self.status = match locale {
+                        self.status = self.program_log.info(match locale {
                             Locale::English => {
                                 format!("Update {} is available", info.latest_version)
                             }
                             Locale::Chinese => format!("发现新版本 {}", info.latest_version),
-                        };
+                        });
                         self.update_info = Some(info);
                         self.update_error = None;
                     }
@@ -4057,19 +4179,19 @@ impl App {
                         self.update_info = None;
                         self.update_error = None;
                         if manual {
-                            self.status = match locale {
+                            self.status = self.program_log.info(match locale {
                                 Locale::English => {
                                     format!("SSH MountMate {} is up to date", info.current_version)
                                 }
                                 Locale::Chinese => {
                                     format!("SSH MountMate {} 已是最新版本", info.current_version)
                                 }
-                            };
+                            });
                         }
                     }
                     Err(error) => {
                         if manual {
-                            self.status = error.clone();
+                            self.status = self.program_log.error(error.clone());
                             self.update_error = Some(error);
                         } else {
                             diagnostic_trace(&format!("automatic update check failed: {error}"));
@@ -4095,7 +4217,7 @@ impl App {
                     }
                     Err(error) => {
                         self.update_error = Some(error.clone());
-                        self.status = error;
+                        self.status = self.program_log.error(error);
                     }
                 }
             }
@@ -4106,10 +4228,10 @@ impl App {
                 if let Some(prepared) = self.prepared_update.take() {
                     prepared.cancel();
                 }
-                self.status = match locale {
+                self.status = self.program_log.info(match locale {
                     Locale::English => "Update installation was postponed".into(),
                     Locale::Chinese => "已暂缓安装更新".into(),
-                };
+                });
             }
             Message::CheckDependencies => {
                 if !self.dependency_checking {
@@ -4122,24 +4244,33 @@ impl App {
                 match result {
                     Ok(status) => {
                         let missing = status.missing();
-                        self.status = if missing.is_empty() {
-                            match locale {
-                                Locale::English => "All mount dependencies are available".into(),
-                                Locale::Chinese => "挂载依赖均已就绪".into(),
-                            }
-                        } else {
-                            match locale {
-                                Locale::English => {
-                                    format!("Missing dependencies: {}", missing.join(", "))
+                        self.status = self.program_log.publish(
+                            if missing.is_empty() {
+                                LogLevel::Info
+                            } else {
+                                LogLevel::Warning
+                            },
+                            if missing.is_empty() {
+                                match locale {
+                                    Locale::English => {
+                                        "All mount dependencies are available".into()
+                                    }
+                                    Locale::Chinese => "挂载依赖均已就绪".into(),
                                 }
-                                Locale::Chinese => {
-                                    format!("缺少依赖：{}", missing.join("、"))
+                            } else {
+                                match locale {
+                                    Locale::English => {
+                                        format!("Missing dependencies: {}", missing.join(", "))
+                                    }
+                                    Locale::Chinese => {
+                                        format!("缺少依赖：{}", missing.join("、"))
+                                    }
                                 }
-                            }
-                        };
+                            },
+                        );
                         self.dependency_status = Some(status);
                     }
-                    Err(error) => self.status = error,
+                    Err(error) => self.status = self.program_log.error(error),
                 }
             }
             #[cfg(windows)]
@@ -4156,7 +4287,9 @@ impl App {
                 if let Some(draft) = &mut self.settings_draft {
                     draft.language = language;
                 }
-                self.status = self.locale().text(TextKey::Settings).into();
+                self.status = self
+                    .program_log
+                    .info(self.locale().text(TextKey::Settings).into());
                 self.sync_tray();
             }
             Message::AppearanceModeChanged(mode) => {
@@ -4199,11 +4332,18 @@ impl App {
             Message::RegisterFileManagerMenu => return self.file_manager_menu_task(true),
             Message::UnregisterFileManagerMenu => return self.file_manager_menu_task(false),
             Message::FileManagerMenuFinished(result) => {
-                self.status = match result {
-                    Ok(true) => locale.text(TextKey::FileManagerMenuRegistered).into(),
-                    Ok(false) => locale.text(TextKey::FileManagerMenuRemoved).into(),
-                    Err(error) => error,
-                };
+                self.status = self.program_log.publish(
+                    if result.is_err() {
+                        LogLevel::Error
+                    } else {
+                        LogLevel::Info
+                    },
+                    match result {
+                        Ok(true) => locale.text(TextKey::FileManagerMenuRegistered).into(),
+                        Ok(false) => locale.text(TextKey::FileManagerMenuRemoved).into(),
+                        Err(error) => error,
+                    },
+                );
             }
             Message::SaveSettings => return self.save_settings(),
             Message::ExportConnections => {
@@ -4250,21 +4390,28 @@ impl App {
             }
             Message::ConnectionsExported(result) => {
                 self.export_pending = false;
-                self.status = match result {
-                    Ok(true) => match locale {
-                        Locale::English => {
-                            "Connections exported without passwords or private key contents."
+                self.status = self.program_log.publish(
+                    if result.is_err() {
+                        LogLevel::Error
+                    } else {
+                        LogLevel::Info
+                    },
+                    match result {
+                        Ok(true) => match locale {
+                            Locale::English => {
+                                "Connections exported without passwords or private key contents."
+                            }
+                            Locale::Chinese => "连接配置已导出，不包含密码和私钥内容。",
                         }
-                        Locale::Chinese => "连接配置已导出，不包含密码和私钥内容。",
-                    }
-                    .into(),
-                    Ok(false) => match locale {
-                        Locale::English => "Export cancelled",
-                        Locale::Chinese => "已取消导出",
-                    }
-                    .into(),
-                    Err(error) => error,
-                };
+                        .into(),
+                        Ok(false) => match locale {
+                            Locale::English => "Export cancelled",
+                            Locale::Chinese => "已取消导出",
+                        }
+                        .into(),
+                        Err(error) => error,
+                    },
+                );
             }
             Message::ImportConnections => {
                 if self.editor_saving || self.connection_list_saving {
@@ -4293,32 +4440,39 @@ impl App {
                             .collect();
                         self.settings_draft = None;
                         self.screen = Screen::Connections;
-                        self.status = outcome
-                            .warning
-                            .unwrap_or_else(|| locale.text(TextKey::SettingsSaved).into());
+                        self.status = self.program_log.publish(
+                            if outcome.warning.is_some() {
+                                LogLevel::Warning
+                            } else {
+                                LogLevel::Info
+                            },
+                            outcome
+                                .warning
+                                .unwrap_or_else(|| locale.text(TextKey::SettingsSaved).into()),
+                        );
                     }
-                    Err(error) => self.status = error,
+                    Err(error) => self.status = self.program_log.error(error),
                 }
             }
             Message::StartupReconciled(result) => {
                 if let Err(error) = result {
                     diagnostic_trace(&format!("login startup reconciliation failed: {error}"));
-                    self.status = match locale {
+                    self.status = self.program_log.error(match locale {
                         Locale::English => format!(
                             "Login startup integration failed and will be retried next launch: {error}"
                         ),
                         Locale::Chinese => {
                             format!("登录自启集成失败，将在下次启动时重试：{error}")
                         }
-                    };
+                    });
                 }
             }
             Message::WinFspInstallDecision(result) => {
                 if result {
-                    self.status = match locale {
+                    self.status = self.program_log.info(match locale {
                         Locale::English => "Installing the Windows mounting component. Please allow the Windows administrator prompt...".into(),
                         Locale::Chinese => "正在安装 Windows 挂载组件，请在系统管理员授权提示中选择允许…".into(),
-                    };
+                    });
                     let paths = self.paths.clone();
                     return Task::perform(
                         async move {
@@ -4331,22 +4485,22 @@ impl App {
                 }
                 self.win_fsp_install_pending = false;
                 self.win_fsp_pending_mounts.clear();
-                self.status = match locale {
+                self.status = self.program_log.info(match locale {
                     Locale::English => "Mounting component installation postponed. You can install it the next time you mount.".into(),
                     Locale::Chinese => "已暂缓安装挂载组件，下次点击挂载时可继续安装。".into(),
-                };
+                });
             }
             Message::WinFspInstallFinished(result) => {
                 self.win_fsp_install_pending = false;
                 let pending_mounts = std::mem::take(&mut self.win_fsp_pending_mounts);
                 match result {
                     Ok(WinFspInstallOutcome::Installed) => {
-                        self.status = match locale {
+                        self.status = self.program_log.info(match locale {
                             Locale::English => {
                                 "Mounting component installed. Ready to mount.".into()
                             }
                             Locale::Chinese => "挂载组件安装完成，可以开始挂载。".into(),
-                        };
+                        });
                         self.dependency_checking = true;
                         let mut tasks = vec![self.dependency_check_task()];
                         tasks.extend(
@@ -4357,49 +4511,49 @@ impl App {
                         return Task::batch(tasks);
                     }
                     Ok(WinFspInstallOutcome::Cancelled) => {
-                        self.status = match locale {
+                        self.status = self.program_log.info(match locale {
                             Locale::English => {
                                 "Installation cancelled. You can try again the next time you mount."
                                     .into()
                             }
                             Locale::Chinese => "已取消安装，下次点击挂载时可重试。".into(),
-                        };
+                        });
                     }
                     Ok(WinFspInstallOutcome::RestartRequired) => {
-                        self.status = match locale {
+                        self.status = self.program_log.info(match locale {
                             Locale::English => {
                                 "Mounting component installed. Restart Windows, then mount again."
                                     .into()
                             }
                             Locale::Chinese => "挂载组件安装完成。请重启 Windows 后再挂载。".into(),
-                        };
+                        });
                     }
                     Err(error) => {
-                        self.status = match locale {
+                        self.status = self.program_log.error(match locale {
                             Locale::English => format!(
                                 "WinFsp installation did not finish: {error}. Install from {WINFSP_INSTALL_URL}, then retry mounting."
                             ),
                             Locale::Chinese => format!(
                                 "WinFsp 安装未完成：{error}。请从 {WINFSP_INSTALL_URL} 安装后重试挂载。"
                             ),
-                        };
+                        });
                     }
                 }
             }
             Message::CancelPendingUnmount(id) => {
                 self.pending_unmount_after_sync.remove(&id);
-                self.status = match locale {
+                self.status = self.program_log.info(match locale {
                     Locale::English => "Automatic unmount cancelled".into(),
                     Locale::Chinese => "已取消同步后自动卸载".into(),
-                };
+                });
             }
             Message::UnmountWaitDecision { ids, result } => match result {
                 rfd::MessageDialogResult::Yes => {
                     self.pending_unmount_after_sync.extend(ids);
-                    self.status = match locale {
+                    self.status = self.program_log.info(match locale {
                         Locale::English => "Waiting for uploads to finish before unmounting".into(),
                         Locale::Chinese => "正在等待上传完成后自动取消挂载".into(),
-                    };
+                    });
                     return self.transfer_task();
                 }
                 rfd::MessageDialogResult::No => return self.confirm_immediate_unmount(ids),
@@ -4450,7 +4604,7 @@ impl App {
                                 None,
                             )),
                         );
-                        self.status = message;
+                        self.status = self.program_log.info(message);
                         if matches!(operation, MountOperation::Unmount) {
                             self.pending_unmount_after_sync.remove(&id);
                             self.confirmed_unmounts.remove(&id);
@@ -4470,10 +4624,10 @@ impl App {
                         self.operation_errors.remove(&id);
                         self.mount_observations
                             .insert(id.clone(), Ok((MountStatus::Unmounted, None)));
-                        self.status = match locale {
+                        self.status = self.program_log.info(match locale {
                             Locale::English => "Mount cancelled".into(),
                             Locale::Chinese => "已取消挂载".into(),
-                        };
+                        });
                     }
                     Err(error) => {
                         self.operation_errors.insert(
@@ -4483,8 +4637,9 @@ impl App {
                                 cause: error.clone(),
                             },
                         );
-                        self.status = connection_error::diagnose(&error)
-                            .map_or(error, |failure| failure.summary(locale));
+                        self.status = self
+                            .program_log
+                            .error(connection_error::summary(&error, locale).unwrap_or(error));
                         tasks.push(
                             self.status_task(StatusPublishPolicy::Silent, Some(vec![id.clone()])),
                         );
@@ -4524,8 +4679,12 @@ impl App {
                     return Task::none();
                 };
                 match result {
-                    Ok(()) => self.status = locale.text(TextKey::OpenedMountpoint).into(),
-                    Err(error) => self.status = error,
+                    Ok(()) => {
+                        self.status = self
+                            .program_log
+                            .info(locale.text(TextKey::OpenedMountpoint).into())
+                    }
+                    Err(error) => self.status = self.program_log.error(error),
                 }
             }
             Message::Edit(id) => {
@@ -4549,16 +4708,23 @@ impl App {
                     self.ssh_import_plan = None;
                     self.ssh_import_actions.clear();
                     self.screen = Screen::ConnectionEditor;
-                    self.status = if can_modify {
-                        locale.editing(server.display_name())
-                    } else {
-                        connection_settings_locked_help(locale).into()
-                    };
+                    self.status = self.program_log.publish(
+                        if can_modify {
+                            LogLevel::Info
+                        } else {
+                            LogLevel::Warning
+                        },
+                        if can_modify {
+                            locale.editing(server.display_name())
+                        } else {
+                            connection_settings_locked_help(locale).into()
+                        },
+                    );
                     match available_windows_drive_letters() {
                         Ok(drives) => self.windows_drive_letters = drives,
                         Err(error) => {
                             self.windows_drive_letters.clear();
-                            self.status = error.to_string();
+                            self.status = self.program_log.error(error.to_string());
                         }
                     }
                     if self.mapping_can_modify(&id)
@@ -4580,7 +4746,9 @@ impl App {
                     return Task::none();
                 };
                 if !self.can_modify(&id) {
-                    self.status = locale.text(TextKey::UnmountBeforeRemove).into();
+                    self.status = self
+                        .program_log
+                        .warning(locale.text(TextKey::UnmountBeforeRemove).into());
                     return Task::none();
                 }
                 if !self.busy.insert(id.clone()) {
@@ -4590,7 +4758,9 @@ impl App {
                 let paths = self.paths.clone();
                 let server = self.servers.iter().find(|server| server.id == id).cloned();
                 let result_id = id.clone();
-                self.status = locale.removing(&operation_display_name(server.as_ref(), &id));
+                self.status = self
+                    .program_log
+                    .info(locale.removing(&operation_display_name(server.as_ref(), &id)));
                 return Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
@@ -4660,12 +4830,19 @@ impl App {
                         self.selected_connections.retain(|selected| {
                             self.servers.iter().any(|server| server.id == *selected)
                         });
-                        self.status = outcome
-                            .warning
-                            .unwrap_or_else(|| locale.text(TextKey::ConnectionRemoved).into());
+                        self.status = self.program_log.publish(
+                            if outcome.warning.is_some() {
+                                LogLevel::Warning
+                            } else {
+                                LogLevel::Info
+                            },
+                            outcome
+                                .warning
+                                .unwrap_or_else(|| locale.text(TextKey::ConnectionRemoved).into()),
+                        );
                         return Task::batch([terminal_task, self.reconcile_startup_task()]);
                     }
-                    Err(error) => self.status = error,
+                    Err(error) => self.status = self.program_log.error(error),
                 }
             }
         }
@@ -4693,8 +4870,13 @@ impl App {
             Err(error) => {
                 diagnostic_trace(&format!("tray unavailable: {error}"));
                 let message = error.to_string();
+                let changed = self.tray_error.as_deref() != Some(message.as_str());
                 self.tray_error = Some(message.clone());
-                self.status = self.locale().tray_unavailable(&message);
+                if changed {
+                    self.status = self
+                        .program_log
+                        .warning(self.locale().tray_unavailable(&message));
+                }
                 match error {
                     TrayError::Transient(_) => {
                         self.tray_retry_at = Some(Instant::now() + self.tray_retry_delay);
@@ -4736,7 +4918,9 @@ impl App {
             TrayAction::ShowMain => self.show_main_window(),
             TrayAction::ShowTransfers => {
                 self.screen = Screen::TransferCenter;
-                self.status = self.locale().text(TextKey::TransferCenter).into();
+                self.status = self
+                    .program_log
+                    .info(self.locale().text(TextKey::TransferCenter).into());
                 Task::batch([self.show_main_window(), self.transfer_task()])
             }
             TrayAction::MountAll => self.handle_app_command(AppCommand::MountAll),
@@ -4750,7 +4934,9 @@ impl App {
             AppCommand::ShowMain => self.show_main_window(),
             AppCommand::ShowTransfers => {
                 self.screen = Screen::TransferCenter;
-                self.status = self.locale().text(TextKey::TransferCenter).into();
+                self.status = self
+                    .program_log
+                    .info(self.locale().text(TextKey::TransferCenter).into());
                 diagnostic_trace(&format!(
                     "transfer center shown with {} popup(s)",
                     usize::from(self.transfer_popup.is_some())
@@ -4761,7 +4947,9 @@ impl App {
             AppCommand::Unmount { id } => self.handle_mount_command(id, MountOperation::Unmount),
             AppCommand::Open { id } => self.open_mountpoint(id),
             AppCommand::RefreshPath { path } => {
-                self.status = self.locale().text(TextKey::Refreshing).into();
+                self.status = self
+                    .program_log
+                    .info(self.locale().text(TextKey::Refreshing).into());
                 let generation = self.claim_status_generation();
                 let expected_status = self.status.clone();
                 let service = self.service.clone();
@@ -4785,10 +4973,14 @@ impl App {
             }
             AppCommand::Refresh { id, relative_dir } => {
                 if !self.mount_targets.iter().any(|server| server.id == id) {
-                    self.status = self.locale().text(TextKey::ConnectionGone).into();
+                    self.status = self
+                        .program_log
+                        .warning(self.locale().text(TextKey::ConnectionGone).into());
                     return Task::none();
                 }
-                self.status = self.locale().text(TextKey::Refreshing).into();
+                self.status = self
+                    .program_log
+                    .info(self.locale().text(TextKey::Refreshing).into());
                 let generation = self.claim_status_generation();
                 let expected_status = self.status.clone();
                 let service = self.service.clone();
@@ -4860,12 +5052,12 @@ impl App {
                 if self.busy.is_empty() {
                     self.request_exit()
                 } else {
-                    self.status = match self.locale() {
+                    self.status = self.program_log.info(match self.locale() {
                         Locale::English => {
                             "Finish the active mount operation before replacing this version".into()
                         }
                         Locale::Chinese => "请等待当前挂载操作完成后再替换版本".into(),
-                    };
+                    });
                     Task::none()
                 }
             }
@@ -4929,7 +5121,9 @@ impl App {
         if self.tray.is_none() {
             return self.request_exit();
         }
-        self.status = self.locale().text(TextKey::RunningInBackground).into();
+        self.status = self
+            .program_log
+            .warning(self.locale().text(TextKey::RunningInBackground).into());
         let main_window = self.main_window;
         diagnostic_trace(&format!("closing main window to tray {main_window:?}"));
         self.main_window_ready = false;
@@ -5058,7 +5252,7 @@ impl App {
             if let Err(error) =
                 mountmate_core::connection::validate_mount_mappings(&next, &self.servers)
             {
-                self.status = error;
+                self.status = self.program_log.error(error);
                 return Task::none();
             }
             self.editor_saving = true;
@@ -5106,12 +5300,16 @@ impl App {
         let validated = match draft.validate(&self.servers) {
             Ok(validated) => validated,
             Err(error) => {
-                self.status = localize_draft_error(self.locale(), &error);
+                self.status = self
+                    .program_log
+                    .error(localize_draft_error(self.locale(), &error));
                 return Task::none();
             }
         };
         self.editor_saving = true;
-        self.status = self.locale().text(TextKey::SavingConnection).into();
+        self.status = self
+            .program_log
+            .info(self.locale().text(TextKey::SavingConnection).into());
         let service = self.service.clone();
         let paths = self.paths.clone();
         let locale = self.locale();
@@ -5347,7 +5545,9 @@ impl App {
         };
         let config_path = PathBuf::from(draft.ssh_config_path.trim());
         if config_path.as_os_str().is_empty() {
-            self.status = self.locale().text(TextKey::SshConfigPathRequired).into();
+            self.status = self
+                .program_log
+                .warning(self.locale().text(TextKey::SshConfigPathRequired).into());
             return Task::none();
         }
         let existing = self.servers.clone();
@@ -5360,9 +5560,10 @@ impl App {
         let batch_source = draft.batch_import_source;
         let result_path = config_path.clone();
         self.ssh_import_loading = true;
-        self.status = self
-            .locale()
-            .loading_path(&config_path.display().to_string());
+        self.status = self.program_log.info(
+            self.locale()
+                .loading_path(&config_path.display().to_string()),
+        );
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
@@ -5387,17 +5588,23 @@ impl App {
 
     fn save_ssh_batch(&mut self) -> Task<Message> {
         let Some(plan) = &self.ssh_import_plan else {
-            self.status = self.locale().text(TextKey::LoadSshBeforeImport).into();
+            self.status = self
+                .program_log
+                .warning(self.locale().text(TextKey::LoadSshBeforeImport).into());
             return Task::none();
         };
         let updates = match plan.apply(&self.ssh_import_actions, &self.servers) {
             Ok(updates) if !updates.is_empty() => updates,
             Ok(_) => {
-                self.status = self.locale().text(TextKey::SelectSshHost).into();
+                self.status = self
+                    .program_log
+                    .warning(self.locale().text(TextKey::SelectSshHost).into());
                 return Task::none();
             }
             Err(error) => {
-                self.status = localize_draft_error(self.locale(), &error);
+                self.status = self
+                    .program_log
+                    .error(localize_draft_error(self.locale(), &error));
                 return Task::none();
             }
         };
@@ -5405,11 +5612,15 @@ impl App {
             .iter()
             .any(|s| self.servers.iter().any(|old| old.id == s.id) && !self.can_modify(&s.id))
         {
-            self.status = connection_settings_locked_help(self.locale()).into();
+            self.status = self
+                .program_log
+                .warning(connection_settings_locked_help(self.locale()).into());
             return Task::none();
         }
         self.editor_saving = true;
-        self.status = self.locale().saving_connections(updates.len());
+        self.status = self
+            .program_log
+            .info(self.locale().saving_connections(updates.len()));
         let paths = self.paths.clone();
         let previous_servers = self.servers.clone();
         let locale = self.locale();
@@ -5461,7 +5672,7 @@ impl App {
         let mut settings = match draft.build(&self.settings, self.locale()) {
             Ok(settings) => settings,
             Err(error) => {
-                self.status = error;
+                self.status = self.program_log.error(error);
                 return Task::none();
             }
         };
@@ -5469,12 +5680,14 @@ impl App {
         let preference_updates = match connection_preference_updates(draft, self.locale()) {
             Ok(updates) => updates,
             Err(error) => {
-                self.status = error;
+                self.status = self.program_log.error(error);
                 return Task::none();
             }
         };
         self.editor_saving = true;
-        self.status = self.locale().text(TextKey::SavingSettings).into();
+        self.status = self
+            .program_log
+            .info(self.locale().text(TextKey::SavingSettings).into());
         let paths = self.paths.clone();
         let result_settings = settings.clone();
         let previous_settings = self.settings.clone();
@@ -5602,14 +5815,15 @@ impl App {
     }
 
     fn file_manager_menu_task(&mut self, register: bool) -> Task<Message> {
-        self.status = self
-            .locale()
-            .text(if register {
-                TextKey::RegisteringFileManagerMenu
-            } else {
-                TextKey::RemovingFileManagerMenu
-            })
-            .into();
+        self.status = self.program_log.info(
+            self.locale()
+                .text(if register {
+                    TextKey::RegisteringFileManagerMenu
+                } else {
+                    TextKey::RemovingFileManagerMenu
+                })
+                .into(),
+        );
         let integration = self.startup_integration_lock.clone();
         Task::perform(
             async move {
@@ -5708,14 +5922,14 @@ impl App {
         }
         if !winfsp::installer_is_embedded() {
             self.win_fsp_pending_mounts.clear();
-            self.status = match self.locale() {
+            self.status = self.program_log.info(match self.locale() {
                 Locale::English => format!(
                     "This source build does not include the Windows mounting component. Install WinFsp from {WINFSP_INSTALL_URL}, then retry mounting."
                 ),
                 Locale::Chinese => format!(
                     "此源码构建未附带 Windows 底层挂载组件。请从 {WINFSP_INSTALL_URL} 安装 WinFsp 后重试挂载。"
                 ),
-            };
+            });
             return Task::none();
         }
         self.win_fsp_install_pending = true;
@@ -5774,25 +5988,26 @@ impl App {
             .as_ref()
             .and_then(|info| info.asset.clone())
         else {
-            self.status = self
-                .update_info
-                .as_ref()
-                .and_then(|info| info.trust_error.as_ref())
-                .map_or_else(
-                    || match self.locale() {
-                        Locale::English => {
-                            "This release has no verified asset for this platform".into()
-                        }
-                        Locale::Chinese => "此版本没有适用于当前平台的已验证安装包".into(),
-                    },
-                    |error| automatic_install_blocked_message(self.locale(), error),
-                );
+            self.status = self.program_log.error(
+                self.update_info
+                    .as_ref()
+                    .and_then(|info| info.trust_error.as_ref())
+                    .map_or_else(
+                        || match self.locale() {
+                            Locale::English => {
+                                "This release has no verified asset for this platform".into()
+                            }
+                            Locale::Chinese => "此版本没有适用于当前平台的已验证安装包".into(),
+                        },
+                        |error| automatic_install_blocked_message(self.locale(), error),
+                    ),
+            );
             return Task::none();
         };
         let executable = match std::env::current_exe() {
             Ok(executable) => executable,
             Err(error) => {
-                self.status = error.to_string();
+                self.status = self.program_log.error(error.to_string());
                 return Task::none();
             }
         };
@@ -5801,10 +6016,10 @@ impl App {
         }
         self.update_downloading = true;
         self.update_error = None;
-        self.status = match self.locale() {
+        self.status = self.program_log.info(match self.locale() {
             Locale::English => "Downloading and verifying update...".into(),
             Locale::Chinese => "正在下载并验证更新...".into(),
-        };
+        });
         let paths = self.paths.clone();
         let progress = self.update_progress.clone();
         Task::perform(
@@ -5886,15 +6101,15 @@ impl App {
         };
         match prepared.launch() {
             Ok(_) => {
-                self.status = match self.locale() {
+                self.status = self.program_log.info(match self.locale() {
                     Locale::English => "Restarting into the verified update...".into(),
                     Locale::Chinese => "正在重启并应用已验证更新...".into(),
-                };
+                });
                 iced::exit()
             }
             Err(error) => {
                 self.update_error = Some(error.to_string());
-                self.status = error.to_string();
+                self.status = self.program_log.error(error.to_string());
                 Task::none()
             }
         }
@@ -5933,7 +6148,7 @@ impl App {
             prepared.cancel();
         }
         self.update_error = Some(message.clone());
-        self.status = message;
+        self.status = self.program_log.info(message);
         true
     }
 
@@ -6019,10 +6234,10 @@ impl App {
             return Task::none();
         }
         self.connection_list_saving = true;
-        self.status = match self.locale() {
+        self.status = self.program_log.info(match self.locale() {
             Locale::English => "Saving connection tags...".into(),
             Locale::Chinese => "正在保存连接标签…".into(),
-        };
+        });
         let paths = self.paths.clone();
         Task::perform(
             async move {
@@ -6373,10 +6588,11 @@ impl App {
                 session.resume_sent = false;
             }
             self.terminal_error = None;
-            self.status = self
-                .locale()
-                .text(TextKey::InteractiveTerminalStarting)
-                .into();
+            self.status = self.program_log.info(
+                self.locale()
+                    .text(TextKey::InteractiveTerminalStarting)
+                    .into(),
+            );
             self.open_terminal_window(id)
         }
     }
@@ -6423,20 +6639,22 @@ impl App {
                         readiness_check_in_flight: false,
                     },
                 );
-                self.status = self
-                    .locale()
-                    .text(TextKey::InteractiveTerminalStarting)
-                    .into();
+                self.status = self.program_log.info(
+                    self.locale()
+                        .text(TextKey::InteractiveTerminalStarting)
+                        .into(),
+                );
             }
             Err(error) => {
                 diagnostic_trace(&format!(
                     "interactive terminal session creation failed for {id} generation {generation}"
                 ));
                 self.terminal_error = Some((id.clone(), error));
-                self.status = self
-                    .locale()
-                    .text(TextKey::InteractiveTerminalFailed)
-                    .into();
+                self.status = self.program_log.error(
+                    self.locale()
+                        .text(TextKey::InteractiveTerminalFailed)
+                        .into(),
+                );
             }
         }
         self.open_terminal_window(id)
@@ -6533,10 +6751,11 @@ impl App {
             session.lifecycle = InteractiveTerminalLifecycle::Exited;
             session.queued_mount = false;
             session.resume_sent = true;
-            self.status = self
-                .locale()
-                .text(TextKey::InteractiveTerminalExited)
-                .into();
+            self.status = self.program_log.info(
+                self.locale()
+                    .text(TextKey::InteractiveTerminalExited)
+                    .into(),
+            );
         }
         Task::none()
     }
@@ -6546,12 +6765,12 @@ impl App {
             return Task::none();
         };
         if !self.session_can_end(&id) {
-            self.status = match self.locale() {
+            self.status = self.program_log.info(match self.locale() {
                 Locale::English => {
                     "Unmount this connection before ending its shared SSH session".into()
                 }
                 Locale::Chinese => "请先卸载此连接，再结束共享 SSH 会话".into(),
-            };
+            });
             return Task::none();
         }
         let window = self.terminal_window.take();
@@ -6579,12 +6798,12 @@ impl App {
             return self.end_interactive_session();
         };
         if !self.session_can_end(&id) {
-            self.status = match self.locale() {
+            self.status = self.program_log.info(match self.locale() {
                 Locale::English => {
                     "Unmount this connection before restarting its shared SSH session".into()
                 }
                 Locale::Chinese => "请先卸载此连接，再重试共享 SSH 会话".into(),
-            };
+            });
             return Task::none();
         }
         self.interactive_terminals.remove(&id);
@@ -6648,14 +6867,14 @@ impl App {
                 return Task::none();
             }
             let locale = self.locale();
-            self.status = match locale {
+            self.status = self.program_log.info(match locale {
                 Locale::English => {
                     "Install the Windows mounting component to continue. This is normally a one-time setup.".into()
                 }
                 Locale::Chinese => {
                     "需要先安装 Windows 底层挂载组件，通常只需安装一次。".into()
                 }
-            };
+            });
             return self.win_fsp_install_prompt();
         }
         if operation == MountOperation::Unmount
@@ -6680,7 +6899,9 @@ impl App {
             && !self.interactive_session_ready(&id)
         {
             let Some(server) = server else {
-                self.status = self.locale().text(TextKey::ConnectionGone).into();
+                self.status = self
+                    .program_log
+                    .warning(self.locale().text(TextKey::ConnectionGone).into());
                 return Task::none();
             };
             return self.queue_interactive_mount(id, server);
@@ -6715,10 +6936,10 @@ impl App {
             .insert(id.clone(), Ok((MountStatus::Starting, None)));
         self.operation_errors.remove(&id);
         let display_name = operation_display_name(server.as_ref(), &id);
-        self.status = match operation {
+        self.status = self.program_log.info(match operation {
             MountOperation::Mount => self.locale().mounting(&display_name),
             MountOperation::Unmount => self.locale().unmounting(&display_name),
-        };
+        });
         let service = self.service.clone();
         let settings = self.settings.clone();
         let locale = self.locale();
@@ -6849,7 +7070,7 @@ impl App {
             self.mount_targets.iter().find(|server| server.id == id),
             &id,
         );
-        self.status = locale.opening(&display_name);
+        self.status = self.program_log.info(locale.opening(&display_name));
         let result_id = id.clone();
         Task::perform(
             async move {
@@ -6870,7 +7091,9 @@ impl App {
 
     fn open_log(&mut self, id: String) -> Task<Message> {
         let Some(server) = self.mount_targets.iter().find(|server| server.id == id) else {
-            self.status = self.locale().text(TextKey::ConnectionGone).into();
+            self.status = self
+                .program_log
+                .warning(self.locale().text(TextKey::ConnectionGone).into());
             return Task::none();
         };
         let display_name = server.display_name().to_owned();
@@ -6884,7 +7107,9 @@ impl App {
             loading: true,
             existed: false,
         });
-        self.status = self.locale().text(TextKey::LoadingLog).into();
+        self.status = self
+            .program_log
+            .info(self.locale().text(TextKey::LoadingLog).into());
         let load = load_log_task(id, path);
         if let Some(window) = self.log_window {
             Task::batch([load, window::gain_focus(window)])
@@ -6909,19 +7134,29 @@ impl App {
 
     fn view(&self, window: window::Id) -> Element<'_, Message> {
         if window == self.main_window {
-            let base = match self.screen {
-                Screen::Connections => self.main_view(),
-                Screen::TransferCenter => self.transfer_center_view(),
-                Screen::ConnectionEditor => container(self.connection_editor_view())
-                    .id(EDITOR_FOCUS_SCOPE)
-                    .width(Fill)
-                    .height(Fill)
-                    .into(),
-                Screen::Settings => container(self.settings_view())
-                    .id(EDITOR_FOCUS_SCOPE)
-                    .width(Fill)
-                    .height(Fill)
-                    .into(),
+            let base: Element<'_, Message> = if self.program_log.collapsed {
+                column![
+                    self.screen_view(),
+                    self.program_log
+                        .view(self.locale())
+                        .map(Message::ProgramLog)
+                ]
+                .into()
+            } else {
+                pane_grid(&self.program_log.panes, |_, is_log, _| {
+                    pane_grid::Content::new(if *is_log {
+                        self.program_log
+                            .view(self.locale())
+                            .map(Message::ProgramLog)
+                    } else {
+                        self.screen_view()
+                    })
+                })
+                .spacing(6)
+                .on_resize(8, |event| {
+                    Message::ProgramLog(program_log::Message::Resize(event))
+                })
+                .into()
             };
             if let Some(prompt) = self.host_key_prompts.front() {
                 let dialog = container(
@@ -6965,6 +7200,23 @@ impl App {
             self.interactive_terminal_view()
         } else {
             self.transfer_popup_view(window)
+        }
+    }
+
+    fn screen_view(&self) -> Element<'_, Message> {
+        match self.screen {
+            Screen::Connections => self.main_view(),
+            Screen::TransferCenter => self.transfer_center_view(),
+            Screen::ConnectionEditor => container(self.connection_editor_view())
+                .id(EDITOR_FOCUS_SCOPE)
+                .width(Fill)
+                .height(Fill)
+                .into(),
+            Screen::Settings => container(self.settings_view())
+                .id(EDITOR_FOCUS_SCOPE)
+                .width(Fill)
+                .height(Fill)
+                .into(),
         }
     }
 
@@ -7449,7 +7701,6 @@ impl App {
                 organization,
                 tags,
                 scrollable(connections).height(Fill),
-                row![text(&self.status), Space::new().width(Fill), text(VERSION)],
             ]
             .spacing(14),
         )
@@ -7730,19 +7981,11 @@ impl App {
             );
         }
 
-        container(
-            column![
-                header,
-                overview,
-                scrollable(connections).height(Fill),
-                row![text(&self.status), Space::new().width(Fill), text(VERSION)],
-            ]
-            .spacing(16),
-        )
-        .padding(18)
-        .width(Fill)
-        .height(Fill)
-        .into()
+        container(column![header, overview, scrollable(connections).height(Fill),].spacing(16))
+            .padding(18)
+            .width(Fill)
+            .height(Fill)
+            .into()
     }
 
     fn connection_editor_view(&self) -> Element<'_, Message> {
@@ -7791,7 +8034,7 @@ impl App {
         .align_y(Center);
 
         if self.editor_saving {
-            return saving_editor_shell(header, &self.status, locale);
+            return saving_editor_shell(header, "", locale);
         }
 
         let source_options = localized_choices(
@@ -7948,7 +8191,7 @@ impl App {
             let content = column![source, import_source, ssh_config_controls, items]
                 .spacing(16)
                 .max_width(900);
-            return editor_shell(header, scrollable(controls.freeze(content)), &self.status);
+            return editor_shell(header, scrollable(controls.freeze(content)), "");
         }
         if draft.source == ConnectionSource::SshConfig {
             let hosts: Vec<_> = self
@@ -7983,7 +8226,7 @@ impl App {
             let content = column![controls.freeze(source), picker]
                 .spacing(16)
                 .max_width(900);
-            return editor_shell(header, scrollable(content), &self.status);
+            return editor_shell(header, scrollable(content), "");
         }
         let mounted_controls = controls;
         let locked = locked || source_locked;
@@ -8432,7 +8675,7 @@ impl App {
         }
         let common = mounted_controls.freeze(common.push(identity).push(details));
         let content = column![common, paths].spacing(16).max_width(900);
-        editor_shell(header, scrollable(content), &self.status)
+        editor_shell(header, scrollable(content), "")
     }
 
     fn settings_view(&self) -> Element<'_, Message> {
@@ -8455,7 +8698,7 @@ impl App {
         .spacing(10)
         .align_y(Center);
         if self.editor_saving {
-            return saving_editor_shell(header, &self.status, locale);
+            return saving_editor_shell(header, "", locale);
         }
         let cache_profile = row![
             settings_folder_input(
@@ -8961,7 +9204,7 @@ impl App {
         ]
         .spacing(18)
         .max_width(900);
-        let base = editor_shell(header, scrollable(content), &self.status);
+        let base = editor_shell(header, scrollable(content), "");
         if let Some(custom) = &self.custom_setting {
             let units = custom_units(custom.kind)
                 .iter()
@@ -9351,7 +9594,7 @@ fn capacity_progress_view(
     .height(Length::Fixed(22.0))
     .into();
 
-    if let Some(help) = capacity_soft_limit_help(capacity, locale) {
+    let content = if let Some(help) = capacity_soft_limit_help(capacity, locale) {
         tooltip(
             content,
             container(text(help).size(12))
@@ -9359,6 +9602,22 @@ fn capacity_progress_view(
                 .style(container::rounded_box),
             tooltip::Position::FollowCursor,
         )
+        .into()
+    } else {
+        content
+    };
+    if capacity.is_some_and(|capacity| {
+        capacity.source == mountmate_core::capacity::CapacitySource::LustreProjectQuota
+    }) {
+        column![
+            content,
+            text(match locale {
+                Locale::English => "Quota snapshot; the server decides whether writes are allowed.",
+                Locale::Chinese => "配额快照仅供参考，能否写入由服务器判定。",
+            })
+            .size(12)
+        ]
+        .spacing(4)
         .into()
     } else {
         content
@@ -9463,13 +9722,27 @@ fn capacity_progress_state(
             quota_usage_percent(capacity.used, capacity.total),
             match locale {
                 Locale::English => format!(
-                    "Capacity: {} / {} used ({}%)",
+                    "{}: {} / {} used ({}%)",
+                    if capacity.source
+                        == mountmate_core::capacity::CapacitySource::LustreProjectQuota
+                    {
+                        "Quota snapshot"
+                    } else {
+                        "Capacity"
+                    },
                     format_bytes(capacity.used),
                     format_bytes(capacity.total),
                     capacity.percent
                 ),
                 Locale::Chinese => format!(
-                    "容量：已用 {} / {}（{}%）",
+                    "{}：已用 {} / {}（{}%）",
+                    if capacity.source
+                        == mountmate_core::capacity::CapacitySource::LustreProjectQuota
+                    {
+                        "配额快照"
+                    } else {
+                        "容量"
+                    },
                     format_bytes(capacity.used),
                     format_bytes(capacity.total),
                     capacity.percent
@@ -11295,7 +11568,11 @@ fn editor_shell<'a>(
         column![
             header.into(),
             container(content.into()).height(Fill).width(Fill),
-            row![text(status), Space::new().width(Fill), text(VERSION)],
+            (!status.is_empty()).then(|| row![
+                text(status).size(15),
+                Space::new().width(Fill),
+                text(VERSION)
+            ]),
         ]
         .spacing(16),
     )
@@ -13259,11 +13536,14 @@ mod localization_tests {
         };
         assert_eq!(
             capacity_progress_state(Some(&lustre_capacity), false, Locale::English),
-            (40.0, "Capacity: 40.0 MiB / 100.0 MiB used (40%)".into())
+            (
+                40.0,
+                "Quota snapshot: 40.0 MiB / 100.0 MiB used (40%)".into()
+            )
         );
         assert_eq!(
             capacity_progress_state(Some(&lustre_capacity), false, Locale::Chinese),
-            (40.0, "容量：已用 40.0 MiB / 100.0 MiB（40%）".into())
+            (40.0, "配额快照：已用 40.0 MiB / 100.0 MiB（40%）".into())
         );
         assert_eq!(
             capacity_soft_limit_help(Some(&lustre_capacity), Locale::English),

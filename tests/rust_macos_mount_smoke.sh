@@ -200,6 +200,7 @@ grep -F 'local file(s) are still waiting to upload' <<<"$queued_output"
 
 export SSH_MOUNTMATE_ACTIVE_PACKAGE_ROOT="$bundle"
 export SSH_MOUNTMATE_ACTIVE_STATE_FILE="$XDG_STATE_HOME/rsshmount/local-sftp.json"
+export SSH_MOUNTMATE_ACTIVE_REMOTE_UPLOAD="$remote_root/upload.bin"
 cargo test --package mountmate-core --test packaged_update --all-features \
   packaged_update_preserves_real_active_mount -- \
   --ignored --exact --test-threads=1

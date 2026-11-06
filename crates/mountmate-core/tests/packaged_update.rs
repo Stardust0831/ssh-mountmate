@@ -29,6 +29,7 @@ use wait_timeout::ChildExt;
 const PACKAGE_ROOT_ENV: &str = "SSH_MOUNTMATE_PACKAGE_ROOT";
 const ACTIVE_PACKAGE_ROOT_ENV: &str = "SSH_MOUNTMATE_ACTIVE_PACKAGE_ROOT";
 const ACTIVE_STATE_FILE_ENV: &str = "SSH_MOUNTMATE_ACTIVE_STATE_FILE";
+const ACTIVE_REMOTE_UPLOAD_ENV: &str = "SSH_MOUNTMATE_ACTIVE_REMOTE_UPLOAD";
 const VERSION_MARKER: &str = "SSHMountMate.update-e2e-version";
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const HELPER_TIMEOUT: Duration = Duration::from_secs(75);
@@ -338,6 +339,10 @@ fn run_active_mount_update() -> TestResult {
         .ok_or_else(|| io::Error::other(format!("{ACTIVE_STATE_FILE_ENV} is not set")))?
         .canonicalize()?;
     let original_state: MountState = read_json(&state_file)?;
+    let remote_upload = env::var_os(ACTIVE_REMOTE_UPLOAD_ENV)
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::other(format!("{ACTIVE_REMOTE_UPLOAD_ENV} is not set")))?;
+    let expected_upload_sha256 = file_sha256(&original_state.mountpoint.join("upload.bin"))?;
     let discovered_paths = AppPaths::discover();
     if discovered_paths
         .state_file(&original_state.server_id)
@@ -497,10 +502,7 @@ fn run_active_mount_update() -> TestResult {
         let snapshot = MountService::new(discovered_paths.clone(), install_root.clone())
             .transfer_snapshot(&updated_state.server_id)?;
         if snapshot.queued == 0 && snapshot.uploading == 0 {
-            return Err(io::Error::other(
-                "the queued upload disappeared during GUI package replacement",
-            )
-            .into());
+            verify_completed_upload(&remote_upload, &expected_upload_sha256)?;
         }
         if !terminate_processes_at(&installed_executable, PROCESS_TIMEOUT)? {
             return Err(io::Error::other(
@@ -519,6 +521,32 @@ fn run_active_mount_update() -> TestResult {
     let _ = parent.wait();
     let _ = terminate_processes_at(&installed_executable, Duration::from_secs(5));
     result
+}
+
+// Completion can race with package replacement. Check the SFTP fixture's
+// backing file directly; the mounted file could still be served from cache.
+fn verify_completed_upload(remote_upload: &Path, expected_sha256: &str) -> TestResult {
+    if file_sha256(remote_upload)? != expected_sha256 {
+        return Err(io::Error::other(
+            "the upload queue emptied without a matching remote file after GUI package replacement",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[test]
+fn completed_upload_requires_matching_remote_contents() {
+    let temp = tempfile::tempdir().unwrap();
+    let original = temp.path().join("original");
+    let remote = temp.path().join("remote");
+    fs::write(&original, b"expected upload").unwrap();
+    let expected = file_sha256(&original).unwrap();
+    assert!(verify_completed_upload(&remote, &expected).is_err());
+    fs::write(&remote, b"incorrect bytes").unwrap();
+    assert!(verify_completed_upload(&remote, &expected).is_err());
+    fs::write(&remote, b"expected upload").unwrap();
+    verify_completed_upload(&remote, &expected).unwrap();
 }
 
 fn test_directory() -> TestResult<TempDir> {

@@ -307,18 +307,24 @@ async fn cancelled_browser_approval_keeps_the_key_and_original_retry_identity() 
     let root = tempfile::tempdir().unwrap();
     let mut confirmations = 0;
     for _ in 0..2 {
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(100),
-                session.enroll_with_progress(&session.connections()[0], root.path(), |progress| {
-                    if matches!(progress, EnrollmentProgress::VerificationRequired(_)) {
-                        confirmations += 1;
-                    }
-                })
-            )
-            .await
-            .is_err()
-        );
+        let (confirmed, confirmation) = tokio::sync::oneshot::channel();
+        let mut confirmed = Some(confirmed);
+        let enrollment =
+            session.enroll_with_progress(&session.connections()[0], root.path(), |progress| {
+                if matches!(progress, EnrollmentProgress::VerificationRequired(_)) {
+                    confirmations += 1;
+                    confirmed.take().unwrap().send(()).unwrap();
+                }
+            });
+        tokio::pin!(enrollment);
+        tokio::select! {
+            result = &mut enrollment => panic!("enrollment completed before cancellation: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(5), confirmation) => {
+                result.expect("browser confirmation was not reached").unwrap();
+            }
+        }
+        // Drop the future while awaiting browser approval, regardless of key
+        // generation or filesystem speed on this test host.
     }
     tokio::time::sleep(Duration::from_millis(2100)).await;
     assert_eq!(confirmations, 2);
