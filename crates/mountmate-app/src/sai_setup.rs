@@ -5,7 +5,7 @@ use iced::{Element, Fill, Task};
 use mountmate_sai::{
     Client, ConfiguredConnection, Connection, EnrollmentProgress, Error, Login, PORTAL, Session,
 };
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -20,6 +20,7 @@ pub enum Message {
     EnrollmentProgress(u64, EnrollmentProgress),
     Finished(u64, Result<ConfiguredConnection, Error>),
     OpenBrowser,
+    ToggleDeviceCode,
     OpenConsole,
     BrowserOpened(u64, bool),
 }
@@ -35,6 +36,7 @@ pub struct State {
     error: Option<Error>,
     browser_failed: bool,
     verification_url: Option<String>,
+    show_device_code: bool,
 }
 impl State {
     pub fn reset(&mut self) {
@@ -61,7 +63,7 @@ impl State {
         &mut self,
         message: Message,
         data_dir: &Path,
-        locale: Locale,
+        _locale: Locale,
     ) -> (Task<Message>, Option<ConfiguredConnection>) {
         match message {
             Message::Start if !self.pending => {
@@ -83,12 +85,13 @@ impl State {
                 match result {
                     Ok(started) => {
                         let (client, login) = *started;
+                        let open_browser = self.open_browser(login.verification_url());
                         self.login = Some(login.clone());
                         let task = Task::perform(
                             async move { client.finish_login(&login).await.map(Arc::new) },
                             move |result| Message::Authorized(generation, result),
                         );
-                        return (self.track(task), None);
+                        return (Task::batch([self.track(task), open_browser]), None);
                     }
                     Err(error) => {
                         self.pending = false;
@@ -160,7 +163,7 @@ impl State {
                     EnrollmentProgress::VerificationRequired(url) => {
                         self.verification_url = Some(url.clone());
                         self.browser_failed = false;
-                        return (self.open_browser(&url, locale), None);
+                        return (self.open_browser(&url), None);
                     }
                     EnrollmentProgress::Applying => {
                         self.verification_url = None;
@@ -191,10 +194,13 @@ impl State {
                     .as_deref()
                     .or_else(|| self.login.as_ref().map(Login::verification_url))
                 {
-                    return (self.open_browser(url, locale), None);
+                    return (self.open_browser(url), None);
                 }
             }
-            Message::OpenConsole => return (self.open_browser(PORTAL, locale), None),
+            Message::ToggleDeviceCode if self.login.is_some() => {
+                self.show_device_code = !self.show_device_code;
+            }
+            Message::OpenConsole => return (self.open_browser(PORTAL), None),
             Message::BrowserOpened(generation, ok) if generation == self.generation => {
                 self.browser_failed = !ok
             }
@@ -202,12 +208,12 @@ impl State {
         }
         (Task::none(), None)
     }
-    fn open_browser(&self, url: &str, locale: Locale) -> Task<Message> {
-        let path = PathBuf::from(url);
+    fn open_browser(&self, url: &str) -> Task<Message> {
+        let url = url.to_owned();
         let generation = self.generation;
         Task::perform(
             async move {
-                tokio::task::spawn_blocking(move || super::open_path(&path, locale))
+                tokio::task::spawn_blocking(move || mountmate_platform::open_browser(&url))
                     .await
                     .is_ok_and(|result| result.is_ok())
             },
@@ -225,17 +231,29 @@ impl State {
                 "登录后选择站点，登记本机公钥，自动填写连接信息。")).size(14),
         ].spacing(10);
         if let Some(login) = &self.login {
+            if !login.has_complete_verification_url()
+                || self.show_device_code
+                || self.browser_failed
+            {
+                content = content
+                    .push(text(login.manual_verification_url()).size(14))
+                    .push(text(login.user_code()).size(24));
+            }
             content = content
-                .push(text(tr(
-                    "Open the page and enter this code:",
-                    "打开登录页面并输入登录码：",
-                )))
-                .push(text(login.verification_url()).size(14))
-                .push(text(login.user_code()).size(24))
                 .push(
                     button(tr("Open sign-in page", "打开登录页面")).on_press(Message::OpenBrowser),
                 )
                 .push(text(tr("Waiting for authorization…", "正在等待授权…")));
+            if login.has_complete_verification_url() {
+                content = content.push(
+                    button(if self.show_device_code {
+                        tr("Hide sign-in code", "收起登录码")
+                    } else {
+                        tr("Use another device", "在其他设备登录")
+                    })
+                    .on_press(Message::ToggleDeviceCode),
+                );
+            }
             if self.browser_failed {
                 content = content.push(text(tr(
                     "Could not open the browser. Open the address above manually.",
@@ -393,9 +411,15 @@ mod tests {
             Path::new("unused"),
             Locale::English,
         );
+        let _ = state.update(
+            Message::BrowserOpened(generation, false),
+            Path::new("unused"),
+            Locale::English,
+        );
         assert!(!state.in_progress());
         assert!(state.error.is_none());
         assert!(!state.ready);
         assert!(state.verification_url.is_none());
+        assert!(!state.browser_failed);
     }
 }
