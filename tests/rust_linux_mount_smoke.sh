@@ -200,6 +200,7 @@ grep -F 'local file(s) are still waiting to upload' <<<"${queued_output}"
 
 export SSH_MOUNTMATE_ACTIVE_PACKAGE_ROOT="${package_root}"
 export SSH_MOUNTMATE_ACTIVE_STATE_FILE="${XDG_STATE_HOME}/rsshmount/local-sftp.json"
+export SSH_MOUNTMATE_ACTIVE_REMOTE_UPLOAD="${remote_root}/upload.bin"
 cargo test --package mountmate-core --test packaged_update --all-features \
   packaged_update_preserves_real_active_mount -- \
   --ignored --exact --test-threads=1
@@ -224,8 +225,10 @@ rc_args=(
   --pass "$(jq -r .rc_pass "${SSH_MOUNTMATE_ACTIVE_STATE_FILE}")"
 )
 queue="$("${rclone}" rc "${rc_args[@]}" vfs/queue)"
-upload_id="$(jq -er '.queue[] | select(.name == "upload.bin" and .uploading == false) | .id' <<<"${queue}")"
-"${rclone}" rc "${rc_args[@]}" vfs/queue-set-expiry "id=${upload_id}" expiry=-1
+upload_id="$(jq -r '.queue[] | select(.name == "upload.bin" and .uploading == false) | .id' <<<"${queue}")"
+if [[ -n "$upload_id" ]]; then
+  "${rclone}" rc "${rc_args[@]}" vfs/queue-set-expiry "id=${upload_id}" expiry=-1
+fi
 
 for _ in $(seq 1 1200); do
   if [[ -f "${remote_root}/upload.bin" ]] \
