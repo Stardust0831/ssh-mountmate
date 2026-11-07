@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fmt;
-use std::fs::{self, File};
+use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -27,13 +27,10 @@ use mountmate_core::capacity::{CapacityInfo, InodeInfo};
 use mountmate_core::config_transfer::{plan_connection_import, write_connection_export};
 use mountmate_core::connection::{
     BatchImportSource, ConnectionDraft, ConnectionSource, DraftError, ImportAction, ImportStatus,
-    PreservedSecretState, SecretAction, SshImportPlan,
+    PreservedSecretState, SshImportPlan,
 };
 use mountmate_core::credential::{
-    CredentialChange, CredentialError, CredentialKind, CredentialMigration, CredentialStore,
-    SystemCredentialStore, credential_reference, delete_credential_references,
-    delete_server_credentials, prepare_server_to_obscure, prepare_server_to_system,
-    replace_verified, rollback_change,
+    CredentialKind, SystemCredentialStore, delete_server_credentials,
 };
 use mountmate_core::dependency::{
     DependencyStatus, WINFSP_INSTALL_URL, check_dependencies, mount_dependency_available,
@@ -50,14 +47,13 @@ use mountmate_core::mountpoint::{
 use mountmate_core::paths::AppPaths;
 use mountmate_core::plink_binary::resolve_plink;
 use mountmate_core::process::MountStatus;
-use mountmate_core::rclone::clear_rclone_remote_secrets;
 use mountmate_core::rclone_binary::resolve_rclone;
 use mountmate_core::service::{MountService, ServiceError};
-use mountmate_core::ssh::{
-    default_ssh_config_path, prepare_managed_ssh_server, remove_managed_ssh_server,
-};
+use mountmate_core::ssh::{default_ssh_config_path, remove_managed_ssh_server};
 use mountmate_core::storage;
-use mountmate_core::transfer::{TransferFile, TransferSnapshot};
+#[cfg(test)]
+use mountmate_core::transfer::TransferFile;
+use mountmate_core::transfer::TransferSnapshot;
 use mountmate_core::update::{UpdateInfo, check_for_updates};
 use mountmate_core::update_helper::{
     UpdateHealthAuthorization, run_update_helper, write_update_health_marker,
@@ -77,15 +73,32 @@ use mountmate_platform::{
 };
 
 mod cli;
+mod configuration;
+mod connection_editor;
+use configuration::{ServerMutation, SettingsMutation, delete_retired_connection_credentials};
+#[cfg(test)]
+use connection_editor::compose_remote_path;
+use connection_editor::{
+    ConnectionEditor, MappingRow, MountpointPreflight, RemotePathChange,
+    mountpoint_preflight_result_is_current, split_remote_path,
+};
 mod connection_error;
 mod host_key_dialog;
 mod i18n;
 mod icons;
+mod mount_feedback;
+mod navigation;
 mod program_log;
 mod read_only;
+#[cfg(test)]
+use mount_feedback::TransferProgressHistory;
+use mount_feedback::{FeedbackRequest, MountFeedbacks, transfer_is_active};
+use navigation::{Navigation, Screen};
 mod sai_setup;
 mod transfer_center;
 mod tray;
+#[cfg(test)]
+mod workflow_tests;
 
 const CUSTOM_MOUNTPOINT_PENDING: &str = "__ui_custom_mountpoint_pending__";
 const EDITOR_FOCUS_SCOPE: &str = "editor-form";
@@ -664,11 +677,8 @@ struct App {
     next_status_read: u64,
     busy: HashSet<String>,
     host_key_prompts: VecDeque<host_key_dialog::Prompt>,
-    transfers: HashMap<String, TransferSnapshot>,
-    transfer_history: HashMap<String, TransferProgressHistory>,
-    transfer_errors: HashMap<String, String>,
     operation_errors: HashMap<String, ConnectionOperationError>,
-    transfer_failures: HashMap<String, u8>,
+    mount_feedback: MountFeedbacks,
     transfer_refreshing: bool,
     main_window: window::Id,
     main_window_ready: bool,
@@ -684,19 +694,12 @@ struct App {
     transfer_popup: Option<window::Id>,
     transfer_popup_expanded: bool,
     dismissed_popups: HashSet<String>,
-    synced_polls: HashMap<String, u8>,
     notification_tracker: TransferNotificationTracker,
     pending_unmount_after_sync: HashSet<String>,
     confirmed_unmounts: HashSet<String>,
     popup_close_notice_shown: bool,
-    screen: Screen,
-    connection_draft: Option<ConnectionDraft>,
-    sai_setup: sai_setup::State,
-    connection_tags_input: String,
-    connection_custom_mountpoint: String,
-    windows_drive_letters: Vec<char>,
-    mountpoint_preflight: MountpointPreflight,
-    mountpoint_preflight_queue: MountpointPreflightQueue,
+    navigation: Navigation,
+    editor: ConnectionEditor,
     settings_draft: Option<SettingsDraft>,
     log_view: Option<MountLogView>,
     log_window: Option<window::Id>,
@@ -707,9 +710,6 @@ struct App {
     terminal_error: Option<(String, String)>,
     custom_setting: Option<CustomSettingDraft>,
     editor_saving: bool,
-    ssh_import_loading: bool,
-    ssh_import_plan: Option<SshImportPlan>,
-    ssh_import_actions: Vec<ImportAction>,
     pending_delete: Option<String>,
     settings_recovery_dialog: Option<String>,
     status: String,
@@ -728,8 +728,6 @@ struct App {
     dependency_checking: bool,
     win_fsp_install_pending: bool,
     win_fsp_pending_mounts: HashSet<String>,
-    capacities: HashMap<String, CapacityInfo>,
-    capacity_errors: HashSet<String>,
     capacity_refreshing: bool,
     capacity_refresh_pending: bool,
 }
@@ -738,13 +736,6 @@ struct App {
 struct UpdateDownloadProgress {
     received: u64,
     total: u64,
-}
-
-#[derive(Debug, Default)]
-struct TransferProgressHistory {
-    active: bool,
-    completed_bytes: u64,
-    known_files: HashMap<String, (u64, u64)>,
 }
 
 #[derive(Default)]
@@ -795,14 +786,6 @@ impl TransferNotificationTracker {
         self.observed_active.remove(server_id);
         self.notified_errors.remove(server_id);
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Screen {
-    Connections,
-    TransferCenter,
-    ConnectionEditor,
-    Settings,
 }
 
 #[derive(Debug, Clone)]
@@ -872,83 +855,6 @@ enum MountErrorAction {
     Retry,
     ViewLog,
     Dismiss,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-enum MountpointPreflight {
-    #[default]
-    NotRequired,
-    Checking(String),
-    Valid(String),
-    Invalid {
-        value: String,
-        error: String,
-    },
-}
-
-impl MountpointPreflight {
-    fn allows_save(&self) -> bool {
-        matches!(self, Self::NotRequired | Self::Valid(_))
-    }
-}
-
-#[derive(Default)]
-struct MountpointPreflightQueue {
-    generation: u64,
-    in_flight: Option<u64>,
-    pending: Option<PendingMountpointPreflight>,
-}
-
-struct PendingMountpointPreflight {
-    generation: u64,
-    value: String,
-    ready: bool,
-}
-
-impl MountpointPreflightQueue {
-    fn replace(&mut self, value: Option<String>) -> u64 {
-        self.generation = self.generation.wrapping_add(1);
-        self.pending = value.map(|value| PendingMountpointPreflight {
-            generation: self.generation,
-            value,
-            ready: false,
-        });
-        // A blocking filesystem probe cannot be cancelled. Keep its slot
-        // occupied across edits and cancellation until it actually finishes.
-        self.generation
-    }
-
-    fn mark_ready(&mut self, generation: u64) {
-        if let Some(pending) = &mut self.pending
-            && pending.generation == generation
-        {
-            pending.ready = true;
-        }
-    }
-
-    fn take_ready(&mut self) -> Option<PendingMountpointPreflight> {
-        if self.in_flight.is_some() || !self.pending.as_ref().is_some_and(|pending| pending.ready) {
-            return None;
-        }
-        let pending = self.pending.take()?;
-        self.in_flight = Some(pending.generation);
-        Some(pending)
-    }
-
-    fn finish(&mut self, generation: u64) {
-        if self.in_flight == Some(generation) {
-            self.in_flight = None;
-        }
-    }
-}
-
-fn mountpoint_preflight_result_is_current(
-    result_generation: u64,
-    current_generation: u64,
-    result_value: &str,
-    current_value: Option<&str>,
-) -> bool {
-    result_generation == current_generation && current_value == Some(result_value)
 }
 
 fn mount_error_summary(locale: Locale, cause: &str) -> String {
@@ -1296,6 +1202,13 @@ impl SettingsDraft {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum UnmountChoice {
+    Wait,
+    Now,
+    Cancel,
+}
+
 #[derive(Debug, Clone)]
 enum Message {
     ProgramLog(program_log::Message),
@@ -1336,7 +1249,7 @@ enum Message {
         results: Vec<(String, u64, MountObservation)>,
     },
     TransferTick,
-    TransfersLoaded(Vec<(String, Result<TransferSnapshot, String>)>),
+    TransfersLoaded(Vec<(FeedbackRequest, Result<TransferSnapshot, String>)>),
     NotificationFinished(Result<(), String>),
     PopupOpened(window::Id),
     ClosePopup(window::Id),
@@ -1386,7 +1299,6 @@ enum Message {
     OpenBatchManagement,
     OpenTransfers,
     CloseTransfers,
-    CloseTransfersDecision(rfd::MessageDialogResult),
     OpenSettings,
     OpenLogChooser,
     LogWindowOpened(window::Id),
@@ -1408,15 +1320,12 @@ enum Message {
     AddMountMapping,
     RemovePrimaryMapping,
     RemoveMountMapping(usize),
-    MappingRemoteBaseChanged(usize, String),
-    MappingRemoteSuffixChanged(usize, String),
     MappingLocalChanged(usize, String),
     MappingLocalChoice(usize, String),
     MappingBrowse(usize),
     MappingPicked(String, Option<PathBuf>),
     MountConnection(String, MountOperation),
-    RemoteBaseChanged(String),
-    RemoteSuffixChanged(String),
+    RemotePathChanged(MappingRow, RemotePathChange),
     MountpointChoiceChanged(String),
     CustomMountpointChanged(String),
     BrowseMountpoint,
@@ -1483,7 +1392,7 @@ enum Message {
     #[cfg(windows)]
     StartupDependenciesChecked(Result<DependencyStatus, String>),
     CapacityTick,
-    CapacitiesLoaded(Vec<(String, Result<Option<CapacityInfo>, String>)>),
+    CapacitiesLoaded(Vec<(FeedbackRequest, Result<Option<CapacityInfo>, String>)>),
     LanguageChanged(Language),
     AppearanceModeChanged(AppearanceMode),
     AccentColorChanged(AccentColor),
@@ -1501,7 +1410,7 @@ enum Message {
     CancelPendingUnmount(String),
     UnmountWaitDecision {
         ids: Vec<String>,
-        result: rfd::MessageDialogResult,
+        choice: UnmountChoice,
     },
     UnmountNowDecision {
         ids: Vec<String>,
@@ -1535,12 +1444,6 @@ enum Message {
     },
 }
 
-#[derive(Debug, Clone)]
-struct ServerMutation {
-    servers: Vec<ServerConfig>,
-    warning: Option<String>,
-}
-
 fn source_config_mutation(message: &Message) -> bool {
     matches!(message,
         Message::ConnectionFieldChanged(field, _) if !matches!(field, ConnectionField::Name | ConnectionField::SshConfigPath))
@@ -1567,8 +1470,6 @@ fn is_editor_mutation(message: &Message) -> bool {
             | Message::SaiSetup(_)
             | Message::RemovePrimaryMapping
             | Message::RemoveMountMapping(_)
-            | Message::MappingRemoteBaseChanged(_, _)
-            | Message::MappingRemoteSuffixChanged(_, _)
             | Message::MappingLocalChanged(_, _)
             | Message::MappingLocalChoice(_, _)
             | Message::MappingBrowse(_)
@@ -1578,8 +1479,7 @@ fn is_editor_mutation(message: &Message) -> bool {
             | Message::BatchImportSourceChanged(_)
             | Message::ConnectionFieldChanged(_, _)
             | Message::ConnectionTagsChanged(_)
-            | Message::RemoteBaseChanged(_)
-            | Message::RemoteSuffixChanged(_)
+            | Message::RemotePathChanged(_, _)
             | Message::MountpointChoiceChanged(_)
             | Message::CustomMountpointChanged(_)
             | Message::BrowseMountpoint
@@ -1626,13 +1526,6 @@ fn is_editor_mutation(message: &Message) -> bool {
             | Message::OpenBatchManagement
             | Message::ImportConnections
     )
-}
-
-#[derive(Debug, Clone)]
-struct SettingsMutation {
-    settings: Settings,
-    servers: Vec<ServerConfig>,
-    warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1733,7 +1626,10 @@ impl App {
                 iced::time::every(Duration::from_millis(250)).map(|_| Message::UpdateProgressTick),
             );
         }
-        if matches!(self.screen, Screen::ConnectionEditor | Screen::Settings) {
+        if matches!(
+            self.navigation.current(),
+            Screen::ConnectionEditor | Screen::Settings
+        ) {
             subscriptions.push(iced::event::listen_with(editor_keyboard_event));
         }
         subscriptions.extend(self.interactive_terminals.values().map(|session| {
@@ -1887,11 +1783,8 @@ impl App {
             next_status_read: 0,
             busy: HashSet::new(),
             host_key_prompts: VecDeque::new(),
-            transfers: HashMap::new(),
-            transfer_history: HashMap::new(),
-            transfer_errors: HashMap::new(),
             operation_errors: HashMap::new(),
-            transfer_failures: HashMap::new(),
+            mount_feedback: MountFeedbacks::default(),
             transfer_refreshing: false,
             main_window,
             main_window_ready: false,
@@ -1907,19 +1800,12 @@ impl App {
             transfer_popup: None,
             transfer_popup_expanded: false,
             dismissed_popups: HashSet::new(),
-            synced_polls: HashMap::new(),
             notification_tracker: TransferNotificationTracker::default(),
             pending_unmount_after_sync: HashSet::new(),
             confirmed_unmounts: HashSet::new(),
             popup_close_notice_shown: false,
-            screen,
-            connection_draft: None,
-            sai_setup: sai_setup::State::default(),
-            connection_tags_input: String::new(),
-            connection_custom_mountpoint: String::new(),
-            windows_drive_letters: Vec::new(),
-            mountpoint_preflight: MountpointPreflight::NotRequired,
-            mountpoint_preflight_queue: MountpointPreflightQueue::default(),
+            navigation: Navigation::new(screen == Screen::TransferCenter),
+            editor: ConnectionEditor::default(),
             settings_draft: None,
             log_view: None,
             log_window: None,
@@ -1930,9 +1816,6 @@ impl App {
             terminal_error: None,
             custom_setting: None,
             editor_saving: false,
-            ssh_import_loading: false,
-            ssh_import_plan: None,
-            ssh_import_actions: Vec::new(),
             pending_delete: None,
             settings_recovery_dialog,
             program_log: {
@@ -1959,8 +1842,6 @@ impl App {
             dependency_checking: false,
             win_fsp_install_pending: false,
             win_fsp_pending_mounts: HashSet::new(),
-            capacities: HashMap::new(),
-            capacity_errors: HashSet::new(),
             capacity_refreshing: false,
             capacity_refresh_pending: false,
         };
@@ -1996,7 +1877,7 @@ impl App {
         if self.editor_saving && is_editor_mutation(&message) {
             return Task::none();
         }
-        if self.sai_setup.in_progress()
+        if self.editor.sai.in_progress()
             && is_editor_mutation(&message)
             && !matches!(
                 message,
@@ -2005,11 +1886,10 @@ impl App {
         {
             return Task::none();
         }
-        if let Some(draft) = &self.connection_draft {
+        if let Some(draft) = &self.editor.draft {
             let row = match &message {
                 Message::RemoveMountMapping(i)
-                | Message::MappingRemoteBaseChanged(i, _)
-                | Message::MappingRemoteSuffixChanged(i, _)
+                | Message::RemotePathChanged(MappingRow::Additional(i), _)
                 | Message::MappingLocalChanged(i, _)
                 | Message::MappingLocalChoice(i, _)
                 | Message::MappingBrowse(i) => Some(*i),
@@ -2019,8 +1899,7 @@ impl App {
             let path_message = matches!(
                 message,
                 Message::RemovePrimaryMapping
-                    | Message::RemoteBaseChanged(_)
-                    | Message::RemoteSuffixChanged(_)
+                    | Message::RemotePathChanged(MappingRow::Primary, _)
                     | Message::MountpointChoiceChanged(_)
                     | Message::CustomMountpointChanged(_)
                     | Message::BrowseMountpoint
@@ -2042,14 +1921,15 @@ impl App {
                     && !path_message
                     && row.is_none()
                     && !matches!(message, Message::CancelEditor | Message::AddMountMapping)
-                    && !matches!(&message, Message::SaiSetup(inner) if self.sai_setup.allows_while_mounted(inner))
+                    && !matches!(&message, Message::SaiSetup(inner) if self.editor.sai.allows_while_mounted(inner))
                 {
                     return Task::none();
                 }
             }
         }
         if self
-            .connection_draft
+            .editor
+            .draft
             .as_ref()
             .is_some_and(|d| d.source == ConnectionSource::SshConfig)
             && source_config_mutation(&message)
@@ -2057,16 +1937,16 @@ impl App {
             return Task::none();
         }
         let task = self.update_message(message);
-        if self.screen != Screen::ConnectionEditor
-            || self.connection_draft.as_ref().is_none_or(|draft| {
+        if self.navigation.context() != Screen::ConnectionEditor
+            || self.editor.draft.as_ref().is_none_or(|draft| {
                 draft.source != ConnectionSource::SaiCluster
                     || draft
                         .editing_id
                         .as_deref()
-                        .is_some_and(|id| !self.can_modify(id) && !self.sai_setup.directory_only())
+                        .is_some_and(|id| !self.can_modify(id) && !self.editor.sai.directory_only())
             })
         {
-            self.sai_setup.reset();
+            self.editor.sai.reset();
         }
         self.sync_tray();
         self.program_log.set_locale(self.locale());
@@ -2083,9 +1963,13 @@ impl App {
             Message::FocusEditorField { window, backwards } => {
                 if window == self.main_window
                     && !self.editor_saving
-                    && matches!(self.screen, Screen::ConnectionEditor | Screen::Settings)
+                    && matches!(
+                        self.navigation.current(),
+                        Screen::ConnectionEditor | Screen::Settings
+                    )
                 {
-                    let scope = if self.screen == Screen::Settings && self.custom_setting.is_some()
+                    let scope = if self.navigation.current() == Screen::Settings
+                        && self.custom_setting.is_some()
                     {
                         CUSTOM_SETTING_FOCUS_SCOPE
                     } else {
@@ -2284,11 +2168,7 @@ impl App {
             Message::Refresh => match storage::load_servers(&self.paths) {
                 Ok(servers) => {
                     self.servers = servers;
-                    self.mount_targets = self
-                        .servers
-                        .iter()
-                        .flat_map(ServerConfig::mount_targets)
-                        .collect();
+                    self.refresh_mount_targets();
                     self.selected_connections
                         .retain(|id| self.servers.iter().any(|server| server.id == *id));
                     self.status = self
@@ -2376,12 +2256,8 @@ impl App {
                 }
                 let mut tasks: Vec<_> = unmounted
                     .iter()
-                    .map(|id| self.close_popups_for_server(id))
+                    .map(|id| self.clear_mount_feedback(id))
                     .collect();
-                for id in &unmounted {
-                    self.capacities.remove(id);
-                    self.capacity_errors.remove(id);
-                }
                 tasks.push(self.capacity_task());
                 tasks.push(set_native_global_progress(
                     self.main_window,
@@ -2414,20 +2290,23 @@ impl App {
             Message::CapacitiesLoaded(results) => {
                 self.capacity_refreshing = false;
                 let mut recheck = Vec::new();
-                for (id, result) in results {
+                for (request, result) in results {
+                    let Some(state) = self.mount_feedback.accept(&request) else {
+                        continue;
+                    };
                     match result {
                         Ok(Some(capacity)) => {
-                            self.capacities.insert(id.clone(), capacity);
-                            self.capacity_errors.remove(&id);
+                            state.capacity = Some(capacity);
+                            state.capacity_failed = false;
                         }
                         Ok(None) => {
-                            self.capacities.remove(&id);
-                            recheck.push(id.clone());
-                            self.capacity_errors.insert(id);
+                            state.capacity = None;
+                            state.capacity_failed = true;
+                            recheck.push(request.id);
                         }
                         Err(_) => {
-                            recheck.push(id.clone());
-                            self.capacity_errors.insert(id);
+                            state.capacity_failed = true;
+                            recheck.push(request.id);
                         }
                     }
                 }
@@ -2445,56 +2324,42 @@ impl App {
                 let previous_active = self.active_transfer_ids();
                 let mut notifications = Vec::new();
                 let mut recheck = Vec::new();
-                for (id, result) in results {
+                for (request, result) in results {
+                    let Some(state) = self.mount_feedback.accept(&request) else {
+                        continue;
+                    };
+                    let id = request.id;
                     match result {
                         Ok(snapshot) => {
-                            let snapshot = self.smooth_transfer_snapshot(&id, snapshot);
-                            self.transfer_failures.remove(&id);
-                            let synced_polls = if snapshot.synced {
-                                let polls = self.synced_polls.entry(id.clone()).or_default();
-                                *polls = polls.saturating_add(1);
-                                *polls
-                            } else {
-                                self.synced_polls.remove(&id);
-                                0
-                            };
+                            let (snapshot, synced_polls) = state.transfers.update(snapshot);
                             let display_name = self
                                 .mount_targets
                                 .iter()
                                 .find(|server| server.id == id)
-                                .map(|server| server.display_name().to_owned())
-                                .unwrap_or_else(|| id.clone());
+                                .map(|server| server.display_name())
+                                .unwrap_or(&id);
                             notifications.extend(self.notification_tracker.observe(
                                 &id,
-                                &display_name,
-                                &snapshot,
+                                display_name,
+                                snapshot,
                                 synced_polls,
                                 locale,
                             ));
-                            self.transfers.insert(id.clone(), snapshot);
-                            self.transfer_errors.remove(&id);
                         }
                         Err(error) => {
                             recheck.push(id.clone());
-                            let failures = self.transfer_failures.entry(id.clone()).or_default();
-                            *failures = failures.saturating_add(1);
-                            if transfer_failure_is_visible(*failures) {
-                                if self.transfer_errors.get(&id) != Some(&error) {
-                                    let name = self
-                                        .mount_targets
-                                        .iter()
-                                        .find(|server| server.id == id)
-                                        .map_or(id.as_str(), ServerConfig::display_name);
-                                    self.program_log.warning(match locale {
-                                        Locale::English => {
-                                            format!("{name}: Transfer status unavailable: {error}")
-                                        }
-                                        Locale::Chinese => {
-                                            format!("{name}：无法获取传输状态：{error}")
-                                        }
-                                    });
-                                }
-                                self.transfer_errors.insert(id, error);
+                            if state.transfers.fail(error.clone()) {
+                                let name = self
+                                    .mount_targets
+                                    .iter()
+                                    .find(|server| server.id == id)
+                                    .map_or(id.as_str(), ServerConfig::display_name);
+                                self.program_log.warning(match locale {
+                                    Locale::English => {
+                                        format!("{name}: Transfer status unavailable: {error}")
+                                    }
+                                    Locale::Chinese => format!("{name}：无法获取传输状态：{error}"),
+                                });
                             }
                         }
                     }
@@ -2509,13 +2374,7 @@ impl App {
                 let ready_unmounts = self
                     .pending_unmount_after_sync
                     .iter()
-                    .filter(|id| {
-                        self.transfers
-                            .get(*id)
-                            .is_some_and(|snapshot| snapshot.synced)
-                            && self.synced_polls.get(*id).copied().unwrap_or(0) >= 2
-                            && !self.transfer_errors.contains_key(*id)
-                    })
+                    .filter(|id| self.mount_feedback.synced(id))
                     .cloned()
                     .collect::<Vec<_>>();
                 for id in &ready_unmounts {
@@ -2653,22 +2512,22 @@ impl App {
                     return Task::none();
                 }
                 let mut draft = ConnectionDraft::default();
-                self.sai_setup.reset();
+                self.editor.sai.reset();
                 draft.ssh_config_path = default_ssh_config_path().display().to_string();
-                self.connection_draft = Some(draft);
-                self.connection_tags_input.clear();
-                self.connection_custom_mountpoint.clear();
+                self.editor.draft = Some(draft);
+                self.editor.tags_input.clear();
+                self.editor.custom_mountpoint.clear();
                 self.invalidate_mountpoint_preflight();
-                self.ssh_import_plan = None;
-                self.ssh_import_actions.clear();
-                self.screen = Screen::ConnectionEditor;
+                self.editor.import_plan = None;
+                self.editor.import_actions.clear();
+                self.navigation.show(Screen::ConnectionEditor);
                 self.status = self
                     .program_log
                     .info(locale.text(TextKey::NewConnection).into());
                 match available_windows_drive_letters() {
-                    Ok(drives) => self.windows_drive_letters = drives,
+                    Ok(drives) => self.editor.drives = drives,
                     Err(error) => {
-                        self.windows_drive_letters.clear();
+                        self.editor.drives.clear();
                         self.status = self.program_log.error(error.to_string());
                     }
                 }
@@ -2862,11 +2721,7 @@ impl App {
                 Ok(servers) => {
                     self.connection_list_saving = false;
                     self.servers = servers;
-                    self.mount_targets = self
-                        .servers
-                        .iter()
-                        .flat_map(ServerConfig::mount_targets)
-                        .collect();
+                    self.refresh_mount_targets();
                     if self.connection_tag_filter.as_ref().is_some_and(|filter| {
                         !self
                             .servers
@@ -2908,13 +2763,9 @@ impl App {
                     .map(|s| s.id.clone())
                     .filter(|id| self.paths.state_file(id).exists())
                     .collect::<Vec<_>>();
-                let (unsafe_ids, safe_ids): (Vec<_>, Vec<_>) = ids.into_iter().partition(|id| {
-                    unmount_needs_confirmation(
-                        self.transfers.get(id),
-                        self.transfer_errors.contains_key(id),
-                        self.synced_polls.get(id).copied().unwrap_or(0),
-                    )
-                });
+                let (unsafe_ids, safe_ids): (Vec<_>, Vec<_>) = ids
+                    .into_iter()
+                    .partition(|id| !self.mount_feedback.synced(id));
                 let mut tasks = Vec::new();
                 for id in safe_ids {
                     tasks.push(self.handle_mount_command(id, MountOperation::Unmount));
@@ -2965,11 +2816,7 @@ impl App {
                 match result {
                     Ok(outcome) => {
                         self.servers = outcome.servers;
-                        self.mount_targets = self
-                            .servers
-                            .iter()
-                            .flat_map(ServerConfig::mount_targets)
-                            .collect();
+                        self.refresh_mount_targets();
                         self.status = self.program_log.publish(
                             if outcome.warning.is_some() {
                                 LogLevel::Warning
@@ -3128,11 +2975,7 @@ impl App {
                     Ok(outcome) => {
                         let terminal_task = self.reconcile_interactive_sessions(&outcome.servers);
                         self.servers = outcome.servers;
-                        self.mount_targets = self
-                            .servers
-                            .iter()
-                            .flat_map(ServerConfig::mount_targets)
-                            .collect();
+                        self.refresh_mount_targets();
                         self.selected_connections
                             .retain(|id| self.servers.iter().any(|server| server.id == *id));
                         self.status = self.program_log.publish(
@@ -3220,11 +3063,7 @@ impl App {
                 Ok(servers) => {
                     self.connection_list_saving = false;
                     self.servers = servers;
-                    self.mount_targets = self
-                        .servers
-                        .iter()
-                        .flat_map(ServerConfig::mount_targets)
-                        .collect();
+                    self.refresh_mount_targets();
                     self.reorder_original = None;
                     self.connection_list_mode = ConnectionListMode::Browse;
                     self.status = self.program_log.info(match locale {
@@ -3258,7 +3097,7 @@ impl App {
                     return Task::none();
                 }
                 self.settings_draft = None;
-                self.screen = Screen::Connections;
+                self.navigation.show(Screen::Connections);
                 self.connection_list_mode = ConnectionListMode::Batch;
                 self.selected_connections.clear();
                 self.status = self.program_log.info(match locale {
@@ -3266,48 +3105,19 @@ impl App {
                     Locale::Chinese => "批量管理连接".into(),
                 });
             }
-            Message::OpenTransfers => {
-                self.screen = Screen::TransferCenter;
+            Message::OpenTransfers => return self.open_transfer_center(),
+            Message::CloseTransfers => {
+                self.navigation.close_transfers();
                 self.status = self
                     .program_log
-                    .info(locale.text(TextKey::TransferCenter).into());
-                return self.transfer_task();
-            }
-            Message::CloseTransfers => {
-                if !self.active_transfer_ids().is_empty() {
-                    let description = match locale {
-                        Locale::English => {
-                            "Uploads are still pending. Closing the transfer center only hides this view; transfers continue in the background and mounted drives must remain available. Close the view?"
+                    .info(if self.active_transfer_ids().is_empty() {
+                        locale.text(TextKey::Ready).into()
+                    } else {
+                        match locale {
+                            Locale::English => "Uploads continue in the background".into(),
+                            Locale::Chinese => "上传仍在后台继续".into(),
                         }
-                        Locale::Chinese => {
-                            "仍有待上传任务。关闭传输中心只会隐藏此页面，传输仍在后台继续，挂载必须保持可用。是否关闭此页面？"
-                        }
-                    };
-                    return Task::perform(
-                        async move {
-                            rfd::AsyncMessageDialog::new()
-                                .set_title(APP_NAME)
-                                .set_description(description)
-                                .set_buttons(rfd::MessageButtons::YesNo)
-                                .show()
-                                .await
-                        },
-                        Message::CloseTransfersDecision,
-                    );
-                }
-                self.screen = Screen::Connections;
-                self.status = self.program_log.info(locale.text(TextKey::Ready).into());
-            }
-            Message::CloseTransfersDecision(result) => {
-                if result == rfd::MessageDialogResult::Yes {
-                    self.screen = Screen::Connections;
-                    self.status = self.program_log.info(match locale {
-                        Locale::English => {
-                            "Transfer center hidden; uploads continue in the background".into()
-                        }
-                        Locale::Chinese => "传输中心已隐藏；上传仍在后台继续".into(),
                     });
-                }
             }
             Message::OpenSettings => {
                 if self.connection_list_saving || self.editor_saving {
@@ -3322,7 +3132,7 @@ impl App {
                     })
                     .collect();
                 self.settings_draft = Some(draft);
-                self.screen = Screen::Settings;
+                self.navigation.show(Screen::Settings);
                 self.status = self.program_log.info(locale.text(TextKey::Settings).into());
                 self.dependency_checking = true;
                 return Task::batch([
@@ -3403,13 +3213,13 @@ impl App {
             }
             Message::CancelEditor => {
                 if !self.editor_saving {
-                    self.sai_setup.reset();
-                    self.connection_draft = None;
+                    self.editor.sai.reset();
+                    self.editor.draft = None;
                     self.settings_draft = None;
-                    self.ssh_import_plan = None;
-                    self.ssh_import_actions.clear();
+                    self.editor.import_plan = None;
+                    self.editor.import_actions.clear();
                     self.invalidate_mountpoint_preflight();
-                    self.screen = Screen::Connections;
+                    self.navigation.show(Screen::Connections);
                     self.status = self
                         .program_log
                         .info(self.locale().text(TextKey::Ready).into());
@@ -3417,8 +3227,8 @@ impl App {
                 }
             }
             Message::ConnectionSourceChanged(source) => {
-                self.sai_setup.reset();
-                if let Some(draft) = &mut self.connection_draft {
+                self.editor.sai.reset();
+                if let Some(draft) = &mut self.editor.draft {
                     draft.source = source;
                     if matches!(
                         source,
@@ -3440,15 +3250,15 @@ impl App {
                         }
                         return self.load_ssh_config();
                     }
-                    self.ssh_import_plan = None;
-                    self.ssh_import_actions.clear();
+                    self.editor.import_plan = None;
+                    self.editor.import_actions.clear();
                 }
             }
             Message::BatchImportSourceChanged(source) => {
-                if let Some(draft) = &mut self.connection_draft {
+                if let Some(draft) = &mut self.editor.draft {
                     draft.batch_import_source = source;
-                    self.ssh_import_plan = None;
-                    self.ssh_import_actions.clear();
+                    self.editor.import_plan = None;
+                    self.editor.import_actions.clear();
                     draft.ssh_config_path = if source == BatchImportSource::SshConfig {
                         default_ssh_config_path().display().to_string()
                     } else {
@@ -3461,19 +3271,21 @@ impl App {
             }
             Message::SaiSetup(message) => {
                 let can_configure = self
-                    .connection_draft
+                    .editor
+                    .draft
                     .as_ref()
                     .and_then(|draft| draft.editing_id.as_ref())
                     .is_none_or(|id| self.can_modify(id));
-                if self.screen == Screen::ConnectionEditor
-                    && let Some(draft) = &mut self.connection_draft
+                if self.navigation.context() == Screen::ConnectionEditor
+                    && let Some(draft) = &mut self.editor.draft
                     && draft.source == ConnectionSource::SaiCluster
                 {
-                    let previous = self.sai_setup.feedback(locale);
+                    let previous = self.editor.sai.feedback(locale);
                     let cancelled = matches!(message, sai_setup::Message::Cancel);
-                    let directory_only = self.sai_setup.directory_only();
+                    let directory_only = self.editor.sai.directory_only();
                     let (task, configured) =
-                        self.sai_setup
+                        self.editor
+                            .sai
                             .update(message, &self.paths.data_dir, locale, draft);
                     match configured {
                         Some(sai_setup::Outcome::Configured(configured)) if can_configure => {
@@ -3499,7 +3311,7 @@ impl App {
                         }
                         _ => {}
                     }
-                    let feedback = self.sai_setup.feedback(locale);
+                    let feedback = self.editor.sai.feedback(locale);
                     if feedback != previous
                         && let Some((level, message)) = feedback
                     {
@@ -3516,7 +3328,7 @@ impl App {
                 }
             }
             Message::ConnectionFieldChanged(field, value) => {
-                if let Some(draft) = &mut self.connection_draft {
+                if let Some(draft) = &mut self.editor.draft {
                     match field {
                         ConnectionField::Name => draft.name = value,
                         ConnectionField::HostAlias => draft.host_alias = value,
@@ -3528,15 +3340,15 @@ impl App {
                         ConnectionField::KeyFile => draft.key_file = value,
                         ConnectionField::SshConfigPath => {
                             draft.ssh_config_path = value;
-                            self.ssh_import_plan = None;
-                            self.ssh_import_actions.clear();
+                            self.editor.import_plan = None;
+                            self.editor.import_actions.clear();
                         }
                     }
                 }
             }
             Message::ConnectionTagsChanged(value) => {
-                self.connection_tags_input = value.clone();
-                if let Some(draft) = &mut self.connection_draft {
+                self.editor.tags_input = value.clone();
+                if let Some(draft) = &mut self.editor.draft {
                     draft.tags = parse_tag_input(&value);
                     draft.folder.clear();
                 }
@@ -3552,11 +3364,7 @@ impl App {
                 let mut tasks = Vec::new();
                 for id in ids {
                     if operation == MountOperation::Unmount
-                        && unmount_needs_confirmation(
-                            self.transfers.get(&id),
-                            self.transfer_errors.contains_key(&id),
-                            self.synced_polls.get(&id).copied().unwrap_or(0),
-                        )
+                        && !self.mount_feedback.synced(&id)
                         && self.mount_status(&id) == Some(MountStatus::Mounted)
                     {
                         unsafe_ids.push(id);
@@ -3570,14 +3378,14 @@ impl App {
                 return Task::batch(tasks);
             }
             Message::RemovePrimaryMapping => {
-                if let Some(draft) = &mut self.connection_draft
+                if let Some(draft) = &mut self.editor.draft
                     && !draft.mounts.is_empty()
                 {
                     draft.primary_mount = false;
                 }
             }
             Message::AddMountMapping => {
-                if let Some(draft) = &mut self.connection_draft
+                if let Some(draft) = &mut self.editor.draft
                     && draft.mounts.len() + usize::from(draft.primary_mount) < 64
                 {
                     draft
@@ -3586,36 +3394,18 @@ impl App {
                 }
             }
             Message::RemoveMountMapping(index) => {
-                if let Some(draft) = &mut self.connection_draft
+                if let Some(draft) = &mut self.editor.draft
                     && index < draft.mounts.len()
                     && (draft.primary_mount || draft.mounts.len() > 1)
                 {
                     draft.mounts.remove(index);
                 }
             }
-            Message::MappingRemoteBaseChanged(index, base) => {
-                if let Some(mapping) = self
-                    .connection_draft
-                    .as_mut()
-                    .and_then(|d| d.mounts.get_mut(index))
-                {
-                    let (_, suffix) = split_remote_path(&mapping.remote_path);
-                    mapping.remote_path = compose_remote_path(&base, &suffix);
-                }
-            }
-            Message::MappingRemoteSuffixChanged(index, suffix) => {
-                if let Some(mapping) = self
-                    .connection_draft
-                    .as_mut()
-                    .and_then(|d| d.mounts.get_mut(index))
-                {
-                    let (base, _) = split_remote_path(&mapping.remote_path);
-                    mapping.remote_path = compose_remote_path(&base, &suffix);
-                }
-            }
+            Message::RemotePathChanged(row, change) => self.editor.change_remote_path(row, change),
             Message::MappingLocalChanged(index, value) => {
                 if let Some(mapping) = self
-                    .connection_draft
+                    .editor
+                    .draft
                     .as_mut()
                     .and_then(|d| d.mounts.get_mut(index))
                 {
@@ -3624,7 +3414,8 @@ impl App {
             }
             Message::MappingLocalChoice(index, value) => {
                 if let Some(mapping) = self
-                    .connection_draft
+                    .editor
+                    .draft
                     .as_mut()
                     .and_then(|d| d.mounts.get_mut(index))
                 {
@@ -3633,7 +3424,8 @@ impl App {
             }
             Message::MappingBrowse(index) => {
                 let Some(id) = self
-                    .connection_draft
+                    .editor
+                    .draft
                     .as_ref()
                     .and_then(|d| d.mounts.get(index))
                     .map(|m| m.id.clone())
@@ -3653,7 +3445,8 @@ impl App {
             Message::MappingPicked(id, path) => {
                 if let Some(path) = path
                     && let Some(mapping) = self
-                        .connection_draft
+                        .editor
+                        .draft
                         .as_mut()
                         .and_then(|d| d.mounts.iter_mut().find(|m| m.id == id))
                 {
@@ -3662,28 +3455,15 @@ impl App {
                         .to_string();
                 }
             }
-            Message::RemoteBaseChanged(base) => {
-                if let Some(draft) = &mut self.connection_draft {
-                    let (_, suffix) = split_remote_path(&draft.remote_path);
-                    draft.remote_path = compose_remote_path(&base, &suffix);
-                }
-            }
-            Message::RemoteSuffixChanged(suffix) => {
-                if let Some(draft) = &mut self.connection_draft {
-                    let (base, _) = split_remote_path(&draft.remote_path);
-                    draft.remote_path = compose_remote_path(&base, &suffix);
-                }
-            }
             Message::MountpointChoiceChanged(choice) => {
-                if let Some(draft) = &mut self.connection_draft {
+                if let Some(draft) = &mut self.editor.draft {
                     if mountpoint_choice(&draft.mountpoint) == "custom"
                         && draft.mountpoint != CUSTOM_MOUNTPOINT_PENDING
                     {
-                        self.connection_custom_mountpoint =
-                            custom_mountpoint_value(&draft.mountpoint);
+                        self.editor.custom_mountpoint = custom_mountpoint_value(&draft.mountpoint);
                     }
                     draft.mountpoint =
-                        mountpoint_value_for_choice(&choice, &self.connection_custom_mountpoint);
+                        mountpoint_value_for_choice(&choice, &self.editor.custom_mountpoint);
                 }
                 if choice == "custom" {
                     return self.start_mountpoint_preflight();
@@ -3691,8 +3471,8 @@ impl App {
                 self.invalidate_mountpoint_preflight();
             }
             Message::CustomMountpointChanged(value) => {
-                self.connection_custom_mountpoint = value.clone();
-                if let Some(draft) = &mut self.connection_draft {
+                self.editor.custom_mountpoint = value.clone();
+                if let Some(draft) = &mut self.editor.draft {
                     draft.mountpoint = custom_mountpoint_draft_value(value);
                 }
                 return self.start_mountpoint_preflight();
@@ -3715,20 +3495,21 @@ impl App {
             }
             Message::MountpointPicked(Some(parent)) => {
                 let name = self
-                    .connection_draft
+                    .editor
+                    .draft
                     .as_ref()
                     .map(|draft| draft.name.as_str())
                     .unwrap_or("mount");
                 let path = suggested_mountpoint(&parent, name).display().to_string();
-                self.connection_custom_mountpoint = path.clone();
-                if let Some(draft) = &mut self.connection_draft {
+                self.editor.custom_mountpoint = path.clone();
+                if let Some(draft) = &mut self.editor.draft {
                     draft.mountpoint = path;
                 }
                 return self.start_mountpoint_preflight();
             }
             Message::MountpointPicked(None) => {}
             Message::MountpointPreflightReady(generation) => {
-                self.mountpoint_preflight_queue.mark_ready(generation);
+                self.editor.preflight_queue.mark_ready(generation);
                 return self.run_ready_mountpoint_preflight();
             }
             Message::MountpointPreflightFinished {
@@ -3736,21 +3517,21 @@ impl App {
                 value,
                 result,
             } => {
-                self.mountpoint_preflight_queue.finish(generation);
-                let current = self.connection_draft.as_ref().map(|draft| {
+                self.editor.preflight_queue.finish(generation);
+                let current = self.editor.draft.as_ref().map(|draft| {
                     if draft.mountpoint == CUSTOM_MOUNTPOINT_PENDING {
-                        self.connection_custom_mountpoint.trim()
+                        self.editor.custom_mountpoint.trim()
                     } else {
                         draft.mountpoint.trim()
                     }
                 });
                 if mountpoint_preflight_result_is_current(
                     generation,
-                    self.mountpoint_preflight_queue.generation,
+                    self.editor.preflight_queue.generation,
                     &value,
                     current,
                 ) {
-                    self.mountpoint_preflight = match result {
+                    self.editor.preflight = match result {
                         Ok(()) => MountpointPreflight::Valid(value),
                         Err(error) => {
                             self.program_log.error(error.clone());
@@ -3761,32 +3542,32 @@ impl App {
                 return self.run_ready_mountpoint_preflight();
             }
             Message::ConnectionAuthChanged(auth) => {
-                if let Some(draft) = &mut self.connection_draft {
+                if let Some(draft) = &mut self.editor.draft {
                     draft.auth = auth;
                 }
             }
             Message::ConnectionMethodChanged(method) => {
-                if let Some(draft) = &mut self.connection_draft {
+                if let Some(draft) = &mut self.editor.draft {
                     draft.set_connection_method(method);
                 }
             }
             Message::PasswordChanged(value) => {
-                if let Some(draft) = &mut self.connection_draft {
+                if let Some(draft) = &mut self.editor.draft {
                     draft.password = value.0;
                 }
             }
             Message::KeyPassphraseChanged(value) => {
-                if let Some(draft) = &mut self.connection_draft {
+                if let Some(draft) = &mut self.editor.draft {
                     draft.key_passphrase = value.0;
                 }
             }
             Message::ClearSecret(kind) => {
-                if let Some(draft) = &mut self.connection_draft {
+                if let Some(draft) = &mut self.editor.draft {
                     draft.clear_preserved_secret(kind);
                 }
             }
             Message::ManagedSshChanged(value) => {
-                if let Some(draft) = &mut self.connection_draft {
+                if let Some(draft) = &mut self.editor.draft {
                     draft.ssh_config_managed = value;
                     if !value {
                         draft.copy_key_to_ssh_dir = false;
@@ -3794,12 +3575,12 @@ impl App {
                 }
             }
             Message::CopyKeyChanged(value) => {
-                if let Some(draft) = &mut self.connection_draft {
+                if let Some(draft) = &mut self.editor.draft {
                     draft.copy_key_to_ssh_dir = value;
                 }
             }
             Message::ConnectionStartupChanged(value) => {
-                if let Some(draft) = &mut self.connection_draft
+                if let Some(draft) = &mut self.editor.draft
                     && draft.connection_method != ConnectionMethod::Interactive
                 {
                     draft.auto_mount_at_login = value;
@@ -3820,10 +3601,10 @@ impl App {
                 );
             }
             Message::SshConfigPicked(Some(path)) => {
-                if let Some(draft) = &mut self.connection_draft {
+                if let Some(draft) = &mut self.editor.draft {
                     draft.ssh_config_path = path.display().to_string();
-                    self.ssh_import_plan = None;
-                    self.ssh_import_actions.clear();
+                    self.editor.import_plan = None;
+                    self.editor.import_actions.clear();
                     return self.load_ssh_config();
                 }
             }
@@ -3845,10 +3626,10 @@ impl App {
                 );
             }
             Message::BatchImportPicked(Some(path)) => {
-                if let Some(draft) = &mut self.connection_draft {
+                if let Some(draft) = &mut self.editor.draft {
                     draft.ssh_config_path = path.display().to_string();
-                    self.ssh_import_plan = None;
-                    self.ssh_import_actions.clear();
+                    self.editor.import_plan = None;
+                    self.editor.import_actions.clear();
                     return self.load_ssh_config();
                 }
             }
@@ -3867,7 +3648,7 @@ impl App {
                 );
             }
             Message::PrivateKeyPicked(Some(path)) => {
-                if let Some(draft) = &mut self.connection_draft {
+                if let Some(draft) = &mut self.editor.draft {
                     draft.key_file = path.display().to_string();
                 }
             }
@@ -3877,11 +3658,11 @@ impl App {
                 config_path,
                 result,
             } => {
-                self.ssh_import_loading = false;
+                self.editor.import_loading = false;
                 if self.editor_saving {
                     return Task::none();
                 }
-                let request_is_current = self.connection_draft.as_ref().is_some_and(|draft| {
+                let request_is_current = self.editor.draft.as_ref().is_some_and(|draft| {
                     matches!(
                         draft.source,
                         ConnectionSource::SshConfig | ConnectionSource::SshConfigBatch
@@ -3897,18 +3678,20 @@ impl App {
                 }
                 match result {
                     Ok(plan) => {
-                        self.ssh_import_actions = plan
+                        self.editor.import_actions = plan
                             .items
                             .iter()
                             .map(|item| item.default_action())
                             .collect();
                         if self
-                            .connection_draft
+                            .editor
+                            .draft
                             .as_ref()
                             .is_some_and(|draft| draft.source == ConnectionSource::SshConfig)
                         {
                             let selected = self
-                                .connection_draft
+                                .editor
+                                .draft
                                 .as_ref()
                                 .map(|draft| draft.host_alias.as_str())
                                 .unwrap_or_default();
@@ -3919,9 +3702,7 @@ impl App {
                                 .find(|server| server.host_alias == selected)
                                 .or_else(|| plan.items.iter().find_map(|item| item.server.as_ref()))
                                 .cloned();
-                            if let (Some(draft), Some(server)) =
-                                (&mut self.connection_draft, server)
-                            {
+                            if let (Some(draft), Some(server)) = (&mut self.editor.draft, server) {
                                 draft.apply_imported_server(&server);
                             }
                         }
@@ -3931,18 +3712,19 @@ impl App {
                             .filter(|item| item.status != ImportStatus::Invalid)
                             .count();
                         self.status = self.program_log.info(locale.loaded_ssh_hosts(valid));
-                        self.ssh_import_plan = Some(plan);
+                        self.editor.import_plan = Some(plan);
                     }
                     Err(error) => {
-                        self.ssh_import_plan = None;
-                        self.ssh_import_actions.clear();
+                        self.editor.import_plan = None;
+                        self.editor.import_actions.clear();
                         self.status = self.program_log.error(error);
                     }
                 }
             }
             Message::SshHostSelected(host_alias) => {
                 let server = self
-                    .ssh_import_plan
+                    .editor
+                    .import_plan
                     .as_ref()
                     .and_then(|plan| {
                         plan.items.iter().find_map(|item| {
@@ -3952,12 +3734,12 @@ impl App {
                         })
                     })
                     .cloned();
-                if let (Some(draft), Some(server)) = (&mut self.connection_draft, server) {
+                if let (Some(draft), Some(server)) = (&mut self.editor.draft, server) {
                     draft.apply_imported_server(&server);
                 }
             }
             Message::SshImportActionChanged(index, action) => {
-                if let Some(selected) = self.ssh_import_actions.get_mut(index) {
+                if let Some(selected) = self.editor.import_actions.get_mut(index) {
                     *selected = action;
                 }
             }
@@ -3968,14 +3750,10 @@ impl App {
                     Ok(outcome) => {
                         let terminal_task = self.reconcile_interactive_sessions(&outcome.servers);
                         self.servers = outcome.servers;
-                        self.mount_targets = self
-                            .servers
-                            .iter()
-                            .flat_map(ServerConfig::mount_targets)
-                            .collect();
-                        self.connection_draft = None;
+                        self.refresh_mount_targets();
+                        self.editor.draft = None;
                         self.invalidate_mountpoint_preflight();
-                        self.screen = Screen::Connections;
+                        self.navigation.show(Screen::Connections);
                         self.status = self.program_log.publish(
                             if outcome.warning.is_some() {
                                 LogLevel::Warning
@@ -4418,14 +4196,14 @@ impl App {
                     return Task::none();
                 }
                 let mut draft = ConnectionDraft::default();
-                self.sai_setup.reset();
+                self.editor.sai.reset();
                 draft.source = ConnectionSource::SshConfigBatch;
                 draft.batch_import_source = BatchImportSource::SshMountMateConfig;
-                self.connection_draft = Some(draft);
-                self.ssh_import_plan = None;
-                self.ssh_import_actions.clear();
+                self.editor.draft = Some(draft);
+                self.editor.import_plan = None;
+                self.editor.import_actions.clear();
                 self.invalidate_mountpoint_preflight();
-                self.screen = Screen::ConnectionEditor;
+                self.navigation.show(Screen::ConnectionEditor);
             }
             Message::SettingsSaved(result) => {
                 self.editor_saving = false;
@@ -4433,13 +4211,9 @@ impl App {
                     Ok(outcome) => {
                         self.settings = outcome.settings;
                         self.servers = outcome.servers;
-                        self.mount_targets = self
-                            .servers
-                            .iter()
-                            .flat_map(ServerConfig::mount_targets)
-                            .collect();
+                        self.refresh_mount_targets();
                         self.settings_draft = None;
-                        self.screen = Screen::Connections;
+                        self.navigation.show(Screen::Connections);
                         self.status = self.program_log.publish(
                             if outcome.warning.is_some() {
                                 LogLevel::Warning
@@ -4547,8 +4321,8 @@ impl App {
                     Locale::Chinese => "已取消同步后自动卸载".into(),
                 });
             }
-            Message::UnmountWaitDecision { ids, result } => match result {
-                rfd::MessageDialogResult::Yes => {
+            Message::UnmountWaitDecision { ids, choice } => match choice {
+                UnmountChoice::Wait => {
                     self.pending_unmount_after_sync.extend(ids);
                     self.status = self.program_log.info(match locale {
                         Locale::English => "Waiting for uploads to finish before unmounting".into(),
@@ -4556,8 +4330,8 @@ impl App {
                     });
                     return self.transfer_task();
                 }
-                rfd::MessageDialogResult::No => return self.confirm_immediate_unmount(ids),
-                _ => {}
+                UnmountChoice::Now => return self.confirm_immediate_unmount(ids),
+                UnmountChoice::Cancel => {}
             },
             Message::UnmountNowDecision { ids, result } => {
                 if result == rfd::MessageDialogResult::Yes {
@@ -4606,9 +4380,7 @@ impl App {
                         );
                         self.status = self.program_log.info(message);
                         if matches!(operation, MountOperation::Unmount) {
-                            self.pending_unmount_after_sync.remove(&id);
-                            self.confirmed_unmounts.remove(&id);
-                            tasks.push(self.close_popups_for_server(&id));
+                            tasks.push(self.clear_mount_feedback(&id));
                         } else {
                             tasks.push(
                                 self.status_task(
@@ -4686,28 +4458,34 @@ impl App {
                     }
                     Err(error) => self.status = self.program_log.error(error),
                 }
+                if matches!(
+                    self.mount_status(&id),
+                    Some(MountStatus::Unmounted | MountStatus::Stale)
+                ) {
+                    return self.clear_mount_feedback(&id);
+                }
             }
             Message::Edit(id) => {
                 if self.connection_list_saving || self.editor_saving {
                     return Task::none();
                 }
                 let can_modify = self.can_modify(&id);
-                self.sai_setup.reset();
+                self.editor.sai.reset();
                 if let Some(server) = self.servers.iter().find(|server| server.id == id) {
-                    self.connection_draft = Some(ConnectionDraft::from_server(server));
-                    self.connection_tags_input = server.tags.join(", ");
-                    if let Some(draft) = &mut self.connection_draft {
+                    self.editor.draft = Some(ConnectionDraft::from_server(server));
+                    self.editor.tags_input = server.tags.join(", ");
+                    if let Some(draft) = &mut self.editor.draft {
                         draft.auto_mount_at_login |= self.settings.startup_all;
                     }
-                    self.connection_custom_mountpoint = custom_mountpoint_value(&server.mountpoint);
-                    if let Some(draft) = &mut self.connection_draft
+                    self.editor.custom_mountpoint = custom_mountpoint_value(&server.mountpoint);
+                    if let Some(draft) = &mut self.editor.draft
                         && draft.ssh_config_path.trim().is_empty()
                     {
                         draft.ssh_config_path = default_ssh_config_path().display().to_string();
                     }
-                    self.ssh_import_plan = None;
-                    self.ssh_import_actions.clear();
-                    self.screen = Screen::ConnectionEditor;
+                    self.editor.import_plan = None;
+                    self.editor.import_actions.clear();
+                    self.navigation.show(Screen::ConnectionEditor);
                     self.status = self.program_log.publish(
                         if can_modify {
                             LogLevel::Info
@@ -4721,9 +4499,9 @@ impl App {
                         },
                     );
                     match available_windows_drive_letters() {
-                        Ok(drives) => self.windows_drive_letters = drives,
+                        Ok(drives) => self.editor.drives = drives,
                         Err(error) => {
-                            self.windows_drive_letters.clear();
+                            self.editor.drives.clear();
                             self.status = self.program_log.error(error.to_string());
                         }
                     }
@@ -4822,11 +4600,7 @@ impl App {
                     Ok(outcome) => {
                         let terminal_task = self.reconcile_interactive_sessions(&outcome.servers);
                         self.servers = outcome.servers;
-                        self.mount_targets = self
-                            .servers
-                            .iter()
-                            .flat_map(ServerConfig::mount_targets)
-                            .collect();
+                        self.refresh_mount_targets();
                         self.selected_connections.retain(|selected| {
                             self.servers.iter().any(|server| server.id == *selected)
                         });
@@ -4913,15 +4687,24 @@ impl App {
         }
     }
 
+    fn open_transfer_center(&mut self) -> Task<Message> {
+        self.navigation.open_transfers();
+        self.status = self
+            .program_log
+            .info(self.locale().text(TextKey::TransferCenter).into());
+        diagnostic_trace(&format!(
+            "transfer center shown with {} popup(s)",
+            usize::from(self.transfer_popup.is_some())
+        ));
+        self.transfer_task()
+    }
+
     fn handle_tray_action(&mut self, action: TrayAction) -> Task<Message> {
         match action {
             TrayAction::ShowMain => self.show_main_window(),
             TrayAction::ShowTransfers => {
-                self.screen = Screen::TransferCenter;
-                self.status = self
-                    .program_log
-                    .info(self.locale().text(TextKey::TransferCenter).into());
-                Task::batch([self.show_main_window(), self.transfer_task()])
+                let transfers = self.open_transfer_center();
+                Task::batch([self.show_main_window(), transfers])
             }
             TrayAction::MountAll => self.handle_app_command(AppCommand::MountAll),
             TrayAction::UnmountAll => self.handle_app_command(AppCommand::UnmountAll),
@@ -4933,15 +4716,8 @@ impl App {
         match command {
             AppCommand::ShowMain => self.show_main_window(),
             AppCommand::ShowTransfers => {
-                self.screen = Screen::TransferCenter;
-                self.status = self
-                    .program_log
-                    .info(self.locale().text(TextKey::TransferCenter).into());
-                diagnostic_trace(&format!(
-                    "transfer center shown with {} popup(s)",
-                    usize::from(self.transfer_popup.is_some())
-                ));
-                Task::batch([self.show_main_window(), self.transfer_task()])
+                let transfers = self.open_transfer_center();
+                Task::batch([self.show_main_window(), transfers])
             }
             AppCommand::Mount { id } => self.handle_mount_command(id, MountOperation::Mount),
             AppCommand::Unmount { id } => self.handle_mount_command(id, MountOperation::Unmount),
@@ -5029,13 +4805,9 @@ impl App {
                     .filter(|server| self.paths.state_file(&server.id).exists())
                     .map(|server| server.id.clone())
                     .collect::<Vec<_>>();
-                let (unsafe_ids, safe_ids): (Vec<_>, Vec<_>) = ids.into_iter().partition(|id| {
-                    unmount_needs_confirmation(
-                        self.transfers.get(id),
-                        self.transfer_errors.contains_key(id),
-                        self.synced_polls.get(id).copied().unwrap_or(0),
-                    )
-                });
+                let (unsafe_ids, safe_ids): (Vec<_>, Vec<_>) = ids
+                    .into_iter()
+                    .partition(|id| !self.mount_feedback.synced(id));
                 let mut tasks = safe_ids
                     .into_iter()
                     .map(|id| self.handle_mount_command(id, MountOperation::Unmount))
@@ -5135,20 +4907,7 @@ impl App {
         if self.exit_confirmation_open {
             return Task::none();
         }
-        let active = self
-            .transfers
-            .values()
-            .filter(|snapshot| transfer_is_active(snapshot))
-            .count();
-        let unknown = self
-            .mount_targets
-            .iter()
-            .filter(|server| self.mount_status(&server.id) == Some(MountStatus::Mounted))
-            .filter(|server| {
-                self.transfer_errors.contains_key(&server.id)
-                    || !self.transfers.contains_key(&server.id)
-            })
-            .count();
+        let (active, unknown) = self.pending_transfer_counts();
         let interactive_sessions = self
             .interactive_terminals
             .values()
@@ -5173,6 +4932,27 @@ impl App {
             },
             |result| Message::ExitDecision(result == rfd::MessageDialogResult::Yes),
         )
+    }
+
+    fn refresh_mount_targets(&mut self) {
+        self.mount_targets = self
+            .servers
+            .iter()
+            .flat_map(ServerConfig::mount_targets)
+            .collect();
+        let ids: HashSet<_> = self
+            .mount_targets
+            .iter()
+            .map(|target| target.id.as_str())
+            .collect();
+        self.mount_feedback.retain(|id| ids.contains(id));
+        self.mount_observations
+            .retain(|id, _| ids.contains(id.as_str()));
+        self.status_reads.retain(|id, _| ids.contains(id.as_str()));
+        self.pending_unmount_after_sync
+            .retain(|id| ids.contains(id.as_str()));
+        self.confirmed_unmounts
+            .retain(|id| ids.contains(id.as_str()));
     }
 
     fn mount_status(&self, id: &str) -> Option<MountStatus> {
@@ -5227,10 +5007,10 @@ impl App {
     }
 
     fn save_connection(&mut self) -> Task<Message> {
-        if self.editor_saving || self.connection_list_saving || self.sai_setup.in_progress() {
+        if self.editor_saving || self.connection_list_saving || self.editor.sai.in_progress() {
             return Task::none();
         }
-        if let Some(draft) = &self.connection_draft
+        if let Some(draft) = &self.editor.draft
             && let Some(previous) = draft
                 .editing_id
                 .as_ref()
@@ -5282,18 +5062,19 @@ impl App {
             );
         }
         if self
-            .connection_draft
+            .editor
+            .draft
             .as_ref()
             .is_some_and(|draft| draft.source == ConnectionSource::SshConfigBatch)
         {
             return self.save_ssh_batch();
         }
-        let Some(draft) = &self.connection_draft else {
+        let Some(draft) = &self.editor.draft else {
             return Task::none();
         };
         if draft.primary_mount
             && mountpoint_choice(&draft.mountpoint) == "custom"
-            && !self.mountpoint_preflight.allows_save()
+            && !self.editor.preflight.allows_save()
         {
             return Task::none();
         }
@@ -5319,144 +5100,17 @@ impl App {
             .and_then(|id| self.servers.iter().find(|server| server.id == id))
             .cloned();
         let credential_storage = self.settings.credential_storage;
-        let custom_mountpoint = (validated.server.primary_mount
-            && mountpoint_choice(&validated.server.mountpoint) == "custom")
-            .then(|| validated.server.mountpoint.clone());
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    if let Some(mountpoint) = custom_mountpoint {
-                        let home = directories::BaseDirs::new()
-                            .map(|directories| directories.home_dir().to_owned())
-                            .unwrap_or_else(|| PathBuf::from("."));
-                        preflight_custom_mountpoint(&mountpoint, &home)
-                            .map_err(|error| error.to_string())?;
-                    }
-                    for mapping in &validated.server.mounts {
-                        if mountpoint_choice(&mapping.mountpoint) == "custom" {
-                            let home = directories::BaseDirs::new()
-                                .map(|d| d.home_dir().to_owned())
-                                .unwrap_or_default();
-                            preflight_custom_mountpoint(&mapping.mountpoint, &home)
-                                .map_err(|e| e.to_string())?;
-                        }
-                    }
-                    let server_id = validated.server.id.clone();
-                    let password = prepare_secret_action(
+                    configuration::save_connection(
+                        &paths,
                         &service,
+                        validated,
+                        previous,
                         credential_storage,
-                        &server_id,
-                        CredentialKind::Password,
-                        &validated.password,
-                    )?;
-                    let key_passphrase = match prepare_secret_action(
-                        &service,
-                        credential_storage,
-                        &server_id,
-                        CredentialKind::KeyPassphrase,
-                        &validated.key_passphrase,
-                    ) {
-                        Ok(prepared) => prepared,
-                        Err(error) => {
-                            let _ = rollback_prepared_secret(&password);
-                            return Err(error);
-                        }
-                    };
-                    let mut server = match validated
-                        .apply_secrets(password.obscured.clone(), key_passphrase.obscured.clone())
-                    {
-                        Ok(server) => server,
-                        Err(error) => {
-                            let _ = rollback_prepared_secrets([&password, &key_passphrase]);
-                            return Err(localize_draft_error(locale, &error));
-                        }
-                    };
-                    password.apply(&mut server);
-                    key_passphrase.apply(&mut server);
-                    let managed_snapshot = match capture_managed_profile(previous.as_ref()) {
-                        Ok(snapshot) => snapshot,
-                        Err(error) => {
-                            let rollback = rollback_prepared_secrets([&password, &key_passphrase]);
-                            return Err(match rollback {
-                                Ok(()) => error,
-                                Err(rollback) => {
-                                    format!("{error}; credential rollback failed: {rollback}")
-                                }
-                            });
-                        }
-                    };
-                    if let Err(error) = prepare_managed_ssh_server(&mut server, &Platform) {
-                        let rollback = rollback_prepared_secrets([&password, &key_passphrase]);
-                        return Err(match rollback {
-                            Ok(()) => error.to_string(),
-                            Err(rollback) => {
-                                format!("{error}; credential rollback failed: {rollback}")
-                            }
-                        });
-                    }
-                    let servers = match storage::upsert_server(&paths, server.clone()) {
-                        Ok(servers) => servers,
-                        Err(error) => {
-                            let managed_rollback = rollback_prepared_managed_profile(
-                                &server,
-                                managed_snapshot.as_ref(),
-                            );
-                            let credential_rollback =
-                                rollback_prepared_secrets([&password, &key_passphrase]);
-                            let mut message = error.to_string();
-                            if let Err(rollback) = managed_rollback {
-                                message.push_str(&format!(
-                                    "; managed SSH rollback failed: {rollback}"
-                                ));
-                            }
-                            if let Err(rollback) = credential_rollback {
-                                message
-                                    .push_str(&format!("; credential rollback failed: {rollback}"));
-                            }
-                            return Err(message);
-                        }
-                    };
-                    let mut cleanup_errors = Vec::new();
-                    if let Some(previous) = &previous {
-                        if previous.ssh_config_managed
-                            && (!server.ssh_config_managed
-                                || previous.managed_ssh_config_path
-                                    != server.managed_ssh_config_path)
-                            && let Err(error) = remove_managed_ssh_server(previous)
-                        {
-                            cleanup_errors.push(match locale {
-                                Locale::English => {
-                                    format!("old managed SSH cleanup failed: {error}")
-                                }
-                                Locale::Chinese => {
-                                    format!("旧托管 SSH 配置清理失败：{error}")
-                                }
-                            });
-                        }
-                        if let Err(error) = delete_retired_connection_credentials(previous, &server)
-                        {
-                            cleanup_errors.push(match locale {
-                                Locale::English => {
-                                    format!("retired credential cleanup failed: {error}")
-                                }
-                                Locale::Chinese => {
-                                    format!("旧系统凭据清理失败：{error}")
-                                }
-                            });
-                        }
-                    }
-                    let warning = (!cleanup_errors.is_empty()).then(|| match locale {
-                        Locale::English => {
-                            format!("Connection saved; {}", cleanup_errors.join("; "))
-                        }
-                        Locale::Chinese => {
-                            format!("连接已保存，但{}", cleanup_errors.join("；"))
-                        }
-                    });
-                    if let Some(warning) = &warning {
-                        diagnostic_trace(warning);
-                    }
-                    Ok(ServerMutation { servers, warning })
+                        locale,
+                    )
                 })
                 .await
                 .unwrap_or_else(|error| Err(error.to_string()))
@@ -5466,7 +5120,7 @@ impl App {
     }
 
     fn start_mountpoint_preflight(&mut self) -> Task<Message> {
-        let Some(draft) = &self.connection_draft else {
+        let Some(draft) = &self.editor.draft else {
             self.invalidate_mountpoint_preflight();
             return Task::none();
         };
@@ -5475,13 +5129,13 @@ impl App {
             return Task::none();
         }
         let value = if draft.mountpoint == CUSTOM_MOUNTPOINT_PENDING {
-            self.connection_custom_mountpoint.trim().to_owned()
+            self.editor.custom_mountpoint.trim().to_owned()
         } else {
             draft.mountpoint.trim().to_owned()
         };
         if value.is_empty() {
-            self.mountpoint_preflight_queue.replace(None);
-            self.mountpoint_preflight = MountpointPreflight::Invalid {
+            self.editor.preflight_queue.replace(None);
+            self.editor.preflight = MountpointPreflight::Invalid {
                 value,
                 error: match self.locale() {
                     Locale::English => "Select a custom mountpoint".into(),
@@ -5490,8 +5144,8 @@ impl App {
             };
             return Task::none();
         }
-        self.mountpoint_preflight = MountpointPreflight::Checking(value.clone());
-        let generation = self.mountpoint_preflight_queue.replace(Some(value));
+        self.editor.preflight = MountpointPreflight::Checking(value.clone());
+        let generation = self.editor.preflight_queue.replace(Some(value));
         Task::perform(
             async move {
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -5502,12 +5156,12 @@ impl App {
     }
 
     fn invalidate_mountpoint_preflight(&mut self) {
-        self.mountpoint_preflight_queue.replace(None);
-        self.mountpoint_preflight = MountpointPreflight::NotRequired;
+        self.editor.preflight_queue.replace(None);
+        self.editor.preflight = MountpointPreflight::NotRequired;
     }
 
     fn run_ready_mountpoint_preflight(&mut self) -> Task<Message> {
-        let Some(pending) = self.mountpoint_preflight_queue.take_ready() else {
+        let Some(pending) = self.editor.preflight_queue.take_ready() else {
             return Task::none();
         };
         let generation = pending.generation;
@@ -5537,10 +5191,10 @@ impl App {
     }
 
     fn load_ssh_config(&mut self) -> Task<Message> {
-        if self.ssh_import_loading {
+        if self.editor.import_loading {
             return Task::none();
         }
-        let Some(draft) = &self.connection_draft else {
+        let Some(draft) = &self.editor.draft else {
             return Task::none();
         };
         let config_path = PathBuf::from(draft.ssh_config_path.trim());
@@ -5559,7 +5213,7 @@ impl App {
         let service = self.service.clone();
         let batch_source = draft.batch_import_source;
         let result_path = config_path.clone();
-        self.ssh_import_loading = true;
+        self.editor.import_loading = true;
         self.status = self.program_log.info(
             self.locale()
                 .loading_path(&config_path.display().to_string()),
@@ -5587,13 +5241,13 @@ impl App {
     }
 
     fn save_ssh_batch(&mut self) -> Task<Message> {
-        let Some(plan) = &self.ssh_import_plan else {
+        let Some(plan) = &self.editor.import_plan else {
             self.status = self
                 .program_log
                 .warning(self.locale().text(TextKey::LoadSshBeforeImport).into());
             return Task::none();
         };
-        let updates = match plan.apply(&self.ssh_import_actions, &self.servers) {
+        let updates = match plan.apply(&self.editor.import_actions, &self.servers) {
             Ok(updates) if !updates.is_empty() => updates,
             Ok(_) => {
                 self.status = self
@@ -5689,123 +5343,19 @@ impl App {
             .program_log
             .info(self.locale().text(TextKey::SavingSettings).into());
         let paths = self.paths.clone();
-        let result_settings = settings.clone();
-        let previous_settings = self.settings.clone();
-        let previous_servers = self.servers.clone();
+        let change = configuration::SettingsChange {
+            settings,
+            previous_settings: self.settings.clone(),
+            previous_servers: self.servers.clone(),
+            preference_updates,
+        };
         let service = self.service.clone();
         let locale = self.locale();
         let startup_lock = self.startup_integration_lock.clone();
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    let storage_changed =
-                        settings.credential_storage != previous_settings.credential_storage;
-                    if storage_changed {
-                        diagnostic_trace(&credential_presence_summary(
-                            "before",
-                            &previous_servers,
-                        ));
-                    }
-                    let credential_migration = if storage_changed {
-                        Some(migrate_servers_for_storage(
-                            &paths,
-                            &service,
-                            &previous_servers,
-                            settings.credential_storage,
-                        )?)
-                    } else {
-                        None
-                    };
-                    let migrated_servers = match storage::update_server_preferences_batch(
-                        &paths,
-                        &preference_updates,
-                    ) {
-                        Ok(servers) => servers,
-                        Err(error) => {
-                            return Err(rollback_credential_storage_change(
-                                &paths,
-                                &previous_servers,
-                                credential_migration.as_ref(),
-                                error.to_string(),
-                            ));
-                        }
-                    };
-                    if storage_changed {
-                        diagnostic_trace(&credential_presence_summary("after", &migrated_servers));
-                    }
-                    if storage_changed && settings.credential_storage == CredentialStorage::System {
-                        for server in &migrated_servers {
-                            if let Err(error) =
-                                clear_rclone_remote_secrets(&paths, server.remote_name())
-                            {
-                                return Err(rollback_credential_storage_change(
-                                    &paths,
-                                    &previous_servers,
-                                    credential_migration.as_ref(),
-                                    error.to_string(),
-                                ));
-                            }
-                        }
-                    }
-                    if let Err(error) = storage::save_settings(&paths, &settings) {
-                        let mut message = rollback_credential_storage_change(
-                            &paths,
-                            &previous_servers,
-                            credential_migration.as_ref(),
-                            error.to_string(),
-                        );
-                        if credential_migration.is_none() {
-                            let rollback_updates = previous_servers
-                                .iter()
-                                .map(|server| storage::ServerPreferenceUpdate {
-                                    id: server.id.clone(),
-                                    tags: None,
-                                    auto_mount_at_login: Some(server.auto_mount_at_login),
-                                })
-                                .collect::<Vec<_>>();
-                            if let Err(rollback) = storage::update_server_preferences_batch(
-                                &paths,
-                                &rollback_updates,
-                            ) {
-                                message.push_str(&format!(
-                                    "; login-startup rollback failed: {rollback}"
-                                ));
-                            }
-                        }
-                        return Err(message);
-                    }
-                    let mut warnings = Vec::new();
-                    if let Err(error) = reconcile_login_startup(&paths, &startup_lock) {
-                        warnings.push(match locale {
-                            Locale::English => format!(
-                                "settings were saved, but login startup integration will be retried next launch: {error}"
-                            ),
-                            Locale::Chinese => format!(
-                                "设置已保存，但登录自启集成失败，将在下次启动时重试：{error}"
-                            ),
-                        });
-                    }
-                    if storage_changed
-                        && settings.credential_storage == CredentialStorage::Obscure
-                        && let Some(error) = credential_migration
-                            .as_ref()
-                            .and_then(|migration| migration.retire_system_references().err())
-                    {
-                        warnings.push(match locale {
-                            Locale::English => format!(
-                                "some retired vault entries could not be removed: {error}"
-                            ),
-                            Locale::Chinese => {
-                                format!("部分旧系统凭据无法删除：{error}")
-                            }
-                        });
-                    }
-                    let warning = (!warnings.is_empty()).then(|| warnings.join("; "));
-                    Ok(SettingsMutation {
-                        settings: result_settings,
-                        servers: migrated_servers,
-                        warning,
-                    })
+                    configuration::save_settings(&paths, &service, change, &startup_lock, locale)
                 })
                 .await
                 .unwrap_or_else(|error| Err(error.to_string()))
@@ -6050,20 +5600,7 @@ impl App {
         if self.block_update_for_interactive_mounts() {
             return Task::none();
         }
-        let active = self
-            .transfers
-            .values()
-            .filter(|snapshot| transfer_is_active(snapshot))
-            .count();
-        let unknown = self
-            .mount_targets
-            .iter()
-            .filter(|server| self.mount_status(&server.id) == Some(MountStatus::Mounted))
-            .filter(|server| {
-                self.transfer_errors.contains_key(&server.id)
-                    || !self.transfers.contains_key(&server.id)
-            })
-            .count();
+        let (active, unknown) = self.pending_transfer_counts();
         if active == 0 && unknown == 0 {
             return self.launch_prepared_update();
         }
@@ -6280,47 +5817,50 @@ impl App {
             self.capacity_refresh_pending = false;
             return Task::none();
         }
-        for server in &servers {
-            if !self.capacities.contains_key(&server.id) {
-                self.capacity_errors.remove(&server.id);
-            }
-        }
+        let requests: Vec<_> = servers
+            .into_iter()
+            .map(|server| {
+                let request = self.mount_feedback.start_read(&server.id);
+                (server, request)
+            })
+            .collect();
         self.capacity_refreshing = true;
         let service = self.service.clone();
-        let failed_ids = servers
+        let failed_requests = requests
             .iter()
-            .map(|server| server.id.clone())
+            .map(|(_, request)| request.clone())
             .collect::<Vec<_>>();
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
                     std::thread::scope(|scope| {
-                        let tasks: Vec<_> = servers
+                        let tasks: Vec<_> = requests
                             .into_iter()
-                            .map(|server| {
+                            .map(|(server, request)| {
                                 let service = service.clone();
-                                let id = server.id.clone();
-                                let task_id = id.clone();
                                 let task = scope.spawn(move || {
                                     service.capacity(&server).map_err(|error| error.to_string())
                                 });
-                                (task_id, task)
+                                (request, task)
                             })
                             .collect();
                         tasks
                             .into_iter()
-                            .map(|(id, task)| match task.join() {
-                                Ok(result) => (id, result),
-                                Err(_) => (id, Err("capacity worker panicked".into())),
+                            .map(|(request, task)| {
+                                (
+                                    request,
+                                    task.join()
+                                        .unwrap_or_else(|_| Err("capacity worker panicked".into())),
+                                )
                             })
                             .collect()
                     })
                 })
                 .await
                 .unwrap_or_else(|error| {
-                    failed_ids
+                    failed_requests
                         .into_iter()
-                        .map(|id| (id, Err(error.to_string())))
+                        .map(|request| (request, Err(error.to_string())))
                         .collect()
                 })
             },
@@ -6332,7 +5872,7 @@ impl App {
         if self.transfer_refreshing {
             return Task::none();
         }
-        let ids: Vec<_> = self
+        let requests: Vec<_> = self
             .mount_targets
             .iter()
             .filter(|server| {
@@ -6340,135 +5880,55 @@ impl App {
                     && !self.busy.contains(&server.id)
             })
             .map(|server| server.id.clone())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|id| self.mount_feedback.start_read(&id))
             .collect();
-        if ids.is_empty() {
+        if requests.is_empty() {
             return set_native_global_progress(self.main_window, self.global_progress_state());
         }
         self.transfer_refreshing = true;
         let service = self.service.clone();
-        let failed_ids = ids.clone();
+        let failed_requests = requests.clone();
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
                     std::thread::scope(|scope| {
-                        let tasks: Vec<_> = ids
+                        let tasks: Vec<_> = requests
                             .into_iter()
-                            .map(|id| {
+                            .map(|request| {
                                 let service = service.clone();
-                                let task_id = id.clone();
+                                let id = request.id.clone();
                                 let task = scope.spawn(move || {
                                     service
                                         .transfer_snapshot(&id)
                                         .map_err(|error| error.to_string())
                                 });
-                                (task_id, task)
+                                (request, task)
                             })
                             .collect();
                         tasks
                             .into_iter()
-                            .map(|(id, task)| match task.join() {
-                                Ok(result) => (id, result),
-                                Err(_) => (id, Err("transfer worker panicked".into())),
+                            .map(|(request, task)| {
+                                (
+                                    request,
+                                    task.join()
+                                        .unwrap_or_else(|_| Err("transfer worker panicked".into())),
+                                )
                             })
                             .collect()
                     })
                 })
                 .await
                 .unwrap_or_else(|error| {
-                    failed_ids
+                    failed_requests
                         .into_iter()
-                        .map(|id| (id, Err(error.to_string())))
+                        .map(|request| (request, Err(error.to_string())))
                         .collect()
                 })
             },
             Message::TransfersLoaded,
         )
-    }
-
-    fn smooth_transfer_snapshot(
-        &mut self,
-        server_id: &str,
-        snapshot: TransferSnapshot,
-    ) -> TransferSnapshot {
-        let history = self
-            .transfer_history
-            .entry(server_id.to_owned())
-            .or_default();
-        Self::smooth_transfer_snapshot_with_history(history, snapshot)
-    }
-
-    fn smooth_transfer_snapshot_with_history(
-        history: &mut TransferProgressHistory,
-        mut snapshot: TransferSnapshot,
-    ) -> TransferSnapshot {
-        let has_work = transfer_is_active(&snapshot);
-        // A new queue after a confirmed idle period starts a fresh progress
-        // session. This prevents bytes from unrelated transfers being mixed.
-        if has_work && !history.active {
-            *history = TransferProgressHistory::default();
-            history.active = true;
-        }
-
-        if history.active {
-            let current_keys: HashSet<String> =
-                snapshot.files.iter().map(transfer_file_key).collect();
-
-            // A file disappearing from a non-empty queue is rclone's normal
-            // completion signal. Do not infer completion when the endpoint
-            // returned no per-file details at all; that can be transient.
-            if !snapshot.files.is_empty() || !has_work {
-                let completed = history
-                    .known_files
-                    .keys()
-                    .filter(|key| !current_keys.contains(*key))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                for key in completed {
-                    if let Some((size, bytes)) = history.known_files.remove(&key) {
-                        history.completed_bytes =
-                            history.completed_bytes.saturating_add(size.max(bytes));
-                    }
-                }
-            }
-
-            for file in &snapshot.files {
-                let key = transfer_file_key(file);
-                let entry = history
-                    .known_files
-                    .entry(key)
-                    .or_insert((file.size, file.bytes));
-                entry.0 = entry.0.max(file.size);
-                entry.1 = entry.1.max(file.bytes);
-            }
-
-            if history.completed_bytes > 0 {
-                let current_queued_bytes = snapshot.queued_bytes;
-                snapshot.queued_bytes = snapshot
-                    .queued_bytes
-                    .saturating_add(history.completed_bytes);
-                snapshot.transferred_bytes = snapshot
-                    .transferred_bytes
-                    .saturating_add(history.completed_bytes);
-                snapshot.percentage = if has_work && current_queued_bytes == 0 {
-                    // rclone can briefly report upload counters without any
-                    // per-file byte total. Keep the percentage indeterminate
-                    // instead of presenting completed bytes as 100%.
-                    0.0
-                } else if snapshot.queued_bytes == 0 {
-                    100.0
-                } else {
-                    (snapshot.transferred_bytes as f64 * 100.0 / snapshot.queued_bytes as f64)
-                        .clamp(0.0, 100.0)
-                };
-            }
-
-            if !has_work {
-                history.active = false;
-                history.known_files.clear();
-            }
-        }
-
-        snapshot
     }
 
     fn reconcile_transfer_popups(&mut self) -> Task<Message> {
@@ -6510,22 +5970,43 @@ impl App {
     }
 
     fn active_transfer_ids(&self) -> HashSet<String> {
-        self.transfers
+        self.mount_targets
             .iter()
-            .filter(|(id, snapshot)| {
-                transfer_is_active(snapshot) && self.mount_status(id) == Some(MountStatus::Mounted)
+            .filter(|target| {
+                self.mount_status(&target.id) == Some(MountStatus::Mounted)
+                    && self
+                        .mount_feedback
+                        .snapshot(&target.id)
+                        .is_some_and(transfer_is_active)
             })
-            .map(|(id, _)| id.clone())
+            .map(|target| target.id.clone())
             .collect()
     }
 
-    fn close_popups_for_server(&mut self, server_id: &str) -> Task<Message> {
+    fn pending_transfer_counts(&self) -> (usize, usize) {
+        self.mount_targets
+            .iter()
+            .filter(|target| {
+                self.mount_status(&target.id) == Some(MountStatus::Mounted)
+                    || self.mount_status_unavailable(&target.id)
+            })
+            .fold((0, 0), |(active, unknown), target| {
+                let snapshot = self
+                    .mount_feedback
+                    .snapshot(&target.id)
+                    .filter(|_| !self.mount_status_unavailable(&target.id));
+                match snapshot {
+                    Some(snapshot) => (active + usize::from(transfer_is_active(snapshot)), unknown),
+                    None => (active, unknown + 1),
+                }
+            })
+    }
+
+    fn clear_mount_feedback(&mut self, server_id: &str) -> Task<Message> {
         self.dismissed_popups.remove(server_id);
-        self.transfers.remove(server_id);
-        self.transfer_history.remove(server_id);
-        self.transfer_errors.remove(server_id);
-        self.transfer_failures.remove(server_id);
-        self.synced_polls.remove(server_id);
+        self.pending_unmount_after_sync.remove(server_id);
+        self.confirmed_unmounts.remove(server_id);
+        self.mount_feedback.forget(server_id);
         self.notification_tracker.forget(server_id);
         self.reconcile_transfer_popups()
     }
@@ -6535,18 +6016,9 @@ impl App {
             .mount_targets
             .iter()
             .filter(|server| self.mount_status(&server.id) == Some(MountStatus::Mounted));
-        let totals = transfer_totals(mounted.map(|server| {
-            if self.transfer_errors.contains_key(&server.id) {
-                None
-            } else {
-                self.transfers.get(&server.id)
-            }
-        }));
-        let out_of_space = self.transfers.iter().any(|(id, snapshot)| {
-            self.mount_status(id) == Some(MountStatus::Mounted) && snapshot.out_of_space
-        });
-
-        global_progress_state(&totals, out_of_space)
+        let totals =
+            transfer_totals(mounted.map(|server| self.mount_feedback.snapshot(&server.id)));
+        global_progress_state(&totals, totals.out_of_space)
     }
 
     fn interactive_session_ready(&self, id: &str) -> bool {
@@ -6686,7 +6158,8 @@ impl App {
         let saving_id = self
             .editor_saving
             .then(|| {
-                self.connection_draft
+                self.editor
+                    .draft
                     .as_ref()
                     .and_then(|draft| draft.editing_id.clone())
             })
@@ -6879,11 +6352,7 @@ impl App {
         }
         if operation == MountOperation::Unmount
             && !self.confirmed_unmounts.remove(&id)
-            && unmount_needs_confirmation(
-                self.transfers.get(&id),
-                self.transfer_errors.contains_key(&id),
-                self.synced_polls.get(&id).copied().unwrap_or(0),
-            )
+            && !self.mount_feedback.synced(&id)
         {
             return self.confirm_waiting_unmount(vec![id]);
         }
@@ -6931,6 +6400,7 @@ impl App {
             return Task::none();
         }
         self.status_reads.remove(&id);
+        let close_feedback = self.clear_mount_feedback(&id);
 
         self.mount_observations
             .insert(id.clone(), Ok((MountStatus::Starting, None)));
@@ -6944,13 +6414,21 @@ impl App {
         let settings = self.settings.clone();
         let locale = self.locale();
         let result_id = id.clone();
-        Task::run(
-            iced::stream::channel(2, async move |mut output| {
-                use iced::futures::SinkExt;
-                let result = match operation {
-                    MountOperation::Mount => {
-                        if let Some(server) = server {
-                            host_key_dialog::mount(service, server, settings, locale, &mut output)
+        Task::batch([
+            close_feedback,
+            Task::run(
+                iced::stream::channel(2, async move |mut output| {
+                    use iced::futures::SinkExt;
+                    let result = match operation {
+                        MountOperation::Mount => {
+                            if let Some(server) = server {
+                                host_key_dialog::mount(
+                                    service,
+                                    server,
+                                    settings,
+                                    locale,
+                                    &mut output,
+                                )
                                 .await
                                 .map(|state| {
                                     state.map(|state| match locale {
@@ -6966,34 +6444,35 @@ impl App {
                                         ),
                                     })
                                 })
-                        } else {
-                            Err(locale.text(TextKey::ConnectionGone).to_owned())
+                            } else {
+                                Err(locale.text(TextKey::ConnectionGone).to_owned())
+                            }
                         }
-                    }
-                    MountOperation::Unmount => tokio::task::spawn_blocking(move || {
-                        service
-                            .unmount(&id)
-                            .map(|()| {
-                                Some(match locale {
-                                    Locale::English => format!("Unmounted {display_name}"),
-                                    Locale::Chinese => format!("已卸载 {display_name}"),
+                        MountOperation::Unmount => tokio::task::spawn_blocking(move || {
+                            service
+                                .unmount(&id)
+                                .map(|()| {
+                                    Some(match locale {
+                                        Locale::English => format!("Unmounted {display_name}"),
+                                        Locale::Chinese => format!("已卸载 {display_name}"),
+                                    })
                                 })
-                            })
-                            .map_err(|error| error.to_string())
-                    })
-                    .await
-                    .unwrap_or_else(|error| Err(error.to_string())),
-                };
-                let _ = output
-                    .send(Message::MountFinished {
-                        id: result_id,
-                        operation,
-                        result,
-                    })
-                    .await;
-            }),
-            |message| message,
-        )
+                                .map_err(|error| error.to_string())
+                        })
+                        .await
+                        .unwrap_or_else(|error| Err(error.to_string())),
+                    };
+                    let _ = output
+                        .send(Message::MountFinished {
+                            id: result_id,
+                            operation,
+                            result,
+                        })
+                        .await;
+                }),
+                |message| message,
+            ),
+        ])
     }
 
     fn confirm_waiting_unmount(&self, ids: Vec<String>) -> Task<Message> {
@@ -7010,25 +6489,39 @@ impl App {
             .join(", ");
         let description = match locale {
             Locale::English => format!(
-                "Uploads are pending or their state is unknown for: {names}.\n\nChoose Yes to wait and unmount automatically after synchronization. Choose No to review the immediate-unmount warning."
+                "Uploads are pending or their state is unknown for: {names}. Choose when to unmount."
             ),
-            Locale::Chinese => format!(
-                "以下挂载仍有待上传内容，或传输状态未知：{names}。\n\n选择“是”将在同步完成后自动取消挂载；选择“否”可继续查看立即取消挂载的风险提示。"
-            ),
+            Locale::Chinese => {
+                format!("以下挂载仍有待上传内容，或传输状态未知：{names}。请选择何时卸载。")
+            }
         };
-        let result_ids = ids.clone();
         Task::perform(
             async move {
-                rfd::AsyncMessageDialog::new()
+                let (wait, now, cancel) = match locale {
+                    Locale::English => ("Unmount after uploads finish", "Unmount now", "Cancel"),
+                    Locale::Chinese => ("上传完成后卸载", "立即卸载", "取消"),
+                };
+                let result = rfd::AsyncMessageDialog::new()
                     .set_title(APP_NAME)
                     .set_description(description)
-                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
+                        wait.into(),
+                        now.into(),
+                        cancel.into(),
+                    ))
                     .show()
-                    .await
+                    .await;
+                if result == rfd::MessageDialogResult::Custom(wait.into()) {
+                    UnmountChoice::Wait
+                } else if result == rfd::MessageDialogResult::Custom(now.into()) {
+                    UnmountChoice::Now
+                } else {
+                    UnmountChoice::Cancel
+                }
             },
-            move |result| Message::UnmountWaitDecision {
-                ids: result_ids.clone(),
-                result,
+            move |choice| Message::UnmountWaitDecision {
+                ids: ids.clone(),
+                choice,
             },
         )
     }
@@ -7204,7 +6697,7 @@ impl App {
     }
 
     fn screen_view(&self) -> Element<'_, Message> {
-        match self.screen {
+        match self.navigation.current() {
             Screen::Connections => self.main_view(),
             Screen::TransferCenter => self.transfer_center_view(),
             Screen::ConnectionEditor => container(self.connection_editor_view())
@@ -7229,8 +6722,8 @@ impl App {
             .filter(|server| {
                 self.mount_status(&server.id) == Some(MountStatus::Mounted)
                     && self
-                        .transfers
-                        .get(&server.id)
+                        .mount_feedback
+                        .snapshot(&server.id)
                         .is_some_and(transfer_is_active)
             })
             .count();
@@ -7660,12 +7153,15 @@ impl App {
                             }
                         },
                         busy: self.busy.contains(&server.id),
-                        transfer: self.transfers.get(&server.id),
-                        transfer_unavailable: self.transfer_errors.contains_key(&server.id),
-                        capacity: self.capacities.get(&server.id),
+                        transfer: self.mount_feedback.snapshot(&server.id),
+                        transfer_unavailable: self
+                            .mount_feedback
+                            .transfer_error(&server.id)
+                            .is_some(),
+                        capacity: self.mount_feedback.capacity(&server.id),
                         capacity_checking: self.capacity_refreshing
-                            && !self.capacities.contains_key(&server.id)
-                            && !self.capacity_errors.contains(&server.id),
+                            && self.mount_feedback.capacity(&server.id).is_none()
+                            && !self.mount_feedback.capacity_failed(&server.id),
                         can_modify: self.can_modify(&server.id),
                         confirming_remove: self.pending_delete.as_deref() == Some(&server.id),
                         waiting_unmount: self.pending_unmount_after_sync.contains(&server.id),
@@ -7772,17 +7268,25 @@ impl App {
             .width(Fill);
             if status == MountStatus::Mounted && !unavailable {
                 details = details.push(capacity_progress_view(
-                    self.capacities.get(id),
-                    self.capacity_refreshing && !self.capacity_errors.contains(id),
+                    self.mount_feedback.capacity(id),
+                    self.capacity_refreshing && !self.mount_feedback.capacity_failed(id),
                     locale,
                 ));
-                if let Some(inode) = self.capacities.get(id).and_then(|c| c.inode.as_ref()) {
+                if let Some(inode) = self
+                    .mount_feedback
+                    .capacity(id)
+                    .and_then(|c| c.inode.as_ref())
+                {
                     details = details.push(inode_progress_view(inode, locale));
                 }
-                if let Some(transfer) = self.transfers.get(id).filter(|t| transfer_is_active(t)) {
+                if let Some(transfer) = self
+                    .mount_feedback
+                    .snapshot(id)
+                    .filter(|t| transfer_is_active(t))
+                {
                     details = details.push(text(transfer_label(locale, transfer)).size(12));
                 }
-                if self.transfer_errors.contains_key(id) {
+                if self.mount_feedback.transfer_error(id).is_some() {
                     details =
                         details.push(text(locale.text(TextKey::TransferStateUnavailable)).size(12));
                 }
@@ -7823,15 +7327,13 @@ impl App {
         let has_mounted_connections = !mounted.is_empty();
         let unavailable_connections = mounted
             .iter()
-            .filter(|server| self.transfer_errors.contains_key(&server.id))
+            .filter(|server| self.mount_feedback.transfer_error(&server.id).is_some())
             .count();
-        let totals = transfer_totals(mounted.iter().map(|server| {
-            if self.transfer_errors.contains_key(&server.id) {
-                None
-            } else {
-                self.transfers.get(&server.id)
-            }
-        }));
+        let totals = transfer_totals(
+            mounted
+                .iter()
+                .map(|server| self.mount_feedback.snapshot(&server.id)),
+        );
         let summary = if mounted.is_empty() {
             locale.text(TextKey::NoMountedConnections).into()
         } else if totals.out_of_space {
@@ -7967,8 +7469,8 @@ impl App {
         for server in mounted {
             connections = connections.push(transfer_connection_view(
                 server,
-                self.transfers.get(&server.id),
-                self.transfer_errors.get(&server.id),
+                self.mount_feedback.snapshot(&server.id),
+                self.mount_feedback.transfer_error(&server.id),
                 locale,
             ));
         }
@@ -7990,7 +7492,7 @@ impl App {
 
     fn connection_editor_view(&self) -> Element<'_, Message> {
         let locale = self.locale();
-        let Some(draft) = &self.connection_draft else {
+        let Some(draft) = &self.editor.draft else {
             return container(text(locale.text(TextKey::ConnectionEditorUnavailable))).into();
         };
         let title = if draft.source == ConnectionSource::SshConfigBatch {
@@ -8012,7 +7514,7 @@ impl App {
                 .as_ref()
                 .is_some_and(|id| !self.mapping_can_modify(id))
             || mountpoint_choice(&draft.mountpoint) != "custom"
-            || self.mountpoint_preflight.allows_save();
+            || self.editor.preflight.allows_save();
         let header = row![
             text(title).size(28),
             Space::new().width(Fill),
@@ -8026,7 +7528,7 @@ impl App {
                 locale.text(TextKey::Save)
             })
             .on_press_maybe(
-                (!self.editor_saving && !self.sai_setup.in_progress() && mountpoint_allows_save)
+                (!self.editor_saving && !self.editor.sai.in_progress() && mountpoint_allows_save)
                     .then_some(Message::SaveConnection),
             ),
         ]
@@ -8081,13 +7583,13 @@ impl App {
                             Message::BrowseSshConfig
                         }
                     )),
-                    button(if self.ssh_import_loading {
+                    button(if self.editor.import_loading {
                         locale.text(TextKey::Loading)
                     } else {
                         locale.text(TextKey::Load)
                     })
                     .on_press_maybe(
-                        (!locked && !self.ssh_import_loading && !self.editor_saving)
+                        (!locked && !self.editor.import_loading && !self.editor_saving)
                             .then_some(Message::LoadSshConfig),
                     ),
                 ]
@@ -8112,7 +7614,7 @@ impl App {
                 .width(Fill),
             );
             let mut items = column![].spacing(8);
-            if let Some(plan) = &self.ssh_import_plan {
+            if let Some(plan) = &self.editor.import_plan {
                 for (index, item) in plan.items.iter().enumerate() {
                     let allowed_values = if item.status == ImportStatus::New {
                         vec![ImportAction::Import, ImportAction::Ignore]
@@ -8122,7 +7624,8 @@ impl App {
                         vec![ImportAction::Ignore]
                     };
                     let action = self
-                        .ssh_import_actions
+                        .editor
+                        .import_actions
                         .get(index)
                         .copied()
                         .unwrap_or(ImportAction::Ignore);
@@ -8195,7 +7698,8 @@ impl App {
         }
         if draft.source == ConnectionSource::SshConfig {
             let hosts: Vec<_> = self
-                .ssh_import_plan
+                .editor
+                .import_plan
                 .as_ref()
                 .into_iter()
                 .flat_map(|plan| &plan.items)
@@ -8216,9 +7720,9 @@ impl App {
             }
         }
         let source_locked = draft.source == ConnectionSource::SshConfig;
-        if draft.source == ConnectionSource::SaiCluster && self.sai_setup.in_progress() {
-            let picker = self.sai_setup.view(locale).map(Message::SaiSetup);
-            let picker = if self.sai_setup.directory_only() {
+        if draft.source == ConnectionSource::SaiCluster && self.editor.sai.in_progress() {
+            let picker = self.editor.sai.view(locale).map(Message::SaiSetup);
+            let picker = if self.editor.sai.directory_only() {
                 picker
             } else {
                 controls.freeze(picker)
@@ -8419,8 +7923,10 @@ impl App {
             locale,
             path_locked,
             "connection-remote-path".into(),
-            Message::RemoteBaseChanged,
-            Message::RemoteSuffixChanged,
+            |base| Message::RemotePathChanged(MappingRow::Primary, RemotePathChange::Base(base)),
+            |suffix| {
+                Message::RemotePathChanged(MappingRow::Primary, RemotePathChange::Suffix(suffix))
+            },
         );
         let primary_choice = mountpoint_choice(&draft.mountpoint);
         let custom_mountpoint = primary_choice == "custom";
@@ -8431,7 +7937,7 @@ impl App {
             ]
             .spacing(5),
             pick_list(
-                mountpoint_options(locale, &self.windows_drive_letters, &draft.mountpoint),
+                mountpoint_options(locale, &self.editor.drives, &draft.mountpoint),
                 Some(mountpoint_option_label(&primary_choice, locale)),
                 move |label| Message::MountpointChoiceChanged(mountpoint_option_value(
                     &label, locale
@@ -8444,7 +7950,7 @@ impl App {
         .width(Fill);
         if custom_mountpoint {
             let custom_value = if draft.mountpoint == CUSTOM_MOUNTPOINT_PENDING {
-                &self.connection_custom_mountpoint
+                &self.editor.custom_mountpoint
             } else {
                 &draft.mountpoint
             };
@@ -8459,7 +7965,7 @@ impl App {
                 ]
                 .spacing(8),
             );
-            let preflight_text = match &self.mountpoint_preflight {
+            let preflight_text = match &self.editor.preflight {
                 MountpointPreflight::Checking(_) => Some(
                     match locale {
                         Locale::English => "Checking mountpoint availability...",
@@ -8523,7 +8029,7 @@ impl App {
             let local = column![
                 text(locale.text(TextKey::Mountpoint)).size(13),
                 pick_list(
-                    mountpoint_options(locale, &self.windows_drive_letters, &mapping.mountpoint),
+                    mountpoint_options(locale, &self.editor.drives, &mapping.mountpoint),
                     Some(mountpoint_option_label(&choice, locale)),
                     move |value| Message::MappingLocalChoice(
                         index,
@@ -8564,8 +8070,18 @@ impl App {
                 locale,
                 frozen,
                 format!("mapping-{}-remote-path", mapping.id),
-                move |base| Message::MappingRemoteBaseChanged(index, base),
-                move |suffix| Message::MappingRemoteSuffixChanged(index, suffix),
+                move |base| {
+                    Message::RemotePathChanged(
+                        MappingRow::Additional(index),
+                        RemotePathChange::Base(base),
+                    )
+                },
+                move |suffix| {
+                    Message::RemotePathChanged(
+                        MappingRow::Additional(index),
+                        RemotePathChange::Suffix(suffix),
+                    )
+                },
             );
             paths = paths.push(
                 controls.freeze(
@@ -8641,7 +8157,7 @@ impl App {
                         Locale::English => "Comma-separated tags",
                         Locale::Chinese => "用逗号分隔多个标签",
                     },
-                    &self.connection_tags_input,
+                    &self.editor.tags_input,
                 )
                 .id("connection-tags")
                 .on_input_maybe((!locked).then_some(Message::ConnectionTagsChanged))
@@ -8671,7 +8187,7 @@ impl App {
         .spacing(16);
         let mut common = column![source, ssh_config_controls].spacing(16);
         if draft.source == ConnectionSource::SaiCluster {
-            common = common.push(self.sai_setup.view(locale).map(Message::SaiSetup));
+            common = common.push(self.editor.sai.view(locale).map(Message::SaiSetup));
         }
         let common = mounted_controls.freeze(common.push(identity).push(details));
         let content = column![common, paths].spacing(16).max_width(900);
@@ -9461,39 +8977,45 @@ impl App {
             .filter(|server| {
                 self.mount_status(&server.id) == Some(MountStatus::Mounted)
                     && self
-                        .transfers
-                        .get(&server.id)
+                        .mount_feedback
+                        .snapshot(&server.id)
                         .is_some_and(transfer_is_active)
             })
             .collect();
-        let totals = transfer_totals(active.iter().map(|server| self.transfers.get(&server.id)));
+        let totals = transfer_totals(
+            active
+                .iter()
+                .map(|server| self.mount_feedback.snapshot(&server.id)),
+        );
         let summary = popup_transfer_summary(locale, &totals, active.len());
         let current_file = active
             .iter()
             .find_map(|server| {
-                self.transfers.get(&server.id).and_then(|snapshot| {
-                    snapshot
-                        .files
-                        .iter()
-                        .find(|file| file.uploading)
-                        .map(|file| {
-                            let filename = Path::new(&file.name)
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy();
-                            format!(
-                                "{}: {} - {}/s",
-                                server.display_name(),
-                                filename,
-                                format_bytes(file.speed.max(0.0) as u64)
-                            )
-                        })
-                })
+                self.mount_feedback
+                    .snapshot(&server.id)
+                    .and_then(|snapshot| {
+                        snapshot
+                            .files
+                            .iter()
+                            .find(|file| file.uploading)
+                            .map(|file| {
+                                let filename = Path::new(&file.name)
+                                    .file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy();
+                                format!(
+                                    "{}: {} - {}/s",
+                                    server.display_name(),
+                                    filename,
+                                    format_bytes(file.speed.max(0.0) as u64)
+                                )
+                            })
+                    })
             })
             .unwrap_or_else(|| {
                 if active.iter().any(|server| {
-                    self.transfers
-                        .get(&server.id)
+                    self.mount_feedback
+                        .snapshot(&server.id)
                         .is_some_and(|snapshot| snapshot.queued > 0 && snapshot.uploading == 0)
                 }) {
                     match locale {
@@ -9533,8 +9055,8 @@ impl App {
             for server in active {
                 details = details.push(transfer_connection_view(
                     server,
-                    self.transfers.get(&server.id),
-                    self.transfer_errors.get(&server.id),
+                    self.mount_feedback.snapshot(&server.id),
+                    self.mount_feedback.transfer_error(&server.id),
                     locale,
                 ));
             }
@@ -10904,25 +10426,6 @@ fn auto_transfer_help(locale: Locale) -> &'static str {
     }
 }
 
-fn split_remote_path(value: &str) -> (String, String) {
-    // Keep the editable suffix intact. Normalizing here would erase a newly
-    // typed separator or space before the user can enter the next component.
-    if let Some(suffix) = value.strip_prefix('/') {
-        ("/".into(), suffix.into())
-    } else {
-        ("$HOME".into(), value.into())
-    }
-}
-
-fn compose_remote_path(base: &str, suffix: &str) -> String {
-    // ConnectionDraft::validate normalizes the completed path when saving.
-    if base == "/" {
-        format!("/{suffix}")
-    } else {
-        suffix.into()
-    }
-}
-
 fn is_drive_mountpoint(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
@@ -11669,328 +11172,6 @@ fn validate_setting_value(
     Ok(())
 }
 
-struct ManagedProfileSnapshot {
-    path: PathBuf,
-    content: Option<Vec<u8>>,
-}
-
-fn capture_managed_profile(
-    previous: Option<&ServerConfig>,
-) -> Result<Option<ManagedProfileSnapshot>, String> {
-    let Some(previous) = previous.filter(|server| server.ssh_config_managed) else {
-        return Ok(None);
-    };
-    let path = PathBuf::from(previous.managed_ssh_config_path.trim());
-    if path.as_os_str().is_empty() {
-        return Ok(None);
-    }
-    let content = match fs::read(&path) {
-        Ok(content) => Some(content),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(format!("{}: {error}", path.display())),
-    };
-    Ok(Some(ManagedProfileSnapshot { path, content }))
-}
-
-fn rollback_prepared_managed_profile(
-    prepared: &ServerConfig,
-    previous: Option<&ManagedProfileSnapshot>,
-) -> Result<(), String> {
-    if !prepared.ssh_config_managed {
-        return Ok(());
-    }
-    let prepared_path = PathBuf::from(prepared.managed_ssh_config_path.trim());
-    if let Some(previous) = previous.filter(|snapshot| snapshot.path == prepared_path)
-        && let Some(content) = &previous.content
-    {
-        return storage::atomic_write(&previous.path, content).map_err(|error| error.to_string());
-    }
-    remove_managed_ssh_server(prepared).map_err(|error| error.to_string())
-}
-
-struct PreparedSecret {
-    kind: CredentialKind,
-    obscured: Option<String>,
-    credential: Option<String>,
-    change: Option<CredentialChange>,
-}
-
-impl PreparedSecret {
-    fn apply(&self, server: &mut ServerConfig) {
-        let Some(reference) = &self.credential else {
-            return;
-        };
-        match self.kind {
-            CredentialKind::Password => {
-                server.password_credential.clone_from(reference);
-            }
-            CredentialKind::KeyPassphrase => {
-                server.key_pass_credential.clone_from(reference);
-            }
-        }
-    }
-}
-
-fn prepare_secret_action(
-    service: &MountService,
-    storage: CredentialStorage,
-    server_id: &str,
-    kind: CredentialKind,
-    action: &SecretAction,
-) -> Result<PreparedSecret, String> {
-    let SecretAction::Obscure(secret) = action else {
-        return Ok(PreparedSecret {
-            kind,
-            obscured: None,
-            credential: None,
-            change: None,
-        });
-    };
-    let obscured = service
-        .obscure_secret(secret)
-        .map_err(|error| error.to_string())?;
-    if storage == CredentialStorage::Obscure {
-        return Ok(PreparedSecret {
-            kind,
-            obscured: Some(obscured),
-            credential: None,
-            change: None,
-        });
-    }
-    let reference = credential_reference(server_id, kind);
-    let change = replace_verified(&SystemCredentialStore, &reference, secret)
-        .map_err(|error| error.to_string())?;
-    Ok(PreparedSecret {
-        kind,
-        obscured: Some(obscured),
-        credential: Some(reference),
-        change: Some(change),
-    })
-}
-
-fn rollback_prepared_secret(secret: &PreparedSecret) -> Result<(), String> {
-    if let Some(change) = &secret.change {
-        rollback_change(&SystemCredentialStore, change).map_err(|error| error.to_string())
-    } else {
-        Ok(())
-    }
-}
-
-fn rollback_prepared_secrets<'a>(
-    secrets: impl IntoIterator<Item = &'a PreparedSecret>,
-) -> Result<(), String> {
-    let mut errors = Vec::new();
-    for secret in secrets {
-        if let Err(error) = rollback_prepared_secret(secret) {
-            errors.push(error);
-        }
-    }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("; "))
-    }
-}
-
-struct CredentialStorageMigration {
-    migrations: Vec<CredentialMigration>,
-    retired_references: Vec<String>,
-}
-
-impl CredentialStorageMigration {
-    fn retire_system_references(&self) -> Result<(), String> {
-        delete_credential_references(&SystemCredentialStore, &self.retired_references)
-            .map_err(|error| error.to_string())
-    }
-}
-
-fn rollback_credential_storage_change(
-    paths: &AppPaths,
-    previous_servers: &[ServerConfig],
-    migration: Option<&CredentialStorageMigration>,
-    message: String,
-) -> String {
-    let Some(migration) = migration else {
-        return message;
-    };
-    rollback_migrations_after_persistence(paths, previous_servers, &migration.migrations, message)
-}
-
-fn credential_presence_summary(stage: &str, servers: &[ServerConfig]) -> String {
-    let records = servers
-        .iter()
-        .map(|server| {
-            format!(
-                "{}[password_obscured={},password_reference={},key_pass_obscured={},key_pass_reference={}]",
-                server.id,
-                !server.password_obscured.is_empty(),
-                !server.password_credential.is_empty(),
-                !server.key_pass_obscured.is_empty(),
-                !server.key_pass_credential.is_empty(),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("credential migration {stage}: {records}")
-}
-
-fn rollback_migrations_after_persistence(
-    paths: &AppPaths,
-    previous_servers: &[ServerConfig],
-    migrations: &[CredentialMigration],
-    mut message: String,
-) -> String {
-    match storage::save_servers(paths, previous_servers) {
-        Ok(()) => {
-            for migration in migrations.iter().rev() {
-                if let Err(rollback) = migration.rollback(&SystemCredentialStore) {
-                    message.push_str(&format!("; credential rollback failed: {rollback}"));
-                }
-            }
-        }
-        Err(rollback) => {
-            // Keep the verified system representation when the server record
-            // could not be restored; deleting it here could remove the last
-            // usable copy referenced by the persisted record.
-            message.push_str(&format!("; server rollback failed: {rollback}"));
-        }
-    }
-    message
-}
-
-fn migrate_servers_for_storage(
-    paths: &AppPaths,
-    service: &MountService,
-    servers: &[ServerConfig],
-    target: CredentialStorage,
-) -> Result<CredentialStorageMigration, String> {
-    let mut migrations = Vec::with_capacity(servers.len());
-    for server in servers {
-        let result = match target {
-            CredentialStorage::System => {
-                prepare_server_to_system(server, &SystemCredentialStore, |obscured| {
-                    service
-                        .reveal_secret(obscured)
-                        .map_err(|error| CredentialError::Reveal(error.to_string()))
-                })
-            }
-            CredentialStorage::Obscure => {
-                prepare_server_to_obscure(server, &SystemCredentialStore, |secret| {
-                    service
-                        .obscure_secret(secret)
-                        .map_err(|error| CredentialError::Obscure(error.to_string()))
-                })
-            }
-        };
-        match result {
-            Ok(migration) => migrations.push(migration),
-            Err(error) => {
-                let mut message = error.to_string();
-                for migration in migrations.iter().rev() {
-                    if let Err(rollback) = migration.rollback(&SystemCredentialStore) {
-                        message.push_str(&format!("; credential rollback failed: {rollback}"));
-                    }
-                }
-                return Err(message);
-            }
-        }
-    }
-    let candidates = migrations
-        .iter()
-        .map(|migration| migration.candidate().clone())
-        .collect::<Vec<_>>();
-    let persisted_candidates =
-        persist_and_reload_servers(paths, &candidates, servers, &migrations)?;
-    let mut finalized = Vec::with_capacity(migrations.len());
-    let mut retired_references = Vec::new();
-    for migration in &migrations {
-        let Some(persisted) = persisted_candidates
-            .iter()
-            .find(|server| server.id == migration.candidate().id)
-        else {
-            return Err(rollback_migrations_after_persistence(
-                paths,
-                servers,
-                &migrations,
-                "credential migration persistence verification failed".into(),
-            ));
-        };
-        let finalized_server = match target {
-            CredentialStorage::System => migration
-                .finalize_to_system(persisted)
-                .map(|server| (server, Vec::new())),
-            CredentialStorage::Obscure => migration.finalize_to_obscure(persisted).map(|commit| {
-                let retired = commit.retired_references().to_vec();
-                (commit.into_server(), retired)
-            }),
-        };
-        match finalized_server {
-            Ok((server, retired)) => {
-                finalized.push(server);
-                retired_references.extend(retired);
-            }
-            Err(error) => {
-                return Err(rollback_migrations_after_persistence(
-                    paths,
-                    servers,
-                    &migrations,
-                    error.to_string(),
-                ));
-            }
-        }
-    }
-    persist_and_reload_servers(paths, &finalized, servers, &migrations)?;
-    Ok(CredentialStorageMigration {
-        migrations,
-        retired_references,
-    })
-}
-
-fn persist_and_reload_servers(
-    paths: &AppPaths,
-    candidate: &[ServerConfig],
-    original: &[ServerConfig],
-    migrations: &[CredentialMigration],
-) -> Result<Vec<ServerConfig>, String> {
-    let result = storage::save_servers(paths, candidate)
-        .map_err(|error| error.to_string())
-        .and_then(|_| storage::load_servers(paths).map_err(|error| error.to_string()))
-        .and_then(|persisted| {
-            (persisted == candidate)
-                .then_some(persisted)
-                .ok_or_else(|| "credential migration persistence verification failed".to_owned())
-        });
-    match result {
-        Ok(persisted) => Ok(persisted),
-        Err(error) => Err(rollback_migrations_after_persistence(
-            paths, original, migrations, error,
-        )),
-    }
-}
-
-fn delete_retired_connection_credentials(
-    previous: &ServerConfig,
-    current: &ServerConfig,
-) -> Result<(), String> {
-    let mut errors = Vec::new();
-    for (old_reference, new_reference) in [
-        (&previous.password_credential, &current.password_credential),
-        (&previous.key_pass_credential, &current.key_pass_credential),
-    ] {
-        if !old_reference.is_empty()
-            && old_reference != new_reference
-            && let Err(error) = SystemCredentialStore.delete(old_reference)
-        {
-            errors.push(error.to_string());
-        }
-    }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("; "))
-    }
-}
-
 fn display_mountpoint(server: &ServerConfig, observed: Option<&Path>, locale: Locale) -> String {
     if let Some(path) = observed {
         mountpoint_open_path(path, cfg!(windows))
@@ -12220,31 +11401,6 @@ fn transfer_label(locale: Locale, snapshot: &TransferSnapshot) -> String {
     } else {
         locale.text(TextKey::CheckingCloudState).into()
     }
-}
-
-fn transfer_file_key(file: &TransferFile) -> String {
-    let name = mountmate_core::transfer::normalized_transfer_name(&file.name);
-    if !name.is_empty() {
-        format!("name:{}", name)
-    } else {
-        format!("id:{}", file.id)
-    }
-}
-
-fn transfer_is_active(snapshot: &TransferSnapshot) -> bool {
-    snapshot.queued > 0 || snapshot.uploading > 0 || snapshot.errors > 0 || snapshot.out_of_space
-}
-
-fn transfer_failure_is_visible(consecutive_failures: u8) -> bool {
-    consecutive_failures >= 3
-}
-
-fn unmount_needs_confirmation(
-    snapshot: Option<&TransferSnapshot>,
-    transfer_unavailable: bool,
-    synced_polls: u8,
-) -> bool {
-    transfer_unavailable || !snapshot.is_some_and(|snapshot| snapshot.synced) || synced_polls < 2
 }
 
 fn retain_dismissed_transfers(
@@ -13335,50 +12491,6 @@ mod localization_tests {
     }
 
     #[test]
-    fn credential_migration_diagnostics_include_only_presence_state() {
-        let server = ServerConfig {
-            id: "alpha".into(),
-            password_obscured: "password-secret-sentinel".into(),
-            key_pass_credential: "credential-secret-sentinel".into(),
-            ..ServerConfig::default()
-        };
-        let summary = credential_presence_summary("before", &[server]);
-        assert!(summary.contains("password_obscured=true"));
-        assert!(summary.contains("password_reference=false"));
-        assert!(summary.contains("key_pass_reference=true"));
-        assert!(!summary.contains("password-secret-sentinel"));
-        assert!(!summary.contains("credential-secret-sentinel"));
-    }
-
-    #[test]
-    fn system_secret_replacement_retains_the_obscured_compatibility_copy() {
-        let mut server = ServerConfig {
-            password_obscured: "obscured-password".into(),
-            key_pass_obscured: "obscured-passphrase".into(),
-            ..ServerConfig::default()
-        };
-        PreparedSecret {
-            kind: CredentialKind::Password,
-            obscured: Some("obscured-password".into()),
-            credential: Some("password-reference".into()),
-            change: None,
-        }
-        .apply(&mut server);
-        PreparedSecret {
-            kind: CredentialKind::KeyPassphrase,
-            obscured: Some("obscured-passphrase".into()),
-            credential: Some("passphrase-reference".into()),
-            change: None,
-        }
-        .apply(&mut server);
-
-        assert_eq!(server.password_obscured, "obscured-password");
-        assert_eq!(server.key_pass_obscured, "obscured-passphrase");
-        assert_eq!(server.password_credential, "password-reference");
-        assert_eq!(server.key_pass_credential, "passphrase-reference");
-    }
-
-    #[test]
     fn windows_allows_resolved_config_profiles_to_use_interactive_transport() {
         assert!(ConnectionMethod::ALL.contains(&ConnectionMethod::Interactive));
     }
@@ -13430,27 +12542,6 @@ mod localization_tests {
 
         apply_read_only_log_action(&mut content, text_editor::Action::SelectAll);
         assert_eq!(content.selection().as_deref(), Some("first\nsecond"));
-    }
-
-    #[test]
-    fn managed_profile_rollback_restores_the_previous_contents() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("alpha.conf");
-        fs::write(&path, b"old profile").unwrap();
-        let prepared = ServerConfig {
-            ssh_config_managed: true,
-            managed_ssh_config_path: path.display().to_string(),
-            ..ServerConfig::default()
-        };
-        let snapshot = ManagedProfileSnapshot {
-            path: path.clone(),
-            content: Some(b"old profile".to_vec()),
-        };
-        fs::write(&path, b"new profile").unwrap();
-
-        rollback_prepared_managed_profile(&prepared, Some(&snapshot)).unwrap();
-
-        assert_eq!(fs::read(path).unwrap(), b"old profile");
     }
 
     #[test]
@@ -13604,8 +12695,7 @@ mod localization_tests {
         }
 
         let mut history = TransferProgressHistory::default();
-        let first =
-            App::smooth_transfer_snapshot_with_history(&mut history, snapshot("first.bin", 100, 1));
+        let first = TransferProgressHistory::smooth(&mut history, snapshot("first.bin", 100, 1));
         assert_eq!(
             (
                 first.queued_bytes,
@@ -13615,8 +12705,7 @@ mod localization_tests {
             (100, 100, 100.0)
         );
 
-        let second =
-            App::smooth_transfer_snapshot_with_history(&mut history, snapshot("second.bin", 0, 1));
+        let second = TransferProgressHistory::smooth(&mut history, snapshot("second.bin", 0, 1));
         assert_eq!(second.queued_bytes, 200);
         assert_eq!(second.transferred_bytes, 100);
         assert_eq!(second.percentage, 50.0);
@@ -13684,11 +12773,14 @@ mod localization_tests {
     }
 
     #[test]
-    fn transfer_error_requires_three_consecutive_failures() {
-        assert!(!transfer_failure_is_visible(1));
-        assert!(!transfer_failure_is_visible(2));
-        assert!(transfer_failure_is_visible(3));
-        assert!(transfer_failure_is_visible(u8::MAX));
+    fn transfer_error_display_is_debounced_but_validity_is_not() {
+        let mut state = mount_feedback::TransferState::default();
+        for failure in 1..=4 {
+            assert_eq!(state.fail("timeout".into()), failure == 3);
+            assert_eq!(state.visible_error().is_some(), failure >= 3);
+            assert!(state.current().is_none());
+            assert!(!state.synced());
+        }
     }
 
     #[test]
@@ -14647,70 +13739,6 @@ mod localization_tests {
     }
 
     #[test]
-    fn mountpoint_preflight_coalesces_typing_until_the_latest_debounce_finishes() {
-        let mut queue = MountpointPreflightQueue::default();
-        let first = queue.replace(Some("/mount/a".into()));
-        let latest = queue.replace(Some("/mount/abc".into()));
-        queue.mark_ready(first);
-        assert!(queue.take_ready().is_none());
-        queue.mark_ready(latest);
-        let request = queue.take_ready().unwrap();
-        assert_eq!(request.value, "/mount/abc");
-        assert_eq!(request.generation, latest);
-        assert!(queue.take_ready().is_none());
-    }
-
-    #[test]
-    fn mountpoint_preflight_limits_slow_probes_and_discards_intermediate_paths() {
-        let mut queue = MountpointPreflightQueue::default();
-        let slow = queue.replace(Some("/slow-network/mount".into()));
-        queue.mark_ready(slow);
-        assert!(queue.take_ready().is_some());
-        let intermediate = queue.replace(Some("/local/m".into()));
-        queue.mark_ready(intermediate);
-        assert!(queue.take_ready().is_none());
-        let latest = queue.replace(Some("/local/mount".into()));
-        queue.mark_ready(latest);
-        assert!(queue.take_ready().is_none());
-
-        queue.finish(slow);
-        let request = queue.take_ready().unwrap();
-        assert_eq!(request.value, "/local/mount");
-        assert_eq!(request.generation, latest);
-        // A delayed or duplicate completion must not release a newer probe.
-        queue.finish(slow);
-        assert_eq!(queue.in_flight, Some(latest));
-    }
-
-    #[test]
-    fn mountpoint_preflight_cancel_and_reopen_same_path_preserves_single_worker() {
-        let mut queue = MountpointPreflightQueue::default();
-        let old = queue.replace(Some("/mount".into()));
-        queue.mark_ready(old);
-        assert!(queue.take_ready().is_some());
-
-        // Cancel, clearing the field, and choosing Auto all invalidate pending
-        // work without freeing the still-running filesystem probe's slot.
-        queue.replace(None);
-        queue.mark_ready(old);
-        assert!(queue.take_ready().is_none());
-        queue.replace(Some("/different".into()));
-        let reopened = queue.replace(Some("/mount".into()));
-        queue.mark_ready(reopened);
-        assert!(queue.take_ready().is_none());
-        assert!(!mountpoint_preflight_result_is_current(
-            old,
-            queue.generation,
-            "/mount",
-            Some("/mount"),
-        ));
-        queue.finish(old);
-        let request = queue.take_ready().unwrap();
-        assert_eq!(request.generation, reopened);
-        assert_eq!(request.value, "/mount");
-    }
-
-    #[test]
     fn mountpoint_preflight_rejects_stale_generations_even_for_the_same_path() {
         assert!(mountpoint_preflight_result_is_current(
             3,
@@ -14943,14 +13971,24 @@ mod localization_tests {
             out_of_space: false,
             synced: true,
         };
-        assert!(unmount_needs_confirmation(Some(&synced), false, 1));
-        assert!(!unmount_needs_confirmation(Some(&synced), false, 2));
-        assert!(unmount_needs_confirmation(Some(&synced), true, 2));
-        assert!(unmount_needs_confirmation(None, false, 2));
-        let mut pending = synced.clone();
+        let mut state = mount_feedback::TransferState::default();
+        assert!(!state.synced());
+        state.update(synced.clone());
+        assert!(!state.synced());
+        state.update(synced.clone());
+        assert!(state.synced());
+        state.fail("timeout".into());
+        assert!(!state.synced());
+        assert!(state.current().is_none());
+        state.update(synced.clone());
+        assert!(!state.synced());
+        state.update(synced.clone());
+        assert!(state.synced());
+        let mut pending = synced;
         pending.synced = false;
         pending.queued = 1;
-        assert!(unmount_needs_confirmation(Some(&pending), false, 2));
+        state.update(pending);
+        assert!(!state.synced());
     }
 
     #[test]

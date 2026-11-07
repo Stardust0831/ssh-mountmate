@@ -1,8 +1,8 @@
 //! Editor-only SAI setup; authentication never enters the mount service or saved settings.
 use crate::i18n::Locale;
 use crate::program_log::Level;
-use iced::widget::{button, checkbox, column, container, pick_list, scrollable, text};
-use iced::{Element, Fill, Task};
+use iced::widget::{button, checkbox, column, container, pick_list, row, scrollable, text};
+use iced::{Element, Fill, Task, clipboard};
 use mountmate_core::connection::{ConnectionDraft, ConnectionSource};
 use mountmate_sai::{
     Client, ConfiguredConnection, Connection, EnrollmentProgress, Error, Login, MountRole,
@@ -31,6 +31,9 @@ pub enum Message {
     EnrollmentProgress(u64, EnrollmentProgress),
     Finished(u64, Result<ConfiguredConnection, Error>),
     OpenBrowser,
+    CopyLink,
+    CopyCode,
+    CopyConsole,
     ToggleDeviceCode,
     OpenConsole,
     BrowserOpened(u64, bool),
@@ -561,14 +564,21 @@ impl State {
                 }
             }
             Message::OpenBrowser => {
-                if let Some(url) = self
-                    .verification_url
-                    .as_deref()
-                    .or_else(|| self.login.as_ref().map(Login::verification_url))
-                {
+                if let Some(url) = self.verification_url() {
                     return (self.open_browser(url), None);
                 }
             }
+            Message::CopyLink => {
+                if let Some(url) = self.verification_url() {
+                    return (clipboard::write(url.to_owned()), None);
+                }
+            }
+            Message::CopyCode => {
+                if let Some(login) = &self.login {
+                    return (clipboard::write(login.user_code().to_owned()), None);
+                }
+            }
+            Message::CopyConsole => return (clipboard::write(PORTAL.to_owned()), None),
             Message::ToggleDeviceCode if self.login.is_some() => {
                 self.show_device_code = !self.show_device_code;
             }
@@ -625,6 +635,12 @@ impl State {
         self.roots_task = Some(handle.abort_on_drop());
         task
     }
+    fn verification_url(&self) -> Option<&str> {
+        self.verification_url
+            .as_deref()
+            .or_else(|| self.login.as_ref().map(Login::verification_url))
+    }
+
     fn open_browser(&self, url: &str) -> Task<Message> {
         let url = url.to_owned();
         let generation = self.generation;
@@ -662,11 +678,22 @@ impl State {
             {
                 content = content
                     .push(text(login.manual_verification_url()).size(14))
-                    .push(text(login.user_code()).size(24));
+                    .push(
+                        row![
+                            text(login.user_code()).size(24),
+                            button(tr("Copy code", "复制验证码")).on_press(Message::CopyCode)
+                        ]
+                        .spacing(10),
+                    );
             }
             content = content
                 .push(
-                    button(tr("Open sign-in page", "打开登录页面")).on_press(Message::OpenBrowser),
+                    row![
+                        button(tr("Open sign-in page", "打开登录页面"))
+                            .on_press(Message::OpenBrowser),
+                        button(tr("Copy link", "复制链接")).on_press(Message::CopyLink)
+                    ]
+                    .spacing(10),
                 )
                 .push(text(tr("Waiting for authorization…", "正在等待授权…")));
             if login.has_complete_verification_url() {
@@ -705,7 +732,14 @@ impl State {
                             "Confirm this connection in the browser. Setup will continue automatically after confirmation.",
                             "请在浏览器确认此连接，确认后会自动完成配置。",
                         )))
-                        .push(button(tr("Open confirmation page", "打开确认页面")).on_press(Message::OpenBrowser));
+                        .push(
+                            row![
+                                button(tr("Open confirmation page", "打开确认页面"))
+                                    .on_press(Message::OpenBrowser),
+                                button(tr("Copy link", "复制链接")).on_press(Message::CopyLink)
+                            ]
+                            .spacing(10),
+                        );
                     if self.browser_failed {
                         content = content
                             .push(text(tr(
@@ -797,7 +831,13 @@ impl State {
                     "Could not open the browser. Open the SAI console manually:",
                     "无法打开浏览器，请手动打开 SAI 控制台：",
                 )))
-                .push(text(PORTAL).size(14));
+                .push(
+                    row![
+                        text(PORTAL).size(14),
+                        button(tr("Copy link", "复制链接")).on_press(Message::CopyConsole)
+                    ]
+                    .spacing(10),
+                );
         }
         if self.in_progress() {
             content = content.push(
